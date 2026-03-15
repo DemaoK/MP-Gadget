@@ -10,6 +10,9 @@
 #include <libgadget/blackhole.h>
 #include <libgadget/density.h>
 #include <libgadget/hydra.h>
+#ifdef SIDM
+#include <libgadget/sidm.h>
+#endif
 #include <libgadget/fof.h>
 #include <libgadget/init.h>
 #include <libgadget/run.h>
@@ -381,6 +384,15 @@ create_gadget_parameter_set()
     param_set_action(ps, "BlackHoleFeedbackMethod", BlackHoleFeedbackMethodAction, NULL);
     param_set_action(ps, "StarformationCriterion", StarformationCriterionAction, NULL);
 
+#ifdef SIDM
+    /* Parameters for the SIDM module */
+    param_declare_int(ps, "SIDMOn", OPTIONAL, 0, "Enables self-interacting dark matter.");
+    param_declare_int(ps, "vdSIDMOn", OPTIONAL, 0, "Enables velocity-dependent self-interacting dark matter.");
+    param_declare_double(ps, "sigma0", OPTIONAL, 0, "Cross section per unit mass in cm^2/g.");
+    param_declare_double(ps, "wTurn", OPTIONAL, 0, "Turnover velocity in km/s.");
+    param_declare_double(ps, "MultiscatteringThreshold", OPTIONAL, -1, "If >= 0, conflicting step-2 scatters are kept with this probability; if < 0, use strict single-scatter claim mode.");
+#endif
+
     return ps;
 }
 
@@ -437,5 +449,8 @@ void read_parameter_file(char *fname, int * ShowBacktrace, double * MaxMemSizePe
     set_blackhole_params(ps);
     set_metal_return_params(ps);
     set_stats_params(ps);
+#ifdef SIDM
+    set_sidm_params(ps);
+#endif
     parameter_set_free(ps);
 }

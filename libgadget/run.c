@@ -37,6 +37,9 @@
 #include "veldisp.h"
 #include "physconst.h"
 #include "plane.h"
+#ifdef SIDM
+#include "sidm.h"
+#endif
 
 static struct ClockTable Clocks;
 /* Size of table full of random numbers generated each timestep.*/
@@ -107,6 +110,12 @@ static struct run_params
 
     int ExcursionSetReionOn; /*Flag for enabling the excursion set reionisation model*/
     int UVBGdim; /*Dimension of excursion set grids*/
+#ifdef SIDM
+    int SIDMOn; /* Flag for enabling the SIDM model */
+    int vdSIDMOn; /* Flag for enabling the velocity dependent SIDM model */
+    double sigma0; /* Cross section for SIDM */
+    double wTurn; /* Turnover velocity for SIDM */
+#endif
 
 } All;
 
@@ -184,6 +193,12 @@ set_all_global_params(ParameterSet * ps)
         }
         All.ExcursionSetReionOn = param_get_int(ps,"ExcursionSetReionOn");
         All.UVBGdim = param_get_int(ps, "UVBGdim");
+#ifdef SIDM
+        All.SIDMOn = param_get_int(ps, "SIDMOn");
+        All.vdSIDMOn = param_get_int(ps, "vdSIDMOn");
+        All.sigma0 = param_get_double(ps, "sigma0");
+        All.wTurn = param_get_double(ps, "wTurn");
+#endif
     }
     MPI_Bcast(&All, sizeof(All), MPI_BYTE, 0, MPI_COMM_WORLD);
 }
@@ -665,6 +680,35 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
         }
         /* We don't need this timestep's tree anymore.*/
         force_tree_free(&gasTree);
+
+#ifdef SIDM
+        /* Run the comoving SIDM scatter solve after the gravity/hydro work for
+         * this step. sidm_force() stores step-local velocity kicks that are
+         * consumed later by the gravity kick paths. */
+        RandTable rnd_sidm = {0};
+        ForceTree sidmTree = {0};
+        if(All.SIDMOn) {
+            int64_t local_active_dm = 0;
+#pragma omp parallel for reduction(+ : local_active_dm)
+            for(int i = 0; i < Act.NumActiveParticle; i++) {
+                int p = Act.ActiveParticle ? Act.ActiveParticle[i] : i;
+                if(P[p].Type == 1 && !P[p].IsGarbage && !P[p].Swallowed)
+                    local_active_dm++;
+            }
+            int64_t global_active_dm = local_active_dm;
+            MPI_Allreduce(MPI_IN_PLACE, &global_active_dm, 1, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
+
+            if(global_active_dm > 0) {
+                rnd_sidm = set_random_numbers(seed, RNDTABLE);
+                force_tree_rebuild_mask(&sidmTree, ddecomp, DMMASK, All.OutputDir);
+                walltime_measure("/SPH/SIDM_Build");
+                sidm_force(&Act, atime, hubble_function(&All.CP, atime), &All.CP, &rnd_sidm, units, &times, &sidmTree);
+                force_tree_free(&sidmTree);
+            }
+        }
+        if(rnd_sidm.Table)
+            free_random_numbers(&rnd_sidm);
+#endif
 
         /* Compute the list of particles that cross a lightcone and write it to disc.
          * This should happen when kick and drift times are synchronised.*/

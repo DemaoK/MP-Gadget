@@ -40,6 +40,7 @@ typedef struct {
 typedef struct {
     int mask;
     int other;
+    int stop; /* Let ngbiter terminate the current walk early. */
     double Hsml;
     double dist[3];
     double r2;

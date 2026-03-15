@@ -38,6 +38,11 @@ FILES = $(shell git ls-files)
 # (easier to extract from other utils, e.g. python)
 include ../Makefile.version
 
+SIDM_OBJS =
+ifneq (,$(findstring -DSIDM,$(OPT)))
+SIDM_OBJS += sidm.o
+endif
+
 # Main Rules
 #
 # make V=1 to see the command line
@@ -56,7 +61,7 @@ GADGET_OBJS =  \
 	 treewalk.o cosmology.o \
 	 gravshort-tree.o gravshort-pair.o hydra.o  timefac.o \
 	 gravpm.o powerspectrum.o \
-	 forcetree.o \
+	 forcetree.o $(SIDM_OBJS) \
 	 petapm.o gravity.o \
 	 densitykernel.o lightcone.o walltime.o\
 	 runtests.o \

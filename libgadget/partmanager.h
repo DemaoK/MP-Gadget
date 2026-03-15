@@ -32,6 +32,13 @@ struct particle_data
     };
     /* Cacheline is here: above data is needed for the treebuild*/
     MyFloat Vel[3];   /* particle velocity at its current time */
+#ifdef SIDM
+    MyFloat SIDMAccel[3]; /* Pending DM velocity kick from SIDM scattering */
+    double SIDMProb; /* Step-1 total scatter probability; -1 means no accepted trial */
+    MyIDType Partner; /* Step-local chosen or claimed SIDM partner */
+    MyFloat SIDMPartnerDist; /* Distance to the chosen step-1 partner */
+    int Scattered; /* Step-local claim/pending-kick flag, cleared after the kick is consumed */
+#endif
     MyFloat FullTreeGravAccel[3]; /* Short-range tree acceleration at the most recent timestep
                                  which included all particles (ie, PM steps). Does not include PM acceleration.
                                  At time of writing this

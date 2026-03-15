@@ -10,6 +10,9 @@ OPTIMIZE =  -fopenmp -O3 -g -Wall -ffast-math
 #--------------------------------------- Basic operation mode of code
 #OPT += VALGRIND     # allow debugging with valgrind, disable the GADGET memory allocator.
 #OPT += -DDEBUG      # print a lot of debugging messages
+#OPT += -DSIDM       # enable the SIDM scattering module
+#OPT += -DSIDMCHECK  # emit SIDM momentum/unit-conversion checks and per-step scatter statistics
+#OPT += -DSIDMFULLCHECK # emit full per-scatter SIDM debug output (implies SIDMCHECK)
 #Disable openmp locking. This means no threading.
 #OPT += -DNO_OPENMP_SPINLOCK
 

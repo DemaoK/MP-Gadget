@@ -935,8 +935,13 @@ int treewalk_visit_ngbiter(TreeWalkQueryBase * I,
     TreeWalkNgbIterBase * iter = (TreeWalkNgbIterBase *) alloca(lv->tw->ngbiter_type_elsize);
 
     /* Kick-start the iteration with other == -1 */
+    iter->stop = 0;
     iter->other = -1;
     lv->tw->ngbiter(I, O, iter, lv);
+    if(iter->stop) {
+        treewalk_add_counters(lv, 0);
+        return 0;
+    }
     /* Check whether the tree contains the particles we are looking for*/
     if((lv->tw->tree->mask & iter->mask) != iter->mask)
         endrun(5, "Treewalk for particles with mask %d but tree mask is only %d overlap %d.\n", iter->mask, lv->tw->tree->mask, lv->tw->tree->mask & iter->mask);
@@ -950,6 +955,8 @@ int treewalk_visit_ngbiter(TreeWalkQueryBase * I,
 
     for(inode = 0; inode < NODELISTLENGTH && I->NodeList[inode] >= 0; inode++)
     {
+        if(iter->stop)
+            break;
         int numcand = ngb_treefind_threads(I, iter, I->NodeList[inode], lv);
         /* Export buffer is full end prematurally */
         if(numcand < 0)
@@ -996,6 +1003,8 @@ int treewalk_visit_ngbiter(TreeWalkQueryBase * I,
             iter->other = other;
 
             lv->tw->ngbiter(I, O, iter, lv);
+            if(iter->stop)
+                break;
         }
 
         ninteractions += numngb;
@@ -1156,19 +1165,28 @@ int treewalk_visit_nolist_ngbiter(TreeWalkQueryBase * I,
     TreeWalkNgbIterBase * iter = (TreeWalkNgbIterBase *) alloca(lv->tw->ngbiter_type_elsize);
 
     /* Kick-start the iteration with other == -1 */
+    iter->stop = 0;
     iter->other = -1;
     lv->tw->ngbiter(I, O, iter, lv);
+    if(iter->stop) {
+        treewalk_add_counters(lv, 0);
+        return 0;
+    }
 
     int64_t ninteractions = 0;
     int inode;
     for(inode = 0; inode < NODELISTLENGTH && I->NodeList[inode] >= 0; inode++)
     {
+        if(iter->stop)
+            break;
         int no = I->NodeList[inode];
         const ForceTree * tree = lv->tw->tree;
         const double BoxSize = tree->BoxSize;
 
         while(no >= 0)
         {
+            if(iter->stop)
+                break;
             struct NODE *current = &tree->Nodes[no];
 
             /* When walking exported particles we start from the encompassing top-level node,
@@ -1238,7 +1256,11 @@ int treewalk_visit_nolist_ngbiter(TreeWalkQueryBase * I,
                         iter->r = sqrt(r2);
                         lv->tw->ngbiter(I, O, iter, lv);
                         ninteractions++;
+                        if(iter->stop)
+                            break;
                     }
+                    if(iter->stop)
+                        break;
                     /* Move sideways*/
                     no = current->sibling;
                     continue;

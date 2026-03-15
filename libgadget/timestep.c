@@ -102,6 +102,9 @@ static inttime_t convert_timestep_to_ti(double dloga, const int p, const inttime
 static int get_timestep_bin(inttime_t dti);
 static void do_grav_short_range_kick(struct particle_data * part, const MyFloat * const GravAccel, const double Fgravkick);
 static void do_hydro_kick(int i, double dt_entr, double Fgravkick, double Fhydrokick, const double atime);
+#ifdef SIDM
+static void do_sidm_kick(struct particle_data * part);
+#endif
 
 static void print_bad_timebin(const double dloga, const inttime_t dti, const int p, const double * const GravAccel, const inttime_t dti_max, enum TimeStepType titype);
 
@@ -263,6 +266,10 @@ apply_hierarchical_grav_kick(const ActiveParticles * subact, Cosmology * CP, Dri
             do_grav_short_range_kick(&P[pa], AccelStore[pa], gravkick);
         else
             do_grav_short_range_kick(&P[pa], P[pa].FullTreeGravAccel, gravkick);
+#ifdef SIDM
+        if(P[pa].Type == 1 && P[pa].Scattered)
+            do_sidm_kick(&P[pa]);
+#endif
 #ifdef DEBUG
 //         message(4, "KICK ID %ld bin %d kick time: %ld + %ld - %ld now %ld hydro %ld kick ti: %ld ti %ld largest %d\n", P[pa].ID, P[pa].TimeBinGravity, P[pa].Ti_kick_grav, dti/2, lowerdti/2,
 //                 P[pa].Ti_kick_grav + dti/2 -lowerdti/2,
@@ -907,6 +914,11 @@ apply_half_kick(const ActiveParticles * act, Cosmology * CP, DriftKickTimes * ti
             P[i].Ti_kick_grav = times->Ti_kick[bin_gravity] + dti_from_timebin(bin_gravity)/2;
 #endif
         }
+#ifdef SIDM
+        /* Apply the resolved SIDM impulse in the non-hierarchical kick path. */
+        if(P[i].Type == 1 && P[i].Scattered == 1)
+            do_sidm_kick(&P[i]);
+#endif
         /* Hydro kick for hydro particles*/
         if(P[i].Type == 0 || P[i].Type == 5) {
             int bin_hydro = P[i].TimeBinHydro;
@@ -1041,6 +1053,24 @@ do_hydro_kick(int i, double dt_entr, double Fgravkick, double Fhydrokick, const 
     }
 #endif
 }
+
+#ifdef SIDM
+/* Apply the resolved SIDM velocity impulse and clear step-local SIDM state. */
+static void
+do_sidm_kick(struct particle_data * part)
+{
+    int j;
+    for(j = 0; j < 3; j++) {
+        part->Vel[j] += part->SIDMAccel[j];
+        part->SIDMAccel[j] = 0;
+    }
+    /* Consume the SIDM kick once so later gravity kicks do not re-apply it. */
+    part->Scattered = 0;
+    part->SIDMProb = -1;
+    part->Partner = (MyIDType)-1;
+    part->SIDMPartnerDist = 0;
+}
+#endif
 
 static double grav_acceleration2(const int p, const MyFloat * const GravAccel, const double atime)
 {
