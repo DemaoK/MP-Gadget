@@ -39,7 +39,8 @@ FILES = $(shell git ls-files)
 include ../Makefile.version
 
 SIDM_OBJS =
-ifneq (,$(findstring -DSIDM,$(OPT)))
+SIDM_DEFINES := $(OPT) $(CFLAGS) $(CPPFLAGS)
+ifneq (,$(findstring -DSIDM,$(SIDM_DEFINES)))
 SIDM_OBJS += sidm.o
 endif
 
