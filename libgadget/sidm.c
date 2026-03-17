@@ -406,6 +406,32 @@ static inline void sidm_store_candidate(struct SIDMPriv *priv, int place,
   }
 }
 
+/* Attempt to claim a partner for this SIDM step.
+ * Returns 1 if the partner was already consumed, 0 if this call claimed it. */
+static inline int sidm_try_claim_partner(int other, TreeWalk *tw) {
+  int already_scattered;
+  struct SIDMPriv *priv = SIDM_GET_PRIV(tw);
+
+  if (priv->PartLocks) {
+    lock_spinlock(other, priv->PartLocks);
+    already_scattered = P[other].Scattered;
+    if (already_scattered == 0) {
+      P[other].Scattered = 1;
+    }
+    unlock_spinlock(other, priv->PartLocks);
+  } else {
+#pragma omp critical(sidm_claim_partner)
+    {
+      already_scattered = P[other].Scattered;
+      if (already_scattered == 0) {
+        P[other].Scattered = 1;
+      }
+    }
+  }
+
+  return already_scattered;
+}
+
 /*******************************************************************/
 /*! Driver routine for the SIDM scatter solve on gravity-active DM particles.
  */
@@ -429,7 +455,7 @@ void sidm_force(const ActiveParticles *act, const double atime,
   priv->rnd = rnd;
   priv->times = times;
   init_kick_factor_data(&priv->kf, times, CP);
-  if (SIDMParams.MultiscatteringThreshold < 0 && PartManager->MaxPart > 0)
+  if (PartManager->MaxPart > 0)
     priv->PartLocks = init_spinlocks(PartManager->MaxPart);
 #ifdef SIDMCHECK
   if (SIDMParams.vdSIDMOn) {
@@ -1235,32 +1261,12 @@ static void sidm_ngbiter_scatter(TreeWalkQuerySIDM_SCATTER *I,
       /* Else: We are the lower ID. We proceed to claim and calculate. */
     }
 
-    /* Now handle the MultiscatteringThreshold-specific logic */
-    if (SIDMParams.MultiscatteringThreshold < 0) {
-      /* Single-scattering mode: claim partner with a protected check+set. */
-      /* We try to "Claim" the partner to prevent race conditions with third
-         parties (C->A or C->B). We perform a lock/critical check-and-set on
-         the Scattered flag.
-      */
-      int already_scattered;
-      /* Claim partner atomically (check+set must be one critical section). */
-      if (SIDM_GET_PRIV(lv->tw)->PartLocks) {
-        lock_spinlock(other, SIDM_GET_PRIV(lv->tw)->PartLocks);
-        already_scattered = P[other].Scattered;
-        if (already_scattered == 0) {
-          P[other].Scattered = 1;
-        }
-        unlock_spinlock(other, SIDM_GET_PRIV(lv->tw)->PartLocks);
-      } else {
-#pragma omp critical(sidm_claim_partner)
-        {
-          already_scattered = P[other].Scattered;
-          if (already_scattered == 0) {
-            P[other].Scattered = 1;
-          }
-        }
-      }
+    /* First mirror strict single-scatter semantics with an atomic claim.
+     * Multiscattering mode only gets a threshold-based second chance if this
+     * strict-style claim loses. */
+    const int already_scattered = sidm_try_claim_partner(other, lv->tw);
 
+    if (SIDMParams.MultiscatteringThreshold < 0) {
       /* Partner was already claimed by a third party or by a previous pass. */
       if (already_scattered == 1) {
         /* We lost the race to claim this particle. Suppress current scattering.
@@ -1293,18 +1299,11 @@ static void sidm_ngbiter_scatter(TreeWalkQuerySIDM_SCATTER *I,
            we are the allowed one.
         */
       }
-    } else {
-      /* Multiscattering mode:
-       * only apply threshold suppression when this partner is in conflict.
-       * This avoids globally thinning all accepted step-1 pairs. */
-      int partner_scattered;
-#pragma omp atomic read
-      partner_scattered = P[other].Scattered;
-      const int partner_conflict =
-          (partner_partner != SIDM_NO_PARTNER && partner_partner != I->ID) ||
-          (partner_scattered == 1);
-
-      if (partner_conflict) {
+    } else if (already_scattered == 1) {
+      /* Strict mode would suppress here because another accepted interaction
+       * already consumed the partner. Multiscattering mode optionally keeps
+       * this extra conflicting scatter. */
+      {
         /* Draw a random number to determine whether to suppress this
          * conflicting scatter event. */
         double rNB = get_random_number(I->ID + 1, SIDM_GET_PRIV(lv->tw)->rnd);
@@ -1335,12 +1334,9 @@ static void sidm_ngbiter_scatter(TreeWalkQuerySIDM_SCATTER *I,
      * queries observe the reservation. */
 #pragma omp atomic write
     P[other].Partner = I->ID;
-    /* Scattered flag already set by the protected claim above if Threshold < 0
-     */
-    if (SIDMParams.MultiscatteringThreshold >= 0) {
-#pragma omp atomic write
-      P[other].Scattered = 1;
-    }
+    /* The strict-style claim above already set Scattered when the partner was
+     * free. If the threshold path kept an extra conflict, the partner was
+     * already marked scattered by the earlier accepted interaction. */
 
     O->Update = 1;
     O->Partner = P[other].ID;
