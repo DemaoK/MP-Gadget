@@ -31,7 +31,7 @@
 
 #define MAX_SIDM_NEIGHBORS                                                     \
   38                   /* Maximum number of neighbors for SIDM interactions*/
-#define ALPHA_FACTOR 3 /* Weighting factor in the SIDM partner-selection draw  \
+#define ALPHA_FACTOR 1 /* Weighting factor in the SIDM partner-selection draw  \
                         */
 #define SIDM_NO_PARTNER ((MyIDType)(-1)) /* Sentinel for no chosen SIDM partner. */
 /* Piecewise-linear lookup for the vdSIDM shape factor as a function of vw^2.
