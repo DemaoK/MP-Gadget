@@ -94,6 +94,23 @@ inttime_t init(int RestartSnapNum, const char * OutputDir, struct header_data * 
 
     init_alloc_particle_slot_memory(PartManager, SlotsManager, InitParams.PartAllocFactor, header, MPI_COMM_WORLD);
 
+#ifdef SIDM
+    /* Older restart snapshots do not carry SIDM transient state. Seed safe
+     * defaults before reading so missing non-fatal blocks leave particles in a
+     * no-pending-scatter state, while newer snapshots can still overwrite them.
+     */
+    #pragma omp parallel for
+    for(i = 0; i < PartManager->NumPart; i++) {
+        int j;
+        for(j = 0; j < 3; j++)
+            P[i].SIDMAccel[j] = 0;
+        P[i].SIDMProb = -1;
+        P[i].Partner = (MyIDType)-1;
+        P[i].SIDMPartnerDist = 0;
+        P[i].Scattered = 0;
+    }
+#endif
+
     /*Read the snapshot*/
     petaio_read_snapshot(RestartSnapNum, OutputDir, CP, header, PartManager, SlotsManager, MPI_COMM_WORLD);
 
