@@ -82,6 +82,7 @@ static struct run_params
                               * and splits the hydro and gravitational timesteps. */
     int MaxDomainTimeBinDepth; /* We should redo domain decompositions every timestep, after the timestep hierarchy gets deeper than this.
                                   Essentially forces a domain decompositon every 2^MaxDomainTimeBinDepth timesteps.*/
+    double ActivePartFracForNewDomainDecomp; /* Threshold for extra non-PM full domain decompositions. 0 preserves the old timebin-depth trigger. */
     int FastParticleType; /*!< flags a particle species to exclude timestep calculations.*/
 
     /* parameters determining output frequency */
@@ -173,6 +174,9 @@ set_all_global_params(ParameterSet * ps)
         All.StarformationOn = param_get_int(ps, "StarformationOn");
         All.MetalReturnOn = param_get_int(ps, "MetalReturnOn");
         All.MaxDomainTimeBinDepth = param_get_int(ps, "MaxDomainTimeBinDepth");
+        All.ActivePartFracForNewDomainDecomp = param_get_double(ps, "ActivePartFracForNewDomainDecomp");
+        if(All.ActivePartFracForNewDomainDecomp < 0 || All.ActivePartFracForNewDomainDecomp > 1)
+            endrun(1, "ActivePartFracForNewDomainDecomp must be between 0 and 1, got %g\n", All.ActivePartFracForNewDomainDecomp);
 
         /*Massive neutrino parameters*/
         All.CP.MassiveNuLinRespOn = param_get_int(ps, "MassiveNuLinRespOn");
@@ -297,6 +301,35 @@ begrun(const int RestartSnapNum, struct header_data * head)
         check_density_entropy(&All.CP, get_MinEgySpec(), head->TimeSnapshot);
 
     return ti_init;
+}
+
+static double
+measure_current_active_particle_fraction(const DriftKickTimes * const times)
+{
+    int64_t local_active = 0;
+    int64_t local_total = 0;
+
+#pragma omp parallel for reduction(+ : local_active, local_total)
+    for(int64_t i = 0; i < PartManager->NumPart; i++) {
+        const struct particle_data * part = &PartManager->Base[i];
+        if(part->IsGarbage || part->Swallowed)
+            continue;
+
+        local_total++;
+
+        const int hydro_particle = part->Type == 0 || part->Type == 5;
+        if(is_timebin_active(part->TimeBinGravity, times->Ti_Current) ||
+           (hydro_particle && is_timebin_active(part->TimeBinHydro, times->Ti_Current)))
+            local_active++;
+    }
+
+    int64_t global_counts[2] = {local_active, local_total};
+    MPI_Allreduce(MPI_IN_PLACE, global_counts, 2, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
+
+    if(global_counts[1] == 0)
+        return 0;
+
+    return (double) global_counts[0] / (double) global_counts[1];
 }
 
 #ifdef DEBUG
@@ -428,9 +461,18 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
         }
 
         int extradomain = is_timebin_active(times.mintimebin + All.MaxDomainTimeBinDepth, times.Ti_Current);
+        int do_full_domain = extradomain || is_PM;
+        if(extradomain && !is_PM && All.ActivePartFracForNewDomainDecomp > 0) {
+            const double active_fraction = measure_current_active_particle_fraction(&times);
+            if(active_fraction < All.ActivePartFracForNewDomainDecomp) {
+                do_full_domain = 0;
+                message(0, "Skipping full domain decomposition: active particle fraction %g < ActivePartFracForNewDomainDecomp %g. Maintaining existing domains.\n",
+                        active_fraction, All.ActivePartFracForNewDomainDecomp);
+            }
+        }
         /* drift and ddecomp decomposition */
         /* at first step this is a noop */
-        if(extradomain || is_PM) {
+        if(do_full_domain) {
             /* Sync positions of all particles */
             drift_all_particles(Ti_Last, times.Ti_Current, &All.CP, rel_random_shift);
             /* full decomposition rebuilds the domain, needs keys.*/
