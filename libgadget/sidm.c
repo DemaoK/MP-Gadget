@@ -148,6 +148,33 @@ void set_sidm_params(ParameterSet *ps) {
     sidm_init_vd_sigma_lookup();
 }
 
+double
+sidm_sigma_over_m_code(double vrel2, double atime, Cosmology * CP, const struct UnitSystem units)
+{
+  const double sigma0_const = SIDMParams.sigma0 * CP->HubbleParam *
+                              units.UnitMass_in_g /
+                              (units.UnitLength_in_cm * units.UnitLength_in_cm) /
+                              (atime * atime);
+  if (!SIDMParams.vdSIDMOn)
+    return sigma0_const;
+
+  if (!SIDMVdSigmaShapeLookupReady)
+    sidm_init_vd_sigma_lookup();
+
+  const double wturn_physical_cgs = SIDMParams.wTurn * 1e5;
+  const double wturn_internal =
+      (wturn_physical_cgs / units.UnitVelocity_in_cm_per_s) * atime;
+  const double wturn2 = wturn_internal * wturn_internal;
+  if (wturn2 <= 0)
+    return 0;
+
+  const double vw2 = (vrel2 + 0.001) / wturn2;
+  const int seg = sidm_vd_sigma_lookup_segment(vw2);
+  if (seg >= 0)
+    return sigma0_const * sidm_vd_sigma_shape_lookup(vw2, seg);
+  return sigma0_const * sidm_vd_sigma_shape_exact(vw2);
+}
+
 /* Cubic-spline smoothing kernel used for the SIDM pair weighting.
  * Adopted from arXiv:1201.5892. */
 double CubicSplineKernel(double r, double h) {

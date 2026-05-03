@@ -39,6 +39,7 @@
 #include "plane.h"
 #ifdef SIDM
 #include "sidm.h"
+#include "sidm_bhseed.h"
 #endif
 
 static struct ClockTable Clocks;
@@ -638,8 +639,13 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
                  (CalcUVBG && All.ExcursionSetReionOn))) {
 
                 /* Seeding: builds its own tree.*/
-                FOFGroups fof = fof_fof(ddecomp, 0, MPI_COMM_WORLD);
+                FOFGroups fof = fof_fof(ddecomp, 0, &All.CP, MPI_COMM_WORLD);
                 if(All.BlackHoleOn && atime >= TimeNextSeedingCheck) {
+#ifdef SIDM
+                    if(sidm_bhseed_is_enabled())
+                        fof_seed_sidm(&fof, &Act, atime, &All.CP, &times, units, MPI_COMM_WORLD);
+                    else
+#endif
                     fof_seed(&fof, &Act, atime, &rnd, MPI_COMM_WORLD);
                     TimeNextSeedingCheck = atime * All.TimeBetweenSeedingSearch;
                 }
@@ -740,7 +746,7 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
         FOFGroups fof = {0};
         if(WriteFOF) {
             /* Compute FOF and assign GrNr so it can be written in checkpoint.*/
-            fof = fof_fof(ddecomp, 1, MPI_COMM_WORLD);
+            fof = fof_fof(ddecomp, 1, &All.CP, MPI_COMM_WORLD);
         }
 
         /* WriteFOF just reminds the checkpoint code to save GroupID*/
@@ -890,7 +896,7 @@ runfof(const int RestartSnapNum, const inttime_t Ti_Current, const struct header
         if(GradRho)
             myfree(GradRho);
     }
-    FOFGroups fof = fof_fof(ddecomp, 1, MPI_COMM_WORLD);
+    FOFGroups fof = fof_fof(ddecomp, 1, &All.CP, MPI_COMM_WORLD);
     fof_save_groups(&fof, All.OutputDir, All.FOFFileBase, RestartSnapNum, &All.CP, header->TimeSnapshot, header->MassTable, All.MetalReturnOn, MPI_COMM_WORLD);
     fof_finish(&fof);
 }

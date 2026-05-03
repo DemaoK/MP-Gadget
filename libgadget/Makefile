@@ -41,7 +41,7 @@ include ../Makefile.version
 SIDM_OBJS =
 SIDM_DEFINES := $(OPT) $(CFLAGS) $(CPPFLAGS)
 ifneq (,$(findstring -DSIDM,$(SIDM_DEFINES)))
-SIDM_OBJS += sidm.o
+SIDM_OBJS += sidm.o sidm_bhseed.o
 endif
 
 # Main Rules

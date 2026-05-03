@@ -59,6 +59,22 @@ struct bh_particle_data {
     MyIDType SwallowID;
     MyFloat Mseed; /*Log the seed mass of BH, would be useful in case of the powerlaw seeding*/
     MyFloat FormationTime;  /*!< formation time of black hole. */
+#ifdef SIDM
+    int SIDMSeedOrigin; /* 1 if this BH was seeded from SIDM collapse */
+    int SIDMSeedTrigger; /* Diagnostic enum for the seeding trigger */
+    MyFloat SIDMSMFPMassInitial; /* Measured SMFP mass at seeding */
+    MyFloat SIDMSMFPRadius; /* Measured SMFP radius at seeding */
+    MyFloat SIDMDarkReservoirMass; /* Remaining dark reservoir available for Bondi accretion */
+    MyFloat SIDMDarkReservoirInitial; /* Initial dark reservoir mass */
+    MyFloat SIDMDarkMdot; /* Dark reservoir accretion rate; does not power AGN feedback */
+    MyFloat SIDMRhoInf; /* Comoving DM density used by the dark Bondi rate */
+    MyFloat SIDMSoundSpeedInf; /* Internal velocity scale used by the dark Bondi rate */
+    MyFloat SIDMReservoirRadius; /* Diagnostic radius used to measure rho_inf/cs_inf */
+    MyFloat SIDMGasDynMassDebt; /* Dynamical mass debt sourced by gas accretion */
+    MyFloat SIDMDMDynMassDebt; /* Dynamical mass debt sourced by dark accretion */
+    MyFloat SIDMCollapseProgress; /* Collapse clock at seeding */
+    MyFloat SIDMCollapseTime; /* t_c estimate used at seeding, in internal time units */
+#endif
     /* Minimum potential reposition helpers*/
     MyFloat MinPot; /* Minimum potential, for diagnostics */
     double MinPotPos[3];

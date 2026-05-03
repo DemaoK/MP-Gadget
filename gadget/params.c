@@ -12,6 +12,7 @@
 #include <libgadget/hydra.h>
 #ifdef SIDM
 #include <libgadget/sidm.h>
+#include <libgadget/sidm_bhseed.h>
 #endif
 #include <libgadget/fof.h>
 #include <libgadget/init.h>
@@ -250,6 +251,23 @@ create_gadget_parameter_set()
     param_declare_int(ps,"MergeGravBound",OPTIONAL, 1, "If set to 1, apply gravitational bound criteria for merging event. This criteria would be automatically turned off if reposition is enabled.");
     param_declare_double(ps, "SeedBHDynMass", OPTIONAL, -1, "The initial dynamic mass of BH, default -1 will use the mass of gas particle. Larger Mdyn would help to stablize the BH in the early phase if turning off reposition.");
 
+#ifdef SIDM
+    /* vdSIDM gravothermal-collapse BH seeding. Defaults leave the feature off. */
+    param_declare_int(ps, "SIDMBHSeedOn", OPTIONAL, 0, "Enable vdSIDM gravothermal-collapse BH seeding from DM particles.");
+    param_declare_int(ps, "SIDMBHDynMassCatchupOn", OPTIONAL, 1, "Enable dynamical-mass catch-up bookkeeping for SIDM-origin BHs.");
+    param_declare_double(ps, "SIDMBHMinFoFMass", OPTIONAL, 1e-2, "Minimum FoF halo mass for SIDM BH seeding in internal mass units.");
+    param_declare_double(ps, "SIDMBHCollapseThreshold", OPTIONAL, 3.0, "Integrated t/t_c threshold for SIDM BH seeding.");
+    param_declare_double(ps, "SIDMBHCollapseCoeff", OPTIONAL, 200.0, "Coefficient A_c in the fallback halo-scale SIDM collapse time.");
+    param_declare_double(ps, "SIDMBHDefaultConcentration", OPTIONAL, 3.0, "Fallback NFW concentration used only when the SIDM BH outer-profile fit fails.");
+    param_declare_double(ps, "SIDMBHReservoirKnudsenThreshold", OPTIONAL, 1.0, "Knudsen threshold defining the local SMFP reservoir.");
+    param_declare_int(ps, "SIDMBHMinReservoirParticles", OPTIONAL, 32, "Minimum number of local DM particles required in the SMFP reservoir diagnostic.");
+    param_declare_double(ps, "SIDMBHReservoirRadiusFactor", OPTIONAL, 4.0, "Reservoir diagnostic radius in units of FORCE_SOFTENING for the first implementation.");
+    param_declare_double(ps, "SIDMBHSeedSMFPFraction", OPTIONAL, 1e-4, "BH seed mass as a fraction of the measured SMFP mass.");
+    param_declare_double(ps, "SIDMBHSeedMassMin", OPTIONAL, 0.0, "Minimum SIDM BH seed mass in internal mass units.");
+    param_declare_double(ps, "SIDMBHSeedMassMax", OPTIONAL, 0.0, "Maximum SIDM BH seed mass in internal mass units; <=0 disables the cap.");
+    param_declare_double(ps, "SIDMBHDarkBondiLambda", OPTIONAL, 0.25, "Dimensionless dark Bondi coefficient for SIDM reservoir accretion.");
+#endif
+
     static ParameterEnum BlackHoleFeedbackMethodEnum [] = {
         {"mass", BH_FEEDBACK_MASS},
         {"volume", BH_FEEDBACK_VOLUME},
@@ -451,6 +469,7 @@ void read_parameter_file(char *fname, int * ShowBacktrace, double * MaxMemSizePe
     set_stats_params(ps);
 #ifdef SIDM
     set_sidm_params(ps);
+    set_sidm_bhseed_params(ps);
 #endif
     parameter_set_free(ps);
 }

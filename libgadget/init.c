@@ -108,6 +108,8 @@ inttime_t init(int RestartSnapNum, const char * OutputDir, struct header_data * 
         P[i].Partner = (MyIDType)-1;
         P[i].SIDMPartnerDist = 0;
         P[i].Scattered = 0;
+        P[i].SIDMBHCollapseProgress = 0;
+        P[i].SIDMBHLastCheckTime = 0;
     }
 #endif
 

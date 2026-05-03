@@ -2,11 +2,16 @@
 #define FOF_H
 
 #include "utils/paramset.h"
+#include "cosmology.h"
 #include "timestep.h"
 #include "slotsmanager.h"
 #include "utils/system.h"
 
 void set_fof_params(ParameterSet * ps);
+
+#ifdef SIDM
+#define SIDM_NFW_FIT_BINS 12
+#endif
 
 void fof_init(double DMMeanSeparation);
 /* For the tests*/
@@ -57,6 +62,24 @@ struct Group
 
     int seed_index;
     int seed_task;
+
+#ifdef SIDM
+    double SIDMSeedPotential;
+    double SIDMSeedPos[3];
+    int sidm_seed_index;
+    int sidm_seed_task;
+    double SIDMBHCollapseProgress;
+    MyFloat SIDMBHLastCheckTime;
+    MyIDType SIDMBHClockID;
+    double SIDMNFWProfileMass[SIDM_NFW_FIT_BINS];
+    double SIDMNFWProfileCount[SIDM_NFW_FIT_BINS];
+    double SIDMNFWScaleRadius;
+    double SIDMNFWScaleDensity;
+    double SIDMNFWFitRMin;
+    double SIDMNFWFitRMax;
+    double SIDMNFWFitQuality;
+    int SIDMNFWFitBins;
+#endif
 };
 
 /* Structure to hold all allocated FOF groups*/
@@ -70,7 +93,7 @@ typedef struct FOFGroups
 /* Computes the Group structure, saved as a global array below.
  * If StoreGrNr is true, this writes to GrNr in partmanager.h.
  * Note this over-writes PeanoKey and means the tree cannot be rebuilt.*/
-FOFGroups fof_fof(DomainDecomp * ddecomp, const int StoreGrNr, MPI_Comm Comm);
+FOFGroups fof_fof(DomainDecomp * ddecomp, const int StoreGrNr, Cosmology * CP, MPI_Comm Comm);
 
 /*Frees the Group structure*/
 void fof_finish(FOFGroups * fof);
@@ -78,6 +101,10 @@ void fof_finish(FOFGroups * fof);
 /*Uses the Group structure to seed blackholes.
  * The active particle struct is used only because we may need to reallocate it. Randon number seeds the BH mass.*/
 void fof_seed(FOFGroups * fof, ActiveParticles * act, double atime, const RandTable * const rnd, MPI_Comm Comm);
+
+#ifdef SIDM
+void fof_seed_sidm(FOFGroups * fof, ActiveParticles * act, double atime, Cosmology * CP, const DriftKickTimes * times, const struct UnitSystem units, MPI_Comm Comm);
+#endif
 
 /* Saves the Group structure to disc.
  Returns 1 if a domain_exchange is needed afterwards.*/

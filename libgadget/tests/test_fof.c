@@ -86,7 +86,7 @@ test_fof(void **state)
     DomainDecomp ddecomp = {0};
     domain_decompose_full(&ddecomp, MPI_COMM_WORLD);
 
-    FOFGroups fof = fof_fof(&ddecomp, 1, MPI_COMM_WORLD);
+    FOFGroups fof = fof_fof(&ddecomp, 1, NULL, MPI_COMM_WORLD);
 
     /* Example assertion: this checks that the groups were allocated. */
     assert_all_true(fof.Group);
