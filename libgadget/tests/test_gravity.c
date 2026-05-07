@@ -205,7 +205,7 @@ static void do_force_test(int Nmesh, double Asmth, double ErrTolForceAcc, int di
     treeacc.FractionalGravitySoftening = 1./30.;
 
     set_gravshort_treepar(treeacc);
-    gravshort_set_softenings(PartManager->BoxSize / cbrt(PartManager->NumPart));
+    gravshort_set_softenings(PartManager->BoxSize / cbrt(PartManager->NumPart), NULL);
 
     /* Twice so the opening angle is consistent*/
     ActiveParticles act = init_empty_active_particles(PartManager);
@@ -325,7 +325,7 @@ static void test_softening_by_type(void ** state) {
     treeacc.TypeGravitySoftening[3] = 2.0;
 
     set_gravshort_treepar(treeacc);
-    gravshort_set_softenings(10.0);
+    gravshort_set_softenings(10.0, NULL);
 
     assert_true(fabs(FORCE_SOFTENING() - 2.8) < 1e-12);
     assert_true(fabs(FORCE_SOFTENING_TYPE(1) - 2.8) < 1e-12);
@@ -336,7 +336,38 @@ static void test_softening_by_type(void ** state) {
 
     treeacc.TypeGravitySoftening[3] = -1.0;
     set_gravshort_treepar(treeacc);
-    gravshort_set_softenings(10.0);
+    gravshort_set_softenings(10.0, NULL);
+
+    assert_true(fabs(FORCE_SOFTENING_TYPE(3) - 2.8) < 1e-12);
+}
+
+static void test_auto_zoom_boundary_softening(void ** state) {
+    (void) state;
+
+    double auto_factors[6] = {0};
+    auto_factors[3] = 8.0;
+
+    struct gravshort_tree_params treeacc = {0};
+    treeacc.FractionalGravitySoftening = 0.1;
+    treeacc.AutoZoomBoundarySoftening = 1;
+
+    set_gravshort_treepar(treeacc);
+    gravshort_set_softenings(10.0, auto_factors);
+
+    assert_true(fabs(FORCE_SOFTENING_TYPE(1) - 2.8) < 1e-12);
+    assert_true(fabs(FORCE_SOFTENING_TYPE(3) - 22.4) < 1e-12);
+    assert_true(fabs(FORCE_SOFTENING_PAIR(1, 3) - 22.4) < 1e-12);
+
+    treeacc.TypeGravitySoftening[3] = 2.0;
+    set_gravshort_treepar(treeacc);
+    gravshort_set_softenings(10.0, auto_factors);
+
+    assert_true(fabs(FORCE_SOFTENING_TYPE(3) - 5.6) < 1e-12);
+
+    treeacc.TypeGravitySoftening[3] = -1.0;
+    treeacc.AutoZoomBoundarySoftening = 0;
+    set_gravshort_treepar(treeacc);
+    gravshort_set_softenings(10.0, auto_factors);
 
     assert_true(fabs(FORCE_SOFTENING_TYPE(3) - 2.8) < 1e-12);
 }
@@ -374,6 +405,7 @@ static int teardown_tree(void **state) {
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_softening_by_type),
+        cmocka_unit_test(test_auto_zoom_boundary_softening),
         cmocka_unit_test(test_force_flat),
         cmocka_unit_test(test_force_close),
         cmocka_unit_test(test_force_random),

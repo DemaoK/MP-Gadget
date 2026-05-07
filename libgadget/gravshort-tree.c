@@ -71,14 +71,19 @@ double FORCE_SOFTENING_PAIR(int ptype1, int ptype2)
 
 /*! Sets the (comoving) softening length, converting from units of the mean separation to comoving internal units. */
 void
-gravshort_set_softenings(double MeanSeparation)
+gravshort_set_softenings(double MeanSeparation, const double * AutoTypeSofteningFactors)
 {
     int ptype;
     GravitySoftening = TreeParams.FractionalGravitySoftening * MeanSeparation;
     for(ptype = 0; ptype < 6; ptype++) {
         GravitySofteningByType[ptype] = GravitySoftening;
-        if(TreeParams.TypeGravitySoftening[ptype] > 0)
+        if(TreeParams.TypeGravitySoftening[ptype] > 0) {
             GravitySofteningByType[ptype] = TreeParams.TypeGravitySoftening[ptype];
+        } else if(TreeParams.AutoZoomBoundarySoftening && AutoTypeSofteningFactors && AutoTypeSofteningFactors[ptype] > 0) {
+            GravitySofteningByType[ptype] = GravitySoftening * AutoTypeSofteningFactors[ptype];
+            message(0, "AutoZoomBoundarySoftening: type %d factor=%g softening=%g\n",
+                    ptype, AutoTypeSofteningFactors[ptype], GravitySofteningByType[ptype]);
+        }
     }
     /* 0: Gas is collisional */
     message(0, "GravitySoftening = %g\n", GravitySoftening);
@@ -116,6 +121,7 @@ set_gravshort_tree_params(ParameterSet * ps)
         TreeParams.TypeGravitySoftening[3] = param_get_double(ps, "GravitySofteningType3");
         TreeParams.TypeGravitySoftening[4] = param_get_double(ps, "GravitySofteningType4");
         TreeParams.TypeGravitySoftening[5] = param_get_double(ps, "GravitySofteningType5");
+        TreeParams.AutoZoomBoundarySoftening = param_get_int(ps, "AutoZoomBoundarySoftening");
         TreeParams.MaxBHOpeningAngle = param_get_double(ps, "MaxBHOpeningAngle");
     }
     MPI_Bcast(&TreeParams, sizeof(struct gravshort_tree_params), MPI_BYTE, 0, MPI_COMM_WORLD);

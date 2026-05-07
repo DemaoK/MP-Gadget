@@ -416,13 +416,18 @@ static void petaio_write_header(BigFile * bf, const double atime, const int64_t 
     (0 != big_block_set_attr(&bh, "UnitLength_in_cm", &data->UnitLength_in_cm, "f8", 1)) ||
     (0 != big_block_set_attr(&bh, "UnitMass_in_g", &data->UnitMass_in_g, "f8", 1)) ||
     (0 != big_block_set_attr(&bh, "UnitVelocity_in_cm_per_s", &data->UnitVelocity_in_cm_per_s, "f8", 1)) ||
-    (0 != big_block_set_attr(&bh, "ZoomHighResTypes", &data->ZoomHighResTypes, "i4", 1)) ||
-    (0 != big_block_set_attr(&bh, "ZoomBoundaryTypes", &data->ZoomBoundaryTypes, "i4", 1)) ||
     (0 != big_block_set_attr(&bh, "CodeVersion", GADGET_VERSION, "S1", strlen(GADGET_VERSION))) ||
     (0 != big_block_set_attr(&bh, "CompilerSettings", GADGET_COMPILER_SETTINGS, "S1", strlen(GADGET_COMPILER_SETTINGS))) ||
     (0 != big_block_set_attr(&bh, "DensityKernel", &dk, "i4", 1)) ||
     (0 != big_block_set_attr(&bh, "HubbleParam", &CP->HubbleParam, "f8", 1)) ) {
         endrun(0, "Failed to write attributes %s\n",
+                    big_file_get_error_message());
+    }
+
+    if(data->ZoomTypeMasksPresent &&
+      ((0 != big_block_set_attr(&bh, "ZoomHighResTypes", &data->ZoomHighResTypes, "i4", 1)) ||
+       (0 != big_block_set_attr(&bh, "ZoomBoundaryTypes", &data->ZoomBoundaryTypes, "i4", 1)))) {
+        endrun(0, "Failed to write zoom type mask attributes %s\n",
                     big_file_get_error_message());
     }
 
@@ -516,8 +521,15 @@ petaio_read_header_internal(BigFile * bf, Cosmology * CP, struct header_data * H
      * and v / sqrt(a) = sqrt(a) dx/dt in the ICs. Note that snapshots never match Gadget-2, which
      * saves physical peculiar velocity / sqrt(a) in both ICs and snapshots. */
     IO.UsePeculiarVelocity = _get_attr_int(&bh, "UsePeculiarVelocity", 0);
-    Header->ZoomHighResTypes = _get_attr_int(&bh, "ZoomHighResTypes", GASMASK | DMMASK);
-    Header->ZoomBoundaryTypes = _get_attr_int(&bh, "ZoomBoundaryTypes", 1 << 3);
+    Header->ZoomTypeMasksPresent = 1;
+    if(0 != big_block_get_attr(&bh, "ZoomHighResTypes", &Header->ZoomHighResTypes, "i4", 1)) {
+        Header->ZoomHighResTypes = GASMASK | DMMASK;
+        Header->ZoomTypeMasksPresent = 0;
+    }
+    if(0 != big_block_get_attr(&bh, "ZoomBoundaryTypes", &Header->ZoomBoundaryTypes, "i4", 1)) {
+        Header->ZoomBoundaryTypes = 1 << 3;
+        Header->ZoomTypeMasksPresent = 0;
+    }
 
     if(0 != big_block_get_attr(&bh, "TotNumPartInit", Header->NTotalInit, "u8", 6)) {
         int ptype;

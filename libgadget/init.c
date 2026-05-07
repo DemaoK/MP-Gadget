@@ -2,6 +2,7 @@
 #include <string.h>
 #include <math.h>
 #include <mpi.h>
+#include <float.h>
 
 #include "init.h"
 #include "utils/endrun.h"
@@ -87,6 +88,7 @@ static void check_positions(struct part_manager_type * PartManager);
 static void check_smoothing_length(struct part_manager_type * PartManager, double * MeanSpacing);
 static void init_alloc_particle_slot_memory(struct part_manager_type * PartManager, struct slots_manager_type * SlotsManager, const double PartAllocFactor, struct header_data * header, MPI_Comm Comm);
 static void validate_zoom_type_masks(const struct header_data * header);
+static void get_zoom_boundary_softening_factors(double * SofteningFactors, const struct header_data * header, const struct part_manager_type * PartManager);
 
 /*! This function reads the initial conditions, allocates storage for the
  *  particle data, validates and initialises the particle data.
@@ -127,8 +129,10 @@ inttime_t init(int RestartSnapNum, const char * OutputDir, struct header_data * 
     check_positions(PartManager);
 
     double MeanSeparation[6] = {0};
+    double ZoomBoundarySofteningFactors[6] = {0};
 
     get_mean_separation(MeanSeparation, PartManager->BoxSize, header->NTotalInit);
+    get_zoom_boundary_softening_factors(ZoomBoundarySofteningFactors, header, PartManager);
 
     if(RestartSnapNum >= 0)
         check_smoothing_length(PartManager, MeanSeparation);
@@ -137,7 +141,7 @@ inttime_t init(int RestartSnapNum, const char * OutputDir, struct header_data * 
      * on Task 0, there will be a lot of imbalance*/
     MPIU_Barrier(MPI_COMM_WORLD);
 
-    gravshort_set_softenings(MeanSeparation[1]);
+    gravshort_set_softenings(MeanSeparation[1], ZoomBoundarySofteningFactors);
     fof_init(MeanSeparation[1]);
 
     inttime_t Ti_Current = init_timebins(header->TimeSnapshot);
@@ -419,6 +423,66 @@ void get_mean_separation(double * MeanSeparation, const double BoxSize, const in
     for(i = 0; i < 6; i++) {
         if(NTotalInit[i] > 0)
             MeanSeparation[i] = BoxSize / pow(NTotalInit[i], 1.0 / 3);
+    }
+}
+
+static double
+get_global_type_mass_extreme(const struct part_manager_type * PartManager, const int ptype, const int find_max)
+{
+    double local = find_max ? 0 : DBL_MAX;
+    int64_t i;
+    for(i = 0; i < PartManager->NumPart; i++) {
+        if(P[i].Type != ptype || P[i].Mass <= 0)
+            continue;
+        if(find_max) {
+            if(P[i].Mass > local)
+                local = P[i].Mass;
+        } else {
+            if(P[i].Mass < local)
+                local = P[i].Mass;
+        }
+    }
+
+    double global = local;
+    MPI_Allreduce(&local, &global, 1, MPI_DOUBLE, find_max ? MPI_MAX : MPI_MIN, MPI_COMM_WORLD);
+    if(!find_max && global == DBL_MAX)
+        global = 0;
+    return global;
+}
+
+static void
+get_zoom_boundary_softening_factors(double * SofteningFactors, const struct header_data * header, const struct part_manager_type * PartManager)
+{
+    memset(SofteningFactors, 0, 6 * sizeof(SofteningFactors[0]));
+
+    if(!header->ZoomTypeMasksPresent)
+        return;
+
+    const int highres_type = 1;
+    double highres_mass = header->MassTable[highres_type];
+    if(highres_mass <= 0)
+        highres_mass = get_global_type_mass_extreme(PartManager, highres_type, 0);
+
+    if(highres_mass <= 0 || header->NTotalInit[highres_type] <= 0) {
+        message(0, "AutoZoomBoundarySoftening: no usable type-1 high-resolution mass; using default softenings.\n");
+        return;
+    }
+
+    int ptype;
+    for(ptype = 0; ptype < 6; ptype++) {
+        if(!(header->ZoomBoundaryTypes & (1 << ptype)) || header->NTotalInit[ptype] <= 0)
+            continue;
+
+        double boundary_mass = header->MassTable[ptype];
+        if(boundary_mass <= 0)
+            boundary_mass = get_global_type_mass_extreme(PartManager, ptype, 1);
+
+        if(boundary_mass <= 0) {
+            message(0, "AutoZoomBoundarySoftening: no usable type-%d boundary mass; using default softening for this type.\n", ptype);
+            continue;
+        }
+
+        SofteningFactors[ptype] = pow(boundary_mass / highres_mass, 1.0 / 3);
     }
 }
 

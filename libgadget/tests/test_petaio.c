@@ -260,6 +260,7 @@ assert_zoom_ic_loaded(const struct header_data * header)
 {
     assert_int_equal(header->ZoomHighResTypes, DMMASK);
     assert_int_equal(header->ZoomBoundaryTypes, 1 << 3);
+    assert_int_equal(header->ZoomTypeMasksPresent, 1);
 
     int64_t offset = 0;
     int ptype;

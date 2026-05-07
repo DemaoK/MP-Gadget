@@ -22,6 +22,8 @@ struct gravshort_tree_params
     /* Explicit comoving Plummer-equivalent softenings by particle type.
      * Non-positive entries use FractionalGravitySoftening * DM mean separation. */
     double TypeGravitySoftening[6];
+    /* Scale zoom boundary softenings from the high-resolution type-1 mass. */
+    int AutoZoomBoundarySoftening;
 };
 
 enum ShortRangeForceWindowType {
@@ -32,8 +34,9 @@ enum ShortRangeForceWindowType {
 /* Fill the short-range gravity table*/
 void gravshort_fill_ntab(const enum ShortRangeForceWindowType ShortRangeForceWindowType, const double Asmth);
 
-/*! Sets the (comoving) softening length, converting from units of the mean DM separation to comoving internal units. */
-void gravshort_set_softenings(double MeanDMSeparation);
+/*! Sets the (comoving) softening length, converting from units of the mean DM separation to comoving internal units.
+ * AutoTypeSofteningFactors may supply per-type factors relative to the legacy softening for zoom boundary types. */
+void gravshort_set_softenings(double MeanDMSeparation, const double * AutoTypeSofteningFactors);
 
 /* gravitational softening length
  * (given in terms of an `equivalent' Plummer softening length) */

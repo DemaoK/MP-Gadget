@@ -198,6 +198,7 @@ create_gadget_parameter_set()
     param_declare_double(ps, "GravitySofteningType3", OPTIONAL, -1, "Explicit comoving Plummer-equivalent gravity softening for type 3 in internal length units. Non-positive uses GravitySoftening.");
     param_declare_double(ps, "GravitySofteningType4", OPTIONAL, -1, "Explicit comoving Plummer-equivalent gravity softening for type 4 in internal length units. Non-positive uses GravitySoftening.");
     param_declare_double(ps, "GravitySofteningType5", OPTIONAL, -1, "Explicit comoving Plummer-equivalent gravity softening for type 5 in internal length units. Non-positive uses GravitySoftening.");
+    param_declare_int(ps, "AutoZoomBoundarySoftening", OPTIONAL, 1, "If enabled, zoom IC boundary types without explicit GravitySofteningTypeN use GravitySoftening scaled by the boundary/high-res particle mass ratio.");
 
     param_declare_double(ps, "ImportBufferBoost", OPTIONAL, 2., "Memory factor to allow for there being more particles imported during treewlk than exported. Increase this if code crashes during treewalk with out of memory.");
     param_declare_double(ps, "PartAllocFactor", OPTIONAL, 1.5, "Over-allocation factor of particles. The load can be imbalanced to allow for the work to be more balanced.");

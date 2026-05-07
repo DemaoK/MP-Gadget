@@ -318,7 +318,7 @@ static int setup_density(void **state) {
     tree_params.FractionalGravitySoftening = 1;
     set_gravshort_treepar(tree_params);
 
-    gravshort_set_softenings(1);
+    gravshort_set_softenings(1, NULL);
     data->dp.BlackHoleMaxAccretionRadius = 99999.;
 
     set_densitypar(data->dp);

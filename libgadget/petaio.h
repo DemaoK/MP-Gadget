@@ -32,6 +32,8 @@ struct header_data
     /* Zoom IC particle type masks. Bit ptype marks a particle type. */
     int ZoomHighResTypes;
     int ZoomBoundaryTypes;
+    /* True when the input header explicitly carried zoom type masks. */
+    int ZoomTypeMasksPresent;
     /* Number of k values to use for the neutrinos.*/
     int neutrinonk;
 };
