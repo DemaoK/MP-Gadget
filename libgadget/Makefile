@@ -21,6 +21,7 @@ TESTED = hci \
 	omega_nu_single \
 	metal_return \
 	cooling_rates \
+	petaio \
 	density \
 	gravity \
 	exchange
@@ -122,6 +123,9 @@ all: libgadget.a libgadget-utils.a
 	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
 
 .objs/test_gravity: tests/test_gravity.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
+	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
+
+.objs/test_petaio: tests/test_petaio.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
 	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
 
 .objs/test_fof: tests/test_fof.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a

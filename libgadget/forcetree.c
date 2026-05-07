@@ -310,7 +310,7 @@ static void init_internal_node(struct NODE *nfreep, struct NODE *parent, int sub
     nfreep->f.InternalTopLevel = 0;
     nfreep->f.DependsOnLocalMass = 0;
     nfreep->f.ChildType = PARTICLE_NODE_TYPE;
-    nfreep->f.unused = 0;
+    nfreep->f.TypeMask = 0;
 
     for(j = 0; j < 3; j++) {
         /* Detect which quadrant we are in by testing the bits of subnode:
@@ -671,7 +671,7 @@ force_tree_create_topnodes(ForceTree * tree, DomainDecomp * ddecomp)
     nfreep->f.InternalTopLevel = 0;
     nfreep->f.DependsOnLocalMass = 0;
     nfreep->f.ChildType = PARTICLE_NODE_TYPE;
-    nfreep->f.unused = 0;
+    nfreep->f.TypeMask = 0;
     memset(&(nfreep->mom.cofm),0,3*sizeof(MyFloat));
     nfreep->mom.mass = 0;
     nfreep->mom.hmax = 0;
@@ -951,6 +951,7 @@ add_particle_moment_to_node(struct NODE * pnode, const struct particle_data * co
     pnode->mom.mass += (part->Mass);
     for(k=0; k<3; k++)
         pnode->mom.cofm[k] += (part->Mass * part->Pos[k]);
+    pnode->f.TypeMask |= 1 << part->Type;
 
     /* We do not add active particles to the hmax here.
      * The active particles will have hsml updated in density_postprocess instead, often to a smaller value.*/
@@ -1089,6 +1090,7 @@ force_update_node_recursive(const int no, const int sib, const int level, const 
         tree->Nodes[no].mom.cofm[2] += (tree->Nodes[p].mom.mass * tree->Nodes[p].mom.cofm[2]);
         if(tree->Nodes[p].mom.hmax > tree->Nodes[no].mom.hmax)
             tree->Nodes[no].mom.hmax = tree->Nodes[p].mom.hmax;
+        tree->Nodes[no].f.TypeMask |= tree->Nodes[p].f.TypeMask;
     }
 
     /*Set the center of mass moments*/
@@ -1147,6 +1149,7 @@ struct topleaf_momentsdata
     MyFloat s[3];
     MyFloat mass;
     MyFloat hmax;
+    int typemask;
 };
 
 /*! This function communicates the values of the multipole moments of the
@@ -1170,6 +1173,7 @@ static void force_exchange_pseudodata(const ForceTree * const tree, const Domain
         TopLeafMoments[i].s[2] = tree->Nodes[no].mom.cofm[2];
         TopLeafMoments[i].mass = tree->Nodes[no].mom.mass;
         TopLeafMoments[i].hmax = tree->Nodes[no].mom.hmax;
+        TopLeafMoments[i].typemask = tree->Nodes[no].f.TypeMask;
     }
 
     /* share the pseudo-particle data across CPUs */
@@ -1206,6 +1210,7 @@ static void force_exchange_pseudodata(const ForceTree * const tree, const Domain
             tree->Nodes[no].mom.cofm[2] = TopLeafMoments[i].s[2];
             tree->Nodes[no].mom.mass = TopLeafMoments[i].mass;
             tree->Nodes[no].mom.hmax = TopLeafMoments[i].hmax;
+            tree->Nodes[no].f.TypeMask = TopLeafMoments[i].typemask;
          }
     }
     myfree(TopLeafMoments);
@@ -1254,6 +1259,7 @@ force_treeupdate_pseudos(const int no, const int level, const ForceTree * const 
     tree->Nodes[no].mom.cofm[1] = 0;
     tree->Nodes[no].mom.cofm[2] = 0;
     tree->Nodes[no].mom.hmax = 0;
+    tree->Nodes[no].f.TypeMask = 0;
 
     /*Make sure all child nodes are done*/
     #pragma omp taskwait
@@ -1269,6 +1275,7 @@ force_treeupdate_pseudos(const int no, const int level, const ForceTree * const 
 
         if(tree->Nodes[p].mom.hmax > tree->Nodes[no].mom.hmax)
             tree->Nodes[no].mom.hmax = tree->Nodes[p].mom.hmax;
+        tree->Nodes[no].f.TypeMask |= tree->Nodes[p].f.TypeMask;
         if(tree->Nodes[p].f.DependsOnLocalMass)
             tree->Nodes[no].f.DependsOnLocalMass = 1;
     }

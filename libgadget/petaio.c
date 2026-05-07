@@ -88,6 +88,7 @@ int GetUsePeculiarVelocity(void)
 
 static void petaio_write_header(BigFile * bf, const double atime, const int64_t * NTotal, const Cosmology * CP, const struct header_data * data);
 static void petaio_read_header_internal(BigFile * bf, Cosmology * CP, struct header_data * data);
+static void petaio_validate_mass_blocks(BigFile * bf, const struct header_data * header, MPI_Comm Comm);
 
 /* these are only used in reading in */
 void petaio_init(void) {
@@ -287,6 +288,9 @@ petaio_read_snapshot(int num, const char * OutputDir, Cosmology * CP, struct hea
             petaio_read_neutrinos(&bf, ThisTask);
     }
 
+    if(ic)
+        petaio_validate_mass_blocks(&bf, header, Comm);
+
     struct conversions conv = {0};
     conv.atime = header->TimeSnapshot;
     conv.hubble = hubble_function(CP, header->TimeSnapshot);
@@ -317,8 +321,8 @@ petaio_read_snapshot(int num, const char * OutputDir, Cosmology * CP, struct hea
                 keep |= (0 == strcmp(IOTable->ent[i].name, "BlackholeMass"));
                 keep |= (0 == strcmp(IOTable->ent[i].name, "MinPotPos"));
             }
-            /* Some IC codes may set the gas particle mass directly, rather than in the header*/
-            if(ptype == 0 && header->MassTable[ptype] <= 0)
+            /* Some IC codes may set particle masses directly, rather than in the header. */
+            if(header->MassTable[ptype] <= 0)
                 keep |= (0 == strcmp(IOTable->ent[i].name, "Mass"));
             if(!keep) continue;
         }
@@ -351,11 +355,13 @@ petaio_read_snapshot(int num, const char * OutputDir, Cosmology * CP, struct hea
          * */
         struct particle_data * parts = PartManager->Base;
         int i;
-        /* touch up the mass -- IC files save mass in header */
+        /* touch up the mass -- most IC files save mass in header.
+         * If MassTable[type] <= 0 the per-particle Mass block read above is authoritative. */
         #pragma omp parallel for
         for(i = 0; i < PartManager->NumPart; i++)
         {
-            parts[i].Mass = header->MassTable[parts[i].Type];
+            if(header->MassTable[parts[i].Type] > 0)
+                parts[i].Mass = header->MassTable[parts[i].Type];
         }
 
         if (!IO.UsePeculiarVelocity ) {
@@ -410,6 +416,8 @@ static void petaio_write_header(BigFile * bf, const double atime, const int64_t 
     (0 != big_block_set_attr(&bh, "UnitLength_in_cm", &data->UnitLength_in_cm, "f8", 1)) ||
     (0 != big_block_set_attr(&bh, "UnitMass_in_g", &data->UnitMass_in_g, "f8", 1)) ||
     (0 != big_block_set_attr(&bh, "UnitVelocity_in_cm_per_s", &data->UnitVelocity_in_cm_per_s, "f8", 1)) ||
+    (0 != big_block_set_attr(&bh, "ZoomHighResTypes", &data->ZoomHighResTypes, "i4", 1)) ||
+    (0 != big_block_set_attr(&bh, "ZoomBoundaryTypes", &data->ZoomBoundaryTypes, "i4", 1)) ||
     (0 != big_block_set_attr(&bh, "CodeVersion", GADGET_VERSION, "S1", strlen(GADGET_VERSION))) ||
     (0 != big_block_set_attr(&bh, "CompilerSettings", GADGET_COMPILER_SETTINGS, "S1", strlen(GADGET_COMPILER_SETTINGS))) ||
     (0 != big_block_set_attr(&bh, "DensityKernel", &dk, "i4", 1)) ||
@@ -508,6 +516,8 @@ petaio_read_header_internal(BigFile * bf, Cosmology * CP, struct header_data * H
      * and v / sqrt(a) = sqrt(a) dx/dt in the ICs. Note that snapshots never match Gadget-2, which
      * saves physical peculiar velocity / sqrt(a) in both ICs and snapshots. */
     IO.UsePeculiarVelocity = _get_attr_int(&bh, "UsePeculiarVelocity", 0);
+    Header->ZoomHighResTypes = _get_attr_int(&bh, "ZoomHighResTypes", GASMASK | DMMASK);
+    Header->ZoomBoundaryTypes = _get_attr_int(&bh, "ZoomBoundaryTypes", 1 << 3);
 
     if(0 != big_block_get_attr(&bh, "TotNumPartInit", Header->NTotalInit, "u8", 6)) {
         int ptype;
@@ -615,6 +625,34 @@ int petaio_read_block(BigFile * bf, const char * blockname, BigArray * array, in
                     big_file_get_error_message());
     }
     return 0;
+}
+
+static void
+petaio_validate_mass_blocks(BigFile * bf, const struct header_data * header, MPI_Comm Comm)
+{
+    int ThisTask;
+    MPI_Comm_rank(Comm, &ThisTask);
+
+    int ptype;
+    for(ptype = 0; ptype < 6; ptype++) {
+        if(header->NTotal[ptype] == 0 || header->MassTable[ptype] > 0)
+            continue;
+
+        char blockname[128];
+        snprintf(blockname, sizeof(blockname), "%d/Mass", ptype);
+
+        BigBlock bm;
+        if(0 != big_file_mpi_open_block(bf, &bm, blockname, Comm)) {
+            endrun(0, "IC header has MassTable[%d] <= 0, but required block %s is missing: %s\n",
+                   ptype, blockname, big_file_get_error_message());
+        }
+        if(0 != big_block_mpi_close(&bm, Comm)) {
+            endrun(0, "Failed to close required mass block %s: %s\n",
+                   blockname, big_file_get_error_message());
+        }
+        if(ThisTask == 0)
+            message(0, "IC type %d uses per-particle masses from %s\n", ptype, blockname);
+    }
 }
 
 /* save a block to disk */

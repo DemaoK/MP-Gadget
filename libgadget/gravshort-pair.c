@@ -83,7 +83,7 @@ grav_short_pair_ngbiter(
 
     double mass = P[other].Mass;
 
-    const double h = FORCE_SOFTENING();
+    const double h = FORCE_SOFTENING_PAIR(I->Type, P[other].Type);
     double fac, pot;
 
     if(r >= h) {

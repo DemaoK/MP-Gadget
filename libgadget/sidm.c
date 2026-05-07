@@ -545,7 +545,7 @@ void sidm_force(const ActiveParticles *act, const double atime,
     /* Initialize the step-local search radius and SIDM bookkeeping. The
      * initial search radius matches the short-range force softening scale. */
 
-    double global_closeness = FORCE_SOFTENING();
+    double global_closeness = FORCE_SOFTENING_TYPE(1);
 #pragma omp parallel for
     for (i = 0; i < act->NumActiveParticle; i++) {
       int p = act->ActiveParticle ? act->ActiveParticle[i] : i;

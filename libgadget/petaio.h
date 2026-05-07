@@ -29,6 +29,9 @@ struct header_data
     double UnitLength_in_cm;
     double UnitMass_in_g;
     double UnitVelocity_in_cm_per_s;
+    /* Zoom IC particle type masks. Bit ptype marks a particle type. */
+    int ZoomHighResTypes;
+    int ZoomBoundaryTypes;
     /* Number of k values to use for the neutrinos.*/
     int neutrinonk;
 };

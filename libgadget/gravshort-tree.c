@@ -28,8 +28,9 @@
  */
 
 static struct gravshort_tree_params TreeParams;
-/*Softening length*/
+/* Legacy Plummer-equivalent softening length. */
 static double GravitySoftening;
+static double GravitySofteningByType[6];
 
 /* gravitational softening length
  * (given in terms of an `equivalent' Plummer softening length)
@@ -40,13 +41,50 @@ double FORCE_SOFTENING(void)
     return 2.8 * GravitySoftening;
 }
 
+double FORCE_SOFTENING_TYPE(int ptype)
+{
+    if(ptype < 0 || ptype >= 6)
+        return FORCE_SOFTENING();
+    return 2.8 * GravitySofteningByType[ptype];
+}
+
+double FORCE_SOFTENING_MASK(int typemask)
+{
+    double h = 0;
+    int ptype;
+    for(ptype = 0; ptype < 6; ptype++) {
+        if(typemask & (1 << ptype)) {
+            const double htype = FORCE_SOFTENING_TYPE(ptype);
+            if(htype > h)
+                h = htype;
+        }
+    }
+    return h;
+}
+
+double FORCE_SOFTENING_PAIR(int ptype1, int ptype2)
+{
+    const double h1 = FORCE_SOFTENING_TYPE(ptype1);
+    const double h2 = FORCE_SOFTENING_TYPE(ptype2);
+    return h1 > h2 ? h1 : h2;
+}
+
 /*! Sets the (comoving) softening length, converting from units of the mean separation to comoving internal units. */
 void
 gravshort_set_softenings(double MeanSeparation)
 {
+    int ptype;
     GravitySoftening = TreeParams.FractionalGravitySoftening * MeanSeparation;
+    for(ptype = 0; ptype < 6; ptype++) {
+        GravitySofteningByType[ptype] = GravitySoftening;
+        if(TreeParams.TypeGravitySoftening[ptype] > 0)
+            GravitySofteningByType[ptype] = TreeParams.TypeGravitySoftening[ptype];
+    }
     /* 0: Gas is collisional */
     message(0, "GravitySoftening = %g\n", GravitySoftening);
+    message(0, "GravitySofteningByType = %g %g %g %g %g %g\n",
+            GravitySofteningByType[0], GravitySofteningByType[1], GravitySofteningByType[2],
+            GravitySofteningByType[3], GravitySofteningByType[4], GravitySofteningByType[5]);
 }
 
 /*This is a helper for the tests*/
@@ -72,6 +110,12 @@ set_gravshort_tree_params(ParameterSet * ps)
         TreeParams.TreeUseBH= param_get_int(ps, "TreeUseBH");
         TreeParams.Rcut = param_get_double(ps, "TreeRcut");
         TreeParams.FractionalGravitySoftening = param_get_double(ps, "GravitySoftening");
+        TreeParams.TypeGravitySoftening[0] = param_get_double(ps, "GravitySofteningType0");
+        TreeParams.TypeGravitySoftening[1] = param_get_double(ps, "GravitySofteningType1");
+        TreeParams.TypeGravitySoftening[2] = param_get_double(ps, "GravitySofteningType2");
+        TreeParams.TypeGravitySoftening[3] = param_get_double(ps, "GravitySofteningType3");
+        TreeParams.TypeGravitySoftening[4] = param_get_double(ps, "GravitySofteningType4");
+        TreeParams.TypeGravitySoftening[5] = param_get_double(ps, "GravitySofteningType5");
         TreeParams.MaxBHOpeningAngle = param_get_double(ps, "MaxBHOpeningAngle");
     }
     MPI_Bcast(&TreeParams, sizeof(struct gravshort_tree_params), MPI_BYTE, 0, MPI_COMM_WORLD);
@@ -156,11 +200,10 @@ grav_short_tree(const ActiveParticles * act, PetaPM * pm, ForceTree * tree, MyFl
 /* Add the acceleration from a node or particle to the output structure,
  * computing the short-range kernel and softening.*/
 static void
-apply_accn_to_output(TreeWalkResultGravShort * output, const double dx[3], const double r2, const double mass, const double cellsize)
+apply_accn_to_output(TreeWalkResultGravShort * output, const double dx[3], const double r2, const double mass, const double cellsize, const double h)
 {
     const double r = sqrt(r2);
 
-    const double h = FORCE_SOFTENING();
     double fac = mass / (r2 * r);
     double facpot = -mass / r;
 
@@ -317,7 +360,10 @@ int force_treeev_shortrange(TreeWalkQueryGravShort * input,
                 no = nop->sibling;
                 if(lv->mode != TREEWALK_TOPTREE) {
                     /* Compute the acceleration and apply it to the output structure*/
-                    apply_accn_to_output(output, dx, r2, nop->mom.mass, cellsize);
+                    const double htarget = FORCE_SOFTENING_TYPE(input->Type);
+                    const double hnode = FORCE_SOFTENING_MASK(nop->f.TypeMask);
+                    const double h = htarget > hnode ? htarget : hnode;
+                    apply_accn_to_output(output, dx, r2, nop->mom.mass, cellsize, h);
                 }
                 continue;
             }
@@ -370,7 +416,7 @@ int force_treeev_shortrange(TreeWalkQueryGravShort * input,
                 dx[j] = NEAREST(P[pp].Pos[j] - inpos[j], BoxSize);
             const double r2 = dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2];
             /* Compute the acceleration and apply it to the output structure*/
-            apply_accn_to_output(output, dx, r2, P[pp].Mass, cellsize);
+            apply_accn_to_output(output, dx, r2, P[pp].Mass, cellsize, FORCE_SOFTENING_PAIR(input->Type, P[pp].Type));
         }
         ninteractions = numcand;
     }

@@ -18,14 +18,6 @@
 #define NODE_NODE_TYPE 1
 #define PSEUDO_NODE_TYPE 2
 
-/* Define to build a tree containing all types of particles*/
-#define ALLMASK (1<<6)-1
-#define GASMASK (1)
-#define DMMASK (2)
-#define NUMASK (1<<2)
-#define STARMASK (1<<4)
-#define BHMASK (1<<5)
-
 struct NodeChild
 {
     /*!< pointers to daughter nodes or daughter particles. */
@@ -61,7 +53,7 @@ struct NODE
         unsigned int DependsOnLocalMass :1;  /* Intersects with local mass */
         unsigned int ChildType :2; /* Specify the type of children this node has: particles, other nodes, or pseudo-particles.
                                     * (should be an enum, but not standard in C).*/
-        unsigned int unused : 3; /* Spare bits*/
+        unsigned int TypeMask :6; /* Particle types contributing mass to this node. */
     } f;
 };
 
@@ -180,6 +172,3 @@ force_update_node_parallel(const ForceTree * tree, const DomainDecomp * ddecomp)
 
 
 #endif
-
-
-

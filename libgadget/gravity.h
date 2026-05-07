@@ -19,6 +19,9 @@ struct gravshort_tree_params
     double Rcut;
     /* Softening as a fraction of DM mean separation. */
     double FractionalGravitySoftening;
+    /* Explicit comoving Plummer-equivalent softenings by particle type.
+     * Non-positive entries use FractionalGravitySoftening * DM mean separation. */
+    double TypeGravitySoftening[6];
 };
 
 enum ShortRangeForceWindowType {
@@ -35,6 +38,9 @@ void gravshort_set_softenings(double MeanDMSeparation);
 /* gravitational softening length
  * (given in terms of an `equivalent' Plummer softening length) */
 double FORCE_SOFTENING(void);
+double FORCE_SOFTENING_TYPE(int ptype);
+double FORCE_SOFTENING_MASK(int typemask);
+double FORCE_SOFTENING_PAIR(int ptype1, int ptype2);
 
 /*Defined in gravpm.c*/
 void gravpm_init_periodic(PetaPM * pm, double BoxSize, double Asmth, int Nmesh, double G);

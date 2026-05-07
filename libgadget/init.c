@@ -39,6 +39,7 @@ static struct init_params
 
     int ExcursionSetReionOn;
     double ExcursionSetZStart;
+    int AllowUnsafeZoomBoundaryTypes;
 } InitParams;
 
 /*Set the global parameters*/
@@ -53,6 +54,7 @@ set_init_params(ParameterSet * ps)
 
         InitParams.ExcursionSetReionOn = param_get_int(ps,"ExcursionSetReionOn");
         InitParams.ExcursionSetZStart = param_get_int(ps,"ExcursionSetZStart");
+        InitParams.AllowUnsafeZoomBoundaryTypes = param_get_int(ps, "AllowUnsafeZoomBoundaryTypes");
     }
     MPI_Bcast(&InitParams, sizeof(InitParams), MPI_BYTE, 0, MPI_COMM_WORLD);
 }
@@ -84,6 +86,7 @@ static void check_omega(struct part_manager_type * PartManager, Cosmology * CP, 
 static void check_positions(struct part_manager_type * PartManager);
 static void check_smoothing_length(struct part_manager_type * PartManager, double * MeanSpacing);
 static void init_alloc_particle_slot_memory(struct part_manager_type * PartManager, struct slots_manager_type * SlotsManager, const double PartAllocFactor, struct header_data * header, MPI_Comm Comm);
+static void validate_zoom_type_masks(const struct header_data * header);
 
 /*! This function reads the initial conditions, allocates storage for the
  *  particle data, validates and initialises the particle data.
@@ -113,6 +116,9 @@ inttime_t init(int RestartSnapNum, const char * OutputDir, struct header_data * 
 
     /*Read the snapshot*/
     petaio_read_snapshot(RestartSnapNum, OutputDir, CP, header, PartManager, SlotsManager, MPI_COMM_WORLD);
+
+    if(RestartSnapNum == -1)
+        validate_zoom_type_masks(header);
 
     domain_test_id_uniqueness(PartManager);
 
@@ -275,7 +281,7 @@ init_alloc_particle_slot_memory(struct part_manager_type * PartManager, struct s
 
     message(0, "Total number of particles: %018ld\n", TotNumPart);
 
-    const char * PARTICLE_TYPE_NAMES [] = {"Gas", "DarkMatter", "Neutrino", "Unknown", "Star", "BlackHole"};
+    const char * PARTICLE_TYPE_NAMES [] = {"Gas", "DarkMatter", "Neutrino", "Boundary", "Star", "BlackHole"};
 
     for(ptype = 0; ptype < 6; ptype ++) {
         double MeanSeparation = header->BoxSize / pow(header->NTotalInit[ptype], 1.0 / 3);
@@ -414,6 +420,33 @@ void get_mean_separation(double * MeanSeparation, const double BoxSize, const in
         if(NTotalInit[i] > 0)
             MeanSeparation[i] = BoxSize / pow(NTotalInit[i], 1.0 / 3);
     }
+}
+
+static void
+validate_zoom_type_masks(const struct header_data * header)
+{
+    const int valid_types = ALLMASK;
+    const int unsafe_boundary = STARMASK | BHMASK;
+
+    if((header->ZoomHighResTypes & ~valid_types) || (header->ZoomBoundaryTypes & ~valid_types))
+        endrun(0, "Invalid zoom type masks in IC header: ZoomHighResTypes=%d ZoomBoundaryTypes=%d\n",
+               header->ZoomHighResTypes, header->ZoomBoundaryTypes);
+
+    if(header->ZoomHighResTypes & header->ZoomBoundaryTypes)
+        endrun(0, "Zoom type masks overlap: ZoomHighResTypes=%d ZoomBoundaryTypes=%d\n",
+               header->ZoomHighResTypes, header->ZoomBoundaryTypes);
+
+    if((header->ZoomBoundaryTypes & unsafe_boundary) && !InitParams.AllowUnsafeZoomBoundaryTypes)
+        endrun(0, "ZoomBoundaryTypes=%d includes star or black-hole particle types. "
+               "Use type 3 for boundary particles, or set AllowUnsafeZoomBoundaryTypes=1 if this is intentional.\n",
+               header->ZoomBoundaryTypes);
+
+    if((header->ZoomBoundaryTypes & NUMASK) && header->NTotal[2] > 0)
+        endrun(0, "ZoomBoundaryTypes=%d includes type 2, but this IC has type 2 neutrino particles. "
+               "Use type 3 for boundary particles.\n", header->ZoomBoundaryTypes);
+
+    message(0, "Zoom type masks: high-res=%d boundary=%d\n",
+            header->ZoomHighResTypes, header->ZoomBoundaryTypes);
 }
 
 /* Initialize the entropy variable in Pressure-Entropy Sph.

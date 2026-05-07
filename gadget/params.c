@@ -192,6 +192,12 @@ create_gadget_parameter_set()
 
     param_declare_double(ps, "GravitySoftening", OPTIONAL, 1./30., "Gravitational Softening. Units of mean separation of DM. ForceSoftening is 2.8 times this.");
     param_declare_int(ps, "GravitySofteningGas", OPTIONAL, 1, "Unused. Previously was for adaptive softening.");
+    param_declare_double(ps, "GravitySofteningType0", OPTIONAL, -1, "Explicit comoving Plummer-equivalent gravity softening for type 0 in internal length units. Non-positive uses GravitySoftening.");
+    param_declare_double(ps, "GravitySofteningType1", OPTIONAL, -1, "Explicit comoving Plummer-equivalent gravity softening for type 1 in internal length units. Non-positive uses GravitySoftening.");
+    param_declare_double(ps, "GravitySofteningType2", OPTIONAL, -1, "Explicit comoving Plummer-equivalent gravity softening for type 2 in internal length units. Non-positive uses GravitySoftening.");
+    param_declare_double(ps, "GravitySofteningType3", OPTIONAL, -1, "Explicit comoving Plummer-equivalent gravity softening for type 3 in internal length units. Non-positive uses GravitySoftening.");
+    param_declare_double(ps, "GravitySofteningType4", OPTIONAL, -1, "Explicit comoving Plummer-equivalent gravity softening for type 4 in internal length units. Non-positive uses GravitySoftening.");
+    param_declare_double(ps, "GravitySofteningType5", OPTIONAL, -1, "Explicit comoving Plummer-equivalent gravity softening for type 5 in internal length units. Non-positive uses GravitySoftening.");
 
     param_declare_double(ps, "ImportBufferBoost", OPTIONAL, 2., "Memory factor to allow for there being more particles imported during treewlk than exported. Increase this if code crashes during treewalk with out of memory.");
     param_declare_double(ps, "PartAllocFactor", OPTIONAL, 1.5, "Over-allocation factor of particles. The load can be imbalanced to allow for the work to be more balanced.");
@@ -202,6 +208,7 @@ create_gadget_parameter_set()
     param_declare_double(ps, "MinGasTemp", OPTIONAL, 5, "Minimum gas temperature");
 
     param_declare_int(ps, "ParticlesAlwaysSorted", OPTIONAL, 0, "If enabled, peano-sort all particles after domain exchange. Much slower, but good for testing.");
+    param_declare_int(ps, "AllowUnsafeZoomBoundaryTypes", OPTIONAL, 0, "Allow ZoomBoundaryTypes to include star or black-hole particle types. Unsafe; use only for legacy ICs.");
 
     param_declare_int(ps, "SnapshotWithFOF", REQUIRED, 0, "Enable Friends-of-Friends halo finder.");
     param_declare_int(ps, "FOFPrimaryLinkTypes", OPTIONAL, 2, "2^ particle types to use as primary FOF targets.");
