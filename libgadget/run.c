@@ -618,6 +618,18 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
          * used to treat effectively instantaneous injections of energy (like from BHs), which is again hard to properly incorporate in the
          * time-integration approach where you want to have a "full" dU/dt all times. (Volker Springel 2020).
          */
+        /* In DM-only SIDM runs there is no gas source-physics block, but the
+         * gravothermal BH seeding clock still needs to run from FoF halos. */
+#ifdef SIDM
+        if(!GasEnabled && is_PM && All.BlackHoleOn && sidm_bhseed_is_enabled() && atime >= TimeNextSeedingCheck) {
+            message(0, "SIDM BH seeding check in DM-only run at a=%g.\n", atime);
+            FOFGroups fof = fof_fof(ddecomp, 0, &All.CP, MPI_COMM_WORLD);
+            fof_seed_sidm(&fof, &Act, atime, &All.CP, &times, units, MPI_COMM_WORLD);
+            fof_finish(&fof);
+            TimeNextSeedingCheck = atime * All.TimeBetweenSeedingSearch;
+        }
+#endif
+
         if(GasEnabled)
         {
             if(!gasTree.tree_allocated_flag)
