@@ -1,6 +1,7 @@
 #include <math.h>
 #include <mpi.h>
 #include <omp.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "sidm_bhseed.h"
@@ -27,7 +28,6 @@ static struct SIDMBHSeedParams {
     double DefaultConcentration;
     double ReservoirKnudsenThreshold;
     int MinReservoirParticles;
-    double ReservoirRadiusFactor;
     double SeedSMFPFraction;
     double SeedMassMin;
     double SeedMassMax;
@@ -48,7 +48,6 @@ set_sidm_bhseed_params(ParameterSet * ps)
         sidm_bhseed_params.DefaultConcentration = param_get_double(ps, "SIDMBHDefaultConcentration");
         sidm_bhseed_params.ReservoirKnudsenThreshold = param_get_double(ps, "SIDMBHReservoirKnudsenThreshold");
         sidm_bhseed_params.MinReservoirParticles = param_get_int(ps, "SIDMBHMinReservoirParticles");
-        sidm_bhseed_params.ReservoirRadiusFactor = param_get_double(ps, "SIDMBHReservoirRadiusFactor");
         sidm_bhseed_params.SeedSMFPFraction = param_get_double(ps, "SIDMBHSeedSMFPFraction");
         sidm_bhseed_params.SeedMassMin = param_get_double(ps, "SIDMBHSeedMassMin");
         sidm_bhseed_params.SeedMassMax = param_get_double(ps, "SIDMBHSeedMassMax");
@@ -145,82 +144,129 @@ sidm_bhseed_estimate_tc_from_group(const struct Group * group, double atime,
     return sidm_bhseed_params.CollapseCoeff / (sigma_code * rho_s * rs) / dyn;
 }
 
+struct SIDMBHReservoirSample {
+    double r;
+    double mass;
+    double vel[3];
+    double vel2;
+};
+
+static int
+sidm_bhseed_compare_reservoir_radius(const void * a, const void * b)
+{
+    const struct SIDMBHReservoirSample * sa = (const struct SIDMBHReservoirSample *) a;
+    const struct SIDMBHReservoirSample * sb = (const struct SIDMBHReservoirSample *) b;
+    return (sa->r > sb->r) - (sa->r < sb->r);
+}
+
+static void
+sidm_bhseed_set_reservoir_state(struct SIDMBHSeedResult * result, double radius,
+    double mass, double rho, double sigma1d, double kn, int numdm, int is_smfp)
+{
+    result->reservoir_radius = radius;
+    result->rho_inf = rho;
+    result->sound_speed_inf = sigma1d;
+    result->knudsen = kn;
+    result->num_dm = numdm;
+    if(is_smfp) {
+        result->smfp_radius = radius;
+        result->smfp_mass = mass;
+    }
+}
+
 static void
 sidm_bhseed_local_smfp_diagnostic(int index, double atime, Cosmology * CP,
     const struct UnitSystem units, const struct kick_factor_data * kf,
     struct SIDMBHSeedResult * result)
 {
-    const double radius = sidm_bhseed_params.ReservoirRadiusFactor * FORCE_SOFTENING();
-    result->smfp_radius = radius;
-    result->reservoir_radius = radius;
-    if(radius <= 0)
+    const double soft = FORCE_SOFTENING();
+    double search_radius = result->nfw_scale_radius;
+    if(search_radius < soft)
+        search_radius = soft;
+    if(search_radius <= 0)
         return;
+
+    int nsamples = 0;
+
+    for(int i = 0; i < PartManager->NumPart; i++) {
+        if(P[i].Type != 1 || P[i].IsGarbage || P[i].Swallowed)
+            continue;
+        double r2 = 0;
+        for(int k = 0; k < 3; k++) {
+            const double dx = NEAREST(P[i].Pos[k] - P[index].Pos[k], PartManager->BoxSize);
+            r2 += dx * dx;
+        }
+        if(r2 <= search_radius * search_radius)
+            nsamples++;
+    }
+
+    if(nsamples <= 0)
+        return;
+
+    struct SIDMBHReservoirSample * samples = (struct SIDMBHReservoirSample *)
+        mymalloc("SIDMSMFPBoundarySamples", sizeof(samples[0]) * nsamples);
+
+    int n = 0;
+    for(int i = 0; i < PartManager->NumPart; i++) {
+        if(P[i].Type != 1 || P[i].IsGarbage || P[i].Swallowed)
+            continue;
+        double r2 = 0;
+        for(int k = 0; k < 3; k++) {
+            const double dx = NEAREST(P[i].Pos[k] - P[index].Pos[k], PartManager->BoxSize);
+            r2 += dx * dx;
+        }
+        if(r2 > search_radius * search_radius)
+            continue;
+        MyFloat VelPred[3];
+        DM_VelPred(i, VelPred, kf);
+        samples[n].r = sqrt(r2);
+        samples[n].mass = P[i].Mass;
+        samples[n].vel2 = 0;
+        for(int k = 0; k < 3; k++) {
+            samples[n].vel[k] = VelPred[k];
+            samples[n].vel2 += VelPred[k] * VelPred[k];
+        }
+        n++;
+    }
+    nsamples = n;
+    qsort(samples, nsamples, sizeof(samples[0]), sidm_bhseed_compare_reservoir_radius);
 
     double mass = 0;
-    double vmean[3] = {0, 0, 0};
-    int numdm = 0;
+    double momentum[3] = {0, 0, 0};
+    double mv2 = 0;
+    double best_kn = 1e30;
 
-    for(int i = 0; i < PartManager->NumPart; i++) {
-        if(P[i].Type != 1 || P[i].IsGarbage || P[i].Swallowed)
-            continue;
-        double r2 = 0;
-        for(int k = 0; k < 3; k++) {
-            const double dx = NEAREST(P[i].Pos[k] - P[index].Pos[k], PartManager->BoxSize);
-            r2 += dx * dx;
-        }
-        if(r2 > radius * radius)
-            continue;
-        MyFloat VelPred[3];
-        DM_VelPred(i, VelPred, kf);
-        mass += P[i].Mass;
+    for(int i = 0; i < nsamples; i++) {
+        mass += samples[i].mass;
+        mv2 += samples[i].mass * samples[i].vel2;
         for(int k = 0; k < 3; k++)
-            vmean[k] += P[i].Mass * VelPred[k];
-        numdm++;
-    }
+            momentum[k] += samples[i].mass * samples[i].vel[k];
 
-    if(mass <= 0 || numdm <= 0)
-        return;
-
-    for(int k = 0; k < 3; k++)
-        vmean[k] /= mass;
-
-    double v2 = 0;
-    for(int i = 0; i < PartManager->NumPart; i++) {
-        if(P[i].Type != 1 || P[i].IsGarbage || P[i].Swallowed)
+        const int numdm = i + 1;
+        if(numdm < sidm_bhseed_params.MinReservoirParticles || mass <= 0 || samples[i].r <= 0)
             continue;
-        double r2 = 0;
-        for(int k = 0; k < 3; k++) {
-            const double dx = NEAREST(P[i].Pos[k] - P[index].Pos[k], PartManager->BoxSize);
-            r2 += dx * dx;
-        }
-        if(r2 > radius * radius)
-            continue;
-        MyFloat VelPred[3];
-        DM_VelPred(i, VelPred, kf);
-        for(int k = 0; k < 3; k++) {
-            const double dv = VelPred[k] - vmean[k];
-            v2 += P[i].Mass * dv * dv;
+
+        const double volume = 4.0 * M_PI / 3.0 * samples[i].r * samples[i].r * samples[i].r;
+        const double rho = mass / volume;
+        double v2 = mv2;
+        for(int k = 0; k < 3; k++)
+            v2 -= momentum[k] * momentum[k] / mass;
+        const double sigma1d2 = DMAX(v2 / (3.0 * mass), 0.0);
+        const double sigma1d = sqrt(sigma1d2);
+        const double vrel2 = 6.0 * sigma1d2;
+        const double sigma_code = sidm_sigma_over_m_code(vrel2, atime, CP, units);
+        const double hscale = sigma1d > 0 && rho > 0 ? sigma1d / sqrt(4.0 * M_PI * CP->GravInternal * rho) : 0;
+        const double mfp = rho > 0 && sigma_code > 0 ? 1.0 / (rho * sigma_code) : 0;
+        const double kn = hscale > 0 ? mfp / hscale : 1e30;
+        const int is_smfp = kn < sidm_bhseed_params.ReservoirKnudsenThreshold;
+
+        if(is_smfp || kn < best_kn) {
+            sidm_bhseed_set_reservoir_state(result, samples[i].r, mass, rho, sigma1d, kn, numdm, is_smfp);
+            best_kn = kn;
         }
     }
 
-    const double volume = 4.0 * M_PI / 3.0 * radius * radius * radius;
-    const double rho = mass / volume;
-    const double sigma1d2 = DMAX(v2 / (3.0 * mass), 0.0);
-    const double sigma1d = sqrt(sigma1d2);
-    const double vrel2 = 6.0 * sigma1d2;
-    const double sigma_code = sidm_sigma_over_m_code(vrel2, atime, CP, units);
-    const double hscale = sigma1d > 0 && rho > 0 ? sigma1d / sqrt(4.0 * M_PI * CP->GravInternal * rho) : 0;
-    const double mfp = rho > 0 && sigma_code > 0 ? 1.0 / (rho * sigma_code) : 0;
-    const double kn = hscale > 0 ? mfp / hscale : 1e30;
-
-    result->num_dm = numdm;
-    result->rho_inf = rho;
-    result->sound_speed_inf = sigma1d;
-    result->knudsen = kn;
-    if(numdm >= sidm_bhseed_params.MinReservoirParticles &&
-       kn < sidm_bhseed_params.ReservoirKnudsenThreshold) {
-        result->smfp_mass = mass;
-    }
+    myfree(samples);
 }
 
 struct SIDMBHSeedResult

@@ -261,7 +261,6 @@ create_gadget_parameter_set()
     param_declare_double(ps, "SIDMBHDefaultConcentration", OPTIONAL, 3.0, "Fallback NFW concentration used only when the SIDM BH outer-profile fit fails.");
     param_declare_double(ps, "SIDMBHReservoirKnudsenThreshold", OPTIONAL, 1.0, "Knudsen threshold defining the local SMFP reservoir.");
     param_declare_int(ps, "SIDMBHMinReservoirParticles", OPTIONAL, 32, "Minimum number of local DM particles required in the SMFP reservoir diagnostic.");
-    param_declare_double(ps, "SIDMBHReservoirRadiusFactor", OPTIONAL, 4.0, "Reservoir diagnostic radius in units of FORCE_SOFTENING for the first implementation.");
     param_declare_double(ps, "SIDMBHSeedSMFPFraction", OPTIONAL, 1e-4, "BH seed mass as a fraction of the measured SMFP mass.");
     param_declare_double(ps, "SIDMBHSeedMassMin", OPTIONAL, 0.0, "Minimum SIDM BH seed mass in internal mass units.");
     param_declare_double(ps, "SIDMBHSeedMassMax", OPTIONAL, 0.0, "Maximum SIDM BH seed mass in internal mass units; <=0 disables the cap.");

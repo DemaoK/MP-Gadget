@@ -46,8 +46,8 @@ double sidm_bhseed_dark_bondi_lambda(void);
 
 /* First-pass seed diagnostics. The collapse clock uses the FoF outer NFW fit
  * when available, falling back to SIDMBHDefaultConcentration only if the fit
- * fails. The SMFP reservoir is still measured with a local DM aperture around
- * the central candidate. */
+ * fails. The SMFP reservoir is measured by a local cumulative Knudsen scan
+ * around the central candidate. */
 struct SIDMBHSeedResult sidm_bhseed_evaluate_candidate(
     int index,
     const struct Group * group,
