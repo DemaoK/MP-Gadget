@@ -74,6 +74,7 @@ struct bh_particle_data {
     MyFloat SIDMDMDynMassDebt; /* Dynamical mass debt sourced by dark accretion */
     MyFloat SIDMCollapseProgress; /* Collapse clock at seeding */
     MyFloat SIDMCollapseTime; /* t_c estimate used at seeding, in internal time units */
+    MyFloat SIDMClockFoFMass; /* FoF mass of the progenitor clock at seeding */
 #endif
     /* Minimum potential reposition helpers*/
     MyFloat MinPot; /* Minimum potential, for diagnostics */

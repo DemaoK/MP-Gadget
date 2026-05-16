@@ -71,6 +71,7 @@ struct Group
     double SIDMBHCollapseProgress;
     MyFloat SIDMBHLastCheckTime;
     MyIDType SIDMBHClockID;
+    double SIDMBHClockFoFMass;
     double SIDMNFWProfileMass[SIDM_NFW_FIT_BINS];
     double SIDMNFWProfileCount[SIDM_NFW_FIT_BINS];
     double SIDMNFWScaleRadius;

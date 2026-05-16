@@ -30,12 +30,17 @@ struct SIDMBHSeedResult {
     double reservoir_radius;
     double collapse_progress;
     double collapse_time;
+    double clock_fof_mass;
+    double previous_clock_fof_mass;
+    double merger_mass_jump;
+    double merger_gamma;
     double knudsen;
     double nfw_scale_radius;
     double nfw_scale_density;
     int num_dm;
     int nfw_fit_used;
     int nfw_fit_bins;
+    int major_merger;
 };
 
 void set_sidm_bhseed_params(ParameterSet * ps);

@@ -110,6 +110,7 @@ inttime_t init(int RestartSnapNum, const char * OutputDir, struct header_data * 
         P[i].Scattered = 0;
         P[i].SIDMBHCollapseProgress = 0;
         P[i].SIDMBHLastCheckTime = 0;
+        P[i].SIDMBHClockFoFMass = 0;
     }
 #endif
 

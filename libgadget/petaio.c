@@ -820,6 +820,8 @@ SIMPLE_GETTER(GTSIDMBHCollapseProgress, SIDMBHCollapseProgress, double, 1, struc
 SIMPLE_SETTER(STSIDMBHCollapseProgress, SIDMBHCollapseProgress, double, 1, struct particle_data)
 SIMPLE_GETTER(GTSIDMBHLastCheckTime, SIDMBHLastCheckTime, float, 1, struct particle_data)
 SIMPLE_SETTER(STSIDMBHLastCheckTime, SIDMBHLastCheckTime, float, 1, struct particle_data)
+SIMPLE_GETTER(GTSIDMBHClockFoFMass, SIDMBHClockFoFMass, double, 1, struct particle_data)
+SIMPLE_SETTER(STSIDMBHClockFoFMass, SIDMBHClockFoFMass, double, 1, struct particle_data)
 #endif
 SIMPLE_GETTER(GTPotential, Potential, float, 1, struct particle_data)
 SIMPLE_GETTER(GTTimeBinHydro, TimeBinHydro, int, 1, struct particle_data)
@@ -865,6 +867,7 @@ SIMPLE_PROPERTY_PI(SIDMGasDynMassDebt, SIDMGasDynMassDebt, float, 1, struct bh_p
 SIMPLE_PROPERTY_PI(SIDMDMDynMassDebt, SIDMDMDynMassDebt, float, 1, struct bh_particle_data)
 SIMPLE_PROPERTY_PI(SIDMCollapseProgress, SIDMCollapseProgress, float, 1, struct bh_particle_data)
 SIMPLE_PROPERTY_PI(SIDMCollapseTime, SIDMCollapseTime, float, 1, struct bh_particle_data)
+SIMPLE_PROPERTY_PI(SIDMClockFoFMass, SIDMClockFoFMass, float, 1, struct bh_particle_data)
 #endif
 
 SIMPLE_SETTER_PI(STBlackholeMinPotPos , MinPotPos[0], double, 3, struct bh_particle_data)
@@ -1022,6 +1025,7 @@ void register_io_blocks(struct IOTable * IOTable, int WriteGroupID, int MetalRet
     IO_REG_NONFATAL(SIDMScattered, "i4", 1, 1, IOTable);
     IO_REG_NONFATAL(SIDMBHCollapseProgress, "f8", 1, 1, IOTable);
     IO_REG_NONFATAL(SIDMBHLastCheckTime, "f4", 1, 1, IOTable);
+    IO_REG_NONFATAL(SIDMBHClockFoFMass, "f8", 1, 1, IOTable);
 #endif
 
     IO_REG(Generation,       "u1", 1, 0, IOTable);
@@ -1095,6 +1099,7 @@ void register_io_blocks(struct IOTable * IOTable, int WriteGroupID, int MetalRet
     IO_REG_NONFATAL(SIDMDMDynMassDebt, "f4", 1, 5, IOTable);
     IO_REG_NONFATAL(SIDMCollapseProgress, "f4", 1, 5, IOTable);
     IO_REG_NONFATAL(SIDMCollapseTime, "f4", 1, 5, IOTable);
+    IO_REG_NONFATAL(SIDMClockFoFMass, "f4", 1, 5, IOTable);
 #endif
 
     /* Smoothing lengths for black hole: this is a new addition*/

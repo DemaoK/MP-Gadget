@@ -590,6 +590,23 @@ static void fof_reduce_base_group(void * pdst, void * psrc) {
     /* preserve the dst FirstPos so all other base group gets the same FirstPos */
 }
 
+#ifdef SIDM
+static int
+fof_sidm_clock_is_better(double mass, double progress, double last_check,
+    double ref_mass, double ref_progress, double ref_last_check)
+{
+    if(mass > ref_mass)
+        return 1;
+    if(mass < ref_mass)
+        return 0;
+    if(progress > ref_progress)
+        return 1;
+    if(progress < ref_progress)
+        return 0;
+    return last_check > ref_last_check;
+}
+#endif
+
 static void fof_reduce_group(void * pdst, void * psrc) {
     struct Group * gdst = (struct Group *) pdst;
     struct Group * gsrc = (struct Group *) psrc;
@@ -628,12 +645,13 @@ static void fof_reduce_group(void * pdst, void * psrc) {
         gdst->sidm_seed_index = gsrc->sidm_seed_index;
         gdst->sidm_seed_task = gsrc->sidm_seed_task;
     }
-    if(gsrc->SIDMBHCollapseProgress > gdst->SIDMBHCollapseProgress ||
-       (gsrc->SIDMBHCollapseProgress == gdst->SIDMBHCollapseProgress &&
-        gsrc->SIDMBHLastCheckTime > gdst->SIDMBHLastCheckTime)) {
+    if(fof_sidm_clock_is_better(gsrc->SIDMBHClockFoFMass, gsrc->SIDMBHCollapseProgress,
+        gsrc->SIDMBHLastCheckTime, gdst->SIDMBHClockFoFMass,
+        gdst->SIDMBHCollapseProgress, gdst->SIDMBHLastCheckTime)) {
         gdst->SIDMBHCollapseProgress = gsrc->SIDMBHCollapseProgress;
         gdst->SIDMBHLastCheckTime = gsrc->SIDMBHLastCheckTime;
         gdst->SIDMBHClockID = gsrc->SIDMBHClockID;
+        gdst->SIDMBHClockFoFMass = gsrc->SIDMBHClockFoFMass;
     }
 #endif
 
@@ -665,6 +683,7 @@ static void add_particle_to_group(struct Group * gdst, int i, int ThisTask) {
             gdst->SIDMSeedPos[j] = 0;
         gdst->sidm_seed_index = gdst->sidm_seed_task = -1;
         gdst->SIDMBHClockID = 0;
+        gdst->SIDMBHClockFoFMass = 0;
 #endif
     }
 
@@ -703,12 +722,14 @@ static void add_particle_to_group(struct Group * gdst, int i, int ThisTask) {
         gdst->sidm_seed_task = ThisTask;
     }
     if(P[index].Type == 1 &&
-       (P[index].SIDMBHCollapseProgress > gdst->SIDMBHCollapseProgress ||
-        (P[index].SIDMBHCollapseProgress == gdst->SIDMBHCollapseProgress &&
-         P[index].SIDMBHLastCheckTime > gdst->SIDMBHLastCheckTime))) {
+       fof_sidm_clock_is_better(P[index].SIDMBHClockFoFMass,
+        P[index].SIDMBHCollapseProgress, P[index].SIDMBHLastCheckTime,
+        gdst->SIDMBHClockFoFMass, gdst->SIDMBHCollapseProgress,
+        gdst->SIDMBHLastCheckTime)) {
         gdst->SIDMBHCollapseProgress = P[index].SIDMBHCollapseProgress;
         gdst->SIDMBHLastCheckTime = P[index].SIDMBHLastCheckTime;
         gdst->SIDMBHClockID = P[index].ID;
+        gdst->SIDMBHClockFoFMass = P[index].SIDMBHClockFoFMass;
     }
 #endif
     /*This used to depend on black holes being enabled, but I do not see why.
@@ -1761,8 +1782,10 @@ fof_seed_sidm_make_one(struct Group * g, int ThisTask, const double atime,
         blackhole_make_one_sidm(index, atime, &seed);
         return 1;
     }
-    message(0, "SIDM BH seed skipped for candidate ID %llu: progress=%g tc=%g NFWfit=%d NFWbins=%d Msmfp=%g Kn=%g Ndm=%d\n",
+    message(0, "SIDM BH seed skipped for candidate ID %llu: progress=%g tc=%g Mclock=%g prev_Mclock=%g major_merger=%d jump=%g gamma=%g NFWfit=%d NFWbins=%d Msmfp=%g Kn=%g Ndm=%d\n",
         (unsigned long long) P[index].ID, seed.collapse_progress, seed.collapse_time,
+        seed.clock_fof_mass, seed.previous_clock_fof_mass,
+        seed.major_merger, seed.merger_mass_jump, seed.merger_gamma,
         seed.nfw_fit_used, seed.nfw_fit_bins, seed.smfp_mass, seed.knudsen, seed.num_dm);
     return 0;
 }

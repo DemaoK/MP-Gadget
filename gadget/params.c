@@ -258,6 +258,8 @@ create_gadget_parameter_set()
     param_declare_double(ps, "SIDMBHMinFoFMass", OPTIONAL, 1e-2, "Minimum FoF halo mass for SIDM BH seeding in internal mass units.");
     param_declare_double(ps, "SIDMBHCollapseThreshold", OPTIONAL, 3.0, "Integrated t/t_c threshold for SIDM BH seeding.");
     param_declare_double(ps, "SIDMBHCollapseCoeff", OPTIONAL, 200.0, "Coefficient A_c in the fallback halo-scale SIDM collapse time.");
+    param_declare_double(ps, "SIDMBHMergerAlpha", OPTIONAL, 2.0, "Alpha coefficient for merger-aware collapse-clock damping.");
+    param_declare_double(ps, "SIDMBHMajorMergerMassJump", OPTIONAL, 0.3, "Fractional FoF mass increase that triggers merger-aware collapse-clock damping.");
     param_declare_double(ps, "SIDMBHDefaultConcentration", OPTIONAL, 3.0, "Fallback NFW concentration used only when the SIDM BH outer-profile fit fails.");
     param_declare_double(ps, "SIDMBHReservoirKnudsenThreshold", OPTIONAL, 1.0, "Knudsen threshold defining the local SMFP reservoir.");
     param_declare_int(ps, "SIDMBHMinReservoirParticles", OPTIONAL, 32, "Minimum number of local DM particles required in the SMFP reservoir diagnostic.");
