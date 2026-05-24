@@ -818,8 +818,8 @@ SIMPLE_GETTER(GTSIDMScattered, Scattered, int, 1, struct particle_data)
 SIMPLE_SETTER(STSIDMScattered, Scattered, int, 1, struct particle_data)
 SIMPLE_GETTER(GTSIDMBHCollapseProgress, SIDMBHCollapseProgress, double, 1, struct particle_data)
 SIMPLE_SETTER(STSIDMBHCollapseProgress, SIDMBHCollapseProgress, double, 1, struct particle_data)
-SIMPLE_GETTER(GTSIDMBHLastCheckTime, SIDMBHLastCheckTime, float, 1, struct particle_data)
-SIMPLE_SETTER(STSIDMBHLastCheckTime, SIDMBHLastCheckTime, float, 1, struct particle_data)
+SIMPLE_GETTER(GTSIDMBHLastCheckTime, SIDMBHLastCheckTime, double, 1, struct particle_data)
+SIMPLE_SETTER(STSIDMBHLastCheckTime, SIDMBHLastCheckTime, double, 1, struct particle_data)
 SIMPLE_GETTER(GTSIDMBHClockFoFMass, SIDMBHClockFoFMass, double, 1, struct particle_data)
 SIMPLE_SETTER(STSIDMBHClockFoFMass, SIDMBHClockFoFMass, double, 1, struct particle_data)
 #endif
@@ -1024,7 +1024,7 @@ void register_io_blocks(struct IOTable * IOTable, int WriteGroupID, int MetalRet
     IO_REG_NONFATAL(SIDMPartnerDist, "f8", 1, 1, IOTable);
     IO_REG_NONFATAL(SIDMScattered, "i4", 1, 1, IOTable);
     IO_REG_NONFATAL(SIDMBHCollapseProgress, "f8", 1, 1, IOTable);
-    IO_REG_NONFATAL(SIDMBHLastCheckTime, "f4", 1, 1, IOTable);
+    IO_REG_NONFATAL(SIDMBHLastCheckTime, "f8", 1, 1, IOTable);
     IO_REG_NONFATAL(SIDMBHClockFoFMass, "f8", 1, 1, IOTable);
 #endif
 

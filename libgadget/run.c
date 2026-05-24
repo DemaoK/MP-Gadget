@@ -596,7 +596,11 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
         }
 
         RandTable rnd = {0};
-        if(GasEnabled || All.LightconeOn)
+        int NeedRandomTable = GasEnabled || All.LightconeOn;
+#ifdef SIDM
+        NeedRandomTable = NeedRandomTable || (All.BlackHoleOn && sidm_bhseed_is_enabled());
+#endif
+        if(NeedRandomTable)
             rnd = set_random_numbers(seed, RNDTABLE);
 
         /* Cooling and extra physics show up as a source term in the evolution equations.
@@ -623,11 +627,13 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
 #ifdef SIDM
         if(!GasEnabled && is_PM && All.BlackHoleOn && sidm_bhseed_is_enabled() && atime >= TimeNextSeedingCheck) {
             message(0, "SIDM BH seeding check in DM-only run at a=%g.\n", atime);
-            FOFGroups fof = fof_fof(ddecomp, 0, &All.CP, MPI_COMM_WORLD);
+            FOFGroups fof = fof_fof(ddecomp, 0, &All.CP, &times, MPI_COMM_WORLD);
             fof_seed_sidm(&fof, &Act, atime, &All.CP, &times, units, MPI_COMM_WORLD);
             fof_finish(&fof);
             TimeNextSeedingCheck = atime * All.TimeBetweenSeedingSearch;
         }
+        if(!GasEnabled && All.BlackHoleOn && sidm_bhseed_is_enabled())
+            sidm_bhseed_update_dm_only(&Act, ddecomp, atime, &All.CP, &times, &rnd);
 #endif
 
         if(GasEnabled)
@@ -651,7 +657,7 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
                  (CalcUVBG && All.ExcursionSetReionOn))) {
 
                 /* Seeding: builds its own tree.*/
-                FOFGroups fof = fof_fof(ddecomp, 0, &All.CP, MPI_COMM_WORLD);
+                FOFGroups fof = fof_fof(ddecomp, 0, &All.CP, &times, MPI_COMM_WORLD);
                 if(All.BlackHoleOn && atime >= TimeNextSeedingCheck) {
 #ifdef SIDM
                     if(sidm_bhseed_is_enabled())
@@ -758,7 +764,7 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
         FOFGroups fof = {0};
         if(WriteFOF) {
             /* Compute FOF and assign GrNr so it can be written in checkpoint.*/
-            fof = fof_fof(ddecomp, 1, &All.CP, MPI_COMM_WORLD);
+            fof = fof_fof(ddecomp, 1, &All.CP, &times, MPI_COMM_WORLD);
         }
 
         /* WriteFOF just reminds the checkpoint code to save GroupID*/
@@ -908,7 +914,7 @@ runfof(const int RestartSnapNum, const inttime_t Ti_Current, const struct header
         if(GradRho)
             myfree(GradRho);
     }
-    FOFGroups fof = fof_fof(ddecomp, 1, &All.CP, MPI_COMM_WORLD);
+    FOFGroups fof = fof_fof(ddecomp, 1, &All.CP, &times, MPI_COMM_WORLD);
     fof_save_groups(&fof, All.OutputDir, All.FOFFileBase, RestartSnapNum, &All.CP, header->TimeSnapshot, header->MassTable, All.MetalReturnOn, MPI_COMM_WORLD);
     fof_finish(&fof);
 }

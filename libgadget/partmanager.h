@@ -39,7 +39,7 @@ struct particle_data
     MyFloat SIDMPartnerDist; /* Distance to the chosen step-1 partner */
     int Scattered; /* Step-local claim/pending-kick flag, cleared after the kick is consumed */
     double SIDMBHCollapseProgress; /* Integrated collapse clock for SIDM BH seeding candidates */
-    MyFloat SIDMBHLastCheckTime; /* Scale factor of the last SIDM BH seeding clock update */
+    double SIDMBHLastCheckTime; /* Scale factor of the last SIDM BH seeding clock update */
     double SIDMBHClockFoFMass; /* FoF mass of the progenitor that last advanced the collapse clock */
 #endif
     MyFloat FullTreeGravAccel[3]; /* Short-range tree acceleration at the most recent timestep

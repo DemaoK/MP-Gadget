@@ -20,9 +20,6 @@
 #include "utils/system.h"
 #include "walltime.h"
 
-#define SIDM_BHSEED_NFW_XMAX 2.1625815870646098
-#define SIDM_BHSEED_NFW_VMAX_COEFF 1.648
-
 static struct SIDMBHSeedParams {
     int SeedOn;
     int DynMassCatchupOn;
@@ -160,21 +157,6 @@ sidm_bhseed_estimate_tc_from_group(const struct Group * group, double atime,
     return sidm_bhseed_params.CollapseCoeff / (sigma_code * rho_s * rs) / dyn;
 }
 
-struct SIDMBHReservoirSample {
-    double r;
-    double mass;
-    double vel[3];
-    double vel2;
-};
-
-static int
-sidm_bhseed_compare_reservoir_radius(const void * a, const void * b)
-{
-    const struct SIDMBHReservoirSample * sa = (const struct SIDMBHReservoirSample *) a;
-    const struct SIDMBHReservoirSample * sb = (const struct SIDMBHReservoirSample *) b;
-    return (sa->r > sb->r) - (sa->r < sb->r);
-}
-
 static void
 sidm_bhseed_set_reservoir_state(struct SIDMBHSeedResult * result, double radius,
     double mass, double rho, double sigma1d, double kn, int numdm, int is_smfp)
@@ -191,78 +173,33 @@ sidm_bhseed_set_reservoir_state(struct SIDMBHSeedResult * result, double radius,
 }
 
 static void
-sidm_bhseed_local_smfp_diagnostic(int index, double atime, Cosmology * CP,
-    const struct UnitSystem units, const struct kick_factor_data * kf,
+sidm_bhseed_smfp_diagnostic_from_group(const struct Group * group, double atime, Cosmology * CP,
+    const struct UnitSystem units,
     struct SIDMBHSeedResult * result)
 {
-    const double soft = FORCE_SOFTENING();
-    double search_radius = result->nfw_scale_radius;
-    if(search_radius < soft)
-        search_radius = soft;
-    if(search_radius <= 0)
+    const double search_radius = group->SIDMSMFPProfileRMax;
+    if(search_radius <= 0 || group->SIDMSMFPProfileBins <= 0)
         return;
-
-    int nsamples = 0;
-
-    for(int i = 0; i < PartManager->NumPart; i++) {
-        if(P[i].Type != 1 || P[i].IsGarbage || P[i].Swallowed)
-            continue;
-        double r2 = 0;
-        for(int k = 0; k < 3; k++) {
-            const double dx = NEAREST(P[i].Pos[k] - P[index].Pos[k], PartManager->BoxSize);
-            r2 += dx * dx;
-        }
-        if(r2 <= search_radius * search_radius)
-            nsamples++;
-    }
-
-    if(nsamples <= 0)
-        return;
-
-    struct SIDMBHReservoirSample * samples = (struct SIDMBHReservoirSample *)
-        mymalloc("SIDMSMFPBoundarySamples", sizeof(samples[0]) * nsamples);
-
-    int n = 0;
-    for(int i = 0; i < PartManager->NumPart; i++) {
-        if(P[i].Type != 1 || P[i].IsGarbage || P[i].Swallowed)
-            continue;
-        double r2 = 0;
-        for(int k = 0; k < 3; k++) {
-            const double dx = NEAREST(P[i].Pos[k] - P[index].Pos[k], PartManager->BoxSize);
-            r2 += dx * dx;
-        }
-        if(r2 > search_radius * search_radius)
-            continue;
-        MyFloat VelPred[3];
-        DM_VelPred(i, VelPred, kf);
-        samples[n].r = sqrt(r2);
-        samples[n].mass = P[i].Mass;
-        samples[n].vel2 = 0;
-        for(int k = 0; k < 3; k++) {
-            samples[n].vel[k] = VelPred[k];
-            samples[n].vel2 += VelPred[k] * VelPred[k];
-        }
-        n++;
-    }
-    nsamples = n;
-    qsort(samples, nsamples, sizeof(samples[0]), sidm_bhseed_compare_reservoir_radius);
 
     double mass = 0;
     double momentum[3] = {0, 0, 0};
     double mv2 = 0;
+    double count = 0;
     double best_kn = 1e30;
 
-    for(int i = 0; i < nsamples; i++) {
-        mass += samples[i].mass;
-        mv2 += samples[i].mass * samples[i].vel2;
+    for(int i = 0; i < SIDM_SMFP_PROFILE_BINS; i++) {
+        mass += group->SIDMSMFPProfileMass[i];
+        mv2 += group->SIDMSMFPProfileMV2[i];
+        count += group->SIDMSMFPProfileCount[i];
         for(int k = 0; k < 3; k++)
-            momentum[k] += samples[i].mass * samples[i].vel[k];
+            momentum[k] += group->SIDMSMFPProfileMomentum[i][k];
 
-        const int numdm = i + 1;
-        if(numdm < sidm_bhseed_params.MinReservoirParticles || mass <= 0 || samples[i].r <= 0)
+        const int numdm = (int)(count + 0.5);
+        const double radius = search_radius * (i + 1.0) / SIDM_SMFP_PROFILE_BINS;
+        if(numdm < sidm_bhseed_params.MinReservoirParticles || mass <= 0 || radius <= 0)
             continue;
 
-        const double volume = 4.0 * M_PI / 3.0 * samples[i].r * samples[i].r * samples[i].r;
+        const double volume = 4.0 * M_PI / 3.0 * radius * radius * radius;
         const double rho = mass / volume;
         double v2 = mv2;
         for(int k = 0; k < 3; k++)
@@ -277,17 +214,15 @@ sidm_bhseed_local_smfp_diagnostic(int index, double atime, Cosmology * CP,
         const int is_smfp = kn < sidm_bhseed_params.ReservoirKnudsenThreshold;
 
         if(is_smfp || kn < best_kn) {
-            sidm_bhseed_set_reservoir_state(result, samples[i].r, mass, rho, sigma1d, kn, numdm, is_smfp);
+            sidm_bhseed_set_reservoir_state(result, radius, mass, rho, sigma1d, kn, numdm, is_smfp);
             best_kn = kn;
         }
     }
-
-    myfree(samples);
 }
 
 struct SIDMBHSeedResult
 sidm_bhseed_evaluate_candidate(int index, const struct Group * group, double atime,
-    Cosmology * CP, const struct UnitSystem units, const struct kick_factor_data * kf)
+    Cosmology * CP, const struct UnitSystem units)
 {
     struct SIDMBHSeedResult result;
     memset(&result, 0, sizeof(result));
@@ -346,7 +281,7 @@ sidm_bhseed_evaluate_candidate(int index, const struct Group * group, double ati
     result.collapse_progress = P[index].SIDMBHCollapseProgress;
     result.clock_fof_mass = P[index].SIDMBHClockFoFMass;
 
-    sidm_bhseed_local_smfp_diagnostic(index, atime, CP, units, kf, &result);
+    sidm_bhseed_smfp_diagnostic_from_group(group, atime, CP, units, &result);
 
     if(result.collapse_progress < sidm_bhseed_params.CollapseThreshold)
         return result;
@@ -387,6 +322,102 @@ struct SIDMBHDMSwallowPriv {
 };
 
 #define SIDM_DM_SWALLOW_GET_PRIV(tw) ((struct SIDMBHDMSwallowPriv *) ((tw)->priv))
+
+static int
+sidm_bhseed_origin_bh_haswork(int n, TreeWalk * tw)
+{
+    (void) tw;
+    return P[n].Type == 5 && !P[n].Swallowed && BHP(n).SIDMSeedOrigin;
+}
+
+static int64_t
+sidm_bhseed_active_origin_bhs(const ActiveParticles * act, int ** ActiveBlackHoles,
+    int64_t * NumActiveBlackHoles)
+{
+    TreeWalk tw_bh[1] = {{0}};
+    tw_bh->haswork = sidm_bhseed_origin_bh_haswork;
+
+    treewalk_build_queue(tw_bh, act->ActiveParticle, act->NumActiveParticle, 0);
+
+    int64_t totbh;
+    MPI_Allreduce(&tw_bh->WorkSetSize, &totbh, 1, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
+
+    *NumActiveBlackHoles = tw_bh->WorkSetSize;
+    if(totbh > 0) {
+        const size_t nalloc = tw_bh->WorkSetSize > 0 ? tw_bh->WorkSetSize : 1;
+        *ActiveBlackHoles = (int *) mymalloc2("SIDMActiveOriginBH",
+            nalloc * sizeof(int));
+        if(tw_bh->WorkSetSize > 0)
+            memcpy(*ActiveBlackHoles, tw_bh->WorkSet, tw_bh->WorkSetSize * sizeof(int));
+    }
+    myfree(tw_bh->WorkSet);
+    return totbh;
+}
+
+static void
+sidm_bhseed_apply_dark_reservoir_accretion(int * ActiveBlackHoles,
+    int64_t NumActiveBlackHoles, double atime, Cosmology * CP, const DriftKickTimes * times)
+{
+    (void) times;
+    if(atime <= 0)
+        return;
+
+    const double hubble = hubble_function(CP, atime);
+    const double a3inv = 1.0 / (atime * atime * atime);
+    double local_dark_mass = 0;
+    int64_t local_updated = 0;
+
+    for(int64_t i = 0; i < NumActiveBlackHoles; i++) {
+        const int n = ActiveBlackHoles[i];
+        BHP(n).SIDMDarkMdot = 0;
+        if(!BHP(n).SIDMSeedOrigin || BHP(n).SIDMDarkReservoirMass <= 0 ||
+           BHP(n).SIDMRhoInf <= 0 || BHP(n).SIDMSoundSpeedInf <= 0)
+            continue;
+
+        int timebin = P[n].TimeBinHydro > 0 ? P[n].TimeBinHydro : P[n].TimeBinGravity;
+        if(timebin <= 0 || hubble <= 0)
+            continue;
+        const double dtime = get_dloga_for_bin(timebin, P[n].Ti_drift) / hubble;
+        if(dtime <= 0)
+            continue;
+
+        const double rho_dark_proper = BHP(n).SIDMRhoInf * a3inv;
+        const double sound_dark_proper = BHP(n).SIDMSoundSpeedInf / atime;
+        const double ainf3 = sound_dark_proper * sound_dark_proper * sound_dark_proper;
+        if(ainf3 <= 0)
+            continue;
+
+        double mdot_dark = 4.0 * M_PI * sidm_bhseed_dark_bondi_lambda() *
+            CP->GravInternal * CP->GravInternal * BHP(n).Mass * BHP(n).Mass *
+            rho_dark_proper / ainf3;
+        double delta_dark = mdot_dark * dtime;
+        if(delta_dark > BHP(n).SIDMDarkReservoirMass)
+            delta_dark = BHP(n).SIDMDarkReservoirMass;
+        if(delta_dark < 0)
+            delta_dark = 0;
+        if(delta_dark <= 0)
+            continue;
+
+        BHP(n).SIDMDarkMdot = delta_dark / dtime;
+        BHP(n).SIDMDarkReservoirMass -= delta_dark;
+        if(sidm_bhseed_dynmass_catchup_on()) {
+            const double buffer = DMAX(P[n].Mass - BHP(n).Mass, 0);
+            const double used = DMIN(buffer, delta_dark);
+            BHP(n).SIDMDMDynMassDebt += delta_dark - used;
+        }
+        BHP(n).Mass += delta_dark;
+        local_dark_mass += delta_dark;
+        local_updated++;
+    }
+
+    double total_dark_mass = local_dark_mass;
+    int64_t total_updated = local_updated;
+    MPI_Allreduce(MPI_IN_PLACE, &total_dark_mass, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &total_updated, 1, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
+    if(total_updated > 0)
+        message(0, "SIDM BH dark-only reservoir accreted %g onto %lld BHs.\n",
+            total_dark_mass, (long long) total_updated);
+}
 
 typedef struct {
     TreeWalkQueryBase base;
@@ -532,7 +563,9 @@ sidm_bhseed_swallow_dm(int * ActiveBlackHoles, int64_t NumActiveBlackHoles,
     RandTable * rnd)
 {
     (void) atime;
-    if(!sidm_bhseed_params.DynMassCatchupOn || NumActiveBlackHoles <= 0)
+    int64_t TotActiveBlackHoles = NumActiveBlackHoles;
+    MPI_Allreduce(MPI_IN_PLACE, &TotActiveBlackHoles, 1, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
+    if(!sidm_bhseed_params.DynMassCatchupOn || TotActiveBlackHoles <= 0)
         return;
 
     struct kick_factor_data kf;
@@ -583,6 +616,26 @@ sidm_bhseed_swallow_dm(int * ActiveBlackHoles, int64_t NumActiveBlackHoles,
     ta_free(priv->N_dm_swallowed);
     force_tree_free(&dmtree);
     walltime_measure("/SIDM/BHDMSwallow");
+}
+
+void
+sidm_bhseed_update_dm_only(const ActiveParticles * act, DomainDecomp * ddecomp,
+    double atime, Cosmology * CP, const DriftKickTimes * times, RandTable * rnd)
+{
+    int * ActiveBlackHoles = NULL;
+    int64_t NumActiveBlackHoles = 0;
+    const int64_t TotActiveBlackHoles = sidm_bhseed_active_origin_bhs(act,
+        &ActiveBlackHoles, &NumActiveBlackHoles);
+    if(TotActiveBlackHoles <= 0)
+        return;
+
+    sidm_bhseed_apply_dark_reservoir_accretion(ActiveBlackHoles,
+        NumActiveBlackHoles, atime, CP, times);
+    sidm_bhseed_swallow_dm(ActiveBlackHoles, NumActiveBlackHoles, ddecomp,
+        atime, CP, times, rnd);
+
+    if(ActiveBlackHoles)
+        myfree(ActiveBlackHoles);
 }
 
 #endif

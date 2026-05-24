@@ -53,18 +53,19 @@ double sidm_bhseed_dark_bondi_lambda(void);
 
 /* First-pass seed diagnostics. The collapse clock uses the FoF-measured Vmax
  * and Rmax to infer equivalent NFW rs and rho_s. The SMFP reservoir is measured
- * by a local cumulative Knudsen scan around the central candidate. */
+ * from the FoF-reduced cumulative Knudsen profile around the central candidate. */
 struct SIDMBHSeedResult sidm_bhseed_evaluate_candidate(
     int index,
     const struct Group * group,
     double atime,
     Cosmology * CP,
-    const struct UnitSystem units,
-    const struct kick_factor_data * kf);
+    const struct UnitSystem units);
 
 void sidm_bhseed_swallow_dm(int * ActiveBlackHoles, int64_t NumActiveBlackHoles,
     DomainDecomp * ddecomp, double atime, Cosmology * CP, const DriftKickTimes * times,
     RandTable * rnd);
+void sidm_bhseed_update_dm_only(const ActiveParticles * act, DomainDecomp * ddecomp,
+    double atime, Cosmology * CP, const DriftKickTimes * times, RandTable * rnd);
 
 #endif
 #endif

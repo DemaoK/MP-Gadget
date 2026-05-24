@@ -11,6 +11,9 @@ void set_fof_params(ParameterSet * ps);
 
 #ifdef SIDM
 #define SIDM_VMAX_PROFILE_BINS 24
+#define SIDM_SMFP_PROFILE_BINS 32
+#define SIDM_BHSEED_NFW_XMAX 2.1625815870646098
+#define SIDM_BHSEED_NFW_VMAX_COEFF 1.648
 #endif
 
 void fof_init(double DMMeanSeparation);
@@ -69,7 +72,7 @@ struct Group
     int sidm_seed_index;
     int sidm_seed_task;
     double SIDMBHCollapseProgress;
-    MyFloat SIDMBHLastCheckTime;
+    double SIDMBHLastCheckTime;
     MyIDType SIDMBHClockID;
     double SIDMBHClockFoFMass;
     double SIDMVmaxProfileMass[SIDM_VMAX_PROFILE_BINS];
@@ -79,6 +82,12 @@ struct Group
     double SIDMVmaxProfileRMin;
     double SIDMVmaxProfileRMax;
     int SIDMVmaxProfileBins;
+    double SIDMSMFPProfileMass[SIDM_SMFP_PROFILE_BINS];
+    double SIDMSMFPProfileCount[SIDM_SMFP_PROFILE_BINS];
+    double SIDMSMFPProfileMomentum[SIDM_SMFP_PROFILE_BINS][3];
+    double SIDMSMFPProfileMV2[SIDM_SMFP_PROFILE_BINS];
+    double SIDMSMFPProfileRMax;
+    int SIDMSMFPProfileBins;
 #endif
 };
 
@@ -93,7 +102,8 @@ typedef struct FOFGroups
 /* Computes the Group structure, saved as a global array below.
  * If StoreGrNr is true, this writes to GrNr in partmanager.h.
  * Note this over-writes PeanoKey and means the tree cannot be rebuilt.*/
-FOFGroups fof_fof(DomainDecomp * ddecomp, const int StoreGrNr, Cosmology * CP, MPI_Comm Comm);
+FOFGroups fof_fof(DomainDecomp * ddecomp, const int StoreGrNr, Cosmology * CP,
+    const DriftKickTimes * times, MPI_Comm Comm);
 
 /*Frees the Group structure*/
 void fof_finish(FOFGroups * fof);
