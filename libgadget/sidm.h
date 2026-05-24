@@ -15,6 +15,12 @@ void sidm_force(const ActiveParticles * act, const double atime, const double hu
  * conversion used by sidm_force(). */
 double sidm_sigma_over_m_code(double vrel2, double atime, Cosmology * CP, const struct UnitSystem units);
 
+/* Return the conductivity-averaged sigma/m in internal comoving code units for
+ * a local one-dimensional internal velocity dispersion. This is intended for
+ * fluid diagnostics such as the SMFP Knudsen number, not pairwise scattering. */
+double sidm_sigma_kappa_over_m_code(double sigma1d, double atime, Cosmology * CP,
+    const struct UnitSystem units);
+
 void set_sidm_params(ParameterSet * ps);
 
 #endif

@@ -1253,14 +1253,15 @@ blackhole_make_one_sidm(int index, const double atime, const struct SIDMBHSeedRe
     if(BHP(child).Mass > P[child].Mass)
         BHP(child).SIDMDMDynMassDebt = BHP(child).Mass - P[child].Mass;
 
-    message(0, "SIDM BH seeded: ID=%llu parent_dyn_mass=%g P.Mass=%g BHP.Mass=%g Msmfp=%g Mres=%g rho_inf_comoving=%g cs_inf_comoving=%g progress=%g tc=%g Mclock=%g major_merger=%d jump=%g gamma=%g NFWfit=%d NFWbins=%d trigger=%d\n",
+    message(0, "SIDM BH seeded: ID=%llu parent_dyn_mass=%g P.Mass=%g BHP.Mass=%g Msmfp=%g Mres=%g rho_inf_comoving=%g sigma1d_internal=%g progress=%g tc=%g Mclock=%g major_merger=%d jump=%g gamma=%g VmaxFoF=%g VmaxInternal=%g RmaxComoving=%g VmaxBins=%d trigger=%d\n",
         (unsigned long long) P[child].ID, parent_mass, P[child].Mass, BHP(child).Mass,
         BHP(child).SIDMSMFPMassInitial, BHP(child).SIDMDarkReservoirMass,
         BHP(child).SIDMRhoInf, BHP(child).SIDMSoundSpeedInf,
         BHP(child).SIDMCollapseProgress, BHP(child).SIDMCollapseTime,
         BHP(child).SIDMClockFoFMass, seed->major_merger,
         seed->merger_mass_jump, seed->merger_gamma,
-        seed->nfw_fit_used, seed->nfw_fit_bins, BHP(child).SIDMSeedTrigger);
+        seed->halo_vmax, seed->halo_vmax_internal, seed->halo_rmax, seed->vmax_profile_bins,
+        BHP(child).SIDMSeedTrigger);
 
     if(P[child].Mass < BHP(child).Mass)
         message(1, "WARNING: SIDM BH subgrid mass (%g) for ID %llu exceeds tracer dynamical mass (%g); DM catch-up debt=%g\n",

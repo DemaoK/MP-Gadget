@@ -35,11 +35,13 @@ struct SIDMBHSeedResult {
     double merger_mass_jump;
     double merger_gamma;
     double knudsen;
+    double halo_vmax;
+    double halo_vmax_internal;
+    double halo_rmax;
     double nfw_scale_radius;
     double nfw_scale_density;
     int num_dm;
-    int nfw_fit_used;
-    int nfw_fit_bins;
+    int vmax_profile_bins;
     int major_merger;
 };
 
@@ -49,10 +51,9 @@ int sidm_bhseed_dynmass_catchup_on(void);
 double sidm_bhseed_min_fof_mass(void);
 double sidm_bhseed_dark_bondi_lambda(void);
 
-/* First-pass seed diagnostics. The collapse clock uses the FoF outer NFW fit
- * when available, falling back to SIDMBHDefaultConcentration only if the fit
- * fails. The SMFP reservoir is measured by a local cumulative Knudsen scan
- * around the central candidate. */
+/* First-pass seed diagnostics. The collapse clock uses the FoF-measured Vmax
+ * and Rmax to infer equivalent NFW rs and rho_s. The SMFP reservoir is measured
+ * by a local cumulative Knudsen scan around the central candidate. */
 struct SIDMBHSeedResult sidm_bhseed_evaluate_candidate(
     int index,
     const struct Group * group,

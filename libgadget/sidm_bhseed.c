@@ -20,6 +20,9 @@
 #include "utils/system.h"
 #include "walltime.h"
 
+#define SIDM_BHSEED_NFW_XMAX 2.1625815870646098
+#define SIDM_BHSEED_NFW_VMAX_COEFF 1.648
+
 static struct SIDMBHSeedParams {
     int SeedOn;
     int DynMassCatchupOn;
@@ -27,7 +30,6 @@ static struct SIDMBHSeedParams {
     double CollapseCoeff;
     double MergerAlpha;
     double MajorMergerMassJump;
-    double DefaultConcentration;
     double ReservoirKnudsenThreshold;
     int MinReservoirParticles;
     double SeedSMFPFraction;
@@ -49,7 +51,6 @@ set_sidm_bhseed_params(ParameterSet * ps)
         sidm_bhseed_params.CollapseCoeff = param_get_double(ps, "SIDMBHCollapseCoeff");
         sidm_bhseed_params.MergerAlpha = param_get_double(ps, "SIDMBHMergerAlpha");
         sidm_bhseed_params.MajorMergerMassJump = param_get_double(ps, "SIDMBHMajorMergerMassJump");
-        sidm_bhseed_params.DefaultConcentration = param_get_double(ps, "SIDMBHDefaultConcentration");
         sidm_bhseed_params.ReservoirKnudsenThreshold = param_get_double(ps, "SIDMBHReservoirKnudsenThreshold");
         sidm_bhseed_params.MinReservoirParticles = param_get_int(ps, "SIDMBHMinReservoirParticles");
         sidm_bhseed_params.SeedSMFPFraction = param_get_double(ps, "SIDMBHSeedSMFPFraction");
@@ -60,8 +61,6 @@ set_sidm_bhseed_params(ParameterSet * ps)
 
         if(sidm_bhseed_params.SeedOn && sidm_bhseed_params.SeedSMFPFraction <= 0)
             endrun(1, "SIDMBHSeedOn requires SIDMBHSeedSMFPFraction > 0.\n");
-        if(sidm_bhseed_params.SeedOn && sidm_bhseed_params.DefaultConcentration <= 1)
-            endrun(1, "SIDMBHDefaultConcentration must be > 1 for the fallback NFW clock.\n");
         if(sidm_bhseed_params.SeedOn && sidm_bhseed_params.MinFoFMass < 0)
             endrun(1, "SIDMBHMinFoFMass must be non-negative.\n");
         if(sidm_bhseed_params.SeedOn && sidm_bhseed_params.MergerAlpha < 0)
@@ -121,46 +120,40 @@ sidm_bhseed_clock_is_better(double mass, double progress, double last_check,
     return last_check > ref_last_check;
 }
 
-/* Halo-scale collapse time. Prefer the outer NFW fit measured during FoF; the
- * default concentration is only a fallback for poorly resolved/failed fits. All
- * quantities are in MP-Gadget internal comoving units, matching the SIDM
- * scatter module's sigma/m conversion. */
+/* Halo-scale collapse time from FoF-measured Vmax and Rmax. FoF stores
+ * SIDMVmax as sqrt(G M(<Rmax) / Rmax) with the usual MP-Gadget Msun/h and kpc/h
+ * code units. The h factors cancel in G M/R. Since Rmax is comoving,
+ * SIDMVmax = sqrt(a) Vmax_phys, and the velocity compared to wTurn is the
+ * internal canonical velocity a Vmax_phys = sqrt(a) SIDMVmax. */
 static double
 sidm_bhseed_estimate_tc_from_group(const struct Group * group, double atime,
     Cosmology * CP, const struct UnitSystem units, struct SIDMBHSeedResult * result)
 {
-    const double mhalo = group->MassType[1] > 0 ? group->MassType[1] : group->Mass;
-    if(mhalo <= 0)
+    if(CP == NULL || atime <= 0 || CP->GravInternal <= 0)
         return 0;
 
-    const double rho_crit0 = 3.0 * CP->Hubble * CP->Hubble / (8.0 * M_PI * CP->GravInternal);
-    const double rho_ref_comoving = 200.0 * CP->Omega0 * rho_crit0;
-    if(rho_ref_comoving <= 0)
+    const double rmax = group->SIDMRmax;
+    const double vmax = group->SIDMVmax;
+    result->halo_vmax = vmax;
+    result->halo_rmax = rmax;
+    result->vmax_profile_bins = group->SIDMVmaxProfileBins;
+    if(rmax <= 0 || vmax <= 0)
         return 0;
 
-    const double r200 = cbrt(3.0 * mhalo / (4.0 * M_PI * rho_ref_comoving));
-    double rs = group->SIDMNFWScaleRadius;
-    double rho_s = group->SIDMNFWScaleDensity;
-    result->nfw_fit_bins = group->SIDMNFWFitBins;
+    const double vmax_internal = sqrt(atime) * vmax;
+    result->halo_vmax_internal = vmax_internal;
 
-    if(rs > 0 && rho_s > 0) {
-        result->nfw_fit_used = 1;
-    } else {
-        const double c = sidm_bhseed_params.DefaultConcentration;
-        rs = r200 / c;
-        const double fc = log(1.0 + c) - c / (1.0 + c);
-        if(rs <= 0 || fc <= 0)
-            return 0;
-        rho_s = mhalo / (4.0 * M_PI * rs * rs * rs * fc);
-        result->nfw_fit_used = 0;
-    }
-
+    const double rs = rmax / SIDM_BHSEED_NFW_XMAX;
+    const double rho_s = vmax * vmax /
+        (SIDM_BHSEED_NFW_VMAX_COEFF * SIDM_BHSEED_NFW_VMAX_COEFF *
+         CP->GravInternal * rs * rs);
     result->nfw_scale_radius = rs;
     result->nfw_scale_density = rho_s;
-    const double v2002 = CP->GravInternal * mhalo / r200;
-    const double vrel2 = 6.0 * DMAX(v2002 / 2.0, 0.0);
-    const double sigma_code = sidm_sigma_over_m_code(vrel2, atime, CP, units);
-    const double dyn = sqrt(4.0 * M_PI * CP->GravInternal * rho_s);
+
+    const double sigma1d_eff = 1.1 * vmax_internal / sqrt(3.0);
+    const double sigma_code = sidm_sigma_kappa_over_m_code(sigma1d_eff, atime, CP, units);
+    const double dyn = sqrt(4.0 * M_PI * CP->GravInternal * rho_s /
+        (atime * atime * atime));
     if(sigma_code <= 0 || rho_s <= 0 || dyn <= 0)
         return 0;
 
@@ -276,9 +269,9 @@ sidm_bhseed_local_smfp_diagnostic(int index, double atime, Cosmology * CP,
             v2 -= momentum[k] * momentum[k] / mass;
         const double sigma1d2 = DMAX(v2 / (3.0 * mass), 0.0);
         const double sigma1d = sqrt(sigma1d2);
-        const double vrel2 = 6.0 * sigma1d2;
-        const double sigma_code = sidm_sigma_over_m_code(vrel2, atime, CP, units);
-        const double hscale = sigma1d > 0 && rho > 0 ? sigma1d / sqrt(4.0 * M_PI * CP->GravInternal * rho) : 0;
+        const double sigma_code = sidm_sigma_kappa_over_m_code(sigma1d, atime, CP, units);
+        const double hscale = sigma1d > 0 && rho > 0 && atime > 0 ?
+            sigma1d / sqrt(4.0 * M_PI * CP->GravInternal * rho * atime) : 0;
         const double mfp = rho > 0 && sigma_code > 0 ? 1.0 / (rho * sigma_code) : 0;
         const double kn = hscale > 0 ? mfp / hscale : 1e30;
         const int is_smfp = kn < sidm_bhseed_params.ReservoirKnudsenThreshold;
@@ -370,11 +363,11 @@ sidm_bhseed_evaluate_candidate(int index, const struct Group * group, double ati
     result.should_seed = 1;
     result.trigger = SIDM_BHSEED_TRIGGER_RESOLVED;
 
-    message(0, "SIDM BH seed candidate ID %llu: progress=%g threshold=%g tc=%g Mclock=%g prev_Mclock=%g major_merger=%d jump=%g gamma=%g NFWfit=%d NFWbins=%d rs=%g rhos=%g Msmfp=%g Rsmfp=%g Kn=%g Ndm=%d Mseed=%g Mres=%g rho_inf_comoving=%g cs_inf_comoving=%g\n",
+    message(0, "SIDM BH seed candidate ID %llu: progress=%g threshold=%g tc=%g Mclock=%g prev_Mclock=%g major_merger=%d jump=%g gamma=%g VmaxFoF=%g VmaxInternal=%g RmaxComoving=%g VmaxBins=%d rsComoving=%g rhosComoving=%g Msmfp=%g Rsmfp=%g Kn=%g Ndm=%d Mseed=%g Mres=%g rho_inf_comoving=%g sigma1d_internal=%g\n",
         (unsigned long long) P[index].ID, result.collapse_progress, sidm_bhseed_params.CollapseThreshold,
         result.collapse_time, result.clock_fof_mass, result.previous_clock_fof_mass,
         result.major_merger, result.merger_mass_jump, result.merger_gamma,
-        result.nfw_fit_used, result.nfw_fit_bins,
+        result.halo_vmax, result.halo_vmax_internal, result.halo_rmax, result.vmax_profile_bins,
         result.nfw_scale_radius, result.nfw_scale_density,
         result.smfp_mass, result.smfp_radius, result.knudsen,
         result.num_dm, result.seed_mass, result.reservoir_mass,

@@ -10,7 +10,7 @@
 void set_fof_params(ParameterSet * ps);
 
 #ifdef SIDM
-#define SIDM_NFW_FIT_BINS 12
+#define SIDM_VMAX_PROFILE_BINS 24
 #endif
 
 void fof_init(double DMMeanSeparation);
@@ -72,14 +72,13 @@ struct Group
     MyFloat SIDMBHLastCheckTime;
     MyIDType SIDMBHClockID;
     double SIDMBHClockFoFMass;
-    double SIDMNFWProfileMass[SIDM_NFW_FIT_BINS];
-    double SIDMNFWProfileCount[SIDM_NFW_FIT_BINS];
-    double SIDMNFWScaleRadius;
-    double SIDMNFWScaleDensity;
-    double SIDMNFWFitRMin;
-    double SIDMNFWFitRMax;
-    double SIDMNFWFitQuality;
-    int SIDMNFWFitBins;
+    double SIDMVmaxProfileMass[SIDM_VMAX_PROFILE_BINS];
+    double SIDMVmaxProfileCount[SIDM_VMAX_PROFILE_BINS];
+    double SIDMVmax; /* sqrt(G M(<Rmax) / Rmax) with comoving Rmax */
+    double SIDMRmax;
+    double SIDMVmaxProfileRMin;
+    double SIDMVmaxProfileRMax;
+    int SIDMVmaxProfileBins;
 #endif
 };
 

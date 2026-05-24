@@ -40,6 +40,10 @@
  * back to the exact expression. */
 #define SIDM_VD_SIGMA_LOOKUP_SEGMENTS 6
 #define SIDM_VD_SIGMA_LOOKUP_BINS 2048
+#define SIDM_VD_SIGMA_KAPPA_LOOKUP_BINS 2048
+#define SIDM_VD_SIGMA_KAPPA_X_MIN 1.0e-4
+#define SIDM_VD_SIGMA_KAPPA_X_MAX 1.0e3
+#define SIDM_VD_SIGMA_KAPPA_LAGUERRE_N 32
 
 /* This structure stores fixed parameters for the SIDM module. The idea is that
  * these are specified in the parameter file and the values never change over
@@ -62,6 +66,32 @@ static float SIDMVdSigmaShapeLookup[SIDM_VD_SIGMA_LOOKUP_SEGMENTS]
                                    [SIDM_VD_SIGMA_LOOKUP_BINS + 1];
 static double SIDMVdSigmaShapeLookupInvDx[SIDM_VD_SIGMA_LOOKUP_SEGMENTS];
 static int SIDMVdSigmaShapeLookupReady = 0;
+static float SIDMVdSigmaKappaShapeLogLookup[SIDM_VD_SIGMA_KAPPA_LOOKUP_BINS + 1];
+static double SIDMVdSigmaKappaShapeLogXMin = 0;
+static double SIDMVdSigmaKappaShapeLookupInvDx = 0;
+static int SIDMVdSigmaKappaShapeLookupReady = 0;
+
+static const double SIDMVdSigmaKappaLaguerreNodes[SIDM_VD_SIGMA_KAPPA_LAGUERRE_N] = {
+    4.44893658332672845e-02, 2.34526109519619635e-01, 5.76884629301886664e-01, 1.07244875381781801e+00,
+    1.72240877644464541e+00, 2.52833670642579422e+00, 3.49221327302199391e+00, 4.61645676974976737e+00,
+    5.90395850417424395e+00, 7.35812673318624100e+00, 8.98294092421259549e+00, 1.07830186325399726e+01,
+    1.27636979867427254e+01, 1.49311397555225582e+01, 1.72924543367153127e+01, 1.98558609403360542e+01,
+    2.26308890131967750e+01, 2.56286360224592471e+01, 2.88621018163234737e+01, 3.23466291539647344e+01,
+    3.61004948057519712e+01, 4.01457197715394400e+01, 4.45092079957549416e+01, 4.92243949873086422e+01,
+    5.43337213333969089e+01, 5.98925091621340187e+01, 6.59753772879350464e+01, 7.26876280906627130e+01,
+    8.01874469779135239e+01, 8.87353404178924023e+01, 9.88295428682839656e+01, 1.11751398097937695e+02,
+};
+
+static const double SIDMVdSigmaKappaLaguerreWeights[SIDM_VD_SIGMA_KAPPA_LAGUERRE_N] = {
+    1.09218341952416309e-01, 2.10443107938836721e-01, 2.35213229669831936e-01, 1.95903335972862913e-01,
+    1.29983786286060971e-01, 7.05786238657117315e-02, 3.17609125091722622e-02, 1.19182148348375566e-02,
+    3.73881629461121200e-03, 9.80803306614873175e-04, 2.14864918801346036e-04, 3.92034196798760943e-05,
+    5.93454161286812604e-06, 7.41640457866693461e-07, 7.60456787912018307e-08, 6.35060222662527120e-09,
+    4.28138297104050558e-10, 2.30589949189112686e-11, 9.79937928872617064e-13, 3.23780165772900330e-14,
+    8.17182344342010498e-16, 1.54213383339368448e-17, 2.11979229016345809e-19, 2.05442967378783204e-21,
+    1.34698258663730675e-23, 5.66129413039691686e-26, 1.41856054546292785e-28, 1.91337549445389003e-31,
+    1.19224876009803425e-34, 2.67151121923985828e-38, 1.33861694210630849e-42, 4.51053619389840956e-48,
+};
 
 static inline double sidm_vd_sigma_shape_exact(double vw2) {
   if (vw2 <= 0)
@@ -126,6 +156,74 @@ static inline double sidm_vd_sigma_shape_lookup(double vw2, int seg) {
   return y0 + frac * (y1 - y0);
 }
 
+static double sidm_vd_sigma_kappa_shape_exact(double x) {
+  if (x <= 0)
+    return 1.0;
+
+  double sum = 0;
+  for (int i = 0; i < SIDM_VD_SIGMA_KAPPA_LAGUERRE_N; i++) {
+    const double t = SIDMVdSigmaKappaLaguerreNodes[i];
+    const double weight = SIDMVdSigmaKappaLaguerreWeights[i];
+    const double vw2 = 4.0 * x * x * t;
+    sum += weight * t * t * t * sidm_vd_sigma_shape_exact(vw2);
+  }
+  return sum / 6.0;
+}
+
+static void sidm_init_vd_sigma_kappa_lookup(void) {
+  if (SIDMVdSigmaKappaShapeLookupReady)
+    return;
+
+  const double logxmin = log(SIDM_VD_SIGMA_KAPPA_X_MIN);
+  const double logxmax = log(SIDM_VD_SIGMA_KAPPA_X_MAX);
+  const double dx = (logxmax - logxmin) / SIDM_VD_SIGMA_KAPPA_LOOKUP_BINS;
+  SIDMVdSigmaKappaShapeLogXMin = logxmin;
+  SIDMVdSigmaKappaShapeLookupInvDx = 1.0 / dx;
+
+  for (int i = 0; i <= SIDM_VD_SIGMA_KAPPA_LOOKUP_BINS; i++) {
+    const double x = exp(logxmin + i * dx);
+    const double shape = DMAX(sidm_vd_sigma_kappa_shape_exact(x), 1e-300);
+    SIDMVdSigmaKappaShapeLogLookup[i] = (float)log(shape);
+  }
+
+  SIDMVdSigmaKappaShapeLookupReady = 1;
+}
+
+static double sidm_vd_sigma_kappa_shape_lookup(double x) {
+  if (x <= 0)
+    return 1.0;
+  if (x < SIDM_VD_SIGMA_KAPPA_X_MIN || x > SIDM_VD_SIGMA_KAPPA_X_MAX)
+    return sidm_vd_sigma_kappa_shape_exact(x);
+
+  if (!SIDMVdSigmaKappaShapeLookupReady)
+    sidm_init_vd_sigma_kappa_lookup();
+
+  const double pos = (log(x) - SIDMVdSigmaKappaShapeLogXMin) *
+                     SIDMVdSigmaKappaShapeLookupInvDx;
+  int idx = (int)pos;
+  if (idx < 0)
+    idx = 0;
+  if (idx >= SIDM_VD_SIGMA_KAPPA_LOOKUP_BINS)
+    idx = SIDM_VD_SIGMA_KAPPA_LOOKUP_BINS - 1;
+  double frac = pos - idx;
+  if (frac < 0)
+    frac = 0;
+  if (frac > 1)
+    frac = 1;
+
+  const double y0 = SIDMVdSigmaKappaShapeLogLookup[idx];
+  const double y1 = SIDMVdSigmaKappaShapeLogLookup[idx + 1];
+  return exp(y0 + frac * (y1 - y0));
+}
+
+static inline double
+sidm_sigma0_over_m_code(double atime, Cosmology * CP,
+                        const struct UnitSystem units) {
+  return SIDMParams.sigma0 * CP->HubbleParam * units.UnitMass_in_g /
+         (units.UnitLength_in_cm * units.UnitLength_in_cm) /
+         (atime * atime);
+}
+
 /* Read and broadcast the run-global SIDM parameters. */
 void set_sidm_params(ParameterSet *ps) {
   int ThisTask;
@@ -144,17 +242,16 @@ void set_sidm_params(ParameterSet *ps) {
   }
   MPI_Bcast(&SIDMParams, sizeof(struct sidm_params), MPI_BYTE, 0,
             MPI_COMM_WORLD);
-  if (SIDMParams.vdSIDMOn)
+  if (SIDMParams.vdSIDMOn) {
     sidm_init_vd_sigma_lookup();
+    sidm_init_vd_sigma_kappa_lookup();
+  }
 }
 
 double
 sidm_sigma_over_m_code(double vrel2, double atime, Cosmology * CP, const struct UnitSystem units)
 {
-  const double sigma0_const = SIDMParams.sigma0 * CP->HubbleParam *
-                              units.UnitMass_in_g /
-                              (units.UnitLength_in_cm * units.UnitLength_in_cm) /
-                              (atime * atime);
+  const double sigma0_const = sidm_sigma0_over_m_code(atime, CP, units);
   if (!SIDMParams.vdSIDMOn)
     return sigma0_const;
 
@@ -173,6 +270,27 @@ sidm_sigma_over_m_code(double vrel2, double atime, Cosmology * CP, const struct 
   if (seg >= 0)
     return sigma0_const * sidm_vd_sigma_shape_lookup(vw2, seg);
   return sigma0_const * sidm_vd_sigma_shape_exact(vw2);
+}
+
+double
+sidm_sigma_kappa_over_m_code(double sigma1d, double atime, Cosmology * CP,
+                             const struct UnitSystem units)
+{
+  const double sigma0_const = sidm_sigma0_over_m_code(atime, CP, units);
+  if (!SIDMParams.vdSIDMOn)
+    return sigma0_const;
+
+  if (!SIDMVdSigmaKappaShapeLookupReady)
+    sidm_init_vd_sigma_kappa_lookup();
+
+  const double wturn_physical_cgs = SIDMParams.wTurn * 1e5;
+  const double wturn_internal =
+      (wturn_physical_cgs / units.UnitVelocity_in_cm_per_s) * atime;
+  if (wturn_internal <= 0)
+    return 0;
+
+  const double x = DMAX(sigma1d, 0.0) / wturn_internal;
+  return sigma0_const * sidm_vd_sigma_kappa_shape_lookup(x);
 }
 
 /* Cubic-spline smoothing kernel used for the SIDM pair weighting.

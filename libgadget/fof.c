@@ -968,7 +968,8 @@ fof_sidm_group_r200(const struct Group * group, Cosmology * CP)
 }
 
 static int
-fof_sidm_nfw_edges(const struct Group * group, Cosmology * CP, double edges[SIDM_NFW_FIT_BINS + 1])
+fof_sidm_vmax_radii(const struct Group * group, Cosmology * CP,
+        double radii[SIDM_VMAX_PROFILE_BINS])
 {
     const double r200 = fof_sidm_group_r200(group, CP);
     if(r200 <= 0)
@@ -978,43 +979,41 @@ fof_sidm_nfw_edges(const struct Group * group, Cosmology * CP, double edges[SIDM
     const double soft = FORCE_SOFTENING();
     if(4.0 * soft > rmin)
         rmin = 4.0 * soft;
-    const double rmax = r200;
-    if(rmin <= 0 || rmax <= 1.5 * rmin)
+    if(rmin <= 0 || r200 <= 1.5 * rmin)
         return 0;
 
     const double lmin = log(rmin);
-    const double dl = (log(rmax) - lmin) / SIDM_NFW_FIT_BINS;
-    for(int i = 0; i <= SIDM_NFW_FIT_BINS; i++)
-        edges[i] = exp(lmin + i * dl);
+    const double dl = (log(r200) - lmin) / (SIDM_VMAX_PROFILE_BINS - 1);
+    for(int i = 0; i < SIDM_VMAX_PROFILE_BINS; i++)
+        radii[i] = exp(lmin + i * dl);
     return 1;
 }
 
 static void
-fof_clear_sidm_nfw_profiles(struct Group * Group, const int NgroupsExt)
+fof_clear_sidm_vmax_profiles(struct Group * Group, const int NgroupsExt)
 {
 #pragma omp parallel for
     for(int i = 0; i < NgroupsExt; i++) {
-        for(int j = 0; j < SIDM_NFW_FIT_BINS; j++) {
-            Group[i].SIDMNFWProfileMass[j] = 0;
-            Group[i].SIDMNFWProfileCount[j] = 0;
+        for(int j = 0; j < SIDM_VMAX_PROFILE_BINS; j++) {
+            Group[i].SIDMVmaxProfileMass[j] = 0;
+            Group[i].SIDMVmaxProfileCount[j] = 0;
         }
-        Group[i].SIDMNFWScaleRadius = 0;
-        Group[i].SIDMNFWScaleDensity = 0;
-        Group[i].SIDMNFWFitRMin = 0;
-        Group[i].SIDMNFWFitRMax = 0;
-        Group[i].SIDMNFWFitQuality = 0;
-        Group[i].SIDMNFWFitBins = 0;
+        Group[i].SIDMVmax = 0;
+        Group[i].SIDMRmax = 0;
+        Group[i].SIDMVmaxProfileRMin = 0;
+        Group[i].SIDMVmaxProfileRMax = 0;
+        Group[i].SIDMVmaxProfileBins = 0;
     }
 }
 
 static void
-fof_add_sidm_nfw_profile_bin(struct Group * group, int pindex, Cosmology * CP)
+fof_add_sidm_vmax_profile_bin(struct Group * group, int pindex, Cosmology * CP)
 {
     if(P[pindex].Type != 1)
         return;
 
-    double edges[SIDM_NFW_FIT_BINS + 1];
-    if(!fof_sidm_nfw_edges(group, CP, edges))
+    double radii[SIDM_VMAX_PROFILE_BINS];
+    if(!fof_sidm_vmax_radii(group, CP, radii))
         return;
 
     double r2 = 0;
@@ -1023,22 +1022,22 @@ fof_add_sidm_nfw_profile_bin(struct Group * group, int pindex, Cosmology * CP)
         r2 += dx * dx;
     }
     const double r = sqrt(r2);
-    if(r < edges[0] || r >= edges[SIDM_NFW_FIT_BINS])
+    if(r > radii[SIDM_VMAX_PROFILE_BINS - 1])
         return;
 
-    int bin = SIDM_NFW_FIT_BINS - 1;
-    for(int j = 0; j < SIDM_NFW_FIT_BINS; j++) {
-        if(r < edges[j + 1]) {
+    int bin = SIDM_VMAX_PROFILE_BINS - 1;
+    for(int j = 0; j < SIDM_VMAX_PROFILE_BINS; j++) {
+        if(r <= radii[j]) {
             bin = j;
             break;
         }
     }
-    group->SIDMNFWProfileMass[bin] += P[pindex].Mass;
-    group->SIDMNFWProfileCount[bin] += 1;
+    group->SIDMVmaxProfileMass[bin] += P[pindex].Mass;
+    group->SIDMVmaxProfileCount[bin] += 1;
 }
 
 static void
-fof_accumulate_sidm_nfw_profiles(struct FOFGroups * fof, const int NgroupsExt,
+fof_accumulate_sidm_vmax_profiles(struct FOFGroups * fof, const int NgroupsExt,
         struct fof_particle_list * HaloLabel, Cosmology * CP)
 {
     if(CP == NULL)
@@ -1053,97 +1052,59 @@ fof_accumulate_sidm_nfw_profiles(struct FOFGroups * fof, const int NgroupsExt,
         for(; start < PartManager->NumPart; start++) {
             if(HaloLabel[start].MinID != group->base.MinID)
                 break;
-            fof_add_sidm_nfw_profile_bin(group, HaloLabel[start].Pindex, CP);
+            fof_add_sidm_vmax_profile_bin(group, HaloLabel[start].Pindex, CP);
         }
     }
 }
 
 static void
-fof_reduce_sidm_nfw_profile(void * pdst, void * psrc)
+fof_reduce_sidm_vmax_profile(void * pdst, void * psrc)
 {
     struct Group * gdst = (struct Group *) pdst;
     struct Group * gsrc = (struct Group *) psrc;
-    for(int j = 0; j < SIDM_NFW_FIT_BINS; j++) {
-        gdst->SIDMNFWProfileMass[j] += gsrc->SIDMNFWProfileMass[j];
-        gdst->SIDMNFWProfileCount[j] += gsrc->SIDMNFWProfileCount[j];
+    for(int j = 0; j < SIDM_VMAX_PROFILE_BINS; j++) {
+        gdst->SIDMVmaxProfileMass[j] += gsrc->SIDMVmaxProfileMass[j];
+        gdst->SIDMVmaxProfileCount[j] += gsrc->SIDMVmaxProfileCount[j];
     }
 }
 
-static double
-fof_sidm_nfw_shell_shape(double r1, double r2, double rs)
-{
-    const double x1 = r1 / rs;
-    const double x2 = r2 / rs;
-    const double f1 = log(1.0 + x1) - x1 / (1.0 + x1);
-    const double f2 = log(1.0 + x2) - x2 / (1.0 + x2);
-    return 4.0 * M_PI * rs * rs * rs * (f2 - f1);
-}
-
 static void
-fof_fit_one_sidm_nfw_profile(struct Group * group, Cosmology * CP)
+fof_measure_one_sidm_vmax_profile(struct Group * group, Cosmology * CP)
 {
-    double edges[SIDM_NFW_FIT_BINS + 1];
-    if(!fof_sidm_nfw_edges(group, CP, edges))
+    double radii[SIDM_VMAX_PROFILE_BINS];
+    if(!fof_sidm_vmax_radii(group, CP, radii))
         return;
 
-    const double r200 = fof_sidm_group_r200(group, CP);
-    double best_chi = 1e300;
-    double best_rs = 0;
-    double best_rhos = 0;
-    int best_bins = 0;
+    double enclosed_mass = 0;
+    double best_vmax2 = 0;
+    double best_rmax = 0;
+    int nonempty_bins = 0;
 
-    for(int ic = 0; ic < 96; ic++) {
-        const double c = exp(log(2.0) + (log(80.0) - log(2.0)) * ic / 95.0);
-        const double rs = r200 / c;
-        double numerator = 0;
-        double denominator = 0;
-        int nbins = 0;
-
-        for(int j = 0; j < SIDM_NFW_FIT_BINS; j++) {
-            const double m = group->SIDMNFWProfileMass[j];
-            if(m <= 0 || group->SIDMNFWProfileCount[j] <= 0)
-                continue;
-            const double shape = fof_sidm_nfw_shell_shape(edges[j], edges[j + 1], rs);
-            if(shape <= 0)
-                continue;
-            numerator += m / shape;
-            denominator += 1;
-            nbins++;
-        }
-        if(nbins < 3 || denominator <= 0)
+    for(int j = 0; j < SIDM_VMAX_PROFILE_BINS; j++) {
+        if(group->SIDMVmaxProfileMass[j] > 0 || group->SIDMVmaxProfileCount[j] > 0)
+            nonempty_bins++;
+        enclosed_mass += group->SIDMVmaxProfileMass[j];
+        if(enclosed_mass <= 0 || radii[j] <= 0)
             continue;
-
-        const double rhos = numerator / denominator;
-        double chi = 0;
-        for(int j = 0; j < SIDM_NFW_FIT_BINS; j++) {
-            const double m = group->SIDMNFWProfileMass[j];
-            if(m <= 0 || group->SIDMNFWProfileCount[j] <= 0)
-                continue;
-            const double model = rhos * fof_sidm_nfw_shell_shape(edges[j], edges[j + 1], rs);
-            const double diff = log(m) - log(model);
-            chi += diff * diff;
-        }
-        chi /= nbins;
-        if(chi < best_chi) {
-            best_chi = chi;
-            best_rs = rs;
-            best_rhos = rhos;
-            best_bins = nbins;
+        const double vmax2 = CP->GravInternal * enclosed_mass / radii[j];
+        if(vmax2 > best_vmax2) {
+            best_vmax2 = vmax2;
+            best_rmax = radii[j];
         }
     }
 
-    if(best_rs > 0 && best_rhos > 0) {
-        group->SIDMNFWScaleRadius = best_rs;
-        group->SIDMNFWScaleDensity = best_rhos;
-        group->SIDMNFWFitRMin = edges[0];
-        group->SIDMNFWFitRMax = edges[SIDM_NFW_FIT_BINS];
-        group->SIDMNFWFitQuality = best_chi;
-        group->SIDMNFWFitBins = best_bins;
+    if(best_vmax2 > 0 && best_rmax > 0) {
+        group->SIDMVmax = sqrt(best_vmax2);
+        group->SIDMRmax = best_rmax;
+        group->SIDMVmaxProfileRMin = radii[0];
+        group->SIDMVmaxProfileRMax = radii[SIDM_VMAX_PROFILE_BINS - 1];
+        group->SIDMVmaxProfileBins = nonempty_bins;
     }
 }
 
 static void
-fof_fit_sidm_nfw_profiles(struct FOFGroups * fof, const int NgroupsExt, Cosmology * CP, MPI_Comm Comm)
+fof_measure_sidm_vmax_profiles(struct FOFGroups * fof, const int NgroupsExt,
+        Cosmology * CP, MPI_Comm Comm)
 {
     if(CP == NULL)
         return;
@@ -1152,7 +1113,7 @@ fof_fit_sidm_nfw_profiles(struct FOFGroups * fof, const int NgroupsExt, Cosmolog
     MPI_Comm_rank(Comm, &ThisTask);
 
     int nlocal_candidates = 0;
-    int nlocal_fit = 0;
+    int nlocal_measured = 0;
     for(int i = 0; i < NgroupsExt; i++) {
         struct Group * group = &fof->Group[i];
         if(group->base.MinIDTask != ThisTask)
@@ -1160,17 +1121,17 @@ fof_fit_sidm_nfw_profiles(struct FOFGroups * fof, const int NgroupsExt, Cosmolog
         if(group->Mass < sidm_bhseed_min_fof_mass() || group->sidm_seed_index < 0)
             continue;
         nlocal_candidates++;
-        fof_fit_one_sidm_nfw_profile(group, CP);
-        if(group->SIDMNFWFitBins > 0)
-            nlocal_fit++;
+        fof_measure_one_sidm_vmax_profile(group, CP);
+        if(group->SIDMVmax > 0 && group->SIDMRmax > 0)
+            nlocal_measured++;
     }
 
     int ntot_candidates = nlocal_candidates;
-    int ntot_fit = nlocal_fit;
+    int ntot_measured = nlocal_measured;
     MPI_Allreduce(MPI_IN_PLACE, &ntot_candidates, 1, MPI_INT, MPI_SUM, Comm);
-    MPI_Allreduce(MPI_IN_PLACE, &ntot_fit, 1, MPI_INT, MPI_SUM, Comm);
-    message(0, "SIDM BH NFW outer-profile fits: %d/%d candidate halos fitted.\n",
-        ntot_fit, ntot_candidates);
+    MPI_Allreduce(MPI_IN_PLACE, &ntot_measured, 1, MPI_INT, MPI_SUM, Comm);
+    message(0, "SIDM BH Vmax profiles: %d/%d candidate halos measured.\n",
+        ntot_measured, ntot_candidates);
 }
 #endif
 
@@ -1201,10 +1162,10 @@ fof_compile_catalogue(struct FOFGroups * fof, const int NgroupsExt, struct fof_p
     fof_reduce_groups(fof->Group, NgroupsExt, sizeof(fof->Group[0]), fof_reduce_group, Comm);
 
 #ifdef SIDM
-    fof_clear_sidm_nfw_profiles(fof->Group, NgroupsExt);
-    fof_accumulate_sidm_nfw_profiles(fof, NgroupsExt, HaloLabel, CP);
-    fof_reduce_groups(fof->Group, NgroupsExt, sizeof(fof->Group[0]), fof_reduce_sidm_nfw_profile, Comm);
-    fof_fit_sidm_nfw_profiles(fof, NgroupsExt, CP, Comm);
+    fof_clear_sidm_vmax_profiles(fof->Group, NgroupsExt);
+    fof_accumulate_sidm_vmax_profiles(fof, NgroupsExt, HaloLabel, CP);
+    fof_reduce_groups(fof->Group, NgroupsExt, sizeof(fof->Group[0]), fof_reduce_sidm_vmax_profile, Comm);
+    fof_measure_sidm_vmax_profiles(fof, NgroupsExt, CP, Comm);
 #endif
 
     /* count Groups and number of particles hosted by me */
@@ -1782,11 +1743,13 @@ fof_seed_sidm_make_one(struct Group * g, int ThisTask, const double atime,
         blackhole_make_one_sidm(index, atime, &seed);
         return 1;
     }
-    message(0, "SIDM BH seed skipped for candidate ID %llu: progress=%g tc=%g Mclock=%g prev_Mclock=%g major_merger=%d jump=%g gamma=%g NFWfit=%d NFWbins=%d Msmfp=%g Kn=%g Ndm=%d\n",
+    message(0, "SIDM BH seed skipped for candidate ID %llu: progress=%g tc=%g Mclock=%g prev_Mclock=%g major_merger=%d jump=%g gamma=%g VmaxFoF=%g VmaxInternal=%g RmaxComoving=%g VmaxBins=%d rsComoving=%g rho_sComoving=%g Msmfp=%g Kn=%g Ndm=%d\n",
         (unsigned long long) P[index].ID, seed.collapse_progress, seed.collapse_time,
         seed.clock_fof_mass, seed.previous_clock_fof_mass,
         seed.major_merger, seed.merger_mass_jump, seed.merger_gamma,
-        seed.nfw_fit_used, seed.nfw_fit_bins, seed.smfp_mass, seed.knudsen, seed.num_dm);
+        seed.halo_vmax, seed.halo_vmax_internal, seed.halo_rmax, seed.vmax_profile_bins,
+        seed.nfw_scale_radius, seed.nfw_scale_density,
+        seed.smfp_mass, seed.knudsen, seed.num_dm);
     return 0;
 }
 
