@@ -1309,20 +1309,22 @@ fof_compile_catalogue(struct FOFGroups * fof, const int NgroupsExt,
     fof_reduce_groups(fof->Group, NgroupsExt, sizeof(fof->Group[0]), fof_reduce_group, Comm);
 
 #ifdef SIDM
-    fof_clear_sidm_vmax_profiles(fof->Group, NgroupsExt);
-    fof_accumulate_sidm_vmax_profiles(fof, NgroupsExt, HaloLabel, CP);
-    fof_reduce_groups(fof->Group, NgroupsExt, sizeof(fof->Group[0]), fof_reduce_sidm_vmax_profile, Comm);
-    fof_measure_sidm_vmax_profiles(fof, NgroupsExt, CP, Comm);
-    fof_reduce_groups(fof->Group, NgroupsExt, sizeof(fof->Group[0]), fof_sidm_copy_owner_profile_state, Comm);
-    struct kick_factor_data kf = {0};
-    const struct kick_factor_data * sidm_kf = NULL;
-    if(times != NULL && CP != NULL) {
-        init_kick_factor_data(&kf, times, CP);
-        sidm_kf = &kf;
+    if(sidm_bhseed_is_enabled()) {
+        fof_clear_sidm_vmax_profiles(fof->Group, NgroupsExt);
+        fof_accumulate_sidm_vmax_profiles(fof, NgroupsExt, HaloLabel, CP);
+        fof_reduce_groups(fof->Group, NgroupsExt, sizeof(fof->Group[0]), fof_reduce_sidm_vmax_profile, Comm);
+        fof_measure_sidm_vmax_profiles(fof, NgroupsExt, CP, Comm);
+        fof_reduce_groups(fof->Group, NgroupsExt, sizeof(fof->Group[0]), fof_sidm_copy_owner_profile_state, Comm);
+        struct kick_factor_data kf = {0};
+        const struct kick_factor_data * sidm_kf = NULL;
+        if(times != NULL && CP != NULL) {
+            init_kick_factor_data(&kf, times, CP);
+            sidm_kf = &kf;
+        }
+        fof_accumulate_sidm_smfp_profiles(fof, NgroupsExt, HaloLabel, sidm_kf);
+        fof_reduce_groups(fof->Group, NgroupsExt, sizeof(fof->Group[0]), fof_reduce_sidm_smfp_profile, Comm);
+        fof_finish_sidm_smfp_profiles(fof, NgroupsExt, Comm);
     }
-    fof_accumulate_sidm_smfp_profiles(fof, NgroupsExt, HaloLabel, sidm_kf);
-    fof_reduce_groups(fof->Group, NgroupsExt, sizeof(fof->Group[0]), fof_reduce_sidm_smfp_profile, Comm);
-    fof_finish_sidm_smfp_profiles(fof, NgroupsExt, Comm);
 #endif
 
     /* count Groups and number of particles hosted by me */

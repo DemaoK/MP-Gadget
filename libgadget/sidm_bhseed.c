@@ -563,9 +563,12 @@ sidm_bhseed_swallow_dm(int * ActiveBlackHoles, int64_t NumActiveBlackHoles,
     RandTable * rnd)
 {
     (void) atime;
+    if(!sidm_bhseed_params.SeedOn || !sidm_bhseed_params.DynMassCatchupOn)
+        return;
+
     int64_t TotActiveBlackHoles = NumActiveBlackHoles;
     MPI_Allreduce(MPI_IN_PLACE, &TotActiveBlackHoles, 1, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
-    if(!sidm_bhseed_params.DynMassCatchupOn || TotActiveBlackHoles <= 0)
+    if(TotActiveBlackHoles <= 0)
         return;
 
     struct kick_factor_data kf;

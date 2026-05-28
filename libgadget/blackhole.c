@@ -351,7 +351,8 @@ blackhole(const ActiveParticles * act, double atime, Cosmology * CP, ForceTree *
     walltime_measure("/BH/Feedback");
 
 #ifdef SIDM
-    sidm_bhseed_swallow_dm(ActiveBlackHoles, NumActiveBlackHoles, ddecomp, atime, CP, times, rnd);
+    if(sidm_bhseed_is_enabled())
+        sidm_bhseed_swallow_dm(ActiveBlackHoles, NumActiveBlackHoles, ddecomp, atime, CP, times, rnd);
 #endif
 
     if(FdBlackholeDetails){
