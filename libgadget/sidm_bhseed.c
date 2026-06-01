@@ -308,7 +308,6 @@ sidm_bhseed_evaluate_candidate(int index, const struct Group * group, double ati
         result.num_dm, result.seed_mass, result.reservoir_mass,
         result.rho_inf, result.sound_speed_inf);
 
-    walltime_measure("/SIDM/BHSeedDiag");
     return result;
 }
 
@@ -566,10 +565,18 @@ sidm_bhseed_swallow_dm(int * ActiveBlackHoles, int64_t NumActiveBlackHoles,
     if(!sidm_bhseed_params.SeedOn || !sidm_bhseed_params.DynMassCatchupOn)
         return;
 
-    int64_t TotActiveBlackHoles = NumActiveBlackHoles;
-    MPI_Allreduce(MPI_IN_PLACE, &TotActiveBlackHoles, 1, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
-    if(TotActiveBlackHoles <= 0)
+    int64_t LocalCatchupBlackHoles = 0;
+    for(int64_t i = 0; i < NumActiveBlackHoles; i++) {
+        if(sidm_bhseed_dm_swallow_haswork(ActiveBlackHoles[i], NULL))
+            LocalCatchupBlackHoles++;
+    }
+    int64_t TotCatchupBlackHoles = LocalCatchupBlackHoles;
+    MPI_Allreduce(MPI_IN_PLACE, &TotCatchupBlackHoles, 1, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
+    if(TotCatchupBlackHoles <= 0)
         return;
+
+    message(0, "SIDM BH DM catch-up treewalk for %lld BHs with dynamical-mass debt.\n",
+        (long long) TotCatchupBlackHoles);
 
     struct kick_factor_data kf;
     init_kick_factor_data(&kf, times, CP);
