@@ -34,7 +34,6 @@ struct SIDMBHSeedResult {
     double previous_clock_fof_mass;
     double merger_mass_jump;
     double merger_gamma;
-    double knudsen;
     double halo_vmax;
     double halo_vmax_internal;
     double halo_rmax;
@@ -52,8 +51,8 @@ double sidm_bhseed_min_fof_mass(void);
 double sidm_bhseed_dark_bondi_lambda(void);
 
 /* First-pass seed diagnostics. The collapse clock uses the FoF-measured Vmax
- * and Rmax to infer equivalent NFW rs and rho_s. The SMFP reservoir is measured
- * from the FoF-reduced cumulative Knudsen profile around the central candidate. */
+ * and Rmax to infer equivalent NFW rs and rho_s. The SMFP reservoir mass is an
+ * analytic fraction of the measured FoF Type 1 DM halo mass. */
 struct SIDMBHSeedResult sidm_bhseed_evaluate_candidate(
     int index,
     const struct Group * group,

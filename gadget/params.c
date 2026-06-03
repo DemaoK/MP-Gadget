@@ -255,15 +255,16 @@ create_gadget_parameter_set()
     /* vdSIDM gravothermal-collapse BH seeding. Defaults leave the feature off. */
     param_declare_int(ps, "SIDMBHSeedOn", OPTIONAL, 0, "Enable vdSIDM gravothermal-collapse BH seeding from DM particles.");
     param_declare_int(ps, "SIDMBHDynMassCatchupOn", OPTIONAL, 1, "Enable dynamical-mass catch-up bookkeeping for SIDM-origin BHs.");
-    param_declare_double(ps, "SIDMBHMinFoFMass", OPTIONAL, 1e-2, "Minimum FoF halo mass for SIDM BH seeding in internal mass units.");
-    param_declare_double(ps, "SIDMBHCollapseThreshold", OPTIONAL, 3.0, "Integrated t/t_c threshold for SIDM BH seeding.");
+    param_declare_double(ps, "SIDMBHMinFoFMass", OPTIONAL, 1e-2, "Minimum FoF Type 1 DM halo mass for SIDM BH seeding in internal mass units.");
+    param_declare_double(ps, "SIDMBHCollapseThreshold", OPTIONAL, 2.0, "Integrated t/t_c threshold for SIDM BH seeding.");
     param_declare_double(ps, "SIDMBHCollapseCoeff", OPTIONAL, 200.0, "Coefficient A_c in the halo-scale SIDM collapse time.");
     param_declare_double(ps, "SIDMBHMergerAlpha", OPTIONAL, 2.0, "Alpha coefficient for merger-aware collapse-clock damping.");
     param_declare_double(ps, "SIDMBHMajorMergerMassJump", OPTIONAL, 0.3, "Fractional FoF mass increase that triggers merger-aware collapse-clock damping.");
     param_declare_double(ps, "SIDMBHDefaultConcentration", OPTIONAL, 3.0, "Deprecated; accepted for old parameter files but ignored.");
-    param_declare_double(ps, "SIDMBHReservoirKnudsenThreshold", OPTIONAL, 1.0, "Knudsen threshold defining the local SMFP reservoir.");
-    param_declare_int(ps, "SIDMBHMinReservoirParticles", OPTIONAL, 32, "Minimum number of local DM particles required in the SMFP reservoir diagnostic.");
-    param_declare_double(ps, "SIDMBHSeedSMFPFraction", OPTIONAL, 1e-4, "BH seed mass as a fraction of the measured SMFP mass.");
+    param_declare_double(ps, "SIDMBHReservoirKnudsenThreshold", OPTIONAL, 1.0, "Deprecated; accepted for old parameter files but ignored.");
+    param_declare_int(ps, "SIDMBHMinReservoirParticles", OPTIONAL, 32, "Deprecated; accepted for old parameter files but ignored.");
+    param_declare_double(ps, "SIDMBHSMFPMassFraction", OPTIONAL, 0.02, "Analytic SMFP reservoir mass as a fraction of the measured FoF Type 1 DM halo mass.");
+    param_declare_double(ps, "SIDMBHSeedSMFPFraction", OPTIONAL, 1e-4, "BH seed mass as a fraction of the analytic SMFP reservoir mass.");
     param_declare_double(ps, "SIDMBHSeedMassMin", OPTIONAL, 0.0, "Minimum SIDM BH seed mass in internal mass units.");
     param_declare_double(ps, "SIDMBHSeedMassMax", OPTIONAL, 0.0, "Maximum SIDM BH seed mass in internal mass units; <=0 disables the cap.");
     param_declare_double(ps, "SIDMBHDarkBondiLambda", OPTIONAL, 0.25, "Dimensionless dark Bondi coefficient for SIDM reservoir accretion.");

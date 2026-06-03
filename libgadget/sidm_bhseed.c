@@ -27,14 +27,15 @@ static struct SIDMBHSeedParams {
     double CollapseCoeff;
     double MergerAlpha;
     double MajorMergerMassJump;
-    double ReservoirKnudsenThreshold;
-    int MinReservoirParticles;
+    double SMFPMassFraction;
     double SeedSMFPFraction;
     double SeedMassMin;
     double SeedMassMax;
     double DarkBondiLambda;
     double MinFoFMass;
 } sidm_bhseed_params;
+
+static const double SIDM_BHSEED_VMAX_TO_SIGMA1D = 1.1;
 
 void
 set_sidm_bhseed_params(ParameterSet * ps)
@@ -48,8 +49,7 @@ set_sidm_bhseed_params(ParameterSet * ps)
         sidm_bhseed_params.CollapseCoeff = param_get_double(ps, "SIDMBHCollapseCoeff");
         sidm_bhseed_params.MergerAlpha = param_get_double(ps, "SIDMBHMergerAlpha");
         sidm_bhseed_params.MajorMergerMassJump = param_get_double(ps, "SIDMBHMajorMergerMassJump");
-        sidm_bhseed_params.ReservoirKnudsenThreshold = param_get_double(ps, "SIDMBHReservoirKnudsenThreshold");
-        sidm_bhseed_params.MinReservoirParticles = param_get_int(ps, "SIDMBHMinReservoirParticles");
+        sidm_bhseed_params.SMFPMassFraction = param_get_double(ps, "SIDMBHSMFPMassFraction");
         sidm_bhseed_params.SeedSMFPFraction = param_get_double(ps, "SIDMBHSeedSMFPFraction");
         sidm_bhseed_params.SeedMassMin = param_get_double(ps, "SIDMBHSeedMassMin");
         sidm_bhseed_params.SeedMassMax = param_get_double(ps, "SIDMBHSeedMassMax");
@@ -58,6 +58,9 @@ set_sidm_bhseed_params(ParameterSet * ps)
 
         if(sidm_bhseed_params.SeedOn && sidm_bhseed_params.SeedSMFPFraction <= 0)
             endrun(1, "SIDMBHSeedOn requires SIDMBHSeedSMFPFraction > 0.\n");
+        if(sidm_bhseed_params.SeedOn &&
+           (sidm_bhseed_params.SMFPMassFraction <= 0 || sidm_bhseed_params.SMFPMassFraction > 1))
+            endrun(1, "SIDMBHSeedOn requires 0 < SIDMBHSMFPMassFraction <= 1.\n");
         if(sidm_bhseed_params.SeedOn && sidm_bhseed_params.MinFoFMass < 0)
             endrun(1, "SIDMBHMinFoFMass must be non-negative.\n");
         if(sidm_bhseed_params.SeedOn && sidm_bhseed_params.MergerAlpha < 0)
@@ -90,6 +93,18 @@ double
 sidm_bhseed_dark_bondi_lambda(void)
 {
     return sidm_bhseed_params.DarkBondiLambda;
+}
+
+static double
+sidm_bhseed_group_dm_mass(const struct Group * group)
+{
+    return group->MassType[1];
+}
+
+static double
+sidm_bhseed_effective_sigma1d(double vmax_internal)
+{
+    return SIDM_BHSEED_VMAX_TO_SIGMA1D * vmax_internal / sqrt(3.0);
 }
 
 static double
@@ -147,7 +162,7 @@ sidm_bhseed_estimate_tc_from_group(const struct Group * group, double atime,
     result->nfw_scale_radius = rs;
     result->nfw_scale_density = rho_s;
 
-    const double sigma1d_eff = 1.1 * vmax_internal / sqrt(3.0);
+    const double sigma1d_eff = sidm_bhseed_effective_sigma1d(vmax_internal);
     const double sigma_code = sidm_sigma_kappa_over_m_code(sigma1d_eff, atime, CP, units);
     const double dyn = sqrt(4.0 * M_PI * CP->GravInternal * rho_s /
         (atime * atime * atime));
@@ -158,66 +173,22 @@ sidm_bhseed_estimate_tc_from_group(const struct Group * group, double atime,
 }
 
 static void
-sidm_bhseed_set_reservoir_state(struct SIDMBHSeedResult * result, double radius,
-    double mass, double rho, double sigma1d, double kn, int numdm, int is_smfp)
-{
-    result->reservoir_radius = radius;
-    result->rho_inf = rho;
-    result->sound_speed_inf = sigma1d;
-    result->knudsen = kn;
-    result->num_dm = numdm;
-    if(is_smfp) {
-        result->smfp_radius = radius;
-        result->smfp_mass = mass;
-    }
-}
-
-static void
-sidm_bhseed_smfp_diagnostic_from_group(const struct Group * group, double atime, Cosmology * CP,
-    const struct UnitSystem units,
+sidm_bhseed_set_analytic_smfp_from_group(const struct Group * group,
     struct SIDMBHSeedResult * result)
 {
-    const double search_radius = group->SIDMSMFPProfileRMax;
-    if(search_radius <= 0 || group->SIDMSMFPProfileBins <= 0)
+    const double dm_halo_mass = sidm_bhseed_group_dm_mass(group);
+    if(dm_halo_mass <= 0)
+        return;
+    if(result->collapse_time <= 0 || result->nfw_scale_radius <= 0 ||
+       result->nfw_scale_density <= 0 || result->halo_vmax_internal <= 0)
         return;
 
-    double mass = 0;
-    double momentum[3] = {0, 0, 0};
-    double mv2 = 0;
-    double count = 0;
-    double best_kn = 1e30;
-
-    for(int i = 0; i < SIDM_SMFP_PROFILE_BINS; i++) {
-        mass += group->SIDMSMFPProfileMass[i];
-        mv2 += group->SIDMSMFPProfileMV2[i];
-        count += group->SIDMSMFPProfileCount[i];
-        for(int k = 0; k < 3; k++)
-            momentum[k] += group->SIDMSMFPProfileMomentum[i][k];
-
-        const int numdm = (int)(count + 0.5);
-        const double radius = search_radius * (i + 1.0) / SIDM_SMFP_PROFILE_BINS;
-        if(numdm < sidm_bhseed_params.MinReservoirParticles || mass <= 0 || radius <= 0)
-            continue;
-
-        const double volume = 4.0 * M_PI / 3.0 * radius * radius * radius;
-        const double rho = mass / volume;
-        double v2 = mv2;
-        for(int k = 0; k < 3; k++)
-            v2 -= momentum[k] * momentum[k] / mass;
-        const double sigma1d2 = DMAX(v2 / (3.0 * mass), 0.0);
-        const double sigma1d = sqrt(sigma1d2);
-        const double sigma_code = sidm_sigma_kappa_over_m_code(sigma1d, atime, CP, units);
-        const double hscale = sigma1d > 0 && rho > 0 && atime > 0 ?
-            sigma1d / sqrt(4.0 * M_PI * CP->GravInternal * rho * atime) : 0;
-        const double mfp = rho > 0 && sigma_code > 0 ? 1.0 / (rho * sigma_code) : 0;
-        const double kn = hscale > 0 ? mfp / hscale : 1e30;
-        const int is_smfp = kn < sidm_bhseed_params.ReservoirKnudsenThreshold;
-
-        if(is_smfp || kn < best_kn) {
-            sidm_bhseed_set_reservoir_state(result, radius, mass, rho, sigma1d, kn, numdm, is_smfp);
-            best_kn = kn;
-        }
-    }
+    result->smfp_mass = sidm_bhseed_params.SMFPMassFraction * dm_halo_mass;
+    result->smfp_radius = result->nfw_scale_radius;
+    result->reservoir_radius = result->nfw_scale_radius;
+    result->rho_inf = result->nfw_scale_density;
+    result->sound_speed_inf = sidm_bhseed_effective_sigma1d(result->halo_vmax_internal);
+    result->num_dm = group->LenType[1];
 }
 
 struct SIDMBHSeedResult
@@ -227,11 +198,11 @@ sidm_bhseed_evaluate_candidate(int index, const struct Group * group, double ati
     struct SIDMBHSeedResult result;
     memset(&result, 0, sizeof(result));
     result.trigger = SIDM_BHSEED_TRIGGER_NONE;
-    result.knudsen = 1e30;
 
     if(!sidm_bhseed_params.SeedOn || P[index].Type != 1)
         return result;
-    if(group->Mass < sidm_bhseed_params.MinFoFMass || group->LenType[5] > 0)
+    const double dm_halo_mass = sidm_bhseed_group_dm_mass(group);
+    if(dm_halo_mass < sidm_bhseed_params.MinFoFMass || group->LenType[5] > 0)
         return result;
 
     const double tc = sidm_bhseed_estimate_tc_from_group(group, atime, CP, units, &result);
@@ -240,7 +211,7 @@ sidm_bhseed_evaluate_candidate(int index, const struct Group * group, double ati
     if(sidm_bhseed_clock_is_better(group->SIDMBHClockFoFMass, group->SIDMBHCollapseProgress,
         group->SIDMBHLastCheckTime, P[index].SIDMBHClockFoFMass,
         P[index].SIDMBHCollapseProgress, P[index].SIDMBHLastCheckTime)) {
-        message(0, "SIDM BH clock inherited: candidate ID=%llu inherited_from=%llu progress=%g last_a=%g Mclock=%g previous_progress=%g previous_last_a=%g previous_Mclock=%g\n",
+        message(0, "SIDM BH clock inherited: candidate ID=%llu inherited_from=%llu progress=%g last_a=%g MclockDM=%g previous_progress=%g previous_last_a=%g previous_MclockDM=%g\n",
             (unsigned long long) P[index].ID,
             (unsigned long long) group->SIDMBHClockID,
             group->SIDMBHCollapseProgress,
@@ -261,27 +232,27 @@ sidm_bhseed_evaluate_candidate(int index, const struct Group * group, double ati
         const double hubble = hubble_function(CP, atime);
         const double dt = log(atime / P[index].SIDMBHLastCheckTime) / hubble;
         double dprogress = dt / tc;
-        if(old_clock_mass > 0 && group->Mass > old_clock_mass && dt > 0) {
-            result.merger_mass_jump = group->Mass / old_clock_mass - 1.0;
+        if(old_clock_mass > 0 && dm_halo_mass > old_clock_mass && dt > 0) {
+            result.merger_mass_jump = dm_halo_mass / old_clock_mass - 1.0;
             if(result.merger_mass_jump > sidm_bhseed_params.MajorMergerMassJump) {
                 result.major_merger = 1;
-                result.merger_gamma = (group->Mass - old_clock_mass) / (dt * old_clock_mass);
+                result.merger_gamma = (dm_halo_mass - old_clock_mass) / (dt * old_clock_mass);
                 dprogress = (1.0 / tc - sidm_bhseed_params.MergerAlpha *
                     result.merger_gamma * old_progress) * dt;
-                message(0, "SIDM BH clock major merger: candidate ID=%llu old_progress=%g dprogress=%g old_Mclock=%g new_Mfof=%g jump=%g gamma=%g alpha=%g tc=%g dt=%g\n",
+                message(0, "SIDM BH clock major merger: candidate ID=%llu old_progress=%g dprogress=%g old_MclockDM=%g new_MdmFoF=%g jump=%g gamma=%g alpha=%g tc=%g dt=%g\n",
                     (unsigned long long) P[index].ID, old_progress, dprogress,
-                    old_clock_mass, group->Mass, result.merger_mass_jump,
+                    old_clock_mass, dm_halo_mass, result.merger_mass_jump,
                     result.merger_gamma, sidm_bhseed_params.MergerAlpha, tc, dt);
             }
         }
         P[index].SIDMBHCollapseProgress = DMAX(P[index].SIDMBHCollapseProgress + dprogress, 0.0);
     }
     P[index].SIDMBHLastCheckTime = atime;
-    P[index].SIDMBHClockFoFMass = group->Mass;
+    P[index].SIDMBHClockFoFMass = dm_halo_mass;
     result.collapse_progress = P[index].SIDMBHCollapseProgress;
     result.clock_fof_mass = P[index].SIDMBHClockFoFMass;
 
-    sidm_bhseed_smfp_diagnostic_from_group(group, atime, CP, units, &result);
+    sidm_bhseed_set_analytic_smfp_from_group(group, &result);
 
     if(result.collapse_progress < sidm_bhseed_params.CollapseThreshold)
         return result;
@@ -298,13 +269,14 @@ sidm_bhseed_evaluate_candidate(int index, const struct Group * group, double ati
     result.should_seed = 1;
     result.trigger = SIDM_BHSEED_TRIGGER_RESOLVED;
 
-    message(0, "SIDM BH seed candidate ID %llu: progress=%g threshold=%g tc=%g Mclock=%g prev_Mclock=%g major_merger=%d jump=%g gamma=%g VmaxFoF=%g VmaxInternal=%g RmaxComoving=%g VmaxBins=%d rsComoving=%g rhosComoving=%g Msmfp=%g Rsmfp=%g Kn=%g Ndm=%d Mseed=%g Mres=%g rho_inf_comoving=%g sigma1d_internal=%g\n",
+    message(0, "SIDM BH seed candidate ID %llu: progress=%g threshold=%g tc=%g MclockDM=%g prev_MclockDM=%g major_merger=%d jump=%g gamma=%g VmaxFoF=%g VmaxInternal=%g RmaxComoving=%g VmaxBins=%d rsComoving=%g rhosComoving=%g MdmHalo=%g fsmfp=%g MsmfpAnalytic=%g Rreservoir=%g Ndm=%d Mseed=%g Mres=%g rho_inf_comoving=%g sigma1d_internal=%g\n",
         (unsigned long long) P[index].ID, result.collapse_progress, sidm_bhseed_params.CollapseThreshold,
         result.collapse_time, result.clock_fof_mass, result.previous_clock_fof_mass,
         result.major_merger, result.merger_mass_jump, result.merger_gamma,
         result.halo_vmax, result.halo_vmax_internal, result.halo_rmax, result.vmax_profile_bins,
         result.nfw_scale_radius, result.nfw_scale_density,
-        result.smfp_mass, result.smfp_radius, result.knudsen,
+        dm_halo_mass, sidm_bhseed_params.SMFPMassFraction,
+        result.smfp_mass, result.reservoir_radius,
         result.num_dm, result.seed_mass, result.reservoir_mass,
         result.rho_inf, result.sound_speed_inf);
 

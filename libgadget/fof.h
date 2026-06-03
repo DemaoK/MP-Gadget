@@ -11,7 +11,6 @@ void set_fof_params(ParameterSet * ps);
 
 #ifdef SIDM
 #define SIDM_VMAX_PROFILE_BINS 24
-#define SIDM_SMFP_PROFILE_BINS 32
 #define SIDM_BHSEED_NFW_XMAX 2.1625815870646098
 #define SIDM_BHSEED_NFW_VMAX_COEFF 1.648
 #endif
@@ -82,12 +81,6 @@ struct Group
     double SIDMVmaxProfileRMin;
     double SIDMVmaxProfileRMax;
     int SIDMVmaxProfileBins;
-    double SIDMSMFPProfileMass[SIDM_SMFP_PROFILE_BINS];
-    double SIDMSMFPProfileCount[SIDM_SMFP_PROFILE_BINS];
-    double SIDMSMFPProfileMomentum[SIDM_SMFP_PROFILE_BINS][3];
-    double SIDMSMFPProfileMV2[SIDM_SMFP_PROFILE_BINS];
-    double SIDMSMFPProfileRMax;
-    int SIDMSMFPProfileBins;
 #endif
 };
 
