@@ -632,8 +632,11 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
             fof_finish(&fof);
             TimeNextSeedingCheck = atime * All.TimeBetweenSeedingSearch;
         }
-        if(!GasEnabled && All.BlackHoleOn && sidm_bhseed_is_enabled())
-            sidm_bhseed_update_dm_only(&Act, ddecomp, atime, &All.CP, &times, &rnd);
+        if(!GasEnabled && All.BlackHoleOn && sidm_bhseed_is_enabled()) {
+            rotate_bhdetails_file(&fds, All.OutputDir, RestartSnapNum);
+            sidm_bhseed_update_dm_only(&Act, ddecomp, atime, &All.CP, &times, &rnd,
+                units, fds.FdBlackHoles, fds.FdBlackholeDetails, &fds.TotalBHDetailsBytesWritten);
+        }
 #endif
 
         if(GasEnabled)

@@ -10,6 +10,7 @@
 
 #include "density.h"
 #include "gravity.h"
+#include "bhinfo.h"
 #include "partmanager.h"
 #include "physconst.h"
 #include "sidm.h"
@@ -36,6 +37,7 @@ static struct SIDMBHSeedParams {
 } sidm_bhseed_params;
 
 static const double SIDM_BHSEED_VMAX_TO_SIGMA1D = 1.1;
+static const int SIDM_BHSEED_MIN_CLOCK_DM_PARTICLES = 200;
 
 void
 set_sidm_bhseed_params(ParameterSet * ps)
@@ -188,7 +190,6 @@ sidm_bhseed_set_analytic_smfp_from_group(const struct Group * group,
     result->reservoir_radius = result->nfw_scale_radius;
     result->rho_inf = result->nfw_scale_density;
     result->sound_speed_inf = sidm_bhseed_effective_sigma1d(result->halo_vmax_internal);
-    result->num_dm = group->LenType[1];
 }
 
 struct SIDMBHSeedResult
@@ -201,8 +202,11 @@ sidm_bhseed_evaluate_candidate(int index, const struct Group * group, double ati
 
     if(!sidm_bhseed_params.SeedOn || P[index].Type != 1)
         return result;
+    result.num_dm = group->LenType[1];
     const double dm_halo_mass = sidm_bhseed_group_dm_mass(group);
     if(dm_halo_mass < sidm_bhseed_params.MinFoFMass || group->LenType[5] > 0)
+        return result;
+    if(group->LenType[1] < SIDM_BHSEED_MIN_CLOCK_DM_PARTICLES)
         return result;
 
     const double tc = sidm_bhseed_estimate_tc_from_group(group, atime, CP, units, &result);
@@ -602,19 +606,32 @@ sidm_bhseed_swallow_dm(int * ActiveBlackHoles, int64_t NumActiveBlackHoles,
 
 void
 sidm_bhseed_update_dm_only(const ActiveParticles * act, DomainDecomp * ddecomp,
-    double atime, Cosmology * CP, const DriftKickTimes * times, RandTable * rnd)
+    double atime, Cosmology * CP, const DriftKickTimes * times, RandTable * rnd,
+    const struct UnitSystem units, FILE * FdBlackHoles, FILE * FdBlackholeDetails,
+    size_t * bhdetailswritten)
 {
     int * ActiveBlackHoles = NULL;
     int64_t NumActiveBlackHoles = 0;
     const int64_t TotActiveBlackHoles = sidm_bhseed_active_origin_bhs(act,
         &ActiveBlackHoles, &NumActiveBlackHoles);
-    if(TotActiveBlackHoles <= 0)
+    if(TotActiveBlackHoles <= 0) {
+        int64_t TotBlackHoles = SlotsManager->info[5].size;
+        MPI_Allreduce(MPI_IN_PLACE, &TotBlackHoles, 1, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
+        if(TotBlackHoles > 0)
+            write_blackhole_txt(FdBlackHoles, units, atime);
         return;
+    }
 
     sidm_bhseed_apply_dark_reservoir_accretion(ActiveBlackHoles,
         NumActiveBlackHoles, atime, CP, times);
     sidm_bhseed_swallow_dm(ActiveBlackHoles, NumActiveBlackHoles, ddecomp,
         atime, CP, times, rnd);
+
+    if(FdBlackholeDetails && bhdetailswritten)
+        *bhdetailswritten += collect_BH_info(ActiveBlackHoles, NumActiveBlackHoles,
+            NULL, PartManager, (struct bh_particle_data*) SlotsManager->info[5].ptr,
+            FdBlackholeDetails, atime);
+    write_blackhole_txt(FdBlackHoles, units, atime);
 
     if(ActiveBlackHoles)
         myfree(ActiveBlackHoles);

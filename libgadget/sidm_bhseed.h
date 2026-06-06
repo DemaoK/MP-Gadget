@@ -3,6 +3,8 @@
 
 #ifdef SIDM
 
+#include <stdio.h>
+
 #include "cosmology.h"
 #include "density.h"
 #include "domain.h"
@@ -64,7 +66,9 @@ void sidm_bhseed_swallow_dm(int * ActiveBlackHoles, int64_t NumActiveBlackHoles,
     DomainDecomp * ddecomp, double atime, Cosmology * CP, const DriftKickTimes * times,
     RandTable * rnd);
 void sidm_bhseed_update_dm_only(const ActiveParticles * act, DomainDecomp * ddecomp,
-    double atime, Cosmology * CP, const DriftKickTimes * times, RandTable * rnd);
+    double atime, Cosmology * CP, const DriftKickTimes * times, RandTable * rnd,
+    const struct UnitSystem units, FILE * FdBlackHoles, FILE * FdBlackholeDetails,
+    size_t * bhdetailswritten);
 
 #endif
 #endif

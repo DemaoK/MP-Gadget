@@ -264,7 +264,7 @@ create_gadget_parameter_set()
     param_declare_double(ps, "SIDMBHReservoirKnudsenThreshold", OPTIONAL, 1.0, "Deprecated; accepted for old parameter files but ignored.");
     param_declare_int(ps, "SIDMBHMinReservoirParticles", OPTIONAL, 32, "Deprecated; accepted for old parameter files but ignored.");
     param_declare_double(ps, "SIDMBHSMFPMassFraction", OPTIONAL, 0.02, "Analytic SMFP reservoir mass as a fraction of the measured FoF Type 1 DM halo mass.");
-    param_declare_double(ps, "SIDMBHSeedSMFPFraction", OPTIONAL, 1e-4, "BH seed mass as a fraction of the analytic SMFP reservoir mass.");
+    param_declare_double(ps, "SIDMBHSeedSMFPFraction", OPTIONAL, 1e-5, "BH seed mass as a fraction of the analytic SMFP reservoir mass.");
     param_declare_double(ps, "SIDMBHSeedMassMin", OPTIONAL, 0.0, "Minimum SIDM BH seed mass in internal mass units.");
     param_declare_double(ps, "SIDMBHSeedMassMax", OPTIONAL, 0.0, "Maximum SIDM BH seed mass in internal mass units; <=0 disables the cap.");
     param_declare_double(ps, "SIDMBHDarkBondiLambda", OPTIONAL, 0.25, "Dimensionless dark Bondi coefficient for SIDM reservoir accretion.");
