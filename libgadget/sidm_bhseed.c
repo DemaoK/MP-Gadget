@@ -215,24 +215,40 @@ sidm_bhseed_evaluate_candidate(int index, const struct Group * group, double ati
     if(sidm_bhseed_clock_is_better(group->SIDMBHClockFoFMass, group->SIDMBHCollapseProgress,
         group->SIDMBHLastCheckTime, P[index].SIDMBHClockFoFMass,
         P[index].SIDMBHCollapseProgress, P[index].SIDMBHLastCheckTime)) {
-        message(0, "SIDM BH clock inherited: candidate ID=%llu inherited_from=%llu progress=%g last_a=%g MclockDM=%g previous_progress=%g previous_last_a=%g previous_MclockDM=%g\n",
-            (unsigned long long) P[index].ID,
-            (unsigned long long) group->SIDMBHClockID,
-            group->SIDMBHCollapseProgress,
-            group->SIDMBHLastCheckTime,
-            group->SIDMBHClockFoFMass,
-            P[index].SIDMBHCollapseProgress,
-            P[index].SIDMBHLastCheckTime,
-            P[index].SIDMBHClockFoFMass);
-        P[index].SIDMBHCollapseProgress = group->SIDMBHCollapseProgress;
-        P[index].SIDMBHLastCheckTime = group->SIDMBHLastCheckTime;
-        P[index].SIDMBHClockFoFMass = group->SIDMBHClockFoFMass;
+        const double max_inherited_clock_mass =
+            (1.0 + sidm_bhseed_params.MajorMergerMassJump) * dm_halo_mass;
+        if(group->SIDMBHClockFoFMass <= max_inherited_clock_mass) {
+            message(1, "SIDM BH clock inherited: candidate ID=%llu inherited_from=%llu progress=%g last_a=%g MclockDM=%g previous_progress=%g previous_last_a=%g previous_MclockDM=%g\n",
+                (unsigned long long) P[index].ID,
+                (unsigned long long) group->SIDMBHClockID,
+                group->SIDMBHCollapseProgress,
+                group->SIDMBHLastCheckTime,
+                group->SIDMBHClockFoFMass,
+                P[index].SIDMBHCollapseProgress,
+                P[index].SIDMBHLastCheckTime,
+                P[index].SIDMBHClockFoFMass);
+            P[index].SIDMBHCollapseProgress = group->SIDMBHCollapseProgress;
+            P[index].SIDMBHLastCheckTime = group->SIDMBHLastCheckTime;
+            P[index].SIDMBHClockFoFMass = group->SIDMBHClockFoFMass;
+        } else {
+            message(1, "SIDM BH clock inheritance rejected: candidate ID=%llu inherited_from=%llu MclockDM=%g current_MdmFoF=%g max_allowed_MclockDM=%g progress=%g previous_progress=%g\n",
+                (unsigned long long) P[index].ID,
+                (unsigned long long) group->SIDMBHClockID,
+                group->SIDMBHClockFoFMass, dm_halo_mass,
+                max_inherited_clock_mass, group->SIDMBHCollapseProgress,
+                P[index].SIDMBHCollapseProgress);
+        }
     }
 
     const double old_progress = P[index].SIDMBHCollapseProgress;
     const double old_clock_mass = P[index].SIDMBHClockFoFMass;
     result.previous_clock_fof_mass = old_clock_mass;
-    if(P[index].SIDMBHLastCheckTime > 0 && atime > P[index].SIDMBHLastCheckTime && tc > 0) {
+    if(tc <= 0) {
+        result.collapse_progress = P[index].SIDMBHCollapseProgress;
+        result.clock_fof_mass = P[index].SIDMBHClockFoFMass;
+        return result;
+    }
+    if(P[index].SIDMBHLastCheckTime > 0 && atime > P[index].SIDMBHLastCheckTime) {
         const double hubble = hubble_function(CP, atime);
         const double dt = log(atime / P[index].SIDMBHLastCheckTime) / hubble;
         double dprogress = dt / tc;
@@ -243,7 +259,7 @@ sidm_bhseed_evaluate_candidate(int index, const struct Group * group, double ati
                 result.merger_gamma = (dm_halo_mass - old_clock_mass) / (dt * old_clock_mass);
                 dprogress = (1.0 / tc - sidm_bhseed_params.MergerAlpha *
                     result.merger_gamma * old_progress) * dt;
-                message(0, "SIDM BH clock major merger: candidate ID=%llu old_progress=%g dprogress=%g old_MclockDM=%g new_MdmFoF=%g jump=%g gamma=%g alpha=%g tc=%g dt=%g\n",
+                message(1, "SIDM BH clock major merger: candidate ID=%llu old_progress=%g dprogress=%g old_MclockDM=%g new_MdmFoF=%g jump=%g gamma=%g alpha=%g tc=%g dt=%g\n",
                     (unsigned long long) P[index].ID, old_progress, dprogress,
                     old_clock_mass, dm_halo_mass, result.merger_mass_jump,
                     result.merger_gamma, sidm_bhseed_params.MergerAlpha, tc, dt);
@@ -273,7 +289,7 @@ sidm_bhseed_evaluate_candidate(int index, const struct Group * group, double ati
     result.should_seed = 1;
     result.trigger = SIDM_BHSEED_TRIGGER_RESOLVED;
 
-    message(0, "SIDM BH seed candidate ID %llu: progress=%g threshold=%g tc=%g MclockDM=%g prev_MclockDM=%g major_merger=%d jump=%g gamma=%g VmaxFoF=%g VmaxInternal=%g RmaxComoving=%g VmaxBins=%d rsComoving=%g rhosComoving=%g MdmHalo=%g fsmfp=%g MsmfpAnalytic=%g Rreservoir=%g Ndm=%d Mseed=%g Mres=%g rho_inf_comoving=%g sigma1d_internal=%g\n",
+    message(1, "SIDM BH seed candidate ID %llu: progress=%g threshold=%g tc=%g MclockDM=%g prev_MclockDM=%g major_merger=%d jump=%g gamma=%g VmaxFoF=%g VmaxInternal=%g RmaxComoving=%g VmaxBins=%d rsComoving=%g rhosComoving=%g MdmHalo=%g fsmfp=%g MsmfpAnalytic=%g Rreservoir=%g Ndm=%d Mseed=%g Mres=%g rho_inf_comoving=%g sigma1d_internal=%g\n",
         (unsigned long long) P[index].ID, result.collapse_progress, sidm_bhseed_params.CollapseThreshold,
         result.collapse_time, result.clock_fof_mass, result.previous_clock_fof_mass,
         result.major_merger, result.merger_mass_jump, result.merger_gamma,
@@ -287,11 +303,19 @@ sidm_bhseed_evaluate_candidate(int index, const struct Group * group, double ati
     return result;
 }
 
+enum SIDMBHDMSwallowMode {
+    SIDM_DM_SWALLOW_MEASURE_DENSITY,
+    SIDM_DM_SWALLOW_MARK,
+    SIDM_DM_SWALLOW_CONSUME,
+};
+
 struct SIDMBHDMSwallowPriv {
     struct kick_factor_data * kf;
     RandTable * rnd;
+    enum SIDMBHDMSwallowMode Mode;
     int64_t * N_dm_swallowed;
     MyIDType * DM_SwallowID;
+    MyFloat * DMDensity;
     MyFloat * AccretedMass;
     MyFloat (*AccretedMomentum)[3];
 };
@@ -400,13 +424,14 @@ typedef struct {
     MyFloat Hsml;
     MyFloat Mass;
     MyFloat BH_Mass;
-    MyFloat RhoInf;
+    MyFloat DMDensity;
     MyFloat DMDynMassDebt;
     MyIDType ID;
 } TreeWalkQuerySIDMDMSwallow;
 
 typedef struct {
     TreeWalkResultBase base;
+    MyFloat DMDensity;
     MyFloat Mass;
     MyFloat AccretedMomentum[3];
 } TreeWalkResultSIDMDMSwallow;
@@ -419,19 +444,25 @@ typedef struct {
 static int
 sidm_bhseed_dm_swallow_haswork(int n, TreeWalk * tw)
 {
+    (void) tw;
     return P[n].Type == 5 && !P[n].Swallowed &&
         BHP(n).SIDMSeedOrigin && BHP(n).SIDMDMDynMassDebt > 0 &&
-        BHP(n).SIDMRhoInf > 0 &&
-        (BHP(n).SIDMReservoirRadius > 0 || P[n].Hsml > 0);
+        FORCE_SOFTENING() > 0;
+}
+
+static double
+sidm_bhseed_dm_swallow_kernel_length(void)
+{
+    return FORCE_SOFTENING();
 }
 
 static void
 sidm_bhseed_dm_swallow_copy(int place, TreeWalkQuerySIDMDMSwallow * I, TreeWalk * tw)
 {
-    I->Hsml = BHP(place).SIDMReservoirRadius > 0 ? BHP(place).SIDMReservoirRadius : P[place].Hsml;
+    I->Hsml = sidm_bhseed_dm_swallow_kernel_length();
     I->Mass = P[place].Mass;
     I->BH_Mass = BHP(place).Mass;
-    I->RhoInf = BHP(place).SIDMRhoInf;
+    I->DMDensity = SIDM_DM_SWALLOW_GET_PRIV(tw)->DMDensity[P[place].PI];
     I->DMDynMassDebt = BHP(place).SIDMDMDynMassDebt;
     I->ID = P[place].ID;
     for(int k = 0; k < 3; k++)
@@ -457,32 +488,49 @@ sidm_bhseed_dm_swallow_ngbiter(TreeWalkQuerySIDMDMSwallow * I,
         return;
     if(P[other].ID == I->ID)
         return;
-    if(iter->base.r2 >= iter->kernel.HH || I->RhoInf <= 0)
-        return;
-
-    const double missing = DMIN(I->DMDynMassDebt, DMAX(I->BH_Mass - I->Mass, 0));
-    if(missing <= 0)
+    if(iter->base.r2 >= iter->kernel.HH)
         return;
 
     const double u = iter->base.r * iter->kernel.Hinv;
     const double wk = density_kernel_wk(&iter->kernel, u);
-    double p = missing * wk / I->RhoInf;
-    if(p > 1)
-        p = 1;
 
-    const double w = get_random_number(P[other].ID + I->ID + 9191, SIDM_DM_SWALLOW_GET_PRIV(lv->tw)->rnd);
-    if(w >= p)
+    if(SIDM_DM_SWALLOW_GET_PRIV(lv->tw)->Mode == SIDM_DM_SWALLOW_MEASURE_DENSITY) {
+        O->DMDensity += P[other].Mass * wk;
         return;
+    }
 
-    MyIDType readid;
-    MyIDType newswallowid = I->ID + 1;
-    MyIDType * swal = SIDM_DM_SWALLOW_GET_PRIV(lv->tw)->DM_SwallowID + P[other].PI;
-#pragma omp atomic read
-    readid = *swal;
-    do {
-        if(readid != 0)
+    if(SIDM_DM_SWALLOW_GET_PRIV(lv->tw)->Mode == SIDM_DM_SWALLOW_MARK) {
+        if(I->DMDensity <= 0)
             return;
-    } while(!__atomic_compare_exchange_n(swal, &readid, newswallowid, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+
+        const double missing = DMIN(I->DMDynMassDebt, DMAX(I->BH_Mass - I->Mass, 0));
+        if(missing <= 0)
+            return;
+
+        double p = missing * wk / I->DMDensity;
+        if(p > 1)
+            p = 1;
+
+        const double w = get_random_number(P[other].ID + I->ID + 9191, SIDM_DM_SWALLOW_GET_PRIV(lv->tw)->rnd);
+        if(w >= p)
+            return;
+
+        MyIDType readid;
+        MyIDType newswallowid = I->ID + 1;
+        MyIDType * swal = SIDM_DM_SWALLOW_GET_PRIV(lv->tw)->DM_SwallowID + other;
+#pragma omp atomic read
+        readid = *swal;
+        do {
+            if(readid < I->ID + 1)
+                newswallowid = I->ID + 1;
+            else
+                break;
+        } while(!__atomic_compare_exchange_n(swal, &readid, newswallowid, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+        return;
+    }
+
+    if(SIDM_DM_SWALLOW_GET_PRIV(lv->tw)->DM_SwallowID[other] != I->ID + 1)
+        return;
 
     O->Mass += P[other].Mass;
     MyFloat VelPred[3];
@@ -501,6 +549,10 @@ sidm_bhseed_dm_swallow_reduce(int place, TreeWalkResultSIDMDMSwallow * remote,
 {
     int PI = P[place].PI;
     (void) mode;
+    if(SIDM_DM_SWALLOW_GET_PRIV(tw)->Mode == SIDM_DM_SWALLOW_MEASURE_DENSITY) {
+        TREEWALK_REDUCE(SIDM_DM_SWALLOW_GET_PRIV(tw)->DMDensity[PI], remote->DMDensity);
+        return;
+    }
     if(remote->Mass <= 0)
         return;
     TREEWALK_REDUCE(SIDM_DM_SWALLOW_GET_PRIV(tw)->AccretedMass[PI], remote->Mass);
@@ -512,6 +564,9 @@ sidm_bhseed_dm_swallow_reduce(int place, TreeWalkResultSIDMDMSwallow * remote,
 static void
 sidm_bhseed_dm_swallow_postprocess(int n, TreeWalk * tw)
 {
+    if(SIDM_DM_SWALLOW_GET_PRIV(tw)->Mode != SIDM_DM_SWALLOW_CONSUME)
+        return;
+
     const int PI = P[n].PI;
     const double accmass = SIDM_DM_SWALLOW_GET_PRIV(tw)->AccretedMass[PI];
     if(accmass <= 0)
@@ -525,11 +580,31 @@ sidm_bhseed_dm_swallow_postprocess(int n, TreeWalk * tw)
     else
         BHP(n).SIDMDMDynMassDebt = 0;
 
-    message(0, "SIDM BH DM catch-up: ID=%llu accreted_dyn_mass=%g new_PMass=%g remaining_dm_debt=%g\n",
+    message(1, "SIDM BH DM catch-up: ID=%llu accreted_dyn_mass=%g new_PMass=%g remaining_dm_debt=%g\n",
         (unsigned long long) P[n].ID, accmass, P[n].Mass, BHP(n).SIDMDMDynMassDebt);
     for(int k = 0; k < 3; k++)
         SIDM_DM_SWALLOW_GET_PRIV(tw)->AccretedMomentum[PI][k] = 0;
     SIDM_DM_SWALLOW_GET_PRIV(tw)->AccretedMass[PI] = 0;
+}
+
+static void
+sidm_bhseed_dm_swallow_init_treewalk(TreeWalk * tw, ForceTree * dmtree,
+    struct SIDMBHDMSwallowPriv * priv)
+{
+    memset(tw, 0, sizeof(TreeWalk));
+    tw->ev_label = "SIDM_BH_DM_SWALLOW";
+    tw->visit = (TreeWalkVisitFunction) treewalk_visit_ngbiter;
+    tw->ngbiter_type_elsize = sizeof(TreeWalkNgbIterSIDMDMSwallow);
+    tw->ngbiter = (TreeWalkNgbIterFunction) sidm_bhseed_dm_swallow_ngbiter;
+    tw->haswork = sidm_bhseed_dm_swallow_haswork;
+    tw->postprocess = (TreeWalkProcessFunction) sidm_bhseed_dm_swallow_postprocess;
+    tw->preprocess = NULL;
+    tw->fill = (TreeWalkFillQueryFunction) sidm_bhseed_dm_swallow_copy;
+    tw->reduce = (TreeWalkReduceResultFunction) sidm_bhseed_dm_swallow_reduce;
+    tw->query_type_elsize = sizeof(TreeWalkQuerySIDMDMSwallow);
+    tw->result_type_elsize = sizeof(TreeWalkResultSIDMDMSwallow);
+    tw->tree = dmtree;
+    tw->priv = priv;
 }
 
 void
@@ -565,29 +640,52 @@ sidm_bhseed_swallow_dm(int * ActiveBlackHoles, int64_t NumActiveBlackHoles,
     priv->rnd = rnd;
     priv->N_dm_swallowed = ta_malloc("sidm_dm_swallowed", int64_t, omp_get_max_threads());
     memset(priv->N_dm_swallowed, 0, sizeof(int64_t) * omp_get_max_threads());
-    priv->DM_SwallowID = mymalloc("SIDMDMSwallowID", SlotsManager->info[1].size * sizeof(MyIDType));
-    priv->AccretedMass = mymalloc("SIDMDMAccretedMass", SlotsManager->info[5].size * sizeof(MyFloat));
-    priv->AccretedMomentum = mymalloc("SIDMDMAccretedMomentum", SlotsManager->info[5].size * sizeof(priv->AccretedMomentum[0]));
-    memset(priv->DM_SwallowID, 0, SlotsManager->info[1].size * sizeof(MyIDType));
-    memset(priv->AccretedMass, 0, SlotsManager->info[5].size * sizeof(MyFloat));
-    memset(priv->AccretedMomentum, 0, SlotsManager->info[5].size * sizeof(priv->AccretedMomentum[0]));
+    const size_t dm_swallow_slots = PartManager->NumPart > 0 ? PartManager->NumPart : 1;
+    const size_t bh_swallow_slots = SlotsManager->info[5].size > 0 ? SlotsManager->info[5].size : 1;
+    priv->DM_SwallowID = mymalloc("SIDMDMSwallowID", dm_swallow_slots * sizeof(MyIDType));
+    priv->DMDensity = mymalloc("SIDMDMDensity", bh_swallow_slots * sizeof(MyFloat));
+    priv->AccretedMass = mymalloc("SIDMDMAccretedMass", bh_swallow_slots * sizeof(MyFloat));
+    priv->AccretedMomentum = mymalloc("SIDMDMAccretedMomentum", bh_swallow_slots * sizeof(priv->AccretedMomentum[0]));
+    memset(priv->DM_SwallowID, 0, dm_swallow_slots * sizeof(MyIDType));
+    memset(priv->DMDensity, 0, bh_swallow_slots * sizeof(MyFloat));
+    memset(priv->AccretedMass, 0, bh_swallow_slots * sizeof(MyFloat));
+    memset(priv->AccretedMomentum, 0, bh_swallow_slots * sizeof(priv->AccretedMomentum[0]));
 
-    TreeWalk tw[1] = {{0}};
-    tw->ev_label = "SIDM_BH_DM_SWALLOW";
-    tw->visit = (TreeWalkVisitFunction) treewalk_visit_ngbiter;
-    tw->ngbiter_type_elsize = sizeof(TreeWalkNgbIterSIDMDMSwallow);
-    tw->ngbiter = (TreeWalkNgbIterFunction) sidm_bhseed_dm_swallow_ngbiter;
-    tw->haswork = sidm_bhseed_dm_swallow_haswork;
-    tw->postprocess = (TreeWalkProcessFunction) sidm_bhseed_dm_swallow_postprocess;
-    tw->preprocess = NULL;
-    tw->fill = (TreeWalkFillQueryFunction) sidm_bhseed_dm_swallow_copy;
-    tw->reduce = (TreeWalkReduceResultFunction) sidm_bhseed_dm_swallow_reduce;
-    tw->query_type_elsize = sizeof(TreeWalkQuerySIDMDMSwallow);
-    tw->result_type_elsize = sizeof(TreeWalkResultSIDMDMSwallow);
-    tw->tree = &dmtree;
-    tw->priv = priv;
+    TreeWalk tw_density[1];
+    priv->Mode = SIDM_DM_SWALLOW_MEASURE_DENSITY;
+    sidm_bhseed_dm_swallow_init_treewalk(tw_density, &dmtree, priv);
+    treewalk_run(tw_density, ActiveBlackHoles, NumActiveBlackHoles);
 
-    treewalk_run(tw, ActiveBlackHoles, NumActiveBlackHoles);
+    int64_t LocalDensityBlackHoles = 0;
+    for(int64_t i = 0; i < NumActiveBlackHoles; i++) {
+        const int n = ActiveBlackHoles[i];
+        if(priv->DMDensity[P[n].PI] > 0)
+            LocalDensityBlackHoles++;
+    }
+    int64_t TotDensityBlackHoles = LocalDensityBlackHoles;
+    MPI_Allreduce(MPI_IN_PLACE, &TotDensityBlackHoles, 1, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
+    if(TotDensityBlackHoles <= 0) {
+        message(0, "SIDM BH DM catch-up skipped: no local DM density measured for %lld BHs with dynamical-mass debt.\n",
+            (long long) TotCatchupBlackHoles);
+        myfree(priv->AccretedMomentum);
+        myfree(priv->AccretedMass);
+        myfree(priv->DMDensity);
+        myfree(priv->DM_SwallowID);
+        ta_free(priv->N_dm_swallowed);
+        force_tree_free(&dmtree);
+        walltime_measure("/SIDM/BHDMSwallow");
+        return;
+    }
+
+    TreeWalk tw_mark[1];
+    priv->Mode = SIDM_DM_SWALLOW_MARK;
+    sidm_bhseed_dm_swallow_init_treewalk(tw_mark, &dmtree, priv);
+    treewalk_run(tw_mark, ActiveBlackHoles, NumActiveBlackHoles);
+
+    TreeWalk tw_consume[1];
+    priv->Mode = SIDM_DM_SWALLOW_CONSUME;
+    sidm_bhseed_dm_swallow_init_treewalk(tw_consume, &dmtree, priv);
+    treewalk_run(tw_consume, ActiveBlackHoles, NumActiveBlackHoles);
 
     int64_t nlocal = 0;
     for(int i = 0; i < omp_get_max_threads(); i++)
@@ -598,6 +696,7 @@ sidm_bhseed_swallow_dm(int * ActiveBlackHoles, int64_t NumActiveBlackHoles,
 
     myfree(priv->AccretedMomentum);
     myfree(priv->AccretedMass);
+    myfree(priv->DMDensity);
     myfree(priv->DM_SwallowID);
     ta_free(priv->N_dm_swallowed);
     force_tree_free(&dmtree);

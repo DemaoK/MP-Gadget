@@ -1762,7 +1762,7 @@ fof_seed_sidm_make_one(struct Group * g, int ThisTask, const double atime,
         blackhole_make_one_sidm(index, atime, &seed);
         return 1;
     }
-    message(0, "SIDM BH seed skipped for candidate ID %llu: progress=%g tc=%g MclockDM=%g prev_MclockDM=%g major_merger=%d jump=%g gamma=%g VmaxFoF=%g VmaxInternal=%g RmaxComoving=%g VmaxBins=%d rsComoving=%g rho_sComoving=%g MsmfpAnalytic=%g Rreservoir=%g Ndm=%d\n",
+    message(1, "SIDM BH seed skipped for candidate ID %llu: progress=%g tc=%g MclockDM=%g prev_MclockDM=%g major_merger=%d jump=%g gamma=%g VmaxFoF=%g VmaxInternal=%g RmaxComoving=%g VmaxBins=%d rsComoving=%g rho_sComoving=%g MsmfpAnalytic=%g Rreservoir=%g Ndm=%d\n",
         (unsigned long long) P[index].ID, seed.collapse_progress, seed.collapse_time,
         seed.clock_fof_mass, seed.previous_clock_fof_mass,
         seed.major_merger, seed.merger_mass_jump, seed.merger_gamma,
@@ -1789,7 +1789,7 @@ void fof_seed_sidm(FOFGroups * fof, ActiveParticles * act, double atime, Cosmolo
     for(i = 0; i < fof->Ngroups; i++)
     {
         Marked[i] =
-            (fof->Group[i].Mass >= sidm_bhseed_min_fof_mass())
+            (fof->Group[i].MassType[1] >= sidm_bhseed_min_fof_mass())
         &&  (fof->Group[i].LenType[5] == 0)
         &&  (fof->Group[i].sidm_seed_index >= 0)
         &&  (fof->Group[i].sidm_seed_task >= 0);
@@ -1862,14 +1862,52 @@ void fof_seed_sidm(FOFGroups * fof, ActiveParticles * act, double atime, Cosmolo
 
     int ThisTask;
     MPI_Comm_rank(Comm, &ThisTask);
+
+    MyIDType * LocalSeededMinIDs = (MyIDType *) mymalloc("SIDMSeededMinIDs",
+        (Nimport > 0 ? Nimport : 1) * sizeof(MyIDType));
     int Nmade = 0;
-    for(n = 0; n < Nimport; n++)
-        Nmade += fof_seed_sidm_make_one(&ImportGroups[n], ThisTask, atime, CP, units);
+    for(n = 0; n < Nimport; n++) {
+        if(fof_seed_sidm_make_one(&ImportGroups[n], ThisTask, atime, CP, units))
+            LocalSeededMinIDs[Nmade++] = ImportGroups[n].base.MinID;
+    }
 
     int NmadeTot = Nmade;
     MPI_Allreduce(MPI_IN_PLACE, &NmadeTot, 1, MPI_INT, MPI_SUM, Comm);
+    if(NmadeTot > 0) {
+        const int local_seeded_bytes = Nmade * (int) sizeof(MyIDType);
+        int * SeededByteCount = ta_malloc("SIDMSeededByteCount", int, NTask);
+        int * SeededByteOffset = ta_malloc("SIDMSeededByteOffset", int, NTask);
+        MPI_Allgather(&local_seeded_bytes, 1, MPI_INT, SeededByteCount, 1, MPI_INT, Comm);
+
+        int total_seeded_bytes = 0;
+        for(i = 0; i < NTask; i++) {
+            SeededByteOffset[i] = total_seeded_bytes;
+            total_seeded_bytes += SeededByteCount[i];
+        }
+
+        MyIDType * AllSeededMinIDs = (MyIDType *) mymalloc("SIDMSeededMinIDsAll",
+            total_seeded_bytes > 0 ? total_seeded_bytes : 1);
+        MPI_Allgatherv(LocalSeededMinIDs, local_seeded_bytes, MPI_BYTE,
+            AllSeededMinIDs, SeededByteCount, SeededByteOffset, MPI_BYTE, Comm);
+
+        const int total_seeded_ids = total_seeded_bytes / (int) sizeof(MyIDType);
+        for(i = 0; i < fof->Ngroups; i++) {
+            for(j = 0; j < total_seeded_ids; j++) {
+                if(fof->Group[i].base.MinID == AllSeededMinIDs[j]) {
+                    fof->Group[i].seed_index = -1;
+                    fof->Group[i].seed_task = -1;
+                    break;
+                }
+            }
+        }
+
+        myfree(AllSeededMinIDs);
+        ta_free(SeededByteOffset);
+        ta_free(SeededByteCount);
+    }
     message(0, "SIDM BH seeding made %d new black hole particles.\n", NmadeTot);
 
+    myfree(LocalSeededMinIDs);
     myfree(ImportGroups);
     walltime_measure("/FOF/SIDMSeeding");
 }

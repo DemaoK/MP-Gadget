@@ -665,7 +665,6 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
 #ifdef SIDM
                     if(sidm_bhseed_is_enabled())
                         fof_seed_sidm(&fof, &Act, atime, &All.CP, &times, units, MPI_COMM_WORLD);
-                    else
 #endif
                     fof_seed(&fof, &Act, atime, &rnd, MPI_COMM_WORLD);
                     TimeNextSeedingCheck = atime * All.TimeBetweenSeedingSearch;

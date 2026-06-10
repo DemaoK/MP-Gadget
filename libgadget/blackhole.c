@@ -1254,7 +1254,7 @@ blackhole_make_one_sidm(int index, const double atime, const struct SIDMBHSeedRe
     if(BHP(child).Mass > P[child].Mass)
         BHP(child).SIDMDMDynMassDebt = BHP(child).Mass - P[child].Mass;
 
-    message(0, "SIDM BH seeded: ID=%llu parent_dyn_mass=%g P.Mass=%g BHP.Mass=%g MsmfpAnalytic=%g Mres=%g rho_inf_comoving=%g sigma1d_internal=%g progress=%g tc=%g MclockDM=%g major_merger=%d jump=%g gamma=%g VmaxFoF=%g VmaxInternal=%g RmaxComoving=%g VmaxBins=%d trigger=%d\n",
+    message(1, "SIDM BH seeded: ID=%llu parent_dyn_mass=%g P.Mass=%g BHP.Mass=%g MsmfpAnalytic=%g Mres=%g rho_inf_comoving=%g sigma1d_internal=%g progress=%g tc=%g MclockDM=%g major_merger=%d jump=%g gamma=%g VmaxFoF=%g VmaxInternal=%g RmaxComoving=%g VmaxBins=%d trigger=%d\n",
         (unsigned long long) P[child].ID, parent_mass, P[child].Mass, BHP(child).Mass,
         BHP(child).SIDMSMFPMassInitial, BHP(child).SIDMDarkReservoirMass,
         BHP(child).SIDMRhoInf, BHP(child).SIDMSoundSpeedInf,
