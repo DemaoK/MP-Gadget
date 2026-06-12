@@ -308,7 +308,9 @@ hierarchical_gravity_and_timesteps(const ActiveParticles * act, PetaPM * pm, con
     inttime_t dti_max = times->PM_length;
 
     if(isPM) {
-        const double asmth = pm->Asmth * PartManager->BoxSize / pm->Nmesh;
+        double asmth = pm->Asmth * PartManager->BoxSize / pm->Nmesh;
+        if(pmzoom && pmzoom->Enabled && pmzoom->Asmth > 0 && pmzoom->Asmth < asmth)
+            asmth = pmzoom->Asmth;
         dti_max = get_PM_timestep_ti(times, atime, CP, FastParticleType, asmth);
         times->PM_length = dti_max;
         times->PM_start = times->PM_kick;

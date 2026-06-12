@@ -807,7 +807,9 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
          * and advance the PM timestep.*/
         int badtimestep=0;
         if(!All.HierarchicalGravity) {
-            const double asmth = pm.Asmth * PartManager->BoxSize / pm.Nmesh;
+            double asmth = pm.Asmth * PartManager->BoxSize / pm.Nmesh;
+            if(pmzoom.Enabled && pmzoom.Asmth > 0 && pmzoom.Asmth < asmth)
+                asmth = pmzoom.Asmth;
             badtimestep = find_timesteps(&Act, &times, atime, All.FastParticleType, &All.CP, asmth, NumCurrentTiStep == 0);
             /* Update velocity and ti_kick to the new step, with the newly computed step size. Unsyncs ti_kick and ti_drift.
              * Both hydro and gravity are kicked.*/

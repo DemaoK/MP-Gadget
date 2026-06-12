@@ -16,7 +16,6 @@ static void pmzoom_potential_transfer(PetaPM * pm, int64_t k2, int kpos[3], pfft
 static void pmzoom_force_x_transfer(PetaPM * pm, int64_t k2, int kpos[3], pfft_complex * value);
 static void pmzoom_force_y_transfer(PetaPM * pm, int64_t k2, int kpos[3], pfft_complex * value);
 static void pmzoom_force_z_transfer(PetaPM * pm, int64_t k2, int kpos[3], pfft_complex * value);
-static void pmzoom_readout_potential(PetaPM * pm, int i, double * mesh, double weight);
 static void pmzoom_readout_force_x(PetaPM * pm, int i, double * mesh, double weight);
 static void pmzoom_readout_force_y(PetaPM * pm, int i, double * mesh, double weight);
 static void pmzoom_readout_force_z(PetaPM * pm, int i, double * mesh, double weight);
@@ -25,22 +24,11 @@ static PMZoomRegion * CurrentPMZoom;
 
 static PetaPMFunctions pmzoom_functions [] =
 {
-    {"PMZoomPotential", NULL, pmzoom_readout_potential},
     {"PMZoomForceX", pmzoom_force_x_transfer, pmzoom_readout_force_x},
     {"PMZoomForceY", pmzoom_force_y_transfer, pmzoom_readout_force_y},
     {"PMZoomForceZ", pmzoom_force_z_transfer, pmzoom_readout_force_z},
     {NULL, NULL, NULL},
 };
-
-static double
-pmzoom_nearest(double dx, double boxsize)
-{
-    if(dx > 0.5 * boxsize)
-        return dx - boxsize;
-    if(dx < -0.5 * boxsize)
-        return dx + boxsize;
-    return dx;
-}
 
 static int
 pmzoom_particle_is_highres(int64_t i, int highres_types)
@@ -153,7 +141,7 @@ pmzoom_update_region(PMZoomRegion * zoom)
         if(!pmzoom_particle_is_highres(i, zoom->HighResTypes))
             continue;
         for(k = 0; k < 3; k++) {
-            const double unwrapped = zoom->Reference[k] + pmzoom_nearest(P[i].Pos[k] - zoom->Reference[k], zoom->BoxSize);
+            const double unwrapped = zoom->Reference[k] + NEAREST(P[i].Pos[k] - zoom->Reference[k], zoom->BoxSize);
             if(unwrapped < local_min[k])
                 local_min[k] = unwrapped;
             if(unwrapped > local_max[k])
@@ -165,10 +153,11 @@ pmzoom_update_region(PMZoomRegion * zoom)
     MPI_Allreduce(local_max, zoom->Max, 3, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
 
     const double placement_cell = zoom->BoxSize / zoom->Nmesh;
+    const double region_margin = zoom->BaseRcut;
     zoom->EnclosingSize = 0;
     for(k = 0; k < 3; k++) {
-        const double lower = pmzoom_floor_cell(zoom->Min[k], placement_cell);
-        const double upper = pmzoom_upper_cell(zoom->Max[k], placement_cell);
+        const double lower = pmzoom_floor_cell(zoom->Min[k] - region_margin, placement_cell);
+        const double upper = pmzoom_upper_cell(zoom->Max[k] + region_margin, placement_cell);
         zoom->Min[k] = lower;
         zoom->Max[k] = upper;
         zoom->Span[k] = upper - lower;
@@ -199,8 +188,8 @@ pmzoom_update_region(PMZoomRegion * zoom)
             zoom->Min[0], zoom->Min[1], zoom->Min[2],
             zoom->Max[0], zoom->Max[1], zoom->Max[2],
             zoom->Span[0], zoom->Span[1], zoom->Span[2]);
-    message(0, "PMZoomCorrection: isolated-mesh total-size=%g cell-size=%g Asmth=%g Rcut=%g corner=(%g %g %g)\n",
-            zoom->TotalMeshSize, zoom->CellSize, zoom->Asmth, zoom->Rcut,
+    message(0, "PMZoomCorrection: isolated-mesh total-size=%g cell-size=%g Asmth=%g Rcut=%g margin=%g corner=(%g %g %g)\n",
+            zoom->TotalMeshSize, zoom->CellSize, zoom->Asmth, zoom->Rcut, region_margin,
             zoom->Corner[0], zoom->Corner[1], zoom->Corner[2]);
 }
 
@@ -220,8 +209,12 @@ static void
 pmzoom_fill_kernel(PMZoomRegion * zoom, double ratio)
 {
     PetaPM * pm = &zoom->PM;
-    if(zoom->KernelK)
+    if(zoom->KernelK) {
         myfree(zoom->KernelK);
+        zoom->KernelK = NULL;
+    }
+
+    zoom->KernelK = (pfft_complex *) mymalloc2("PMZoomKernelK", pm->priv->fftsize * sizeof(double));
 
     double * real = (double *) mymalloc2("PMZoomKernelReal", pm->priv->fftsize * sizeof(double));
     memset(real, 0, pm->priv->fftsize * sizeof(double));
@@ -264,7 +257,6 @@ pmzoom_fill_kernel(PMZoomRegion * zoom, double ratio)
         }
     }
 
-    zoom->KernelK = (pfft_complex *) mymalloc2("PMZoomKernelK", pm->priv->fftsize * sizeof(double));
     pfft_execute_dft_r2c(pm->priv->plan_forw, real, zoom->KernelK);
     myfree(real);
 
@@ -281,7 +273,7 @@ pmzoom_ensure_pm(PMZoomRegion * zoom, double G)
         endrun(0, "PMZoomCorrection: invalid high/base Asmth ratio %g. high=%g base=%g\n",
                ratio, zoom->Asmth, base_asmth);
 
-    if(!zoom->PMInitialized || zoom->PM.Nmesh != zoom->Nmesh || zoom->PM.BoxSize != zoom->TotalMeshSize) {
+    if(!zoom->PMInitialized || zoom->PM.Nmesh != zoom->Nmesh) {
         if(zoom->PMInitialized) {
             if(zoom->KernelK) {
                 myfree(zoom->KernelK);
@@ -293,6 +285,12 @@ pmzoom_ensure_pm(PMZoomRegion * zoom, double G)
         zoom->PMInitialized = 1;
         zoom->KernelTotalMeshSize = 0;
         zoom->KernelAsmthRatio = 0;
+    }
+    else {
+        zoom->PM.BoxSize = zoom->TotalMeshSize;
+        zoom->PM.CellSize = zoom->TotalMeshSize / zoom->Nmesh;
+        zoom->PM.Asmth = zoom->SplitAsmth;
+        zoom->PM.G = G;
     }
 
     if(!pmzoom_kernel_is_current(zoom, ratio))
@@ -324,7 +322,7 @@ pmzoom_unwrap_position(const PMZoomRegion * zoom, double pos, int axis)
 {
     if(!zoom || !zoom->Enabled)
         return pos;
-    return zoom->Reference[axis] + pmzoom_nearest(pos - zoom->Reference[axis], zoom->BoxSize);
+    return zoom->Reference[axis] + NEAREST(pos - zoom->Reference[axis], zoom->BoxSize);
 }
 
 int
@@ -354,13 +352,24 @@ pmzoom_node_location(const PMZoomRegion * zoom, const double center[3], double l
     int any_boundary = 0;
     int k;
     for(k = 0; k < 3; k++) {
-        const double c = pmzoom_unwrap_position(zoom, center[k], k);
-        const double left = c - 0.5 * len;
-        const double right = c + 0.5 * len;
+        const double c0 = pmzoom_unwrap_position(zoom, center[k], k);
+        int overlaps = 0;
+        int inside = 0;
+        int image;
+        for(image = -1; image <= 1; image++) {
+            const double c = c0 + image * zoom->BoxSize;
+            const double left = c - 0.5 * len;
+            const double right = c + 0.5 * len;
+            if(right <= zoom->Min[k] || left >= zoom->Max[k])
+                continue;
+            overlaps = 1;
+            if(left >= zoom->Min[k] && right <= zoom->Max[k])
+                inside = 1;
+        }
 
-        if(right <= zoom->Min[k] || left >= zoom->Max[k])
+        if(!overlaps)
             return PMZOOM_OUTSIDE;
-        if(left < zoom->Min[k] || right > zoom->Max[k])
+        if(!inside)
             any_boundary = 1;
     }
     return any_boundary ? PMZOOM_BOUNDARY : PMZOOM_INSIDE;
@@ -399,6 +408,8 @@ static PetaPMRegion *
 pmzoom_prepare(PetaPM * pm, PetaPMParticleStruct * pstruct, void * userdata, int * Nregions)
 {
     PMZoomRegion * zoom = (PMZoomRegion *) userdata;
+    PetaPMRegion * regions = (PetaPMRegion *) mymalloc2("PMZoomRegions", sizeof(PetaPMRegion));
+    memset(regions, 0, sizeof(PetaPMRegion));
     pstruct->RegionInd = (int *) mymalloc2("PMZoomRegionInd", pstruct->NumPart * sizeof(int));
 
     int64_t i;
@@ -436,8 +447,6 @@ pmzoom_prepare(PetaPM * pm, PetaPMParticleStruct * pstruct, void * userdata, int
     message(0, "PMZoomCorrection: applying isolated PM correction to %lld particles inside fine mesh\n",
             (long long) global_count);
 
-    PetaPMRegion * regions = (PetaPMRegion *) mymalloc2("PMZoomRegions", sizeof(PetaPMRegion));
-    memset(regions, 0, sizeof(PetaPMRegion));
     *Nregions = 1;
 
     int k;
@@ -542,13 +551,6 @@ pmzoom_force_z_transfer(PetaPM * pm, int64_t k2, int kpos[3], pfft_complex * val
 {
     (void) k2;
     pmzoom_force_transfer(pm, kpos[2], value);
-}
-
-static void
-pmzoom_readout_potential(PetaPM * pm, int i, double * mesh, double weight)
-{
-    (void) pm;
-    P[i].Potential += weight * mesh[0];
 }
 
 static void

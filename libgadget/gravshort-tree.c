@@ -351,6 +351,7 @@ int force_treeev_shortrange(TreeWalkQueryGravShort * input,
     const double * inpos = input->base.Pos;
     const PMZoomRegion * pmzoom = GRAV_GET_PRIV(lv->tw)->PMZoom;
     const int target_in_pmzoom = pmzoom_target_inside(pmzoom, inpos);
+    const int use_pmzoom_target = pmzoom && pmzoom->Enabled && target_in_pmzoom;
 
     /*Start the tree walk*/
     int listindex, ninteractions=0;
@@ -379,8 +380,10 @@ int force_treeev_shortrange(TreeWalkQueryGravShort * input,
             for(i = 0; i < 3; i++)
                 dx[i] = NEAREST(nop->mom.cofm[i] - inpos[i], BoxSize);
             const double r2 = dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2];
-            const int node_pmzoom_location = pmzoom_node_location(pmzoom, nop->center, nop->len);
-            const double node_rcut = pmzoom_interaction_rcut(pmzoom, target_in_pmzoom, node_pmzoom_location, rcut);
+            int node_pmzoom_location = PMZOOM_OUTSIDE;
+            if(use_pmzoom_target)
+                node_pmzoom_location = pmzoom_node_location(pmzoom, nop->center, nop->len);
+            const double node_rcut = pmzoom_interaction_rcut(pmzoom, use_pmzoom_target, node_pmzoom_location, rcut);
             const double node_rcut2 = node_rcut * node_rcut;
 
             /* Discard this node, move to sibling*/
@@ -393,7 +396,7 @@ int force_treeev_shortrange(TreeWalkQueryGravShort * input,
 
             /* This node accelerates the particle directly, and is not opened.*/
             int open_node = shall_we_open_node(nop->len, nop->mom.mass, r2, nop->center, inpos, BoxSize, aold, TreeUseBH, BHOpeningAngle2);
-            if(pmzoom && pmzoom->Enabled && target_in_pmzoom && node_pmzoom_location == PMZOOM_BOUNDARY)
+            if(use_pmzoom_target && node_pmzoom_location == PMZOOM_BOUNDARY)
                 open_node = 1;
 
             if(!open_node)
@@ -405,7 +408,7 @@ int force_treeev_shortrange(TreeWalkQueryGravShort * input,
                     const double htarget = FORCE_SOFTENING_TYPE(input->Type);
                     const double hnode = FORCE_SOFTENING_MASK(nop->f.TypeMask);
                     const double h = htarget > hnode ? htarget : hnode;
-                    const double node_cellsize = pmzoom_interaction_cellsize(pmzoom, target_in_pmzoom, node_pmzoom_location, cellsize);
+                    const double node_cellsize = pmzoom_interaction_cellsize(pmzoom, use_pmzoom_target, node_pmzoom_location, cellsize);
                     apply_accn_to_output(output, dx, r2, nop->mom.mass, node_cellsize, h);
                 }
                 continue;
@@ -459,8 +462,10 @@ int force_treeev_shortrange(TreeWalkQueryGravShort * input,
                 dx[j] = NEAREST(P[pp].Pos[j] - inpos[j], BoxSize);
             const double r2 = dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2];
             /* Compute the acceleration and apply it to the output structure*/
-            const int particle_pmzoom_location = pmzoom_point_location(pmzoom, P[pp].Pos);
-            const double particle_cellsize = pmzoom_interaction_cellsize(pmzoom, target_in_pmzoom, particle_pmzoom_location, cellsize);
+            int particle_pmzoom_location = PMZOOM_OUTSIDE;
+            if(use_pmzoom_target)
+                particle_pmzoom_location = pmzoom_point_location(pmzoom, P[pp].Pos);
+            const double particle_cellsize = pmzoom_interaction_cellsize(pmzoom, use_pmzoom_target, particle_pmzoom_location, cellsize);
             apply_accn_to_output(output, dx, r2, P[pp].Mass, particle_cellsize, FORCE_SOFTENING_PAIR(input->Type, P[pp].Type));
         }
         ninteractions = numcand;
