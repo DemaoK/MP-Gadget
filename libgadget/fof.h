@@ -2,13 +2,16 @@
 #define FOF_H
 
 #include "utils/paramset.h"
+#include "cosmology.h"
 #include "timestep.h"
 #include "slotsmanager.h"
 #include "utils/system.h"
 
 void set_fof_params(ParameterSet * ps);
 
-void fof_init(double DMMeanSeparation);
+double fof_get_mean_primary_separation(const struct part_manager_type * PartManager, const Cosmology * CP, int primary_mask);
+double fof_get_comoving_linking_length(const struct part_manager_type * PartManager, const Cosmology * CP);
+void fof_init(const struct part_manager_type * PartManager, const Cosmology * CP, double Type1MeanSeparation);
 /* For the tests*/
 void set_fof_testpar(int FOFSaveParticles, double FOFHaloLinkingLength, int FOFHaloMinLength);
 

@@ -133,6 +133,7 @@ inttime_t init(int RestartSnapNum, const char * OutputDir, struct header_data * 
 
     get_mean_separation(MeanSeparation, PartManager->BoxSize, header->NTotalInit);
     get_zoom_boundary_softening_factors(ZoomBoundarySofteningFactors, header, PartManager);
+    const double DMMeanSeparation = fof_get_mean_primary_separation(PartManager, CP, 1 << 1);
 
     if(RestartSnapNum >= 0)
         check_smoothing_length(PartManager, MeanSeparation);
@@ -141,8 +142,8 @@ inttime_t init(int RestartSnapNum, const char * OutputDir, struct header_data * 
      * on Task 0, there will be a lot of imbalance*/
     MPIU_Barrier(MPI_COMM_WORLD);
 
-    gravshort_set_softenings(MeanSeparation[1], ZoomBoundarySofteningFactors);
-    fof_init(MeanSeparation[1]);
+    gravshort_set_softenings(DMMeanSeparation > 0 ? DMMeanSeparation : MeanSeparation[1], ZoomBoundarySofteningFactors);
+    fof_init(PartManager, CP, DMMeanSeparation);
 
     inttime_t Ti_Current = init_timebins(header->TimeSnapshot);
 

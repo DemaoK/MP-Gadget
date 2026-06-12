@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <inttypes.h>
+#include <math.h>
 #include <omp.h>
 
 #include "utils/endrun.h"
@@ -80,9 +81,110 @@ void set_fof_testpar(int FOFSaveParticles, double FOFHaloLinkingLength, int FOFH
 
 }
 
-void fof_init(double DMMeanSeparation)
+static double
+get_primary_omega(const int primary_mask, const int64_t * global_count, const Cosmology * CP)
 {
-    fof_params.FOFHaloComovingLinkingLength = fof_params.FOFHaloLinkingLength * DMMeanSeparation;
+    const int baryon_mask = (1 << 0) | (1 << 4) | (1 << 5);
+    const int supported_mask = baryon_mask | (1 << 1) | (1 << 2);
+    const int64_t global_baryon_count = global_count[0] + global_count[4] + global_count[5];
+    const int64_t selected_baryon_count =
+        ((primary_mask & (1 << 0)) ? global_count[0] : 0)
+        + ((primary_mask & (1 << 4)) ? global_count[4] : 0)
+        + ((primary_mask & (1 << 5)) ? global_count[5] : 0);
+    double omega = 0;
+
+    if(primary_mask & ~supported_mask) {
+        message(0, "FOF linking normalization: primary mask %d includes unsupported boundary types; using zero linking length.\n",
+                primary_mask);
+        return 0;
+    }
+
+    if(primary_mask & (1 << 1)) {
+        omega += CP->OmegaCDM;
+        if(global_baryon_count == 0)
+            omega += CP->OmegaBaryon;
+    }
+
+    if(selected_baryon_count > 0)
+        omega += CP->OmegaBaryon;
+
+    if(primary_mask & (1 << 2))
+        omega += get_omega_nu(&CP->ONu, 1);
+
+    return omega;
+}
+
+double fof_get_mean_primary_separation(const struct part_manager_type * PartManager, const Cosmology * CP, int primary_mask)
+{
+    int64_t local_count[6] = {0};
+    int64_t global_count[6] = {0};
+    double local_mass[6] = {0};
+    double global_mass[6] = {0};
+
+    int64_t i;
+    #pragma omp parallel for reduction(+: local_count[:6]) reduction(+: local_mass[:6])
+    for(i = 0; i < PartManager->NumPart; i++) {
+        if(P[i].IsGarbage)
+            continue;
+        if(P[i].Type >= 0 && P[i].Type < 6) {
+            local_count[P[i].Type]++;
+            local_mass[P[i].Type] += P[i].Mass;
+        }
+    }
+
+    MPI_Allreduce(local_count, global_count, 6, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(local_mass, global_mass, 6, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+
+    int64_t global_primary_count = 0;
+    double global_primary_mass = 0;
+    int ptype;
+    for(ptype = 0; ptype < 6; ptype++) {
+        if(primary_mask & (1 << ptype)) {
+            global_primary_count += global_count[ptype];
+            global_primary_mass += global_mass[ptype];
+        }
+    }
+
+    if(global_primary_count <= 0 || global_primary_mass <= 0) {
+        message(0, "FOF linking normalization: primary mask %d selected no positive-mass particles; using zero linking length.\n",
+                primary_mask);
+        return 0;
+    }
+
+    const double omega_primary = get_primary_omega(primary_mask, global_count, CP);
+    const double rho_primary = omega_primary * CP->RhoCrit;
+    if(rho_primary <= 0) {
+        message(0, "FOF linking normalization: primary mask %d has non-positive density: omega=%g RhoCrit=%g; using zero linking length.\n",
+                primary_mask, omega_primary, CP->RhoCrit);
+        return 0;
+    }
+
+    const double mean_primary_mass = global_primary_mass / global_primary_count;
+    const double mean_separation = pow(mean_primary_mass / rho_primary, 1.0 / 3.0);
+
+    message(0,
+        "FOF linking normalization: primary mask %d, primary particles %" PRId64
+        ", mean primary mass %g, omega %g, mean separation %g\n",
+        primary_mask, global_primary_count, mean_primary_mass,
+        omega_primary, mean_separation);
+
+    return mean_separation;
+}
+
+double fof_get_comoving_linking_length(const struct part_manager_type * PartManager, const Cosmology * CP)
+{
+    const double mean_separation = fof_get_mean_primary_separation(PartManager, CP, fof_params.FOFPrimaryLinkTypes);
+    return fof_params.FOFHaloLinkingLength * mean_separation;
+}
+
+void fof_init(const struct part_manager_type * PartManager, const Cosmology * CP, double Type1MeanSeparation)
+{
+    if(fof_params.FOFPrimaryLinkTypes == (1 << 1) && Type1MeanSeparation > 0) {
+        message(0, "FOF linking normalization: reusing type-1 mean separation %g\n", Type1MeanSeparation);
+        fof_params.FOFHaloComovingLinkingLength = fof_params.FOFHaloLinkingLength * Type1MeanSeparation;
+    } else {
+        fof_params.FOFHaloComovingLinkingLength = fof_get_comoving_linking_length(PartManager, CP);
+    }
 }
 
 static double fof_periodic_wrap(double x, double BoxSize)
