@@ -101,6 +101,10 @@ pmzoom_init(PMZoomRegion * zoom, const struct header_data * header,
     const double base_cell = header->BoxSize / base_nmesh;
     zoom->BaseRcut = tree_rcut * base_asmth * base_cell;
 
+    if(allocator_malloc_init(zoom->WorkspaceAlloc, "PMZoom", 0, 0, NULL) != 0)
+        endrun(0, "PMZoomCorrection: failed to initialize persistent workspace allocator.\n");
+    zoom->WorkspaceInitialized = 1;
+
     message(0, "PMZoomCorrection: enabled high-res-types=%d PMZoomNmesh=%d base-cell=%g base-Rcut=%g\n",
             zoom->HighResTypes, zoom->Nmesh, base_cell, zoom->BaseRcut);
 }
@@ -275,12 +279,14 @@ static void
 pmzoom_fill_kernel(PMZoomRegion * zoom, double ratio)
 {
     PetaPM * pm = &zoom->PM;
+    message(0, "PMZoomCorrection: recomputing isolated PM kernel total-size=%g ratio=%g\n",
+            zoom->TotalMeshSize, ratio);
     if(zoom->KernelK) {
         myfree(zoom->KernelK);
         zoom->KernelK = NULL;
     }
 
-    zoom->KernelK = (pfft_complex *) mymalloc2("PMZoomKernelK", pm->priv->fftsize * sizeof(double));
+    zoom->KernelK = (pfft_complex *) allocator_alloc_top(zoom->WorkspaceAlloc, "PMZoomKernelK", pm->priv->fftsize * sizeof(double));
 
     double * real = (double *) mymalloc2("PMZoomKernelReal", pm->priv->fftsize * sizeof(double));
     memset(real, 0, pm->priv->fftsize * sizeof(double));
@@ -341,7 +347,8 @@ pmzoom_ensure_pm(PMZoomRegion * zoom, double G)
 
     if(!zoom->PMInitialized || zoom->PM.Nmesh != zoom->Nmesh) {
         pmzoom_release_pm(zoom);
-        petapm_init(&zoom->PM, zoom->TotalMeshSize, zoom->SplitAsmth, zoom->Nmesh, G, MPI_COMM_WORLD);
+        petapm_init_with_allocator(&zoom->PM, zoom->TotalMeshSize, zoom->SplitAsmth, zoom->Nmesh, G, MPI_COMM_WORLD,
+                                   zoom->WorkspaceAlloc);
         zoom->PMInitialized = 1;
         zoom->KernelTotalMeshSize = 0;
         zoom->KernelAsmthRatio = 0;
@@ -374,8 +381,19 @@ pmzoom_force(PMZoomRegion * zoom, double G, const PetaPMParticleStruct * pstruct
     CurrentPMZoom = zoom;
     petapm_force(&zoom->PM, pmzoom_prepare, &global_functions, pmzoom_functions, &zoom_pstruct, zoom);
     CurrentPMZoom = NULL;
-    pmzoom_release_pm(zoom);
     walltime_measure("/PMZoom");
+}
+
+void
+pmzoom_destroy(PMZoomRegion * zoom)
+{
+    if(!zoom || !zoom->Enabled)
+        return;
+    pmzoom_release_pm(zoom);
+    if(zoom->WorkspaceInitialized) {
+        allocator_destroy(zoom->WorkspaceAlloc);
+        zoom->WorkspaceInitialized = 0;
+    }
 }
 
 double

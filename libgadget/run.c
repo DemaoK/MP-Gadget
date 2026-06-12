@@ -857,6 +857,7 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
         NumCurrentTiStep++;
     }
 
+    pmzoom_destroy(&pmzoom);
     close_outputfiles(&fds);
 }
 

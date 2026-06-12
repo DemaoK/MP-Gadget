@@ -17,6 +17,7 @@ typedef struct PMZoomRegion {
     int HighResTypes;
     int Nmesh;
     int AutoNmesh;
+    int WorkspaceInitialized;
     int64_t NumHighRes;
     double BoxSize;
     double Reference[3];
@@ -36,6 +37,7 @@ typedef struct PMZoomRegion {
     double KernelTotalMeshSize;
     double KernelAsmthRatio;
     PetaPM PM;
+    Allocator WorkspaceAlloc[1];
     pfft_complex * KernelK;
 } PMZoomRegion;
 
@@ -45,6 +47,7 @@ void pmzoom_init(PMZoomRegion * zoom, const struct header_data * header,
 
 void pmzoom_update_region(PMZoomRegion * zoom);
 void pmzoom_force(PMZoomRegion * zoom, double G, const PetaPMParticleStruct * pstruct);
+void pmzoom_destroy(PMZoomRegion * zoom);
 double pmzoom_unwrap_position(const PMZoomRegion * zoom, double pos, int axis);
 int pmzoom_point_location(const PMZoomRegion * zoom, const double pos[3]);
 int pmzoom_node_location(const PMZoomRegion * zoom, const double center[3], double len);

@@ -3,6 +3,7 @@
 #include <pfft.h>
 
 #include "powerspectrum.h"
+#include "utils/memory.h"
 
 typedef struct Region {
     /* represents a region in the FFT Mesh */
@@ -129,6 +130,8 @@ typedef void * (*petapm_mfree_func)(void * ptr);
 void petapm_module_init(int Nthreads);
 
 void petapm_init(PetaPM * pm, double BoxSize, double Asmth, int Nmesh, double G, MPI_Comm comm);
+void petapm_init_with_allocator(PetaPM * pm, double BoxSize, double Asmth, int Nmesh, double G, MPI_Comm comm,
+                                Allocator * persistent_alloc);
 void petapm_destroy(PetaPM * pm);
 void petapm_region_init_strides(PetaPMRegion * region);
 

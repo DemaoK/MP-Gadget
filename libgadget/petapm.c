@@ -136,6 +136,16 @@ petapm_module_init(int Nthreads)
 void
 petapm_init(PetaPM * pm, double BoxSize, double Asmth, int Nmesh, double G, MPI_Comm comm)
 {
+    petapm_init_with_allocator(pm, BoxSize, Asmth, Nmesh, G, comm, A_MAIN);
+}
+
+void
+petapm_init_with_allocator(PetaPM * pm, double BoxSize, double Asmth, int Nmesh, double G, MPI_Comm comm,
+                           Allocator * persistent_alloc)
+{
+    if(!persistent_alloc)
+        persistent_alloc = A_MAIN;
+
     /* define the global long / short range force cut */
     pm->BoxSize = BoxSize;
     pm->Asmth = Asmth;
@@ -150,7 +160,7 @@ petapm_init(PetaPM * pm, double BoxSize, double Asmth, int Nmesh, double G, MPI_
     int ThisTask;
     int NTask;
 
-    pm->Mesh2Task[0] = (int *) mymalloc2("Mesh2Task", 2*sizeof(int) * Nmesh);
+    pm->Mesh2Task[0] = (int *) allocator_alloc_top(persistent_alloc, "Mesh2Task", 2*sizeof(int) * Nmesh);
     pm->Mesh2Task[1] = pm->Mesh2Task[0] + Nmesh;
 
     MPI_Comm_rank(comm, &ThisTask);
