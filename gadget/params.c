@@ -122,7 +122,7 @@ create_gadget_parameter_set()
     param_declare_int(ps,    "Nmesh", OPTIONAL, -1, "Size of the PM grid on which to compute the long-range force.");
     param_declare_int(ps, "PMZoomCorrectionOn", OPTIONAL, 0, "Enable Gadget-4-style high-resolution PM correction for zoom ICs.");
     param_declare_int(ps, "PMZoomHighResTypes", OPTIONAL, -1, "Particle type mask for the high-resolution PM region. If negative, use IC ZoomHighResTypes metadata.");
-    param_declare_int(ps, "PMZoomNmesh", OPTIONAL, -1, "Size of the high-resolution zoom PM grid. If negative, use Nmesh.");
+    param_declare_int(ps, "PMZoomNmesh", OPTIONAL, -1, "Size of the high-resolution zoom PM grid. If negative, start from Nmesh and increase as needed to keep the high-resolution PM cutoff no larger than the base cutoff.");
 
     static ParameterEnum ShortRangeForceWindowTypeEnum [] = {
         {"exact", SHORTRANGE_FORCE_WINDOW_TYPE_EXACT},

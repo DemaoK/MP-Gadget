@@ -16,6 +16,7 @@ typedef struct PMZoomRegion {
     int Enabled;
     int HighResTypes;
     int Nmesh;
+    int AutoNmesh;
     int64_t NumHighRes;
     double BoxSize;
     double Reference[3];

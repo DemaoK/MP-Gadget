@@ -50,6 +50,16 @@ pmzoom_upper_cell(double x, double cellsize)
     return (floor(x / cellsize) + 1) * cellsize;
 }
 
+static int
+pmzoom_min_nmesh_for_base_rcut(double enclosing_size, double base_cell)
+{
+    const double required_cells = 2.0 * enclosing_size / base_cell;
+    int min_nmesh = 10 + (int) ceil(required_cells - 1e-12);
+    if(min_nmesh <= 10)
+        min_nmesh = 11;
+    return min_nmesh;
+}
+
 void
 pmzoom_init(PMZoomRegion * zoom, const struct header_data * header,
             int enabled, int highres_types, int nmesh,
@@ -74,7 +84,8 @@ pmzoom_init(PMZoomRegion * zoom, const struct header_data * header,
         endrun(0, "PMZoomHighResTypes=%d overlaps ZoomBoundaryTypes=%d. Boundary particles cannot define the high-res PM region.\n",
                zoom->HighResTypes, header->ZoomBoundaryTypes);
 
-    zoom->Nmesh = nmesh > 0 ? nmesh : base_nmesh;
+    zoom->AutoNmesh = nmesh <= 0;
+    zoom->Nmesh = zoom->AutoNmesh ? base_nmesh : nmesh;
     if(zoom->Nmesh <= 10)
         endrun(0, "PMZoomNmesh=%d is too small. Gadget-4-style zero padding needs PMZoomNmesh > 10.\n", zoom->Nmesh);
 
@@ -196,11 +207,25 @@ pmzoom_update_region(PMZoomRegion * zoom)
     if(zoom->EnclosingSize <= 0)
         endrun(0, "PMZoomCorrection: degenerate high-res region size %g.\n", zoom->EnclosingSize);
 
+    const double base_cell = zoom->BaseRcut / (zoom->TreeRcut * zoom->SplitAsmth);
+    const int min_nmesh = pmzoom_min_nmesh_for_base_rcut(zoom->EnclosingSize, base_cell);
+    if(zoom->Nmesh < min_nmesh) {
+        if(zoom->AutoNmesh) {
+            message(0, "PMZoomCorrection: increasing automatic PMZoomNmesh from %d to %d to keep high-res Rcut <= base Rcut.\n",
+                    zoom->Nmesh, min_nmesh);
+            zoom->Nmesh = min_nmesh;
+        }
+        else {
+            endrun(0, "PMZoomCorrection: PMZoomNmesh=%d is too small for high-res span %g; use PMZoomNmesh >= %d to keep high-res Rcut <= base Rcut.\n",
+                   zoom->Nmesh, zoom->EnclosingSize, min_nmesh);
+        }
+    }
+
     zoom->TotalMeshSize = 2.0 * zoom->EnclosingSize * (zoom->Nmesh / ((double) (zoom->Nmesh - 10)));
     zoom->CellSize = zoom->TotalMeshSize / zoom->Nmesh;
     zoom->Asmth = zoom->SplitAsmth * zoom->CellSize;
     zoom->Rcut = zoom->TreeRcut * zoom->Asmth;
-    if(zoom->Rcut > zoom->BaseRcut)
+    if(zoom->Rcut > zoom->BaseRcut * (1.0 + 1e-12))
         endrun(0, "PMZoomCorrection: high-res Rcut=%g exceeds base Rcut=%g. Increase PMZoomNmesh or shrink the high-res region.\n",
                zoom->Rcut, zoom->BaseRcut);
 
@@ -213,8 +238,8 @@ pmzoom_update_region(PMZoomRegion * zoom)
             zoom->Min[0], zoom->Min[1], zoom->Min[2],
             zoom->Max[0], zoom->Max[1], zoom->Max[2],
             zoom->Span[0], zoom->Span[1], zoom->Span[2]);
-    message(0, "PMZoomCorrection: isolated-mesh total-size=%g cell-size=%g Asmth=%g Rcut=%g margin=(%g %g %g) corner=(%g %g %g)\n",
-            zoom->TotalMeshSize, zoom->CellSize, zoom->Asmth, zoom->Rcut,
+    message(0, "PMZoomCorrection: isolated-mesh nmesh=%d total-size=%g cell-size=%g Asmth=%g Rcut=%g margin=(%g %g %g) corner=(%g %g %g)\n",
+            zoom->Nmesh, zoom->TotalMeshSize, zoom->CellSize, zoom->Asmth, zoom->Rcut,
             region_margin[0], region_margin[1], region_margin[2],
             zoom->Corner[0], zoom->Corner[1], zoom->Corner[2]);
 }
