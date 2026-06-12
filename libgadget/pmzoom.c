@@ -153,17 +153,42 @@ pmzoom_update_region(PMZoomRegion * zoom)
     MPI_Allreduce(local_max, zoom->Max, 3, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
 
     const double placement_cell = zoom->BoxSize / zoom->Nmesh;
-    const double region_margin = zoom->BaseRcut;
+    const double requested_margin = zoom->BaseRcut;
+    double region_margin[3] = {requested_margin, requested_margin, requested_margin};
     zoom->EnclosingSize = 0;
     for(k = 0; k < 3; k++) {
-        const double lower = pmzoom_floor_cell(zoom->Min[k] - region_margin, placement_cell);
-        const double upper = pmzoom_upper_cell(zoom->Max[k] + region_margin, placement_cell);
+        const double raw_lower = pmzoom_floor_cell(zoom->Min[k], placement_cell);
+        const double raw_upper = pmzoom_upper_cell(zoom->Max[k], placement_cell);
+        const double raw_span = raw_upper - raw_lower;
+        if(raw_span >= 0.5 * zoom->BoxSize)
+            endrun(0, "PMZoomCorrection: unpadded high-res span %g along axis %d is too large for unambiguous periodic placement in box %g.\n",
+                   raw_span, k, zoom->BoxSize);
+
+        double lower = raw_lower;
+        double upper = raw_upper;
+        int shrink;
+        for(shrink = 0; shrink < 64; shrink++) {
+            lower = pmzoom_floor_cell(zoom->Min[k] - region_margin[k], placement_cell);
+            upper = pmzoom_upper_cell(zoom->Max[k] + region_margin[k], placement_cell);
+            if(upper - lower < 0.5 * zoom->BoxSize)
+                break;
+            region_margin[k] *= 0.5;
+        }
+        if(upper - lower >= 0.5 * zoom->BoxSize) {
+            region_margin[k] = 0;
+            lower = raw_lower;
+            upper = raw_upper;
+        }
+        if(shrink > 0)
+            message(0, "PMZoomCorrection: reduced margin along axis %d from %g to %g to keep the zoom region below half the periodic box.\n",
+                    k, requested_margin, region_margin[k]);
+
         zoom->Min[k] = lower;
         zoom->Max[k] = upper;
         zoom->Span[k] = upper - lower;
         if(zoom->Span[k] >= 0.5 * zoom->BoxSize)
-            endrun(0, "PMZoomCorrection: high-res span %g along axis %d is too large for unambiguous periodic placement in box %g.\n",
-                   zoom->Span[k], k, zoom->BoxSize);
+            endrun(0, "PMZoomCorrection: padded high-res span %g along axis %d remains too large for unambiguous periodic placement in box %g; raw span is %g.\n",
+                   zoom->Span[k], k, zoom->BoxSize, raw_span);
         if(zoom->Span[k] > zoom->EnclosingSize)
             zoom->EnclosingSize = zoom->Span[k];
     }
@@ -188,8 +213,9 @@ pmzoom_update_region(PMZoomRegion * zoom)
             zoom->Min[0], zoom->Min[1], zoom->Min[2],
             zoom->Max[0], zoom->Max[1], zoom->Max[2],
             zoom->Span[0], zoom->Span[1], zoom->Span[2]);
-    message(0, "PMZoomCorrection: isolated-mesh total-size=%g cell-size=%g Asmth=%g Rcut=%g margin=%g corner=(%g %g %g)\n",
-            zoom->TotalMeshSize, zoom->CellSize, zoom->Asmth, zoom->Rcut, region_margin,
+    message(0, "PMZoomCorrection: isolated-mesh total-size=%g cell-size=%g Asmth=%g Rcut=%g margin=(%g %g %g) corner=(%g %g %g)\n",
+            zoom->TotalMeshSize, zoom->CellSize, zoom->Asmth, zoom->Rcut,
+            region_margin[0], region_margin[1], region_margin[2],
             zoom->Corner[0], zoom->Corner[1], zoom->Corner[2]);
 }
 
