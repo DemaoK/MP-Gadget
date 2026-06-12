@@ -257,6 +257,21 @@ pmzoom_kernel_is_current(const PMZoomRegion * zoom, double ratio)
 }
 
 static void
+pmzoom_release_pm(PMZoomRegion * zoom)
+{
+    if(zoom->KernelK) {
+        myfree(zoom->KernelK);
+        zoom->KernelK = NULL;
+    }
+    if(zoom->PMInitialized) {
+        petapm_destroy(&zoom->PM);
+        zoom->PMInitialized = 0;
+    }
+    zoom->KernelTotalMeshSize = 0;
+    zoom->KernelAsmthRatio = 0;
+}
+
+static void
 pmzoom_fill_kernel(PMZoomRegion * zoom, double ratio)
 {
     PetaPM * pm = &zoom->PM;
@@ -325,13 +340,7 @@ pmzoom_ensure_pm(PMZoomRegion * zoom, double G)
                ratio, zoom->Asmth, base_asmth);
 
     if(!zoom->PMInitialized || zoom->PM.Nmesh != zoom->Nmesh) {
-        if(zoom->PMInitialized) {
-            if(zoom->KernelK) {
-                myfree(zoom->KernelK);
-                zoom->KernelK = NULL;
-            }
-            petapm_destroy(&zoom->PM);
-        }
+        pmzoom_release_pm(zoom);
         petapm_init(&zoom->PM, zoom->TotalMeshSize, zoom->SplitAsmth, zoom->Nmesh, G, MPI_COMM_WORLD);
         zoom->PMInitialized = 1;
         zoom->KernelTotalMeshSize = 0;
@@ -365,6 +374,7 @@ pmzoom_force(PMZoomRegion * zoom, double G, const PetaPMParticleStruct * pstruct
     CurrentPMZoom = zoom;
     petapm_force(&zoom->PM, pmzoom_prepare, &global_functions, pmzoom_functions, &zoom_pstruct, zoom);
     CurrentPMZoom = NULL;
+    pmzoom_release_pm(zoom);
     walltime_measure("/PMZoom");
 }
 
