@@ -353,8 +353,6 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
     PMZoomRegion pmzoom = {0};
     pmzoom_init(&pmzoom, header, All.PMZoomCorrectionOn, All.PMZoomHighResTypes,
                 All.PMZoomNmesh, All.Asmth, All.Nmesh, get_gravshort_treepar().Rcut);
-    pmzoom_update_region(&pmzoom);
-    pmzoom_require_force_implemented(&pmzoom);
 
     /*define excursion set PetaPM structs*/
     /*because we need to FFT 3 grids, and we can't separate sets of regions, we need 3 PetaPM structs */
@@ -547,7 +545,7 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
         if(is_PM)
         {
             /* Tree freed in PM*/
-            gravpm_force(&pm, ddecomp, &All.CP, atime, units.UnitLength_in_cm, All.OutputDir, header->TimeIC);
+            gravpm_force(&pm, ddecomp, &pmzoom, &All.CP, atime, units.UnitLength_in_cm, All.OutputDir, header->TimeIC);
 
             /* compute and output energy statistics if desired. */
             if(fds.FdEnergy)
@@ -565,14 +563,14 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
                 /* We need to store a GravAccel for new star particles as well, so we need extra memory.*/
                 GravAccel.nstore = PartManager->NumPart + SlotsManager->info[0].size;
                 GravAccel.GravAccel = (MyFloat (*) [3]) mymalloc2("GravAccel", GravAccel.nstore * sizeof(GravAccel.GravAccel[0]));
-                hierarchical_gravity_accelerations(&Act, &pm, ddecomp, GravAccel, &times, HybridNuTracer, &All.CP, All.OutputDir);
+                hierarchical_gravity_accelerations(&Act, &pm, &pmzoom, ddecomp, GravAccel, &times, HybridNuTracer, &All.CP, All.OutputDir);
             }
             else if(All.TreeGravOn && totgravactive) {
                     ForceTree Tree = {0};
                     /* Do a short range pairwise only step if desired*/
                     const double rho0 = All.CP.Omega0 * 3 * All.CP.Hubble * All.CP.Hubble / (8 * M_PI * All.CP.GravInternal);
                     force_tree_full(&Tree, ddecomp, HybridNuTracer, All.OutputDir);
-                    grav_short_tree(&Act, &pm, &Tree, NULL, rho0, times.Ti_Current);
+                    grav_short_tree(&Act, &pm, &pmzoom, &Tree, NULL, rho0, times.Ti_Current);
                     force_tree_free(&Tree);
             }
         }
@@ -821,7 +819,7 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
              * each timebin has a force done individually and we do not store the acceleration hierarchy.
              * This does mean we double the cost of the force evaluations.*/
             if(totgravactive)
-                badtimestep = hierarchical_gravity_and_timesteps(&Act, &pm, ddecomp, GravAccel, &times, atime, HybridNuTracer, All.FastParticleType, &All.CP, All.OutputDir);
+                badtimestep = hierarchical_gravity_and_timesteps(&Act, &pm, &pmzoom, ddecomp, GravAccel, &times, atime, HybridNuTracer, All.FastParticleType, &All.CP, All.OutputDir);
             if(GasEnabled) {
                 /* Find hydro timesteps and apply the hydro kick, unsyncing the drift and kick times. */
                 badtimestep += find_hydro_timesteps(&Act, &times, atime, &All.CP, NumCurrentTiStep == 0);
@@ -917,5 +915,5 @@ runpower(const struct header_data * header)
     /* ... read in initial model */
     domain_decompose_full(ddecomp, MPI_COMM_WORLD);	/* do initial domain decomposition (gives equal numbers of particles) */
     /*PM needs a tree*/
-    gravpm_force(&pm, ddecomp, &All.CP, header->TimeSnapshot, header->UnitLength_in_cm, All.OutputDir, header->TimeSnapshot);
+    gravpm_force(&pm, ddecomp, NULL, &All.CP, header->TimeSnapshot, header->UnitLength_in_cm, All.OutputDir, header->TimeSnapshot);
 }

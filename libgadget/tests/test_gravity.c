@@ -191,7 +191,7 @@ static void do_force_test(int Nmesh, double Asmth, double ErrTolForceAcc, int di
     struct UnitSystem units = get_unitsystem(3.085678e21, 1.989e43, 1e5);
     init_cosmology(&CP, 0.01, units);
 
-    gravpm_force(&pm, &ddecomp, &CP, 0.1, CM_PER_MPC/1000., ".", 0.01);
+    gravpm_force(&pm, &ddecomp, NULL, &CP, 0.1, CM_PER_MPC/1000., ".", 0.01);
     ForceTree Tree = {0};
     force_tree_full(&Tree, &ddecomp, 1, NULL);
     const double rho0 = CP.Omega0 * 3 * CP.Hubble * CP.Hubble / (8 * M_PI * G);
@@ -209,8 +209,8 @@ static void do_force_test(int Nmesh, double Asmth, double ErrTolForceAcc, int di
 
     /* Twice so the opening angle is consistent*/
     ActiveParticles act = init_empty_active_particles(PartManager);
-    grav_short_tree(&act, &pm, &Tree, NULL, rho0, 0);
-    grav_short_tree(&act, &pm, &Tree, NULL, rho0, 0);
+    grav_short_tree(&act, &pm, NULL, &Tree, NULL, rho0, 0);
+    grav_short_tree(&act, &pm, NULL, &Tree, NULL, rho0, 0);
 
     force_tree_free(&Tree);
     petapm_destroy(&pm);

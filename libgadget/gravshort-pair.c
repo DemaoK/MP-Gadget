@@ -28,6 +28,7 @@ grav_short_pair(const ActiveParticles * act, PetaPM * pm, ForceTree * tree, doub
     priv.Rcut = Rcut * pm->Asmth * priv.cellsize;
     priv.G = pm->G;
     priv.cbrtrho0 = pow(rho0, 1.0 / 3);
+    priv.PMZoom = NULL;
     priv.Accel = (MyFloat (*) [3]) mymalloc2("GravAccel", PartManager->NumPart * sizeof(priv.Accel[0]));
 
     message(0, "Starting pair-wise short range gravity...\n");

@@ -58,7 +58,9 @@ gravpm_init_periodic(PetaPM * pm, double BoxSize, double Asmth, int Nmesh, doubl
  * Parameters: Cosmology, Time, UnitLength_in_cm and PowerOutputDir are used by the power spectrum output code.
  * TimeIC is used by the massive neutrino code.*/
 void
-gravpm_force(PetaPM * pm, DomainDecomp * ddecomp, Cosmology * CP, double Time, double UnitLength_in_cm, const char * PowerOutputDir, double TimeIC) {
+gravpm_force(PetaPM * pm, DomainDecomp * ddecomp, PMZoomRegion * pmzoom,
+             Cosmology * CP, double Time, double UnitLength_in_cm,
+             const char * PowerOutputDir, double TimeIC) {
     PetaPMParticleStruct pstruct = {
         P,
         sizeof(P[0]),
@@ -70,6 +72,9 @@ gravpm_force(PetaPM * pm, DomainDecomp * ddecomp, Cosmology * CP, double Time, d
         NULL,
         PartManager->NumPart,
     };
+
+    pmzoom_update_region(pmzoom);
+    pmzoom_require_force_implemented(pmzoom);
 
     PetaPMGlobalFunctions global_functions = {NULL, NULL, potential_transfer};
 

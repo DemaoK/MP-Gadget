@@ -85,7 +85,7 @@ pmzoom_init(PMZoomRegion * zoom, const struct header_data * header,
 void
 pmzoom_update_region(PMZoomRegion * zoom)
 {
-    if(!zoom->Enabled)
+    if(!zoom || !zoom->Enabled)
         return;
 
     int ThisTask, NTask;
@@ -183,9 +183,56 @@ pmzoom_update_region(PMZoomRegion * zoom)
 void
 pmzoom_require_force_implemented(const PMZoomRegion * zoom)
 {
-    if(!zoom->Enabled)
+    if(!zoom || !zoom->Enabled)
         return;
 
     endrun(0, "PMZoomCorrectionOn selected a Gadget-4-style high-res PM region, "
               "but the isolated PM force/readout path is not implemented yet.\n");
+}
+
+double
+pmzoom_unwrap_position(const PMZoomRegion * zoom, double pos, int axis)
+{
+    if(!zoom || !zoom->Enabled)
+        return pos;
+    return zoom->Reference[axis] + pmzoom_nearest(pos - zoom->Reference[axis], zoom->BoxSize);
+}
+
+int
+pmzoom_point_location(const PMZoomRegion * zoom, const double pos[3])
+{
+    if(!zoom || !zoom->Enabled)
+        return PMZOOM_OUTSIDE;
+
+    int k;
+    for(k = 0; k < 3; k++) {
+        const double unwrapped = pmzoom_unwrap_position(zoom, pos[k], k);
+        if(unwrapped < zoom->Min[k] || unwrapped >= zoom->Max[k])
+            return PMZOOM_OUTSIDE;
+    }
+    return PMZOOM_INSIDE;
+}
+
+int
+pmzoom_node_location(const PMZoomRegion * zoom, const double center[3], double len)
+{
+    if(!zoom || !zoom->Enabled)
+        return PMZOOM_OUTSIDE;
+
+    if(len >= 0.5 * zoom->BoxSize)
+        return PMZOOM_BOUNDARY;
+
+    int any_boundary = 0;
+    int k;
+    for(k = 0; k < 3; k++) {
+        const double c = pmzoom_unwrap_position(zoom, center[k], k);
+        const double left = c - 0.5 * len;
+        const double right = c + 0.5 * len;
+
+        if(right <= zoom->Min[k] || left >= zoom->Max[k])
+            return PMZOOM_OUTSIDE;
+        if(left < zoom->Min[k] || right > zoom->Max[k])
+            any_boundary = 1;
+    }
+    return any_boundary ? PMZOOM_BOUNDARY : PMZOOM_INSIDE;
 }

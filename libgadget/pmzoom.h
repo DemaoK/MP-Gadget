@@ -5,6 +5,12 @@
 
 #include "petaio.h"
 
+enum PMZoomLocation {
+    PMZOOM_OUTSIDE = 0,
+    PMZOOM_INSIDE = 1,
+    PMZOOM_BOUNDARY = 2,
+};
+
 typedef struct PMZoomRegion {
     int Enabled;
     int HighResTypes;
@@ -32,5 +38,8 @@ void pmzoom_init(PMZoomRegion * zoom, const struct header_data * header,
 
 void pmzoom_update_region(PMZoomRegion * zoom);
 void pmzoom_require_force_implemented(const PMZoomRegion * zoom);
+double pmzoom_unwrap_position(const PMZoomRegion * zoom, double pos, int axis);
+int pmzoom_point_location(const PMZoomRegion * zoom, const double pos[3]);
+int pmzoom_node_location(const PMZoomRegion * zoom, const double center[3], double len);
 
 #endif

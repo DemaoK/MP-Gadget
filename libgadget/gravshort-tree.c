@@ -144,7 +144,8 @@ force_treeev_shortrange(TreeWalkQueryGravShort * input,
  * only true on PM steps where all particles are active.
  */
 void
-grav_short_tree(const ActiveParticles * act, PetaPM * pm, ForceTree * tree, MyFloat (* AccelStore)[3], double rho0, inttime_t Ti_Current)
+grav_short_tree(const ActiveParticles * act, PetaPM * pm, const PMZoomRegion * pmzoom,
+                ForceTree * tree, MyFloat (* AccelStore)[3], double rho0, inttime_t Ti_Current)
 {
     TreeWalk tw[1] = {{0}};
     struct GravShortPriv priv;
@@ -153,6 +154,7 @@ grav_short_tree(const ActiveParticles * act, PetaPM * pm, ForceTree * tree, MyFl
     priv.G = pm->G;
     priv.cbrtrho0 = pow(rho0, 1.0 / 3);
     priv.Ti_Current = Ti_Current;
+    priv.PMZoom = pmzoom;
     priv.Accel = AccelStore;
     int accelstorealloc = 0;
     if(!AccelStore) {
@@ -289,6 +291,34 @@ shall_we_open_node(const double len, const double mass, const double r2, const d
     return 0;
 }
 
+static int
+pmzoom_target_inside(const PMZoomRegion * pmzoom, const double pos[3])
+{
+    return pmzoom_point_location(pmzoom, pos) == PMZOOM_INSIDE;
+}
+
+static int
+pmzoom_use_highres_split(const PMZoomRegion * pmzoom, int target_inside, int source_location)
+{
+    return pmzoom && pmzoom->Enabled && target_inside && source_location == PMZOOM_INSIDE;
+}
+
+static double
+pmzoom_interaction_cellsize(const PMZoomRegion * pmzoom, int target_inside, int source_location, double base_cellsize)
+{
+    if(pmzoom_use_highres_split(pmzoom, target_inside, source_location))
+        return pmzoom->CellSize;
+    return base_cellsize;
+}
+
+static double
+pmzoom_interaction_rcut(const PMZoomRegion * pmzoom, int target_inside, int source_location, double base_rcut)
+{
+    if(pmzoom_use_highres_split(pmzoom, target_inside, source_location))
+        return pmzoom->Rcut;
+    return base_rcut;
+}
+
 /*! In the TreePM algorithm, the tree is walked only locally around the
  *  target coordinate.  Tree nodes that fall outside a box of half
  *  side-length Rcut= RCUT*ASMTH*MeshSize can be discarded. The short-range
@@ -309,7 +339,6 @@ int force_treeev_shortrange(TreeWalkQueryGravShort * input,
     /*Tree-opening constants*/
     const double cellsize = GRAV_GET_PRIV(lv->tw)->cellsize;
     const double rcut = GRAV_GET_PRIV(lv->tw)->Rcut;
-    const double rcut2 = rcut * rcut;
     const double aold = TreeParams.ErrTolForceAcc * input->OldAcc;
     const int TreeUseBH = TreeParams.TreeUseBH;
     double BHOpeningAngle2 = TreeParams.BHOpeningAngle * TreeParams.BHOpeningAngle;
@@ -320,6 +349,8 @@ int force_treeev_shortrange(TreeWalkQueryGravShort * input,
 
     /*Input particle data*/
     const double * inpos = input->base.Pos;
+    const PMZoomRegion * pmzoom = GRAV_GET_PRIV(lv->tw)->PMZoom;
+    const int target_in_pmzoom = pmzoom_target_inside(pmzoom, inpos);
 
     /*Start the tree walk*/
     int listindex, ninteractions=0;
@@ -348,9 +379,12 @@ int force_treeev_shortrange(TreeWalkQueryGravShort * input,
             for(i = 0; i < 3; i++)
                 dx[i] = NEAREST(nop->mom.cofm[i] - inpos[i], BoxSize);
             const double r2 = dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2];
+            const int node_pmzoom_location = pmzoom_node_location(pmzoom, nop->center, nop->len);
+            const double node_rcut = pmzoom_interaction_rcut(pmzoom, target_in_pmzoom, node_pmzoom_location, rcut);
+            const double node_rcut2 = node_rcut * node_rcut;
 
             /* Discard this node, move to sibling*/
-            if(shall_we_discard_node(nop->len, r2, nop->center, inpos, BoxSize, rcut, rcut2))
+            if(shall_we_discard_node(nop->len, r2, nop->center, inpos, BoxSize, node_rcut, node_rcut2))
             {
                 no = nop->sibling;
                 /* Don't add this node*/
@@ -359,6 +393,8 @@ int force_treeev_shortrange(TreeWalkQueryGravShort * input,
 
             /* This node accelerates the particle directly, and is not opened.*/
             int open_node = shall_we_open_node(nop->len, nop->mom.mass, r2, nop->center, inpos, BoxSize, aold, TreeUseBH, BHOpeningAngle2);
+            if(pmzoom && pmzoom->Enabled && target_in_pmzoom && node_pmzoom_location == PMZOOM_BOUNDARY)
+                open_node = 1;
 
             if(!open_node)
             {
@@ -369,7 +405,8 @@ int force_treeev_shortrange(TreeWalkQueryGravShort * input,
                     const double htarget = FORCE_SOFTENING_TYPE(input->Type);
                     const double hnode = FORCE_SOFTENING_MASK(nop->f.TypeMask);
                     const double h = htarget > hnode ? htarget : hnode;
-                    apply_accn_to_output(output, dx, r2, nop->mom.mass, cellsize, h);
+                    const double node_cellsize = pmzoom_interaction_cellsize(pmzoom, target_in_pmzoom, node_pmzoom_location, cellsize);
+                    apply_accn_to_output(output, dx, r2, nop->mom.mass, node_cellsize, h);
                 }
                 continue;
             }
@@ -422,7 +459,9 @@ int force_treeev_shortrange(TreeWalkQueryGravShort * input,
                 dx[j] = NEAREST(P[pp].Pos[j] - inpos[j], BoxSize);
             const double r2 = dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2];
             /* Compute the acceleration and apply it to the output structure*/
-            apply_accn_to_output(output, dx, r2, P[pp].Mass, cellsize, FORCE_SOFTENING_PAIR(input->Type, P[pp].Type));
+            const int particle_pmzoom_location = pmzoom_point_location(pmzoom, P[pp].Pos);
+            const double particle_cellsize = pmzoom_interaction_cellsize(pmzoom, target_in_pmzoom, particle_pmzoom_location, cellsize);
+            apply_accn_to_output(output, dx, r2, P[pp].Mass, particle_cellsize, FORCE_SOFTENING_PAIR(input->Type, P[pp].Type));
         }
         ninteractions = numcand;
     }

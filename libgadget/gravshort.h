@@ -4,6 +4,7 @@
 #include "partmanager.h"
 #include "treewalk.h"
 #include "gravity.h"
+#include "pmzoom.h"
 #include <math.h>
 
 typedef struct {
@@ -39,6 +40,8 @@ struct GravShortPriv {
      * Note: should account for
      * massive neutrinos, but doesn't. */
     double cbrtrho0;
+    /* Optional high-resolution PM region for Gadget-4-style zoom cutoffs. */
+    const PMZoomRegion * PMZoom;
     /* Pointer to the place to store accelerations*/
     MyFloat (*Accel)[3];
 };
