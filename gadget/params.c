@@ -120,6 +120,9 @@ create_gadget_parameter_set()
     param_declare_double(ps, "Asmth", OPTIONAL, 1.5, "The scale of the short-range/long-range force split in units of FFT-mesh cells."
                                                       "Larger values suppresses grid anisotropy. ShortRangeForceWindowType = erfc supports any value. 'exact' only supports 1.5. ");
     param_declare_int(ps,    "Nmesh", OPTIONAL, -1, "Size of the PM grid on which to compute the long-range force.");
+    param_declare_int(ps, "PMZoomCorrectionOn", OPTIONAL, 0, "Enable Gadget-4-style high-resolution PM correction setup for zoom ICs. The force path is still guarded as incomplete.");
+    param_declare_int(ps, "PMZoomHighResTypes", OPTIONAL, -1, "Particle type mask for the high-resolution PM region. If negative, use IC ZoomHighResTypes metadata.");
+    param_declare_int(ps, "PMZoomNmesh", OPTIONAL, -1, "Size of the high-resolution zoom PM grid. If negative, use Nmesh.");
 
     static ParameterEnum ShortRangeForceWindowTypeEnum [] = {
         {"exact", SHORTRANGE_FORCE_WINDOW_TYPE_EXACT},

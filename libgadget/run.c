@@ -37,6 +37,7 @@
 #include "veldisp.h"
 #include "physconst.h"
 #include "plane.h"
+#include "pmzoom.h"
 #ifdef SIDM
 #include "sidm.h"
 #endif
@@ -91,6 +92,9 @@ static struct run_params
     double TimeMax;			/*!< marks the point of time until the simulation is to be evolved */
 
     int Nmesh;
+    int PMZoomCorrectionOn;
+    int PMZoomHighResTypes;
+    int PMZoomNmesh;
 
     /* variables that keep track of cumulative CPU consumption */
 
@@ -149,6 +153,9 @@ set_all_global_params(ParameterSet * ps)
         All.Asmth = param_get_double(ps, "Asmth");
         All.ShortRangeForceWindowType = (enum ShortRangeForceWindowType) param_get_enum(ps, "ShortRangeForceWindowType");
         All.Nmesh = param_get_int(ps, "Nmesh");
+        All.PMZoomCorrectionOn = param_get_int(ps, "PMZoomCorrectionOn");
+        All.PMZoomHighResTypes = param_get_int(ps, "PMZoomHighResTypes");
+        All.PMZoomNmesh = param_get_int(ps, "PMZoomNmesh");
 
         All.CoolingOn = param_get_int(ps, "CoolingOn");
         All.HydroOn = param_get_int(ps, "HydroOn");
@@ -343,6 +350,12 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
 
     PetaPM pm = {0};
     gravpm_init_periodic(&pm, PartManager->BoxSize, All.Asmth, All.Nmesh, All.CP.GravInternal);
+    PMZoomRegion pmzoom = {0};
+    pmzoom_init(&pmzoom, header, All.PMZoomCorrectionOn, All.PMZoomHighResTypes,
+                All.PMZoomNmesh, All.Asmth, All.Nmesh, get_gravshort_treepar().Rcut);
+    pmzoom_update_region(&pmzoom);
+    pmzoom_require_force_implemented(&pmzoom);
+
     /*define excursion set PetaPM structs*/
     /*because we need to FFT 3 grids, and we can't separate sets of regions, we need 3 PetaPM structs */
     /*also, we will need different pencils and layouts due to different zero cells*/

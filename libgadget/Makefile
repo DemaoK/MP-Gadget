@@ -62,7 +62,7 @@ GADGET_OBJS =  \
 	 winds.o veldisp.o density.o metal_return.o \
 	 treewalk.o cosmology.o \
 	 gravshort-tree.o gravshort-pair.o hydra.o  timefac.o \
-	 gravpm.o powerspectrum.o \
+	 gravpm.o pmzoom.o powerspectrum.o \
 	 forcetree.o $(SIDM_OBJS) \
 	 petapm.o gravity.o \
 	 densitykernel.o lightcone.o walltime.o\
