@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "petaio.h"
+#include "petapm.h"
 
 enum PMZoomLocation {
     PMZOOM_OUTSIDE = 0,
@@ -30,6 +31,11 @@ typedef struct PMZoomRegion {
     double Asmth;
     double Rcut;
     double Corner[3];
+    int PMInitialized;
+    double KernelTotalMeshSize;
+    double KernelAsmthRatio;
+    PetaPM PM;
+    pfft_complex * KernelK;
 } PMZoomRegion;
 
 void pmzoom_init(PMZoomRegion * zoom, const struct header_data * header,
@@ -37,7 +43,7 @@ void pmzoom_init(PMZoomRegion * zoom, const struct header_data * header,
                  double base_asmth, int base_nmesh, double tree_rcut);
 
 void pmzoom_update_region(PMZoomRegion * zoom);
-void pmzoom_require_force_implemented(const PMZoomRegion * zoom);
+void pmzoom_force(PMZoomRegion * zoom, double G, const PetaPMParticleStruct * pstruct);
 double pmzoom_unwrap_position(const PMZoomRegion * zoom, double pos, int axis);
 int pmzoom_point_location(const PMZoomRegion * zoom, const double pos[3]);
 int pmzoom_node_location(const PMZoomRegion * zoom, const double center[3], double len);

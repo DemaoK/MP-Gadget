@@ -74,7 +74,6 @@ gravpm_force(PetaPM * pm, DomainDecomp * ddecomp, PMZoomRegion * pmzoom,
     };
 
     pmzoom_update_region(pmzoom);
-    pmzoom_require_force_implemented(pmzoom);
 
     PetaPMGlobalFunctions global_functions = {NULL, NULL, potential_transfer};
 
@@ -112,6 +111,7 @@ gravpm_force(PetaPM * pm, DomainDecomp * ddecomp, PMZoomRegion * pmzoom,
      * not the density.
      * */
     petapm_force(pm, _prepare, &global_functions, functions, &pstruct, &Tree);
+    pmzoom_force(pmzoom, CP->GravInternal, &pstruct);
     powerspectrum_sum(pm->ps);
     /*Now save the power spectrum*/
     powerspectrum_save(pm->ps, PowerOutputDir, "powerspectrum", Time, GrowthFactor(CP, Time, 1.0));

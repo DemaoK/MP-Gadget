@@ -72,6 +72,19 @@ static PetaPMReionPartStruct * CPS_R; /* stored by calculate_uvbg, how to access
 #define FESCSPH(i) ((double*) (&((char*)CPS_R->Sphslot)[CPS_R->sph_elsize * *PI(i) + CPS_R->offset_fesc_sph]))
 #define SFR(i) ((double*)  (&((char*)CPS_R->Sphslot)[CPS_R->sph_elsize * *PI(i) + CPS_R->offset_sfr]))
 
+static void
+petapm_get_position(int i, double pos[3])
+{
+    if(CPS->position) {
+        CPS->position(i, pos, CPS->position_userdata);
+        return;
+    }
+    double * raw = POS(i);
+    int k;
+    for(k = 0; k < 3; k++)
+        pos[k] = raw[k];
+}
+
 PetaPMRegion * petapm_get_fourier_region(PetaPM * pm) {
     return &pm->fourier_space_region;
 }
@@ -81,6 +94,25 @@ PetaPMRegion * petapm_get_real_region(PetaPM * pm) {
 int petapm_mesh_to_k(PetaPM * pm, int i) {
     /*Return the position of this point on the Fourier mesh*/
     return i<=pm->Nmesh/2 ? i : (i-pm->Nmesh);
+}
+ptrdiff_t petapm_fourier_index_from_kpos(PetaPM * pm, const int kpos[3])
+{
+    int meshpos[3];
+    int k;
+    for(k = 0; k < 3; k++)
+        meshpos[k] = kpos[k] >= 0 ? kpos[k] : kpos[k] + pm->Nmesh;
+
+    /* Fourier-space PFFT storage is transposed into (y, z, x). */
+    const int transposed[3] = {meshpos[1], meshpos[2], meshpos[0]};
+    const PetaPMRegion * region = &pm->fourier_space_region;
+    ptrdiff_t linear = 0;
+    for(k = 0; k < 3; k++) {
+        const ptrdiff_t local = transposed[k] - region->offset[k];
+        if(local < 0 || local >= region->size[k])
+            return -1;
+        linear += local * region->strides[k];
+    }
+    return linear;
 }
 int *petapm_get_thistask2d(PetaPM * pm) {
     return pm->ThisTask2d;
@@ -962,7 +994,8 @@ pm_iterate_one(PetaPM * pm,
     int k;
     int iCell[3];  /* integer coordinate on the regional mesh */
     double Res[3]; /* residual*/
-    double * Pos = POS(i);
+    double Pos[3];
+    petapm_get_position(i, Pos);
     const int RegionInd = CPS->RegionInd ? CPS->RegionInd[i] : 0;
 
     /* Asserts that the swallowed particles are not considered (region -2).*/

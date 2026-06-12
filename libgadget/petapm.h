@@ -84,6 +84,8 @@ typedef struct {
     int * RegionInd;
     int (*active) (int i);
     int64_t NumPart;
+    void (*position) (int i, double pos[3], void * userdata);
+    void * position_userdata;
 } PetaPMParticleStruct;
 
 /* extra particle info used in reionisation*/
@@ -154,6 +156,7 @@ void petapm_force_finish(PetaPM * pm);
 PetaPMRegion * petapm_get_fourier_region(PetaPM * pm);
 PetaPMRegion * petapm_get_real_region(PetaPM * pm);
 int petapm_mesh_to_k(PetaPM * pm, int i);
+ptrdiff_t petapm_fourier_index_from_kpos(PetaPM * pm, const int kpos[3]);
 int *petapm_get_thistask2d(PetaPM * pm);
 int *petapm_get_ntask2d(PetaPM * pm);
 pfft_complex * petapm_alloc_rhok(PetaPM * pm);
