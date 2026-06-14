@@ -34,10 +34,9 @@ typedef struct PMZoomRegion {
     double Rcut;
     double Corner[3];
     int PMInitialized;
-    double KernelTotalMeshSize;
-    double KernelAsmthRatio;
     PetaPM PM;
     Allocator WorkspaceAlloc[1];
+    /* Step-local correction kernel, valid only during pmzoom_force. */
     pfft_complex * KernelK;
 } PMZoomRegion;
 

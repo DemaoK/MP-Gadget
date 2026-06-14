@@ -248,18 +248,6 @@ pmzoom_update_region(PMZoomRegion * zoom)
             zoom->Corner[0], zoom->Corner[1], zoom->Corner[2]);
 }
 
-static int
-pmzoom_kernel_is_current(const PMZoomRegion * zoom, double ratio)
-{
-    if(!zoom->PMInitialized || !zoom->KernelK)
-        return 0;
-    if(zoom->KernelTotalMeshSize != zoom->TotalMeshSize)
-        return 0;
-    if(fabs(zoom->KernelAsmthRatio - ratio) > 1e-12)
-        return 0;
-    return 1;
-}
-
 static void
 pmzoom_release_pm(PMZoomRegion * zoom)
 {
@@ -271,22 +259,16 @@ pmzoom_release_pm(PMZoomRegion * zoom)
         petapm_destroy(&zoom->PM);
         zoom->PMInitialized = 0;
     }
-    zoom->KernelTotalMeshSize = 0;
-    zoom->KernelAsmthRatio = 0;
 }
 
-static void
+static pfft_complex *
 pmzoom_fill_kernel(PMZoomRegion * zoom, double ratio)
 {
     PetaPM * pm = &zoom->PM;
     message(0, "PMZoomCorrection: recomputing isolated PM kernel total-size=%g ratio=%g\n",
             zoom->TotalMeshSize, ratio);
-    if(zoom->KernelK) {
-        myfree(zoom->KernelK);
-        zoom->KernelK = NULL;
-    }
 
-    zoom->KernelK = (pfft_complex *) allocator_alloc_top(zoom->WorkspaceAlloc, "PMZoomKernelK", pm->priv->fftsize * sizeof(double));
+    pfft_complex * kernel_k = (pfft_complex *) mymalloc2("PMZoomKernelK", pm->priv->fftsize * sizeof(double));
 
     double * real = (double *) mymalloc2("PMZoomKernelReal", pm->priv->fftsize * sizeof(double));
     memset(real, 0, pm->priv->fftsize * sizeof(double));
@@ -329,14 +311,13 @@ pmzoom_fill_kernel(PMZoomRegion * zoom, double ratio)
         }
     }
 
-    pfft_execute_dft_r2c(pm->priv->plan_forw, real, zoom->KernelK);
+    pfft_execute_dft_r2c(pm->priv->plan_forw, real, kernel_k);
     myfree(real);
 
-    zoom->KernelTotalMeshSize = zoom->TotalMeshSize;
-    zoom->KernelAsmthRatio = ratio;
+    return kernel_k;
 }
 
-static void
+static double
 pmzoom_ensure_pm(PMZoomRegion * zoom, double G)
 {
     const double base_asmth = zoom->BaseRcut / zoom->TreeRcut;
@@ -350,8 +331,6 @@ pmzoom_ensure_pm(PMZoomRegion * zoom, double G)
         petapm_init_with_allocator(&zoom->PM, zoom->TotalMeshSize, zoom->SplitAsmth, zoom->Nmesh, G, MPI_COMM_WORLD,
                                    zoom->WorkspaceAlloc);
         zoom->PMInitialized = 1;
-        zoom->KernelTotalMeshSize = 0;
-        zoom->KernelAsmthRatio = 0;
     }
     else {
         zoom->PM.BoxSize = zoom->TotalMeshSize;
@@ -360,8 +339,7 @@ pmzoom_ensure_pm(PMZoomRegion * zoom, double G)
         zoom->PM.G = G;
     }
 
-    if(!pmzoom_kernel_is_current(zoom, ratio))
-        pmzoom_fill_kernel(zoom, ratio);
+    return ratio;
 }
 
 void
@@ -370,7 +348,8 @@ pmzoom_force(PMZoomRegion * zoom, double G, const PetaPMParticleStruct * pstruct
     if(!zoom || !zoom->Enabled)
         return;
 
-    pmzoom_ensure_pm(zoom, G);
+    const double ratio = pmzoom_ensure_pm(zoom, G);
+    zoom->KernelK = pmzoom_fill_kernel(zoom, ratio);
 
     PetaPMParticleStruct zoom_pstruct = *pstruct;
     zoom_pstruct.RegionInd = NULL;
@@ -381,6 +360,8 @@ pmzoom_force(PMZoomRegion * zoom, double G, const PetaPMParticleStruct * pstruct
     CurrentPMZoom = zoom;
     petapm_force(&zoom->PM, pmzoom_prepare, &global_functions, pmzoom_functions, &zoom_pstruct, zoom);
     CurrentPMZoom = NULL;
+    myfree(zoom->KernelK);
+    zoom->KernelK = NULL;
     walltime_measure("/PMZoom");
 }
 
