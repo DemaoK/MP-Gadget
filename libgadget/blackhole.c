@@ -191,15 +191,30 @@ check_grav_bound(double dx[3], double dv[3], double da[3], const double atime)
 static int
 blackhole_haswork(int n, TreeWalk * tw){
     /*Black hole not being swallowed*/
-    return (P[n].Type == 5) && (!P[n].Swallowed);
+    if(P[n].Type != 5 || P[n].Swallowed)
+        return 0;
+#ifdef SIDM
+    /* SIDM BH seeding converts a type-1 particle after the hydro density/tree
+     * update. Defer normal BH physics until the next step, when the seed has a
+     * valid BH smoothing length and appears in the gas/BH tree.
+     */
+    const double atime = tw->priv ? *((double *) tw->priv) : 0;
+    if(BHP(n).SIDMSeedOrigin && BHP(n).FormationTime >= atime)
+        return 0;
+#else
+    (void) tw;
+#endif
+    return 1;
 }
 
 /* Build a list of active black holes, done once and reused for all the later treewalks.*/
 int
-blackholes_active(const ActiveParticles * act, int ** ActiveBlackHoles, int64_t * NumActiveBlackHoles)
+blackholes_active(const ActiveParticles * act, int ** ActiveBlackHoles, int64_t * NumActiveBlackHoles,
+        const double atime)
 {
     TreeWalk tw_bh[1] = {{0}};
     tw_bh->haswork = blackhole_haswork;
+    tw_bh->priv = (void *) &atime;
 
     /* Build the queue once, since it is really 'all black holes' and similar for all treewalks.*/
     treewalk_build_queue(tw_bh, act->ActiveParticle, act->NumActiveParticle, 0);
@@ -232,7 +247,7 @@ blackhole(const ActiveParticles * act, double atime, Cosmology * CP, ForceTree *
     /* Build the queue once, since it is really 'all black holes' and similar for all treewalks.*/
     int * ActiveBlackHoles = NULL;
     int64_t NumActiveBlackHoles = 0;
-    totbh = blackholes_active(act, &ActiveBlackHoles, &NumActiveBlackHoles);
+    totbh = blackholes_active(act, &ActiveBlackHoles, &NumActiveBlackHoles, atime);
     if(totbh == 0) {
         return;
     }

@@ -87,11 +87,11 @@ void set_fof_testpar(int FOFSaveParticles, double FOFHaloLinkingLength, int FOFH
 }
 
 static double
-get_primary_omega(const int primary_mask, const int64_t * global_count, const Cosmology * CP)
+get_primary_omega(const int primary_mask, const int64_t * global_count,
+        const int64_t global_separate_baryon_count, const Cosmology * CP)
 {
     const int baryon_mask = (1 << 0) | (1 << 4) | (1 << 5);
     const int supported_mask = baryon_mask | (1 << 1) | (1 << 2);
-    const int64_t global_baryon_count = global_count[0] + global_count[4] + global_count[5];
     const int64_t selected_baryon_count =
         ((primary_mask & (1 << 0)) ? global_count[0] : 0)
         + ((primary_mask & (1 << 4)) ? global_count[4] : 0)
@@ -106,7 +106,7 @@ get_primary_omega(const int primary_mask, const int64_t * global_count, const Co
 
     if(primary_mask & (1 << 1)) {
         omega += CP->OmegaCDM;
-        if(global_baryon_count == 0)
+        if(global_separate_baryon_count == 0)
             omega += CP->OmegaBaryon;
     }
 
@@ -119,32 +119,54 @@ get_primary_omega(const int primary_mask, const int64_t * global_count, const Co
     return omega;
 }
 
+static int
+fof_particle_is_separate_baryon(int i)
+{
+    if(P[i].Type == 0 || P[i].Type == 4)
+        return 1;
+    if(P[i].Type == 5) {
+#ifdef SIDM
+        if(SlotsManager->info[5].enabled && P[i].PI >= 0 && P[i].PI < SlotsManager->info[5].size)
+            return !BHP(i).SIDMSeedOrigin;
+#endif
+        return 1;
+    }
+    return 0;
+}
+
 static void
-get_global_particle_counts(const struct part_manager_type * PartManager, int64_t * global_count, MPI_Comm Comm)
+get_global_particle_counts(const struct part_manager_type * PartManager, int64_t * global_count,
+        int64_t * global_separate_baryon_count, MPI_Comm Comm)
 {
     int64_t local_count[6] = {0};
+    int64_t local_separate_baryon_count = 0;
 
     int64_t i;
-    #pragma omp parallel for reduction(+: local_count[:6])
+    #pragma omp parallel for reduction(+: local_count[:6]) reduction(+: local_separate_baryon_count)
     for(i = 0; i < PartManager->NumPart; i++) {
         if(P[i].IsGarbage)
             continue;
         if(P[i].Type >= 0 && P[i].Type < 6)
             local_count[P[i].Type]++;
+        if(fof_particle_is_separate_baryon(i))
+            local_separate_baryon_count++;
     }
 
     MPI_Allreduce(local_count, global_count, 6, MPI_INT64, MPI_SUM, Comm);
+    MPI_Allreduce(&local_separate_baryon_count, global_separate_baryon_count, 1, MPI_INT64, MPI_SUM, Comm);
 }
 
 double fof_get_mean_primary_separation(const struct part_manager_type * PartManager, const Cosmology * CP, int primary_mask)
 {
     int64_t local_count[6] = {0};
     int64_t global_count[6] = {0};
+    int64_t local_separate_baryon_count = 0;
+    int64_t global_separate_baryon_count = 0;
     double local_mass[6] = {0};
     double global_mass[6] = {0};
 
     int64_t i;
-    #pragma omp parallel for reduction(+: local_count[:6]) reduction(+: local_mass[:6])
+    #pragma omp parallel for reduction(+: local_count[:6]) reduction(+: local_mass[:6]) reduction(+: local_separate_baryon_count)
     for(i = 0; i < PartManager->NumPart; i++) {
         if(P[i].IsGarbage)
             continue;
@@ -152,10 +174,13 @@ double fof_get_mean_primary_separation(const struct part_manager_type * PartMana
             local_count[P[i].Type]++;
             local_mass[P[i].Type] += P[i].Mass;
         }
+        if(fof_particle_is_separate_baryon(i))
+            local_separate_baryon_count++;
     }
 
     MPI_Allreduce(local_count, global_count, 6, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
     MPI_Allreduce(local_mass, global_mass, 6, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(&local_separate_baryon_count, &global_separate_baryon_count, 1, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
 
     int64_t global_primary_count = 0;
     double global_primary_mass = 0;
@@ -173,7 +198,7 @@ double fof_get_mean_primary_separation(const struct part_manager_type * PartMana
         return 0;
     }
 
-    const double omega_primary = get_primary_omega(primary_mask, global_count, CP);
+    const double omega_primary = get_primary_omega(primary_mask, global_count, global_separate_baryon_count, CP);
     const double rho_primary = omega_primary * CP->RhoCrit;
     if(rho_primary <= 0) {
         message(0, "FOF linking normalization: primary mask %d has non-positive density: omega=%g RhoCrit=%g; using zero linking length.\n",
@@ -1300,8 +1325,9 @@ fof_compile_catalogue(struct FOFGroups * fof, const int NgroupsExt,
 #ifdef SIDM
     if(sidm_bhseed_is_enabled()) {
         int64_t global_count[6] = {0};
-        get_global_particle_counts(PartManager, global_count, Comm);
-        const double omega_type1 = get_primary_omega(1 << 1, global_count, CP);
+        int64_t global_separate_baryon_count = 0;
+        get_global_particle_counts(PartManager, global_count, &global_separate_baryon_count, Comm);
+        const double omega_type1 = get_primary_omega(1 << 1, global_count, global_separate_baryon_count, CP);
         message(0, "SIDM BH profile normalization: type-1 omega %g\n", omega_type1);
         fof_clear_sidm_vmax_profiles(fof->Group, NgroupsExt);
         fof_accumulate_sidm_vmax_profiles(fof, NgroupsExt, HaloLabel, CP, omega_type1);

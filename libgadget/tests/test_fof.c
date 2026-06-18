@@ -171,6 +171,87 @@ test_fof_linking_uses_cdm_density_when_baryons_are_separate(void **state)
 }
 
 static void
+test_fof_linking_uses_cdm_density_when_bh_baryons_are_separate(void **state)
+{
+    (void) state;
+    const int NumPrimary = 8;
+    const int NumBH = 1;
+    const double BoxSize = 100;
+    const double MeanSeparation = 2;
+
+    set_fof_testpar(1, 0.2, 5);
+    particle_alloc_memory(PartManager, BoxSize, NumPrimary + NumBH);
+    PartManager->NumPart = NumPrimary + NumBH;
+
+    int i;
+    for(i = 0; i < NumPrimary; i++) {
+        P[i].Type = 1;
+        P[i].Mass = 1;
+        P[i].IsGarbage = 0;
+    }
+    P[i].Type = 5;
+    P[i].Mass = 1;
+    P[i].IsGarbage = 0;
+
+    Cosmology CP = {0};
+    CP.Omega0 = 1.0;
+    CP.OmegaBaryon = 0.1;
+    CP.OmegaCDM = 0.8;
+    CP.RhoCrit = 1 / pow(MeanSeparation, 3) / CP.OmegaCDM;
+
+    const double mean_separation = fof_get_mean_primary_separation(PartManager, &CP, 1 << 1);
+    assert_true(fabs(mean_separation - MeanSeparation) < 1e-12);
+
+    myfree(P);
+}
+
+#ifdef SIDM
+static void
+test_fof_linking_ignores_sidm_type5_when_detecting_separate_baryons(void **state)
+{
+    (void) state;
+    const int NumPrimary = 8;
+    const int NumBH = 1;
+    const double BoxSize = 100;
+    const double MeanSeparation = 2;
+
+    set_fof_testpar(1, 0.2, 5);
+    particle_alloc_memory(PartManager, BoxSize, NumPrimary + NumBH);
+    PartManager->NumPart = NumPrimary + NumBH;
+
+    int i;
+    for(i = 0; i < NumPrimary; i++) {
+        P[i].Type = 1;
+        P[i].Mass = 1;
+        P[i].IsGarbage = 0;
+    }
+    P[i].Type = 5;
+    P[i].Mass = 1;
+    P[i].IsGarbage = 0;
+    P[i].PI = 0;
+
+    slots_init(0.01 * PartManager->MaxPart, SlotsManager);
+    slots_set_enabled(5, sizeof(struct bh_particle_data), SlotsManager);
+    int64_t newSlots[6] = {0, 0, 0, 0, 0, NumBH};
+    slots_reserve(0, newSlots, SlotsManager);
+    SlotsManager->info[5].size = NumBH;
+    BhP[0].SIDMSeedOrigin = 1;
+
+    Cosmology CP = {0};
+    CP.Omega0 = 1.0;
+    CP.OmegaBaryon = 0.1;
+    CP.OmegaCDM = 0.8;
+    CP.RhoCrit = 1 / pow(MeanSeparation, 3) / (CP.OmegaCDM + CP.OmegaBaryon);
+
+    const double mean_separation = fof_get_mean_primary_separation(PartManager, &CP, 1 << 1);
+    assert_true(fabs(mean_separation - MeanSeparation) < 1e-12);
+
+    slots_free(SlotsManager);
+    myfree(P);
+}
+#endif
+
+static void
 test_fof(void **state)
 {
     int NTask;
@@ -215,6 +296,10 @@ int main(void) {
         cmocka_unit_test(test_fof_linking_uses_primary_mass_density),
         cmocka_unit_test(test_fof_linking_handles_massive_neutrino_density),
         cmocka_unit_test(test_fof_linking_uses_cdm_density_when_baryons_are_separate),
+        cmocka_unit_test(test_fof_linking_uses_cdm_density_when_bh_baryons_are_separate),
+#ifdef SIDM
+        cmocka_unit_test(test_fof_linking_ignores_sidm_type5_when_detecting_separate_baryons),
+#endif
         cmocka_unit_test(test_fof),
     };
     return cmocka_run_group_tests_mpi(tests, NULL, NULL);
