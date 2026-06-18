@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <math.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -14,6 +15,10 @@
 
 #include "walltime.h"
 #include "blackhole.h"
+#ifdef SIDM
+#include "gravity.h"
+#include "sidm_bhseed.h"
+#endif
 #include "domain.h"
 #include "winds.h"
 
@@ -112,6 +117,23 @@ get_primary_omega(const int primary_mask, const int64_t * global_count, const Co
         omega += get_omega_nu(&CP->ONu, 1);
 
     return omega;
+}
+
+static void
+get_global_particle_counts(const struct part_manager_type * PartManager, int64_t * global_count, MPI_Comm Comm)
+{
+    int64_t local_count[6] = {0};
+
+    int64_t i;
+    #pragma omp parallel for reduction(+: local_count[:6])
+    for(i = 0; i < PartManager->NumPart; i++) {
+        if(P[i].IsGarbage)
+            continue;
+        if(P[i].Type >= 0 && P[i].Type < 6)
+            local_count[P[i].Type]++;
+    }
+
+    MPI_Allreduce(local_count, global_count, 6, MPI_INT64, MPI_SUM, Comm);
 }
 
 double fof_get_mean_primary_separation(const struct part_manager_type * PartManager, const Cosmology * CP, int primary_mask)
@@ -218,7 +240,9 @@ static void fof_reduce_groups(
 static void fof_finish_group_properties(FOFGroups * fof, double BoxSize);
 
 static int fof_compile_base(struct BaseGroup * base, int NgroupsExt, struct fof_particle_list * HaloLabel, MPI_Comm Comm);
-static void fof_compile_catalogue(FOFGroups * fof, const int NgroupsExt, struct fof_particle_list * HaloLabel, MPI_Comm Comm);
+static void fof_compile_catalogue(FOFGroups * fof, const int NgroupsExt,
+    struct fof_particle_list * HaloLabel, Cosmology * CP, const DriftKickTimes * times,
+    MPI_Comm Comm);
 
 static struct Group *
 fof_alloc_group(const struct BaseGroup * base, const int NgroupsExt);
@@ -257,7 +281,8 @@ static MPI_Datatype MPI_TYPE_GROUP;
  **/
 
 FOFGroups
-fof_fof(DomainDecomp * ddecomp, const int StoreGrNr, MPI_Comm Comm)
+fof_fof(DomainDecomp * ddecomp, const int StoreGrNr, Cosmology * CP,
+    const DriftKickTimes * times, MPI_Comm Comm)
 {
     int i;
 
@@ -341,7 +366,7 @@ fof_fof(DomainDecomp * ddecomp, const int StoreGrNr, MPI_Comm Comm)
 
     myfree(base);
 
-    fof_compile_catalogue(&fof, NgroupsExt, HaloLabel, Comm);
+    fof_compile_catalogue(&fof, NgroupsExt, HaloLabel, CP, times, Comm);
 
     MPIU_Barrier(Comm);
     message(0, "Finished FoF. Group properties are now allocated.. (presently allocated=%g MB)\n",
@@ -687,6 +712,23 @@ static void fof_reduce_base_group(void * pdst, void * psrc) {
     /* preserve the dst FirstPos so all other base group gets the same FirstPos */
 }
 
+#ifdef SIDM
+static int
+fof_sidm_clock_is_better(double mass, double progress, double last_check,
+    double ref_mass, double ref_progress, double ref_last_check)
+{
+    if(mass > ref_mass)
+        return 1;
+    if(mass < ref_mass)
+        return 0;
+    if(progress > ref_progress)
+        return 1;
+    if(progress < ref_progress)
+        return 0;
+    return last_check > ref_last_check;
+}
+#endif
+
 static void fof_reduce_group(void * pdst, void * psrc) {
     struct Group * gdst = (struct Group *) pdst;
     struct Group * gsrc = (struct Group *) psrc;
@@ -716,6 +758,24 @@ static void fof_reduce_group(void * pdst, void * psrc) {
         gdst->seed_index = gsrc->seed_index;
         gdst->seed_task = gsrc->seed_task;
     }
+#ifdef SIDM
+    if(gsrc->SIDMSeedPotential < gdst->SIDMSeedPotential)
+    {
+        gdst->SIDMSeedPotential = gsrc->SIDMSeedPotential;
+        for(j = 0; j < 3; j++)
+            gdst->SIDMSeedPos[j] = gsrc->SIDMSeedPos[j];
+        gdst->sidm_seed_index = gsrc->sidm_seed_index;
+        gdst->sidm_seed_task = gsrc->sidm_seed_task;
+    }
+    if(fof_sidm_clock_is_better(gsrc->SIDMBHClockFoFMass, gsrc->SIDMBHCollapseProgress,
+        gsrc->SIDMBHLastCheckTime, gdst->SIDMBHClockFoFMass,
+        gdst->SIDMBHCollapseProgress, gdst->SIDMBHLastCheckTime)) {
+        gdst->SIDMBHCollapseProgress = gsrc->SIDMBHCollapseProgress;
+        gdst->SIDMBHLastCheckTime = gsrc->SIDMBHLastCheckTime;
+        gdst->SIDMBHClockID = gsrc->SIDMBHClockID;
+        gdst->SIDMBHClockFoFMass = gsrc->SIDMBHClockFoFMass;
+    }
+#endif
 
     int d1, d2;
     for(d1 = 0; d1 < 3; d1++)
@@ -739,6 +799,14 @@ static void add_particle_to_group(struct Group * gdst, int i, int ThisTask) {
         memset(gdst, 0, sizeof(gdst[0]));
         gdst->base = base;
         gdst->seed_index = gdst->seed_task = -1;
+#ifdef SIDM
+        gdst->SIDMSeedPotential = LARGE;
+        for(int j = 0; j < 3; j++)
+            gdst->SIDMSeedPos[j] = 0;
+        gdst->sidm_seed_index = gdst->sidm_seed_task = -1;
+        gdst->SIDMBHClockID = 0;
+        gdst->SIDMBHClockFoFMass = 0;
+#endif
     }
 
     gdst->Length ++;
@@ -766,6 +834,26 @@ static void add_particle_to_group(struct Group * gdst, int i, int ThisTask) {
         gdst->BH_Mdot += BHP(index).Mdot;
         gdst->BH_Mass += BHP(index).Mass;
     }
+#ifdef SIDM
+    if(P[index].Type == 1 && P[index].Potential < gdst->SIDMSeedPotential)
+    {
+        gdst->SIDMSeedPotential = P[index].Potential;
+        for(int j = 0; j < 3; j++)
+            gdst->SIDMSeedPos[j] = P[index].Pos[j];
+        gdst->sidm_seed_index = index;
+        gdst->sidm_seed_task = ThisTask;
+    }
+    if(P[index].Type == 1 &&
+       fof_sidm_clock_is_better(P[index].SIDMBHClockFoFMass,
+        P[index].SIDMBHCollapseProgress, P[index].SIDMBHLastCheckTime,
+        gdst->SIDMBHClockFoFMass, gdst->SIDMBHCollapseProgress,
+        gdst->SIDMBHLastCheckTime)) {
+        gdst->SIDMBHCollapseProgress = P[index].SIDMBHCollapseProgress;
+        gdst->SIDMBHLastCheckTime = P[index].SIDMBHLastCheckTime;
+        gdst->SIDMBHClockID = P[index].ID;
+        gdst->SIDMBHClockFoFMass = P[index].SIDMBHClockFoFMass;
+    }
+#endif
     /*This used to depend on black holes being enabled, but I do not see why.
      * I think because it is only useful for seeding*/
     /* Don't make bh in wind.*/
@@ -972,12 +1060,223 @@ static void fof_set_escapefraction(struct FOFGroups * fof, const int NgroupsExt,
 }
 #endif
 
+#ifdef SIDM
+static int
+fof_lower_bound_halo_label(struct fof_particle_list * HaloLabel, int n, MyIDType minid)
+{
+    int left = 0;
+    int right = n;
+    while(left < right) {
+        int mid = left + (right - left) / 2;
+        if(HaloLabel[mid].MinID < minid)
+            left = mid + 1;
+        else
+            right = mid;
+    }
+    return left;
+}
+
+static double
+fof_sidm_group_r200(const struct Group * group, Cosmology * CP, const double omega_type1)
+{
+    const double mhalo = group->MassType[1];
+    if(mhalo <= 0 || CP == NULL)
+        return 0;
+
+    const double rho_ref_comoving = 200.0 * omega_type1 * CP->RhoCrit;
+    if(rho_ref_comoving <= 0)
+        return 0;
+    return cbrt(3.0 * mhalo / (4.0 * M_PI * rho_ref_comoving));
+}
+
+static int
+fof_sidm_vmax_radii(const struct Group * group, Cosmology * CP,
+        const double omega_type1, double radii[SIDM_VMAX_PROFILE_BINS])
+{
+    const double r200 = fof_sidm_group_r200(group, CP, omega_type1);
+    if(r200 <= 0)
+        return 0;
+
+    double rmin = 0.03 * r200;
+    const double soft = FORCE_SOFTENING_TYPE(1);
+    if(4.0 * soft > rmin)
+        rmin = 4.0 * soft;
+    if(rmin <= 0 || r200 <= 1.5 * rmin)
+        return 0;
+
+    const double lmin = log(rmin);
+    const double dl = (log(r200) - lmin) / (SIDM_VMAX_PROFILE_BINS - 1);
+    for(int i = 0; i < SIDM_VMAX_PROFILE_BINS; i++)
+        radii[i] = exp(lmin + i * dl);
+    return 1;
+}
+
 static void
-fof_compile_catalogue(struct FOFGroups * fof, const int NgroupsExt, struct fof_particle_list * HaloLabel, MPI_Comm Comm)
+fof_clear_sidm_vmax_profiles(struct Group * Group, const int NgroupsExt)
+{
+#pragma omp parallel for
+    for(int i = 0; i < NgroupsExt; i++) {
+        for(int j = 0; j < SIDM_VMAX_PROFILE_BINS; j++) {
+            Group[i].SIDMVmaxProfileMass[j] = 0;
+            Group[i].SIDMVmaxProfileCount[j] = 0;
+        }
+        Group[i].SIDMVmax = 0;
+        Group[i].SIDMRmax = 0;
+        Group[i].SIDMVmaxProfileRMin = 0;
+        Group[i].SIDMVmaxProfileRMax = 0;
+        Group[i].SIDMVmaxProfileBins = 0;
+    }
+}
+
+static void
+fof_add_sidm_vmax_profile_bin(struct Group * group, int pindex, Cosmology * CP,
+        const double omega_type1)
+{
+    if(P[pindex].Type != 1)
+        return;
+
+    double radii[SIDM_VMAX_PROFILE_BINS];
+    if(!fof_sidm_vmax_radii(group, CP, omega_type1, radii))
+        return;
+
+    double r2 = 0;
+    for(int k = 0; k < 3; k++) {
+        const double dx = NEAREST(P[pindex].Pos[k] - group->SIDMSeedPos[k], PartManager->BoxSize);
+        r2 += dx * dx;
+    }
+    const double r = sqrt(r2);
+    if(r > radii[SIDM_VMAX_PROFILE_BINS - 1])
+        return;
+
+    int bin = SIDM_VMAX_PROFILE_BINS - 1;
+    for(int j = 0; j < SIDM_VMAX_PROFILE_BINS; j++) {
+        if(r <= radii[j]) {
+            bin = j;
+            break;
+        }
+    }
+    group->SIDMVmaxProfileMass[bin] += P[pindex].Mass;
+    group->SIDMVmaxProfileCount[bin] += 1;
+}
+
+static void
+fof_accumulate_sidm_vmax_profiles(struct FOFGroups * fof, const int NgroupsExt,
+        struct fof_particle_list * HaloLabel, Cosmology * CP, const double omega_type1)
+{
+    if(CP == NULL)
+        return;
+
+    for(int i = 0; i < NgroupsExt; i++) {
+        struct Group * group = &fof->Group[i];
+        if(group->sidm_seed_index < 0 || group->MassType[1] < sidm_bhseed_min_fof_mass())
+            continue;
+
+        int start = fof_lower_bound_halo_label(HaloLabel, PartManager->NumPart, group->base.MinID);
+        for(; start < PartManager->NumPart; start++) {
+            if(HaloLabel[start].MinID != group->base.MinID)
+                break;
+            fof_add_sidm_vmax_profile_bin(group, HaloLabel[start].Pindex, CP, omega_type1);
+        }
+    }
+}
+
+static void
+fof_reduce_sidm_vmax_profile(void * pdst, void * psrc)
+{
+    struct Group * gdst = (struct Group *) pdst;
+    struct Group * gsrc = (struct Group *) psrc;
+    for(int j = 0; j < SIDM_VMAX_PROFILE_BINS; j++) {
+        gdst->SIDMVmaxProfileMass[j] += gsrc->SIDMVmaxProfileMass[j];
+        gdst->SIDMVmaxProfileCount[j] += gsrc->SIDMVmaxProfileCount[j];
+    }
+}
+
+static void
+fof_sidm_copy_owner_profile_state(void * pdst, void * psrc)
+{
+    /* fof_reduce_groups copies the reduced owner state back to ghost entries after this no-op reducer. */
+    (void) pdst;
+    (void) psrc;
+}
+
+static void
+fof_measure_one_sidm_vmax_profile(struct Group * group, Cosmology * CP,
+        const double omega_type1)
+{
+    double radii[SIDM_VMAX_PROFILE_BINS];
+    if(!fof_sidm_vmax_radii(group, CP, omega_type1, radii))
+        return;
+
+    double enclosed_mass = 0;
+    double best_vmax2 = 0;
+    double best_rmax = 0;
+    int nonempty_bins = 0;
+
+    for(int j = 0; j < SIDM_VMAX_PROFILE_BINS; j++) {
+        if(group->SIDMVmaxProfileMass[j] > 0 || group->SIDMVmaxProfileCount[j] > 0)
+            nonempty_bins++;
+        enclosed_mass += group->SIDMVmaxProfileMass[j];
+        if(enclosed_mass <= 0 || radii[j] <= 0)
+            continue;
+        const double vmax2 = CP->GravInternal * enclosed_mass / radii[j];
+        if(vmax2 > best_vmax2) {
+            best_vmax2 = vmax2;
+            best_rmax = radii[j];
+        }
+    }
+
+    if(best_vmax2 > 0 && best_rmax > 0) {
+        group->SIDMVmax = sqrt(best_vmax2);
+        group->SIDMRmax = best_rmax;
+        group->SIDMVmaxProfileRMin = radii[0];
+        group->SIDMVmaxProfileRMax = radii[SIDM_VMAX_PROFILE_BINS - 1];
+        group->SIDMVmaxProfileBins = nonempty_bins;
+    }
+}
+
+static void
+fof_measure_sidm_vmax_profiles(struct FOFGroups * fof, const int NgroupsExt,
+        Cosmology * CP, const double omega_type1, MPI_Comm Comm)
+{
+    if(CP == NULL)
+        return;
+
+    int ThisTask;
+    MPI_Comm_rank(Comm, &ThisTask);
+
+    int nlocal_candidates = 0;
+    int nlocal_measured = 0;
+    for(int i = 0; i < NgroupsExt; i++) {
+        struct Group * group = &fof->Group[i];
+        if(group->base.MinIDTask != ThisTask)
+            continue;
+        if(group->MassType[1] < sidm_bhseed_min_fof_mass() || group->sidm_seed_index < 0)
+            continue;
+        nlocal_candidates++;
+        fof_measure_one_sidm_vmax_profile(group, CP, omega_type1);
+        if(group->SIDMVmax > 0 && group->SIDMRmax > 0)
+            nlocal_measured++;
+    }
+
+    int ntot_candidates = nlocal_candidates;
+    int ntot_measured = nlocal_measured;
+    MPI_Allreduce(MPI_IN_PLACE, &ntot_candidates, 1, MPI_INT, MPI_SUM, Comm);
+    MPI_Allreduce(MPI_IN_PLACE, &ntot_measured, 1, MPI_INT, MPI_SUM, Comm);
+    message(0, "SIDM BH Vmax profiles: %d/%d candidate halos measured.\n",
+        ntot_measured, ntot_candidates);
+}
+
+#endif
+
+static void
+fof_compile_catalogue(struct FOFGroups * fof, const int NgroupsExt,
+        struct fof_particle_list * HaloLabel, Cosmology * CP, const DriftKickTimes * times,
+        MPI_Comm Comm)
 {
     int i, start, ThisTask;
 
     MPI_Comm_rank(Comm, &ThisTask);
+    (void) times;
 
     start = 0;
     for(i = 0; i < NgroupsExt; i++)
@@ -997,6 +1296,20 @@ fof_compile_catalogue(struct FOFGroups * fof, const int NgroupsExt, struct fof_p
 
     /* collect global properties */
     fof_reduce_groups(fof->Group, NgroupsExt, sizeof(fof->Group[0]), fof_reduce_group, Comm);
+
+#ifdef SIDM
+    if(sidm_bhseed_is_enabled()) {
+        int64_t global_count[6] = {0};
+        get_global_particle_counts(PartManager, global_count, Comm);
+        const double omega_type1 = get_primary_omega(1 << 1, global_count, CP);
+        message(0, "SIDM BH profile normalization: type-1 omega %g\n", omega_type1);
+        fof_clear_sidm_vmax_profiles(fof->Group, NgroupsExt);
+        fof_accumulate_sidm_vmax_profiles(fof, NgroupsExt, HaloLabel, CP, omega_type1);
+        fof_reduce_groups(fof->Group, NgroupsExt, sizeof(fof->Group[0]), fof_reduce_sidm_vmax_profile, Comm);
+        fof_measure_sidm_vmax_profiles(fof, NgroupsExt, CP, omega_type1, Comm);
+        fof_reduce_groups(fof->Group, NgroupsExt, sizeof(fof->Group[0]), fof_sidm_copy_owner_profile_state, Comm);
+    }
+#endif
 
     /* count Groups and number of particles hosted by me */
     fof->Ngroups = 0;
@@ -1435,6 +1748,15 @@ static int cmp_seed_task(const void * c1, const void * c2) {
     return g1->seed_task - g2->seed_task;
 }
 
+#ifdef SIDM
+static int cmp_sidm_seed_task(const void * c1, const void * c2) {
+    const struct Group * g1 = (const struct Group *) c1;
+    const struct Group * g2 = (const struct Group *) c2;
+
+    return g1->sidm_seed_task - g2->sidm_seed_task;
+}
+#endif
+
 static void fof_seed_make_one(struct Group * g, int ThisTask, const double atime, const RandTable * const rnd) {
    if(g->seed_task != ThisTask) {
         endrun(7771, "Seed does not belong to the right task");
@@ -1549,6 +1871,171 @@ void fof_seed(FOFGroups * fof, ActiveParticles * act, double atime, const RandTa
 
     walltime_measure("/FOF/Seeding");
 }
+
+#ifdef SIDM
+static int
+fof_seed_sidm_make_one(struct Group * g, int ThisTask, const double atime,
+        Cosmology * CP, const struct UnitSystem units)
+{
+   if(g->sidm_seed_task != ThisTask) {
+        endrun(7775, "SIDM seed does not belong to the right task");
+    }
+    int index = g->sidm_seed_index;
+    struct SIDMBHSeedResult seed = sidm_bhseed_evaluate_candidate(index, g, atime, CP, units);
+    if(seed.should_seed) {
+        blackhole_make_one_sidm(index, atime, &seed);
+        return 1;
+    }
+    message(1, "SIDM BH seed skipped for candidate ID %llu: progress=%g tc=%g MclockDM=%g prev_MclockDM=%g major_merger=%d jump=%g gamma=%g VmaxFoF=%g VmaxInternal=%g RmaxComoving=%g VmaxBins=%d rsComoving=%g rho_sComoving=%g MsmfpAnalytic=%g Rreservoir=%g Ndm=%d\n",
+        (unsigned long long) P[index].ID, seed.collapse_progress, seed.collapse_time,
+        seed.clock_fof_mass, seed.previous_clock_fof_mass,
+        seed.major_merger, seed.merger_mass_jump, seed.merger_gamma,
+        seed.halo_vmax, seed.halo_vmax_internal, seed.halo_rmax, seed.vmax_profile_bins,
+        seed.nfw_scale_radius, seed.nfw_scale_density,
+        seed.smfp_mass, seed.reservoir_radius, seed.num_dm);
+    return 0;
+}
+
+void fof_seed_sidm(FOFGroups * fof, ActiveParticles * act, double atime, Cosmology * CP, const DriftKickTimes * times, const struct UnitSystem units, MPI_Comm Comm)
+{
+    (void) times;
+    if(!sidm_bhseed_is_enabled())
+        return;
+
+    int i, j, n;
+    int NTask;
+    MPI_Comm_size(Comm, &NTask);
+
+    char * Marked = (char *) mymalloc2("SIDMSeedMark", fof->Ngroups);
+
+    int Nexport = 0;
+#pragma omp parallel for reduction(+:Nexport)
+    for(i = 0; i < fof->Ngroups; i++)
+    {
+        Marked[i] =
+            (fof->Group[i].MassType[1] >= sidm_bhseed_min_fof_mass())
+        &&  (fof->Group[i].LenType[5] == 0)
+        &&  (fof->Group[i].sidm_seed_index >= 0)
+        &&  (fof->Group[i].sidm_seed_task >= 0);
+
+        if(Marked[i]) Nexport ++;
+    }
+    struct Group * ExportGroups = (struct Group *) mymalloc("SIDMSeedExport", sizeof(fof->Group[0]) * Nexport);
+    j = 0;
+    for(i = 0; i < fof->Ngroups; i ++) {
+        if(Marked[i]) {
+            ExportGroups[j] = fof->Group[i];
+            j++;
+        }
+    }
+    myfree(Marked);
+
+    qsort_openmp(ExportGroups, Nexport, sizeof(ExportGroups[0]), cmp_sidm_seed_task);
+
+    int * Send_count = ta_malloc("SIDMSeedSend_count", int, NTask);
+    int * Recv_count = ta_malloc("SIDMSeedRecv_count", int, NTask);
+
+    memset(Send_count, 0, NTask * sizeof(int));
+    for(i = 0; i < Nexport; i++) {
+        Send_count[ExportGroups[i].sidm_seed_task]++;
+    }
+
+    MPI_Alltoall(Send_count, 1, MPI_INT, Recv_count, 1, MPI_INT, Comm);
+
+    int Nimport = 0;
+    for(j = 0;  j < NTask; j++)
+        Nimport += Recv_count[j];
+
+    struct Group * ImportGroups = (struct Group *)
+            mymalloc2("SIDMSeedImportGroups", Nimport * sizeof(struct Group));
+
+    MPI_Alltoallv_smart(ExportGroups, Send_count, NULL, MPI_TYPE_GROUP,
+                        ImportGroups, Recv_count, NULL, MPI_TYPE_GROUP,
+                        Comm);
+
+    myfree(ExportGroups);
+    ta_free(Recv_count);
+    ta_free(Send_count);
+
+    int ntot_candidates = 0;
+    MPI_Allreduce(&Nimport, &ntot_candidates, 1, MPI_INT, MPI_SUM, Comm);
+    message(0, "SIDM BH seeding evaluating %d candidate halos.\n", ntot_candidates);
+
+    if(Nimport + SlotsManager->info[5].size > SlotsManager->info[5].maxsize)
+    {
+        int *ActiveParticle_tmp=NULL;
+        if(act->ActiveParticle) {
+            ActiveParticle_tmp = (int *) mymalloc2("SIDMActiveParticle_tmp", act->NumActiveParticle * sizeof(int));
+            memmove(ActiveParticle_tmp, act->ActiveParticle, act->NumActiveParticle * sizeof(int));
+            myfree(act->ActiveParticle);
+        }
+
+        int64_t atleast[6];
+        int64_t ii;
+        for(ii = 0; ii < 6; ii++)
+            atleast[ii] = SlotsManager->info[ii].maxsize;
+        atleast[5] += ntot_candidates*1.1 + 1;
+        slots_reserve(1, atleast, SlotsManager);
+
+        if(ActiveParticle_tmp) {
+            act->ActiveParticle = (int *) mymalloc("ActiveParticle", sizeof(int)*(act->NumActiveParticle + PartManager->MaxPart - PartManager->NumPart));
+            memmove(act->ActiveParticle, ActiveParticle_tmp, act->NumActiveParticle * sizeof(int));
+            myfree(ActiveParticle_tmp);
+        }
+    }
+
+    int ThisTask;
+    MPI_Comm_rank(Comm, &ThisTask);
+
+    MyIDType * LocalSeededMinIDs = (MyIDType *) mymalloc("SIDMSeededMinIDs",
+        (Nimport > 0 ? Nimport : 1) * sizeof(MyIDType));
+    int Nmade = 0;
+    for(n = 0; n < Nimport; n++) {
+        if(fof_seed_sidm_make_one(&ImportGroups[n], ThisTask, atime, CP, units))
+            LocalSeededMinIDs[Nmade++] = ImportGroups[n].base.MinID;
+    }
+
+    int NmadeTot = Nmade;
+    MPI_Allreduce(MPI_IN_PLACE, &NmadeTot, 1, MPI_INT, MPI_SUM, Comm);
+    if(NmadeTot > 0) {
+        const int local_seeded_bytes = Nmade * (int) sizeof(MyIDType);
+        int * SeededByteCount = ta_malloc("SIDMSeededByteCount", int, NTask);
+        int * SeededByteOffset = ta_malloc("SIDMSeededByteOffset", int, NTask);
+        MPI_Allgather(&local_seeded_bytes, 1, MPI_INT, SeededByteCount, 1, MPI_INT, Comm);
+
+        int total_seeded_bytes = 0;
+        for(i = 0; i < NTask; i++) {
+            SeededByteOffset[i] = total_seeded_bytes;
+            total_seeded_bytes += SeededByteCount[i];
+        }
+
+        MyIDType * AllSeededMinIDs = (MyIDType *) mymalloc("SIDMSeededMinIDsAll",
+            total_seeded_bytes > 0 ? total_seeded_bytes : 1);
+        MPI_Allgatherv(LocalSeededMinIDs, local_seeded_bytes, MPI_BYTE,
+            AllSeededMinIDs, SeededByteCount, SeededByteOffset, MPI_BYTE, Comm);
+
+        const int total_seeded_ids = total_seeded_bytes / (int) sizeof(MyIDType);
+        for(i = 0; i < fof->Ngroups; i++) {
+            for(j = 0; j < total_seeded_ids; j++) {
+                if(fof->Group[i].base.MinID == AllSeededMinIDs[j]) {
+                    fof->Group[i].seed_index = -1;
+                    fof->Group[i].seed_task = -1;
+                    break;
+                }
+            }
+        }
+
+        myfree(AllSeededMinIDs);
+        ta_free(SeededByteOffset);
+        ta_free(SeededByteCount);
+    }
+    message(0, "SIDM BH seeding made %d new black hole particles.\n", NmadeTot);
+
+    myfree(LocalSeededMinIDs);
+    myfree(ImportGroups);
+    walltime_measure("/FOF/SIDMSeeding");
+}
+#endif
 
 static int fof_compare_HaloLabel_MinID(const void *a, const void *b)
 {

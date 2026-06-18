@@ -866,6 +866,12 @@ SIMPLE_GETTER(GTSIDMPartnerDist, SIDMPartnerDist, double, 1, struct particle_dat
 SIMPLE_SETTER(STSIDMPartnerDist, SIDMPartnerDist, double, 1, struct particle_data)
 SIMPLE_GETTER(GTSIDMScattered, Scattered, int, 1, struct particle_data)
 SIMPLE_SETTER(STSIDMScattered, Scattered, int, 1, struct particle_data)
+SIMPLE_GETTER(GTSIDMBHCollapseProgress, SIDMBHCollapseProgress, double, 1, struct particle_data)
+SIMPLE_SETTER(STSIDMBHCollapseProgress, SIDMBHCollapseProgress, double, 1, struct particle_data)
+SIMPLE_GETTER(GTSIDMBHLastCheckTime, SIDMBHLastCheckTime, double, 1, struct particle_data)
+SIMPLE_SETTER(STSIDMBHLastCheckTime, SIDMBHLastCheckTime, double, 1, struct particle_data)
+SIMPLE_GETTER(GTSIDMBHClockFoFMass, SIDMBHClockFoFMass, double, 1, struct particle_data)
+SIMPLE_SETTER(STSIDMBHClockFoFMass, SIDMBHClockFoFMass, double, 1, struct particle_data)
 #endif
 SIMPLE_GETTER(GTPotential, Potential, float, 1, struct particle_data)
 SIMPLE_GETTER(GTTimeBinHydro, TimeBinHydro, int, 1, struct particle_data)
@@ -896,6 +902,23 @@ SIMPLE_PROPERTY_PI(BlackholeJumpToMinPot, JumpToMinPot, int, 1, struct bh_partic
 SIMPLE_PROPERTY_PI(BlackholeMtrack, Mtrack, float, 1, struct bh_particle_data)
 SIMPLE_PROPERTY_PI(BlackholeMseed, Mseed, float, 1, struct bh_particle_data)
 SIMPLE_PROPERTY_PI(BlackholeKineticFdbkEnergy, KineticFdbkEnergy, float, 1, struct bh_particle_data)
+#ifdef SIDM
+SIMPLE_PROPERTY_PI(SIDMBHSeedOrigin, SIDMSeedOrigin, int, 1, struct bh_particle_data)
+SIMPLE_PROPERTY_PI(SIDMBHSeedTrigger, SIDMSeedTrigger, int, 1, struct bh_particle_data)
+SIMPLE_PROPERTY_PI(SIDMSMFPMassInitial, SIDMSMFPMassInitial, float, 1, struct bh_particle_data)
+SIMPLE_PROPERTY_PI(SIDMSMFPRadius, SIDMSMFPRadius, float, 1, struct bh_particle_data)
+SIMPLE_PROPERTY_PI(SIDMDarkReservoirMass, SIDMDarkReservoirMass, float, 1, struct bh_particle_data)
+SIMPLE_PROPERTY_PI(SIDMDarkReservoirInitial, SIDMDarkReservoirInitial, float, 1, struct bh_particle_data)
+SIMPLE_PROPERTY_PI(SIDMDarkMdot, SIDMDarkMdot, float, 1, struct bh_particle_data)
+SIMPLE_PROPERTY_PI(SIDMRhoInf, SIDMRhoInf, float, 1, struct bh_particle_data)
+SIMPLE_PROPERTY_PI(SIDMSoundSpeedInf, SIDMSoundSpeedInf, float, 1, struct bh_particle_data)
+SIMPLE_PROPERTY_PI(SIDMReservoirRadius, SIDMReservoirRadius, float, 1, struct bh_particle_data)
+SIMPLE_PROPERTY_PI(SIDMGasDynMassDebt, SIDMGasDynMassDebt, float, 1, struct bh_particle_data)
+SIMPLE_PROPERTY_PI(SIDMDMDynMassDebt, SIDMDMDynMassDebt, float, 1, struct bh_particle_data)
+SIMPLE_PROPERTY_PI(SIDMCollapseProgress, SIDMCollapseProgress, float, 1, struct bh_particle_data)
+SIMPLE_PROPERTY_PI(SIDMCollapseTime, SIDMCollapseTime, float, 1, struct bh_particle_data)
+SIMPLE_PROPERTY_PI(SIDMClockFoFMass, SIDMClockFoFMass, float, 1, struct bh_particle_data)
+#endif
 
 SIMPLE_SETTER_PI(STBlackholeMinPotPos , MinPotPos[0], double, 3, struct bh_particle_data)
 
@@ -1050,6 +1073,9 @@ void register_io_blocks(struct IOTable * IOTable, int WriteGroupID, int MetalRet
     IO_REG_NONFATAL(SIDMPartner, "u8", 1, 1, IOTable);
     IO_REG_NONFATAL(SIDMPartnerDist, "f8", 1, 1, IOTable);
     IO_REG_NONFATAL(SIDMScattered, "i4", 1, 1, IOTable);
+    IO_REG_NONFATAL(SIDMBHCollapseProgress, "f8", 1, 1, IOTable);
+    IO_REG_NONFATAL(SIDMBHLastCheckTime, "f8", 1, 1, IOTable);
+    IO_REG_NONFATAL(SIDMBHClockFoFMass, "f8", 1, 1, IOTable);
 #endif
 
     IO_REG(Generation,       "u1", 1, 0, IOTable);
@@ -1108,6 +1134,23 @@ void register_io_blocks(struct IOTable * IOTable, int WriteGroupID, int MetalRet
     IO_REG(BlackholeMtrack,         "f4", 1, 5, IOTable);
     IO_REG_NONFATAL(BlackholeMseed,         "f4", 1, 5, IOTable);
     IO_REG_NONFATAL(BlackholeKineticFdbkEnergy, "f4", 1, 5, IOTable);
+#ifdef SIDM
+    IO_REG_NONFATAL(SIDMBHSeedOrigin, "i4", 1, 5, IOTable);
+    IO_REG_NONFATAL(SIDMBHSeedTrigger, "i4", 1, 5, IOTable);
+    IO_REG_NONFATAL(SIDMSMFPMassInitial, "f4", 1, 5, IOTable);
+    IO_REG_NONFATAL(SIDMSMFPRadius, "f4", 1, 5, IOTable);
+    IO_REG_NONFATAL(SIDMDarkReservoirMass, "f4", 1, 5, IOTable);
+    IO_REG_NONFATAL(SIDMDarkReservoirInitial, "f4", 1, 5, IOTable);
+    IO_REG_NONFATAL(SIDMDarkMdot, "f4", 1, 5, IOTable);
+    IO_REG_NONFATAL(SIDMRhoInf, "f4", 1, 5, IOTable);
+    IO_REG_NONFATAL(SIDMSoundSpeedInf, "f4", 1, 5, IOTable);
+    IO_REG_NONFATAL(SIDMReservoirRadius, "f4", 1, 5, IOTable);
+    IO_REG_NONFATAL(SIDMGasDynMassDebt, "f4", 1, 5, IOTable);
+    IO_REG_NONFATAL(SIDMDMDynMassDebt, "f4", 1, 5, IOTable);
+    IO_REG_NONFATAL(SIDMCollapseProgress, "f4", 1, 5, IOTable);
+    IO_REG_NONFATAL(SIDMCollapseTime, "f4", 1, 5, IOTable);
+    IO_REG_NONFATAL(SIDMClockFoFMass, "f4", 1, 5, IOTable);
+#endif
 
     /* Smoothing lengths for black hole: this is a new addition*/
     IO_REG_NONFATAL(SmoothingLength,  "f4", 1, 5, IOTable);

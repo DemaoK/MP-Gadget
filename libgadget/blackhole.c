@@ -11,6 +11,9 @@
 #include "treewalk.h"
 #include "slotsmanager.h"
 #include "blackhole.h"
+#ifdef SIDM
+#include "sidm_bhseed.h"
+#endif
 #include "timestep.h"
 #include "density.h"
 #include "sfr_eff.h"
@@ -63,6 +66,10 @@ typedef struct {
     MyFloat Accel[3];
     MyIDType ID;
     MyFloat Mtrack;
+#ifdef SIDM
+    int SIDMSeedOrigin;
+    MyFloat SIDMGasDynMassDebt;
+#endif
 } TreeWalkQueryBHAccretion;
 
 typedef struct {
@@ -343,8 +350,13 @@ blackhole(const ActiveParticles * act, double atime, Cosmology * CP, ForceTree *
 
     walltime_measure("/BH/Feedback");
 
+#ifdef SIDM
+    if(sidm_bhseed_is_enabled())
+        sidm_bhseed_swallow_dm(ActiveBlackHoles, NumActiveBlackHoles, ddecomp, atime, CP, times, rnd);
+#endif
+
     if(FdBlackholeDetails){
-        *bhdetailswritten += collect_BH_info(ActiveBlackHoles, NumActiveBlackHoles, priv, PartManager, (struct bh_particle_data*) SlotsManager->info[5].ptr, FdBlackholeDetails);
+        *bhdetailswritten += collect_BH_info(ActiveBlackHoles, NumActiveBlackHoles, priv, PartManager, (struct bh_particle_data*) SlotsManager->info[5].ptr, FdBlackholeDetails, atime);
     }
 
     myfree(priv->BH_accreted_momentum);
@@ -411,7 +423,42 @@ blackhole_accretion_postprocess(int i, TreeWalk * tw)
 
     double dtime = get_dloga_for_bin(P[i].TimeBinHydro, P[i].Ti_drift) / BH_GET_PRIV(tw)->hubble;
 
-    BHP(i).Mass += BHP(i).Mdot * dtime;
+    double delta_gas = BHP(i).Mdot * dtime;
+    double delta_dark = 0;
+
+#ifdef SIDM
+    BHP(i).SIDMDarkMdot = 0;
+    if(BHP(i).SIDMSeedOrigin && BHP(i).SIDMDarkReservoirMass > 0 &&
+       BHP(i).SIDMRhoInf > 0 && BHP(i).SIDMSoundSpeedInf > 0) {
+        const double rho_dark_proper = BHP(i).SIDMRhoInf * BH_GET_PRIV(tw)->a3inv;
+        const double sound_dark_proper = BHP(i).SIDMSoundSpeedInf / BH_GET_PRIV(tw)->atime;
+        const double ainf3 = sound_dark_proper * sound_dark_proper * sound_dark_proper;
+        if(ainf3 > 0) {
+            double mdot_dark = 4.0 * M_PI * sidm_bhseed_dark_bondi_lambda() *
+                BH_GET_PRIV(tw)->CP->GravInternal * BH_GET_PRIV(tw)->CP->GravInternal *
+                BHP(i).Mass * BHP(i).Mass * rho_dark_proper / ainf3;
+            delta_dark = mdot_dark * dtime;
+            if(delta_dark > BHP(i).SIDMDarkReservoirMass)
+                delta_dark = BHP(i).SIDMDarkReservoirMass;
+            if(delta_dark < 0)
+                delta_dark = 0;
+            BHP(i).SIDMDarkMdot = dtime > 0 ? delta_dark / dtime : 0;
+            BHP(i).SIDMDarkReservoirMass -= delta_dark;
+        }
+    }
+
+    if(BHP(i).SIDMSeedOrigin && sidm_bhseed_dynmass_catchup_on()) {
+        double buffer = DMAX(P[i].Mass - BHP(i).Mass, 0);
+        double used = DMIN(buffer, delta_gas);
+        buffer -= used;
+        BHP(i).SIDMGasDynMassDebt += delta_gas - used;
+
+        used = DMIN(buffer, delta_dark);
+        BHP(i).SIDMDMDynMassDebt += delta_dark - used;
+    }
+#endif
+
+    BHP(i).Mass += delta_gas + delta_dark;
 
     /*************************************************************************/
 
@@ -590,8 +637,14 @@ blackhole_accretion_ngbiter(TreeWalkQueryBHAccretion * I,
             /* This is an averaged Mdot, because Mdot increases BH_Mass but not Mass.
              * So if the total accretion is significantly above the dynamical mass,
              * a particle is swallowed. */
-            if((I->BH_Mass - BHPartMass) > 0 && I->Density > 0)
+            if((I->BH_Mass - BHPartMass) > 0 && I->Density > 0) {
+#ifdef SIDM
+                if(I->SIDMSeedOrigin && sidm_bhseed_dynmass_catchup_on())
+                    p = DMIN(I->SIDMGasDynMassDebt, I->BH_Mass - BHPartMass) * wk / I->Density;
+                else
+#endif
                 p = (I->BH_Mass - BHPartMass) * wk / I->Density;
+            }
 
             /* compute random number, uniform in [0,1] */
             const double w = get_random_number(P[other].ID, BH_GET_PRIV(lv->tw)->rnd);
@@ -684,6 +737,10 @@ blackhole_accretion_copy(int place, TreeWalkQueryBHAccretion * I, TreeWalk * tw)
     I->Density = BHP(place).Density;
     I->ID = P[place].ID;
     I->Mtrack = BHP(place).Mtrack;
+#ifdef SIDM
+    I->SIDMSeedOrigin = BHP(place).SIDMSeedOrigin;
+    I->SIDMGasDynMassDebt = BHP(place).SIDMGasDynMassDebt;
+#endif
 }
 
 typedef struct {
@@ -968,18 +1025,29 @@ blackhole_feedback_postprocess(int n, TreeWalk * tw)
         for(k = 0; k < 3; k++)
             P[n].Vel[k] = (P[n].Vel[k] * P[n].Mass + BH_GET_PRIV(tw)->BH_accreted_momentum[PI][k]) / (P[n].Mass + accmass);
         /* Add the mass to Mtrack if there is room*/
-        const double SeedBHDynMass = blackhole_params.SeedBHDynMass;
-        if(SeedBHDynMass > 0 && BHP(n).Mtrack + accmass < SeedBHDynMass) {
-            /* Still seed mass regime*/
-            BHP(n).Mtrack += accmass;
-        } else if(BHP(n).Mtrack < SeedBHDynMass) {
-            /* Transitioning to regular BH */
-            P[n].Mass = BHP(n).Mtrack + accmass;
-            BHP(n).Mtrack = SeedBHDynMass;
-        }
-        else {
-            /* Already regular BH, add accretion to regular mass*/
+#ifdef SIDM
+        if(BHP(n).SIDMSeedOrigin) {
             P[n].Mass += accmass;
+            if(BHP(n).SIDMGasDynMassDebt > accmass)
+                BHP(n).SIDMGasDynMassDebt -= accmass;
+            else
+                BHP(n).SIDMGasDynMassDebt = 0;
+        } else
+#endif
+        {
+            const double SeedBHDynMass = blackhole_params.SeedBHDynMass;
+            if(SeedBHDynMass > 0 && BHP(n).Mtrack + accmass < SeedBHDynMass) {
+                /* Still seed mass regime*/
+                BHP(n).Mtrack += accmass;
+            } else if(BHP(n).Mtrack < SeedBHDynMass) {
+                /* Transitioning to regular BH */
+                P[n].Mass = BHP(n).Mtrack + accmass;
+                BHP(n).Mtrack = SeedBHDynMass;
+            }
+            else {
+                /* Already regular BH, add accretion to regular mass*/
+                P[n].Mass += accmass;
+            }
         }
     }
 
@@ -1052,6 +1120,38 @@ bh_powerlaw_seed_mass(const MyIDType ID, const RandTable * const rnd)
     return mass;
 }
 
+#ifdef SIDM
+void
+blackhole_init_sidm_slot_fields(struct bh_particle_data * bh)
+{
+    if(bh == NULL)
+        return;
+    bh->SIDMSeedOrigin = 0;
+    bh->SIDMSeedTrigger = SIDM_BHSEED_TRIGGER_NONE;
+    bh->SIDMSMFPMassInitial = 0;
+    bh->SIDMSMFPRadius = 0;
+    bh->SIDMDarkReservoirMass = 0;
+    bh->SIDMDarkReservoirInitial = 0;
+    bh->SIDMDarkMdot = 0;
+    bh->SIDMRhoInf = 0;
+    bh->SIDMSoundSpeedInf = 0;
+    bh->SIDMReservoirRadius = 0;
+    bh->SIDMGasDynMassDebt = 0;
+    bh->SIDMDMDynMassDebt = 0;
+    bh->SIDMCollapseProgress = 0;
+    bh->SIDMCollapseTime = 0;
+    bh->SIDMClockFoFMass = 0;
+}
+#endif
+
+static void
+blackhole_init_sidm_fields(int child)
+{
+#ifdef SIDM
+    blackhole_init_sidm_slot_fields(&BHP(child));
+#endif
+}
+
 void
 blackhole_make_one(int index, const double atime, const RandTable * const rnd) {
     if(P[index].Type != 0)
@@ -1094,6 +1194,7 @@ blackhole_make_one(int index, const double atime, const RandTable * const rnd) {
     BHP(child).DF_SurroundingDensity = 0;
     BHP(child).JumpToMinPot = 0;
     BHP(child).CountProgs = 1;
+    blackhole_init_sidm_fields(child);
 
     if (blackhole_params.SeedBHDynMass>0){
         BHP(child).Mtrack = P[child].Mass;
@@ -1109,3 +1210,72 @@ blackhole_make_one(int index, const double atime, const RandTable * const rnd) {
     BHP(child).KineticFdbkEnergy = 0;
     BHP(child).VDisp = 0;
 }
+
+#ifdef SIDM
+void
+blackhole_make_one_sidm(int index, const double atime, const struct SIDMBHSeedResult * seed)
+{
+    if(P[index].Type != 1)
+        endrun(7773, "Only DM turns into SIDM-seeded blackholes, got type %d\n", P[index].Type);
+    if(seed == NULL || seed->seed_mass <= 0)
+        endrun(7774, "SIDM BH seed requested with non-positive seed mass.\n");
+
+    const double parent_mass = P[index].Mass;
+    int child = slots_convert(index, 5, -1, PartManager, SlotsManager);
+
+    if(P[child].TimeBinHydro == 0)
+        P[child].TimeBinHydro = P[child].TimeBinGravity;
+
+    BHP(child).Mass = seed->seed_mass;
+    BHP(child).Mseed = BHP(child).Mass;
+    BHP(child).Mdot = 0;
+    BHP(child).FormationTime = atime;
+    BHP(child).SwallowID = (MyIDType) -1;
+    BHP(child).Density = 0;
+    BHP(child).TimeBinDynFric = P[child].TimeBinHydro;
+
+    for(int j = 0; j < 3; j++) {
+        BHP(child).MinPotPos[j] = P[child].Pos[j];
+        BHP(child).DFAccel[j] = 0;
+        BHP(child).DF_SurroundingVel[j] = 0;
+        BHP(child).DragAccel[j] = 0;
+    }
+    BHP(child).DF_SurroundingRmsVel = 0;
+    BHP(child).DF_SurroundingDensity = 0;
+    BHP(child).JumpToMinPot = 0;
+    BHP(child).CountProgs = 1;
+    BHP(child).Mtrack = -1;
+    BHP(child).KineticFdbkEnergy = 0;
+    BHP(child).VDisp = 0;
+
+    blackhole_init_sidm_fields(child);
+    BHP(child).SIDMSeedOrigin = 1;
+    BHP(child).SIDMSeedTrigger = seed->trigger;
+    BHP(child).SIDMSMFPMassInitial = seed->smfp_mass;
+    BHP(child).SIDMSMFPRadius = seed->smfp_radius;
+    BHP(child).SIDMDarkReservoirMass = seed->reservoir_mass;
+    BHP(child).SIDMDarkReservoirInitial = seed->reservoir_mass;
+    BHP(child).SIDMRhoInf = seed->rho_inf;
+    BHP(child).SIDMSoundSpeedInf = seed->sound_speed_inf;
+    BHP(child).SIDMReservoirRadius = seed->reservoir_radius;
+    BHP(child).SIDMCollapseProgress = seed->collapse_progress;
+    BHP(child).SIDMCollapseTime = seed->collapse_time;
+    BHP(child).SIDMClockFoFMass = seed->clock_fof_mass;
+    if(BHP(child).Mass > P[child].Mass)
+        BHP(child).SIDMDMDynMassDebt = BHP(child).Mass - P[child].Mass;
+
+    message(1, "SIDM BH seeded: ID=%llu parent_dyn_mass=%g P.Mass=%g BHP.Mass=%g MsmfpAnalytic=%g Mres=%g rho_inf_comoving=%g sigma1d_internal=%g progress=%g tc=%g MclockDM=%g major_merger=%d jump=%g gamma=%g VmaxFoF=%g VmaxInternal=%g RmaxComoving=%g VmaxBins=%d trigger=%d\n",
+        (unsigned long long) P[child].ID, parent_mass, P[child].Mass, BHP(child).Mass,
+        BHP(child).SIDMSMFPMassInitial, BHP(child).SIDMDarkReservoirMass,
+        BHP(child).SIDMRhoInf, BHP(child).SIDMSoundSpeedInf,
+        BHP(child).SIDMCollapseProgress, BHP(child).SIDMCollapseTime,
+        BHP(child).SIDMClockFoFMass, seed->major_merger,
+        seed->merger_mass_jump, seed->merger_gamma,
+        seed->halo_vmax, seed->halo_vmax_internal, seed->halo_rmax, seed->vmax_profile_bins,
+        BHP(child).SIDMSeedTrigger);
+
+    if(P[child].Mass < BHP(child).Mass)
+        message(1, "WARNING: SIDM BH subgrid mass (%g) for ID %llu exceeds tracer dynamical mass (%g); DM catch-up debt=%g\n",
+            BHP(child).Mass, (unsigned long long) P[child].ID, P[child].Mass, BHP(child).SIDMDMDynMassDebt);
+}
+#endif

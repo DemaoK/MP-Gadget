@@ -40,6 +40,7 @@
 #include "pmzoom.h"
 #ifdef SIDM
 #include "sidm.h"
+#include "sidm_bhseed.h"
 #endif
 
 static struct ClockTable Clocks;
@@ -606,7 +607,11 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
         }
 
         RandTable rnd = {0};
-        if(GasEnabled || All.LightconeOn)
+        int NeedRandomTable = GasEnabled || All.LightconeOn;
+#ifdef SIDM
+        NeedRandomTable = NeedRandomTable || (All.BlackHoleOn && sidm_bhseed_is_enabled());
+#endif
+        if(NeedRandomTable)
             rnd = set_random_numbers(seed, RNDTABLE);
 
         /* Cooling and extra physics show up as a source term in the evolution equations.
@@ -628,6 +633,23 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
          * used to treat effectively instantaneous injections of energy (like from BHs), which is again hard to properly incorporate in the
          * time-integration approach where you want to have a "full" dU/dt all times. (Volker Springel 2020).
          */
+        /* In DM-only SIDM runs there is no gas source-physics block, but the
+         * gravothermal BH seeding clock still needs to run from FoF halos. */
+#ifdef SIDM
+        if(!GasEnabled && is_PM && All.BlackHoleOn && sidm_bhseed_is_enabled() && atime >= TimeNextSeedingCheck) {
+            message(0, "SIDM BH seeding check in DM-only run at a=%g.\n", atime);
+            FOFGroups fof = fof_fof(ddecomp, 0, &All.CP, &times, MPI_COMM_WORLD);
+            fof_seed_sidm(&fof, &Act, atime, &All.CP, &times, units, MPI_COMM_WORLD);
+            fof_finish(&fof);
+            TimeNextSeedingCheck = atime * All.TimeBetweenSeedingSearch;
+        }
+        if(!GasEnabled && All.BlackHoleOn && sidm_bhseed_is_enabled()) {
+            rotate_bhdetails_file(&fds, All.OutputDir, RestartSnapNum);
+            sidm_bhseed_update_dm_only(&Act, ddecomp, atime, &All.CP, &times, &rnd,
+                units, fds.FdBlackHoles, fds.FdBlackholeDetails, &fds.TotalBHDetailsBytesWritten);
+        }
+#endif
+
         if(GasEnabled)
         {
             if(!gasTree.tree_allocated_flag)
@@ -649,8 +671,12 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
                  (CalcUVBG && All.ExcursionSetReionOn))) {
 
                 /* Seeding: builds its own tree.*/
-                FOFGroups fof = fof_fof(ddecomp, 0, MPI_COMM_WORLD);
+                FOFGroups fof = fof_fof(ddecomp, 0, &All.CP, &times, MPI_COMM_WORLD);
                 if(All.BlackHoleOn && atime >= TimeNextSeedingCheck) {
+#ifdef SIDM
+                    if(sidm_bhseed_is_enabled())
+                        fof_seed_sidm(&fof, &Act, atime, &All.CP, &times, units, MPI_COMM_WORLD);
+#endif
                     fof_seed(&fof, &Act, atime, &rnd, MPI_COMM_WORLD);
                     TimeNextSeedingCheck = atime * All.TimeBetweenSeedingSearch;
                 }
@@ -751,7 +777,7 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
         FOFGroups fof = {0};
         if(WriteFOF) {
             /* Compute FOF and assign GrNr so it can be written in checkpoint.*/
-            fof = fof_fof(ddecomp, 1, MPI_COMM_WORLD);
+            fof = fof_fof(ddecomp, 1, &All.CP, &times, MPI_COMM_WORLD);
         }
 
         /* WriteFOF just reminds the checkpoint code to save GroupID*/
@@ -904,7 +930,7 @@ runfof(const int RestartSnapNum, const inttime_t Ti_Current, const struct header
         if(GradRho)
             myfree(GradRho);
     }
-    FOFGroups fof = fof_fof(ddecomp, 1, MPI_COMM_WORLD);
+    FOFGroups fof = fof_fof(ddecomp, 1, &All.CP, &times, MPI_COMM_WORLD);
     fof_save_groups(&fof, All.OutputDir, All.FOFFileBase, RestartSnapNum, &All.CP, header->TimeSnapshot, header->MassTable, All.MetalReturnOn, MPI_COMM_WORLD);
     fof_finish(&fof);
 }

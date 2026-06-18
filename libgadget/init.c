@@ -19,6 +19,7 @@
 #include "sfr_eff.h"
 #include "exchange.h"
 #include "fof.h"
+#include "blackhole.h"
 #include "timestep.h"
 #include "timebinmgr.h"
 #include "cosmology.h"
@@ -113,6 +114,15 @@ inttime_t init(int RestartSnapNum, const char * OutputDir, struct header_data * 
         P[i].Partner = (MyIDType)-1;
         P[i].SIDMPartnerDist = 0;
         P[i].Scattered = 0;
+        P[i].SIDMBHCollapseProgress = 0;
+        P[i].SIDMBHLastCheckTime = 0;
+        P[i].SIDMBHClockFoFMass = 0;
+    }
+    if(SlotsManager->info[5].enabled) {
+        int64_t ibh;
+        #pragma omp parallel for
+        for(ibh = 0; ibh < SlotsManager->info[5].size; ibh++)
+            blackhole_init_sidm_slot_fields(&BhP[ibh]);
     }
 #endif
 

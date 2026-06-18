@@ -65,4 +65,13 @@ void blackhole(const ActiveParticles * act, double atime, Cosmology * CP, ForceT
 /* Make a black hole from the particle at index. Random number generator used for the initial mass drawn from a power law.*/
 void blackhole_make_one(int index, const double atime, const RandTable * const rnd);
 
+#ifdef SIDM
+struct SIDMBHSeedResult;
+struct bh_particle_data;
+void blackhole_init_sidm_slot_fields(struct bh_particle_data * bh);
+/* Make a SIDM-origin black hole by converting a type-1 DM particle. The
+ * dynamical particle mass P.Mass is intentionally left unchanged. */
+void blackhole_make_one_sidm(int index, const double atime, const struct SIDMBHSeedResult * seed);
+#endif
+
 #endif

@@ -38,6 +38,9 @@ struct particle_data
     MyIDType Partner; /* Step-local chosen or claimed SIDM partner */
     MyFloat SIDMPartnerDist; /* Distance to the chosen step-1 partner */
     int Scattered; /* Step-local claim/pending-kick flag, cleared after the kick is consumed */
+    double SIDMBHCollapseProgress; /* Integrated collapse clock for SIDM BH seeding candidates */
+    double SIDMBHLastCheckTime; /* Scale factor of the last SIDM BH seeding clock update */
+    double SIDMBHClockFoFMass; /* FoF Type 1 DM mass of the progenitor that last advanced the collapse clock */
 #endif
     MyFloat FullTreeGravAccel[3]; /* Short-range tree acceleration at the most recent timestep
                                  which included all particles (ie, PM steps). Does not include PM acceleration.

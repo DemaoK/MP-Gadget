@@ -7,6 +7,9 @@
 #include "blackhole.h"
 #include "bhinfo.h"
 #include "physconst.h"
+#ifdef SIDM
+#include "sidm_bhseed.h"
+#endif
 
 /* Structure needs to be packed to ensure disc write is the same on all architectures and the record size is correct. */
 struct __attribute__((__packed__)) BHinfo{
@@ -57,6 +60,24 @@ struct __attribute__((__packed__)) BHinfo{
     double MgasEnc;
     int KEflag;
 
+#ifdef SIDM
+    int SIDMSeedOrigin;
+    int SIDMSeedTrigger;
+    MyFloat SIDMSMFPMassInitial;
+    MyFloat SIDMSMFPRadius;
+    MyFloat SIDMDarkReservoirMass;
+    MyFloat SIDMDarkReservoirInitial;
+    MyFloat SIDMDarkMdot;
+    MyFloat SIDMRhoInf;
+    MyFloat SIDMSoundSpeedInf;
+    MyFloat SIDMReservoirRadius;
+    MyFloat SIDMGasDynMassDebt;
+    MyFloat SIDMDMDynMassDebt;
+    MyFloat SIDMCollapseProgress;
+    MyFloat SIDMCollapseTime;
+    MyFloat SIDMClockFoFMass;
+#endif
+
     double a;
     /* See size1 above*/
     int size2;
@@ -64,7 +85,7 @@ struct __attribute__((__packed__)) BHinfo{
 
 
 size_t
-collect_BH_info(const int * const ActiveBlackHoles, const int64_t NumActiveBlackHoles, struct BHPriv *priv, const struct part_manager_type * const PartManager, const struct bh_particle_data* const BHManager, FILE * FdBlackholeDetails)
+collect_BH_info(const int * const ActiveBlackHoles, const int64_t NumActiveBlackHoles, struct BHPriv *priv, const struct part_manager_type * const PartManager, const struct bh_particle_data* const BHManager, FILE * FdBlackholeDetails, const double atime)
 {
     int i;
 
@@ -97,12 +118,12 @@ collect_BH_info(const int * const ActiveBlackHoles, const int64_t NumActiveBlack
         info->minTimeBin = BHManager[PI].minTimeBin;
         info->encounter = BHManager[PI].encounter;
 
-        info->BH_Entropy = priv->BH_Entropy[PI];
+        info->BH_Entropy = priv ? priv->BH_Entropy[PI] : 0;
         int k;
         for(k=0; k < 3; k++) {
             info->MinPotPos[k] = BHManager[PI].MinPotPos[k] - PartManager->CurrentParticleOffset[k];
-            info->BH_SurroundingGasVel[k] = priv->BH_SurroundingGasVel[PI][k];
-            info->BH_accreted_momentum[k] = priv->BH_accreted_momentum[PI][k];
+            info->BH_SurroundingGasVel[k] = priv ? priv->BH_SurroundingGasVel[PI][k] : 0;
+            info->BH_accreted_momentum[k] = priv ? priv->BH_accreted_momentum[PI][k] : 0;
             info->BH_DragAccel[k] = BHManager[PI].DragAccel[k];
             info->BH_FullTreeGravAccel[k] = pp[p_i].FullTreeGravAccel[k];
             info->Pos[k] = pp[p_i].Pos[k] - PartManager->CurrentParticleOffset[k];
@@ -121,11 +142,11 @@ collect_BH_info(const int * const ActiveBlackHoles, const int64_t NumActiveBlack
         info->BH_SurroundingVel[2] = BHManager[PI].DF_SurroundingVel[2];
 
         /****************************************************************************/
-        info->BH_accreted_BHMass = priv->BH_accreted_BHMass[PI];
-        info->BH_accreted_Mass = priv->BH_accreted_Mass[PI];
-        info->BH_FeedbackWeightSum = priv->BH_FeedbackWeightSum[PI];
+        info->BH_accreted_BHMass = priv ? priv->BH_accreted_BHMass[PI] : 0;
+        info->BH_accreted_Mass = priv ? priv->BH_accreted_Mass[PI] : 0;
+        info->BH_FeedbackWeightSum = priv ? priv->BH_FeedbackWeightSum[PI] : 0;
 
-        info->SPH_SwallowID = priv->SPH_SwallowID[PI];
+        info->SPH_SwallowID = priv ? priv->SPH_SwallowID[PI] : 0;
         info->SwallowID =  BHManager[PI].SwallowID;
         info->CountProgs = BHManager[PI].CountProgs;
         info->Swallowed =  pp[p_i].Swallowed;
@@ -141,12 +162,30 @@ collect_BH_info(const int * const ActiveBlackHoles, const int64_t NumActiveBlack
         info->Mdyn = pp[p_i].Mass;
 
         info->KineticFdbkEnergy = BHManager[PI].KineticFdbkEnergy;
-        info->NumDM = priv->NumDM[PI];
+        info->NumDM = priv ? priv->NumDM[PI] : 0;
         info->VDisp = BHManager[PI].VDisp;
-        info->MgasEnc = priv->MgasEnc[PI];
-        info->KEflag = priv->KEflag[PI];
+        info->MgasEnc = priv ? priv->MgasEnc[PI] : 0;
+        info->KEflag = priv ? priv->KEflag[PI] : 0;
 
-        info->a = priv->atime;
+#ifdef SIDM
+        info->SIDMSeedOrigin = BHManager[PI].SIDMSeedOrigin;
+        info->SIDMSeedTrigger = BHManager[PI].SIDMSeedTrigger;
+        info->SIDMSMFPMassInitial = BHManager[PI].SIDMSMFPMassInitial;
+        info->SIDMSMFPRadius = BHManager[PI].SIDMSMFPRadius;
+        info->SIDMDarkReservoirMass = BHManager[PI].SIDMDarkReservoirMass;
+        info->SIDMDarkReservoirInitial = BHManager[PI].SIDMDarkReservoirInitial;
+        info->SIDMDarkMdot = BHManager[PI].SIDMDarkMdot;
+        info->SIDMRhoInf = BHManager[PI].SIDMRhoInf;
+        info->SIDMSoundSpeedInf = BHManager[PI].SIDMSoundSpeedInf;
+        info->SIDMReservoirRadius = BHManager[PI].SIDMReservoirRadius;
+        info->SIDMGasDynMassDebt = BHManager[PI].SIDMGasDynMassDebt;
+        info->SIDMDMDynMassDebt = BHManager[PI].SIDMDMDynMassDebt;
+        info->SIDMCollapseProgress = BHManager[PI].SIDMCollapseProgress;
+        info->SIDMCollapseTime = BHManager[PI].SIDMCollapseTime;
+        info->SIDMClockFoFMass = BHManager[PI].SIDMClockFoFMass;
+#endif
+
+        info->a = atime;
     }
 
     fwrite(infos,sizeof(struct BHinfo),NumActiveBlackHoles,FdBlackholeDetails);
@@ -165,11 +204,30 @@ write_blackhole_txt(FILE * FdBlackHoles, const struct UnitSystem units, const do
     int total_bh, i;
     double total_mdoteddington;
     double total_mass_holes, total_mdot;
+#ifdef SIDM
+    const int write_sidm_columns = sidm_bhseed_is_enabled();
+    int total_sidm_bh;
+    double total_sidm_dark_mdot;
+    double total_sidm_dark_meddington;
+    double total_sidm_reservoir;
+    double total_sidm_reservoir_initial;
+    double total_sidm_gas_dyn_mass_debt;
+    double total_sidm_dm_dyn_mass_debt;
+#endif
 
     double Local_BH_mass = 0;
     double Local_BH_Mdot = 0;
     double Local_BH_Medd = 0;
     int Local_BH_num = 0;
+#ifdef SIDM
+    double Local_SIDM_DarkMdot = 0;
+    double Local_SIDM_DarkMedd = 0;
+    double Local_SIDM_Reservoir = 0;
+    double Local_SIDM_ReservoirInitial = 0;
+    double Local_SIDM_GasDynMassDebt = 0;
+    double Local_SIDM_DMDynMassDebt = 0;
+    int Local_SIDM_BH_num = 0;
+#endif
     /* Compute total mass of black holes
      * present by summing contents of black hole array*/
     #pragma omp parallel for reduction(+ : Local_BH_num) reduction(+: Local_BH_mass) reduction(+: Local_BH_Mdot) reduction(+: Local_BH_Medd)
@@ -180,13 +238,43 @@ write_blackhole_txt(FILE * FdBlackHoles, const struct UnitSystem units, const do
         Local_BH_num++;
         Local_BH_mass += BhP[i].Mass;
         Local_BH_Mdot += BhP[i].Mdot;
-        Local_BH_Medd += BhP[i].Mdot/BhP[i].Mass;
+        if(BhP[i].Mass > 0)
+            Local_BH_Medd += BhP[i].Mdot/BhP[i].Mass;
     }
+#ifdef SIDM
+    if(write_sidm_columns) {
+        #pragma omp parallel for reduction(+ : Local_SIDM_BH_num) reduction(+: Local_SIDM_DarkMdot, Local_SIDM_DarkMedd, Local_SIDM_Reservoir, Local_SIDM_ReservoirInitial, Local_SIDM_GasDynMassDebt, Local_SIDM_DMDynMassDebt)
+        for(i = 0; i < SlotsManager->info[5].size; i ++)
+        {
+            if(BhP[i].SwallowID != (MyIDType) -1 || !BhP[i].SIDMSeedOrigin)
+                continue;
+            Local_SIDM_BH_num++;
+            Local_SIDM_DarkMdot += BhP[i].SIDMDarkMdot;
+            if(BhP[i].Mass > 0)
+                Local_SIDM_DarkMedd += BhP[i].SIDMDarkMdot / BhP[i].Mass;
+            Local_SIDM_Reservoir += BhP[i].SIDMDarkReservoirMass;
+            Local_SIDM_ReservoirInitial += BhP[i].SIDMDarkReservoirInitial;
+            Local_SIDM_GasDynMassDebt += BhP[i].SIDMGasDynMassDebt;
+            Local_SIDM_DMDynMassDebt += BhP[i].SIDMDMDynMassDebt;
+        }
+    }
+#endif
 
     MPI_Reduce(&Local_BH_mass, &total_mass_holes, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&Local_BH_Mdot, &total_mdot, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&Local_BH_Medd, &total_mdoteddington, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&Local_BH_num, &total_bh, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+#ifdef SIDM
+    if(write_sidm_columns) {
+        MPI_Reduce(&Local_SIDM_DarkMdot, &total_sidm_dark_mdot, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&Local_SIDM_DarkMedd, &total_sidm_dark_meddington, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&Local_SIDM_Reservoir, &total_sidm_reservoir, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&Local_SIDM_ReservoirInitial, &total_sidm_reservoir_initial, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&Local_SIDM_GasDynMassDebt, &total_sidm_gas_dyn_mass_debt, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&Local_SIDM_DMDynMassDebt, &total_sidm_dm_dyn_mass_debt, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&Local_SIDM_BH_num, &total_sidm_bh, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+    }
+#endif
 
     if(FdBlackHoles)
     {
@@ -197,8 +285,24 @@ write_blackhole_txt(FILE * FdBlackHoles, const struct UnitSystem units, const do
         total_mdoteddington *= 1.0 / ((4 * M_PI * GRAVITY * LIGHTCGS * PROTONMASS /
                     (0.1 * LIGHTCGS * LIGHTCGS * THOMPSON)) * units.UnitTime_in_s);
 
+#ifdef SIDM
+        if(write_sidm_columns) {
+            double sidm_dark_mdot_in_msun_per_year =
+                total_sidm_dark_mdot * (units.UnitMass_in_g / SOLAR_MASS) / (units.UnitTime_in_s / SEC_PER_YEAR);
+            total_sidm_dark_meddington *= 1.0 / ((4 * M_PI * GRAVITY * LIGHTCGS * PROTONMASS /
+                        (0.1 * LIGHTCGS * LIGHTCGS * THOMPSON)) * units.UnitTime_in_s);
+
+            fprintf(FdBlackHoles, "%g %d %g %g %g %g %d %g %g %g %g %g %g %g\n",
+                    atime, total_bh, total_mass_holes, total_mdot, mdot_in_msun_per_year, total_mdoteddington,
+                    total_sidm_bh, total_sidm_dark_mdot, sidm_dark_mdot_in_msun_per_year,
+                    total_sidm_dark_meddington, total_sidm_reservoir, total_sidm_reservoir_initial,
+                    total_sidm_gas_dyn_mass_debt, total_sidm_dm_dyn_mass_debt);
+        } else
+#endif
+        {
         fprintf(FdBlackHoles, "%g %d %g %g %g %g\n",
                 atime, total_bh, total_mass_holes, total_mdot, mdot_in_msun_per_year, total_mdoteddington);
+        }
         fflush(FdBlackHoles);
     }
 }
