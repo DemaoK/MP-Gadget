@@ -56,6 +56,11 @@ struct BlackholeParams
     /************************************************************************/
 } blackhole_params;
 
+struct BlackholeActivePriv
+{
+    double atime;
+};
+
 typedef struct {
     TreeWalkQueryBase base;
     MyFloat Density;
@@ -198,7 +203,8 @@ blackhole_haswork(int n, TreeWalk * tw){
      * update. Defer normal BH physics until the next step, when the seed has a
      * valid BH smoothing length and appears in the gas/BH tree.
      */
-    const double atime = tw->priv ? *((double *) tw->priv) : 0;
+    struct BlackholeActivePriv * priv = (struct BlackholeActivePriv *) tw->priv;
+    const double atime = priv ? priv->atime : 0;
     if(BHP(n).SIDMSeedOrigin && BHP(n).FormationTime >= atime)
         return 0;
 #else
@@ -213,8 +219,9 @@ blackholes_active(const ActiveParticles * act, int ** ActiveBlackHoles, int64_t 
         const double atime)
 {
     TreeWalk tw_bh[1] = {{0}};
+    struct BlackholeActivePriv priv = {.atime = atime};
     tw_bh->haswork = blackhole_haswork;
-    tw_bh->priv = (void *) &atime;
+    tw_bh->priv = &priv;
 
     /* Build the queue once, since it is really 'all black holes' and similar for all treewalks.*/
     treewalk_build_queue(tw_bh, act->ActiveParticle, act->NumActiveParticle, 0);

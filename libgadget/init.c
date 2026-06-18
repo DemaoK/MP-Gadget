@@ -129,8 +129,7 @@ inttime_t init(int RestartSnapNum, const char * OutputDir, struct header_data * 
     /*Read the snapshot*/
     petaio_read_snapshot(RestartSnapNum, OutputDir, CP, header, PartManager, SlotsManager, MPI_COMM_WORLD);
 
-    if(RestartSnapNum == -1)
-        validate_zoom_type_masks(header);
+    validate_zoom_type_masks(header);
 
     domain_test_id_uniqueness(PartManager);
 
@@ -469,17 +468,36 @@ get_zoom_boundary_softening_factors(double * SofteningFactors, const struct head
     if(!header->ZoomTypeMasksPresent)
         return;
 
-    const int highres_type = 1;
-    double highres_mass = header->MassTable[highres_type];
-    if(highres_mass <= 0)
-        highres_mass = get_global_type_mass_extreme(PartManager, highres_type, 0);
+    int highres_type = -1;
+    double highres_mass = 0;
+    int ptype;
+    for(ptype = 0; ptype < 6; ptype++) {
+        if(!(header->ZoomHighResTypes & (1 << ptype)) || header->NTotalInit[ptype] <= 0)
+            continue;
 
-    if(highres_mass <= 0 || header->NTotalInit[highres_type] <= 0) {
-        message(0, "AutoZoomBoundarySoftening: no usable type-1 high-resolution mass; using default softenings.\n");
-        return;
+        double type_mass = header->MassTable[ptype];
+        if(type_mass <= 0)
+            type_mass = get_global_type_mass_extreme(PartManager, ptype, 0);
+
+        if(type_mass <= 0) {
+            message(0, "AutoZoomBoundarySoftening: no usable type-%d high-resolution mass.\n", ptype);
+            continue;
+        }
+
+        if(highres_mass <= 0 || type_mass < highres_mass) {
+            highres_mass = type_mass;
+            highres_type = ptype;
+        }
     }
 
-    int ptype;
+    if(highres_mass <= 0) {
+        message(0, "AutoZoomBoundarySoftening: no usable high-resolution mass for ZoomHighResTypes=%d; using default softenings.\n",
+                header->ZoomHighResTypes);
+        return;
+    }
+    message(0, "AutoZoomBoundarySoftening: using type-%d high-resolution mass %g as reference.\n",
+            highres_type, highres_mass);
+
     for(ptype = 0; ptype < 6; ptype++) {
         if(!(header->ZoomBoundaryTypes & (1 << ptype)) || header->NTotalInit[ptype] <= 0)
             continue;

@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <math.h>
 #include <omp.h>
 
@@ -122,6 +123,8 @@ get_primary_omega(const int primary_mask, const int64_t * global_count,
 static int
 fof_particle_is_separate_baryon(int i)
 {
+    if(P[i].Swallowed)
+        return 0;
     if(P[i].Type == 0 || P[i].Type == 4)
         return 1;
     if(P[i].Type == 5) {
@@ -144,7 +147,7 @@ get_global_particle_counts(const struct part_manager_type * PartManager, int64_t
     int64_t i;
     #pragma omp parallel for reduction(+: local_count[:6]) reduction(+: local_separate_baryon_count)
     for(i = 0; i < PartManager->NumPart; i++) {
-        if(P[i].IsGarbage)
+        if(P[i].IsGarbage || P[i].Swallowed)
             continue;
         if(P[i].Type >= 0 && P[i].Type < 6)
             local_count[P[i].Type]++;
@@ -168,7 +171,7 @@ double fof_get_mean_primary_separation(const struct part_manager_type * PartMana
     int64_t i;
     #pragma omp parallel for reduction(+: local_count[:6]) reduction(+: local_mass[:6]) reduction(+: local_separate_baryon_count)
     for(i = 0; i < PartManager->NumPart; i++) {
-        if(P[i].IsGarbage)
+        if(P[i].IsGarbage || P[i].Swallowed)
             continue;
         if(P[i].Type >= 0 && P[i].Type < 6) {
             local_count[P[i].Type]++;
@@ -2024,7 +2027,10 @@ void fof_seed_sidm(FOFGroups * fof, ActiveParticles * act, double atime, Cosmolo
     int NmadeTot = Nmade;
     MPI_Allreduce(MPI_IN_PLACE, &NmadeTot, 1, MPI_INT, MPI_SUM, Comm);
     if(NmadeTot > 0) {
-        const int local_seeded_bytes = Nmade * (int) sizeof(MyIDType);
+        const size_t local_seeded_bytes_size = (size_t) Nmade * sizeof(MyIDType);
+        if(local_seeded_bytes_size > INT_MAX)
+            endrun(2027, "Too many SIDM BH seeds on one task for MPI_Allgatherv byte counts: %d seeds.\n", Nmade);
+        const int local_seeded_bytes = (int) local_seeded_bytes_size;
         int * SeededByteCount = ta_malloc("SIDMSeededByteCount", int, NTask);
         int * SeededByteOffset = ta_malloc("SIDMSeededByteOffset", int, NTask);
         MPI_Allgather(&local_seeded_bytes, 1, MPI_INT, SeededByteCount, 1, MPI_INT, Comm);
@@ -2032,6 +2038,8 @@ void fof_seed_sidm(FOFGroups * fof, ActiveParticles * act, double atime, Cosmolo
         int total_seeded_bytes = 0;
         for(i = 0; i < NTask; i++) {
             SeededByteOffset[i] = total_seeded_bytes;
+            if(SeededByteCount[i] > INT_MAX - total_seeded_bytes)
+                endrun(2035, "Too many SIDM BH seeds globally for MPI_Allgatherv byte counts.\n");
             total_seeded_bytes += SeededByteCount[i];
         }
 
