@@ -460,6 +460,15 @@ get_global_type_mass_extreme(const struct part_manager_type * PartManager, const
     return global;
 }
 
+static double
+get_zoom_type_mass(const struct header_data * header, const struct part_manager_type * PartManager, const int ptype, const int find_max)
+{
+    double type_mass = header->MassTable[ptype];
+    if(type_mass <= 0)
+        type_mass = get_global_type_mass_extreme(PartManager, ptype, find_max);
+    return type_mass;
+}
+
 static void
 get_zoom_boundary_softening_factors(double * SofteningFactors, const struct header_data * header, const struct part_manager_type * PartManager)
 {
@@ -471,22 +480,33 @@ get_zoom_boundary_softening_factors(double * SofteningFactors, const struct head
     int highres_type = -1;
     double highres_mass = 0;
     int ptype;
-    for(ptype = 0; ptype < 6; ptype++) {
-        if(!(header->ZoomHighResTypes & (1 << ptype)) || header->NTotalInit[ptype] <= 0)
-            continue;
 
-        double type_mass = header->MassTable[ptype];
-        if(type_mass <= 0)
-            type_mass = get_global_type_mass_extreme(PartManager, ptype, 0);
+    /* Prefer the DM mass when available: gas masses can become variable after
+     * star formation, which would make auto boundary softenings restart-dependent. */
+    if((header->ZoomHighResTypes & (1 << 1)) && header->NTotalInit[1] > 0) {
+        highres_mass = get_zoom_type_mass(header, PartManager, 1, 0);
+        if(highres_mass > 0)
+            highres_type = 1;
+        else
+            message(0, "AutoZoomBoundarySoftening: no usable type-1 high-resolution mass; falling back to the high-resolution mask.\n");
+    }
 
-        if(type_mass <= 0) {
-            message(0, "AutoZoomBoundarySoftening: no usable type-%d high-resolution mass.\n", ptype);
-            continue;
-        }
+    if(highres_mass <= 0) {
+        for(ptype = 0; ptype < 6; ptype++) {
+            if(!(header->ZoomHighResTypes & (1 << ptype)) || header->NTotalInit[ptype] <= 0)
+                continue;
 
-        if(highres_mass <= 0 || type_mass < highres_mass) {
-            highres_mass = type_mass;
-            highres_type = ptype;
+            double type_mass = get_zoom_type_mass(header, PartManager, ptype, 0);
+
+            if(type_mass <= 0) {
+                message(0, "AutoZoomBoundarySoftening: no usable type-%d high-resolution mass.\n", ptype);
+                continue;
+            }
+
+            if(highres_mass <= 0 || type_mass < highres_mass) {
+                highres_mass = type_mass;
+                highres_type = ptype;
+            }
         }
     }
 
@@ -502,9 +522,7 @@ get_zoom_boundary_softening_factors(double * SofteningFactors, const struct head
         if(!(header->ZoomBoundaryTypes & (1 << ptype)) || header->NTotalInit[ptype] <= 0)
             continue;
 
-        double boundary_mass = header->MassTable[ptype];
-        if(boundary_mass <= 0)
-            boundary_mass = get_global_type_mass_extreme(PartManager, ptype, 1);
+        double boundary_mass = get_zoom_type_mass(header, PartManager, ptype, 1);
 
         if(boundary_mass <= 0) {
             message(0, "AutoZoomBoundarySoftening: no usable type-%d boundary mass; using default softening for this type.\n", ptype);
