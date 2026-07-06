@@ -5,6 +5,7 @@
 #include <omp.h>
 
 #include "utils/endrun.h"
+#include "utils/system.h"
 #include "utils/mymalloc.h"
 #include "partmanager.h"
 #include "forcetree.h"
@@ -141,33 +142,32 @@ static PetaPMRegion * _prepare(PetaPM * pm, PetaPMParticleStruct * pstruct, void
     PetaPMRegion * regions = (PetaPMRegion *) mymalloc2("Regions", sizeof(PetaPMRegion) * tree->NTopLeaves);
     pstruct->RegionInd = (int *) mymalloc2("RegionInd", PartManager->NumPart * sizeof(int));
     int r = 0;
+    int leaf;
 
-    int no = tree->firstnode; /* start with the root */
-    while(no >= 0) {
-
-        if(!(tree->Nodes[no].f.DependsOnLocalMass)) {
-            /* node doesn't contain particles on this process, do not open */
-            no = tree->Nodes[no].sibling;
+    /* Use the domain decomposition directly: every non-garbage local particle
+     * has a TopLeaf owned by this task, and force_tree_create_nodes inserts it
+     * below that top leaf.  The older DependsOnLocalMass tree walk may group
+     * regions, but in zoom/domain layouts it can skip valid local top-leaf
+     * branches and leave particles without a PM region. */
+    for(leaf = 0; leaf < tree->NTopLeaves; leaf++) {
+        if(tree->TopLeaves[leaf].Task != tree->ThisTask)
             continue;
-        }
-        if(
-            /* node is large */
-           (tree->Nodes[no].len <= pm->BoxSize / pm->Nmesh * 24)
-           ||
-            /* node is a top leaf */
-            ( !tree->Nodes[no].f.InternalTopLevel && (tree->Nodes[no].f.TopLevel) )
-                ) {
-            regions[r].no = no;
-            r ++;
-            /* do not open */
-            no = tree->Nodes[no].sibling;
-            continue;
-        }
-        /* open */
-        no = tree->Nodes[no].s.suns[0];
+        const int no = tree->TopLeaves[leaf].treenode;
+        if(no < tree->firstnode || no >= tree->firstnode + tree->numnodes)
+            endrun(122, "Invalid local top leaf %d treenode %d, first %ld numnodes %ld last %ld\n",
+                   leaf, no, tree->firstnode, tree->numnodes, tree->lastnode);
+        if(tree->Nodes[no].f.ChildType == PSEUDO_NODE_TYPE)
+            endrun(122, "Local top leaf %d treenode %d is pseudo on task %d\n",
+                   leaf, no, tree->ThisTask);
+        regions[r].no = no;
+        r++;
     }
 
     *Nregions = r;
+    if(*Nregions <= 0)
+        endrun(122, "No PM regions on task %d although NumPart=%ld\n",
+               tree->ThisTask, PartManager->NumPart);
+
     int maxNregions;
     MPI_Reduce(&r, &maxNregions, 1, MPI_INT, MPI_MAX, 0, MPI_COMM_WORLD);
     message(0, "max number of regions is %d\n", maxNregions);
@@ -193,11 +193,110 @@ static PetaPMRegion * _prepare(PetaPM * pm, PetaPMParticleStruct * pstruct, void
         regions[r].numpart = pm_mark_region_for_node(regions[r].no, r, pstruct->RegionInd, tree);
         numpart += regions[r].numpart;
     }
+
+    int64_t missed = 0;
+    int64_t missed_by_type[7] = {0};
+    int64_t missed_garbage = 0;
+    int64_t missed_swallowed = 0;
+    int nsample = 0;
+    const int maxsample = 8;
+
     for(i = 0; i < PartManager->NumPart; i ++) {
         if(pstruct->RegionInd[i] == -1) {
-            message(1, "i = %ld father %d not assigned to a region\n", i, force_get_father(i, tree));
+            const int type = P[i].Type;
+            const int father = force_get_father(i, tree);
+            const int topLeaf = P[i].TopLeaf;
+            int topTask = -1;
+            int topNode = -1;
+            int tlChildType = -1;
+            int tlTopLevel = -1;
+            int tlInternalTopLevel = -1;
+            int tlDependsOnLocalMass = -1;
+            int tlSibling = -1;
+            int tlFather = -1;
+            MyFloat tlLen = 0;
+            if(topLeaf >= 0 && topLeaf < tree->NTopLeaves) {
+                topTask = tree->TopLeaves[topLeaf].Task;
+                topNode = tree->TopLeaves[topLeaf].treenode;
+                if(topNode >= tree->firstnode && topNode < tree->firstnode + tree->numnodes) {
+                    const struct NODE * tnode = &tree->Nodes[topNode];
+                    tlChildType = tnode->f.ChildType;
+                    tlTopLevel = tnode->f.TopLevel;
+                    tlInternalTopLevel = tnode->f.InternalTopLevel;
+                    tlDependsOnLocalMass = tnode->f.DependsOnLocalMass;
+                    tlSibling = tnode->sibling;
+                    tlFather = tnode->father;
+                    tlLen = tnode->len;
+                }
+            }
+            missed++;
+            if(type >= 0 && type < 6)
+                missed_by_type[type]++;
+            else
+                missed_by_type[6]++;
+            if(P[i].IsGarbage)
+                missed_garbage++;
+            if(P[i].Swallowed)
+                missed_swallowed++;
+
+            if(nsample < maxsample) {
+                if(father >= tree->firstnode && father < tree->firstnode + tree->numnodes) {
+                    const struct NODE * fnode = &tree->Nodes[father];
+                    message(1,
+                            "PMREGION_MISSED sample=%d i=%ld id=%llu type=%d topLeaf=%d garbage=%d swallowed=%d "
+                            "topTask=%d topNode=%d tlChildType=%d tlTopLevel=%d tlInternalTopLevel=%d "
+                            "tlDependsOnLocalMass=%d tlSibling=%d tlFather=%d tlLen=%g "
+                            "father=%d fChildType=%d fTopLevel=%d fInternalTopLevel=%d fDependsOnLocalMass=%d "
+                            "fSibling=%d fFather=%d fLen=%g\n",
+                            nsample, i, (unsigned long long) P[i].ID, type, topLeaf,
+                            P[i].IsGarbage, P[i].Swallowed, topTask, topNode,
+                            tlChildType, tlTopLevel, tlInternalTopLevel,
+                            tlDependsOnLocalMass, tlSibling, tlFather, tlLen,
+                            father, fnode->f.ChildType,
+                            fnode->f.TopLevel, fnode->f.InternalTopLevel,
+                            fnode->f.DependsOnLocalMass, fnode->sibling,
+                            fnode->father, fnode->len);
+                }
+                else {
+                    message(1,
+                            "PMREGION_MISSED sample=%d i=%ld id=%llu type=%d topLeaf=%d garbage=%d swallowed=%d "
+                            "topTask=%d topNode=%d tlChildType=%d tlTopLevel=%d tlInternalTopLevel=%d "
+                            "tlDependsOnLocalMass=%d tlSibling=%d tlFather=%d tlLen=%g "
+                            "father=%d invalid father firstnode=%ld numnodes=%ld lastnode=%ld\n",
+                            nsample, i, (unsigned long long) P[i].ID, type, topLeaf,
+                            P[i].IsGarbage, P[i].Swallowed, topTask, topNode,
+                            tlChildType, tlTopLevel, tlInternalTopLevel,
+                            tlDependsOnLocalMass, tlSibling, tlFather, tlLen,
+                            father, tree->firstnode, tree->numnodes, tree->lastnode);
+                }
+                nsample++;
+            }
         }
     }
+
+    int64_t missed_totals[10] = {0};
+    int64_t missed_local[10] = {
+        missed_by_type[0], missed_by_type[1], missed_by_type[2],
+        missed_by_type[3], missed_by_type[4], missed_by_type[5],
+        missed_by_type[6], missed, missed_garbage, missed_swallowed
+    };
+    MPI_Reduce(missed_local, missed_totals, 10, MPI_INT64, MPI_SUM, 0, MPI_COMM_WORLD);
+    if(missed > 0) {
+        message(1,
+                "PMREGION_MISSED_LOCAL total=%ld type0=%ld type1=%ld type2=%ld type3=%ld type4=%ld type5=%ld "
+                "typeOther=%ld garbage=%ld swallowed=%ld processed=%ld numpart=%ld\n",
+                missed, missed_by_type[0], missed_by_type[1], missed_by_type[2],
+                missed_by_type[3], missed_by_type[4], missed_by_type[5],
+                missed_by_type[6], missed_garbage, missed_swallowed,
+                numpart, PartManager->NumPart);
+    }
+    message(0,
+            "PMREGION_MISSED_GLOBAL total=%ld type0=%ld type1=%ld type2=%ld type3=%ld type4=%ld type5=%ld "
+            "typeOther=%ld garbage=%ld swallowed=%ld\n",
+            missed_totals[7], missed_totals[0], missed_totals[1], missed_totals[2],
+            missed_totals[3], missed_totals[4], missed_totals[5],
+            missed_totals[6], missed_totals[8], missed_totals[9]);
+
     /* All particles shall have been processed just once. Otherwise we die */
     if((numpart+numswallowed) != PartManager->NumPart) {
         endrun(1, "Processed only %ld particles out of %ld\n", numpart, PartManager->NumPart);

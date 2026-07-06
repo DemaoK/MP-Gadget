@@ -32,7 +32,7 @@ struct Pencil { /* a pencil starting at offset, with lenght len */
     int offset[3];
     int len;
     int first;
-    int meshbuf_first; /* first pixel in meshbuf */
+    ptrdiff_t meshbuf_first; /* first pixel in meshbuf */
     int task;
 };
 static int pencil_cmp_target(const void * v1, const void * v2);
@@ -753,6 +753,15 @@ layout_build_pencils(PetaPM * pm,
                 p->meshbuf_first = (regions[r].buffer - meshbuf) +
                     regions[r].strides[0] * ix +
                     regions[r].strides[1] * iy;
+                if(p->meshbuf_first < 0 ||
+                   p->meshbuf_first + p->len > (ptrdiff_t) pm->priv->meshbufsize) {
+                    endrun(1, "bad PM pencil r=%d ix=%d iy=%d first=%td len=%d meshbufsize=%zu "
+                           "region off=(%td %td %td) size=(%td %td %td) strides=(%td %td %td)\n",
+                           r, ix, iy, p->meshbuf_first, p->len, pm->priv->meshbufsize,
+                           regions[r].offset[0], regions[r].offset[1], regions[r].offset[2],
+                           regions[r].size[0], regions[r].size[1], regions[r].size[2],
+                           regions[r].strides[0], regions[r].strides[1], regions[r].strides[2]);
+                }
                 /* now lets compress the pencil */
                 while((p->len > 0) && (meshbuf[p->meshbuf_first + p->len - 1] == 0.0)) {
                     p->len --;
