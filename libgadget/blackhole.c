@@ -653,7 +653,8 @@ blackhole_accretion_ngbiter(TreeWalkQueryBHAccretion * I,
              * when BHP.Mass < SeedBHDynMass. Mtrack is initialized as gas particle mass and is capped
              * at SeedBHDynMass. Mtrack traces the BHP.Mass by stochastically swallowing gas and
              * therefore ensures mass conservation.*/
-            if(blackhole_params.SeedBHDynMass > 0 && I->Mtrack < blackhole_params.SeedBHDynMass)
+            if(blackhole_params.SeedBHDynMass > 0 && I->Mtrack >= 0 &&
+                    I->Mtrack < blackhole_params.SeedBHDynMass)
                 BHPartMass = I->Mtrack;
 
             /* This is an averaged Mdot, because Mdot increases BH_Mass but not Mass.
