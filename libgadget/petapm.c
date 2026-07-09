@@ -31,7 +31,7 @@ static void layout_iterate_cells(PetaPM * pm, struct Layout * L, cell_iterator i
 struct Pencil { /* a pencil starting at offset, with lenght len */
     int offset[3];
     int len;
-    int first;
+    int64_t first; /* absolute offset into BufSend/BufRecv; can exceed INT32_MAX */
     ptrdiff_t meshbuf_first; /* first pixel in meshbuf */
     int task;
 };
@@ -638,17 +638,20 @@ layout_prepare (PetaPM * pm,
 
     MPI_Comm_size(L->comm, &NTask);
 
-    L->ibuffer = (int *) mymalloc("PMlayout", sizeof(int) * NTask * 8);
+    /* The cell displacements need 64 bits, so they lead the buffer to stay aligned. */
+    const size_t ibufsize = sizeof(int64_t) * NTask * 2 + sizeof(int) * NTask * 6;
+    L->ibuffer = (char *) mymalloc("PMlayout", ibufsize);
 
-    memset(L->ibuffer, 0, sizeof(int) * NTask * 8);
-    L->NpSend = &L->ibuffer[NTask * 0];
-    L->NpRecv = &L->ibuffer[NTask * 1];
-    L->NcSend = &L->ibuffer[NTask * 2];
-    L->NcRecv = &L->ibuffer[NTask * 3];
-    L->DcSend = &L->ibuffer[NTask * 4];
-    L->DcRecv = &L->ibuffer[NTask * 5];
-    L->DpSend = &L->ibuffer[NTask * 6];
-    L->DpRecv = &L->ibuffer[NTask * 7];
+    memset(L->ibuffer, 0, ibufsize);
+    L->DcSend = (int64_t *) L->ibuffer;
+    L->DcRecv = L->DcSend + NTask;
+    int * ibuf = (int *) (L->DcRecv + NTask);
+    L->NpSend = &ibuf[NTask * 0];
+    L->NpRecv = &ibuf[NTask * 1];
+    L->NcSend = &ibuf[NTask * 2];
+    L->NcRecv = &ibuf[NTask * 3];
+    L->DpSend = &ibuf[NTask * 4];
+    L->DpRecv = &ibuf[NTask * 5];
 
     L->NpExport = 0;
     L->NcExport = 0;
@@ -705,7 +708,7 @@ layout_prepare (PetaPM * pm,
         endrun(1, "NpExport = %ld NpSend=%d DpSend=%d\n", L->NpExport, L->NpSend[NTask -1], L->DpSend[NTask - 1]);
     }
     if(L->DcSend[NTask - 1] + L->NcSend[NTask -1] != L->NcExport) {
-        endrun(1, "NcExport = %ld NcSend=%d DcSend=%d\n", L->NcExport, L->NcSend[NTask -1], L->DcSend[NTask - 1]);
+        endrun(1, "NcExport = %ld NcSend=%d DcSend=%ld\n", L->NcExport, L->NcSend[NTask -1], L->DcSend[NTask - 1]);
     }
     int64_t totNpAlloc = reduce_int64(NpAlloc, L->comm);
     int64_t totNpExport = reduce_int64(L->NpExport, L->comm);
@@ -833,6 +836,60 @@ static void layout_finish(struct Layout * L) {
     myfree(L->ibuffer);
 }
 
+/* MPI_Alltoallv for the cell buffers, with 64-bit displacements. In zoom runs
+ * a single rank's regions can cover most of the mesh, so its total cell count
+ * exceeds INT32_MAX and MPI_Alltoallv's int displacements overflow. The
+ * per-destination counts still fit an int, so exchange pairwise, following
+ * MPI_Alltoallv_sparse. */
+static void
+layout_alltoallv_cells(double * sendbuf, const int * sendcnts, const int64_t * sdispls,
+                       double * recvbuf, const int * recvcnts, const int64_t * rdispls,
+                       MPI_Comm comm)
+{
+    int ThisTask;
+    int NTask;
+    MPI_Comm_rank(comm, &ThisTask);
+    MPI_Comm_size(comm, &NTask);
+    int PTask;
+    int ngrp;
+
+    for(PTask = 0; NTask > (1 << PTask); PTask++);
+
+    int n_requests = 0;
+    MPI_Request * requests = (MPI_Request *) mymalloc("requests", NTask * 2 * sizeof(MPI_Request));
+
+    for(ngrp = 0; ngrp < (1 << PTask); ngrp++)
+    {
+        int target = ThisTask ^ ngrp;
+        if(target >= NTask) continue;
+        if(target == ThisTask || recvcnts[target] == 0) continue;
+        MPI_Irecv(recvbuf + rdispls[target], recvcnts[target],
+                MPI_DOUBLE, target, 101935, comm, &requests[n_requests++]);
+    }
+
+    MPI_Barrier(comm);
+    /* as in MPI_Alltoallv_sparse: ensure all receives are posted before the sends */
+
+    for(ngrp = 0; ngrp < (1 << PTask); ngrp++)
+    {
+        int target = ThisTask ^ ngrp;
+        if(target >= NTask) continue;
+        if(target == ThisTask || sendcnts[target] == 0) continue;
+        MPI_Isend(sendbuf + sdispls[target], sendcnts[target],
+                MPI_DOUBLE, target, 101935, comm, &requests[n_requests++]);
+    }
+
+    /* the self exchange is a local copy */
+    if(sendcnts[ThisTask] != recvcnts[ThisTask])
+        endrun(1, "Cell exchange: self send %d != recv %d\n", sendcnts[ThisTask], recvcnts[ThisTask]);
+    if(sendcnts[ThisTask])
+        memcpy(recvbuf + rdispls[ThisTask], sendbuf + sdispls[ThisTask],
+                sizeof(double) * sendcnts[ThisTask]);
+
+    MPI_Waitall(n_requests, requests, MPI_STATUSES_IGNORE);
+    myfree(requests);
+}
+
 /* exchange cells to their pfft host, then reduce the cells to the pfft
  * array */
 static void to_pfft(double * cell, double * buf) {
@@ -863,9 +920,9 @@ layout_build_and_exchange_cells_to_pfft(
     }
 
     /* receive cells */
-    MPI_Alltoallv(
-            L->BufSend, L->NcSend, L->DcSend, MPI_DOUBLE,
-            L->BufRecv, L->NcRecv, L->DcRecv, MPI_DOUBLE,
+    layout_alltoallv_cells(
+            L->BufSend, L->NcSend, L->DcSend,
+            L->BufRecv, L->NcRecv, L->DcRecv,
             L->comm);
 
 #if 0
@@ -917,9 +974,9 @@ layout_build_and_exchange_cells_to_local(
 
     /* exchange cells */
     /* notice the order is reversed from to_pfft */
-    MPI_Alltoallv(
-            L->BufRecv, L->NcRecv, L->DcRecv, MPI_DOUBLE,
-            L->BufSend, L->NcSend, L->DcSend, MPI_DOUBLE,
+    layout_alltoallv_cells(
+            L->BufRecv, L->NcRecv, L->DcRecv,
+            L->BufSend, L->NcSend, L->DcSend,
             L->comm);
 
     /* distribute BufSend to meshbuf */

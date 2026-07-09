@@ -37,12 +37,14 @@ struct Layout {
     int64_t NcImport;
     int * NcSend;
     int * NcRecv;
-    int * DcSend;
-    int * DcRecv;
+    /* Cell displacements are 64-bit: in zoom runs a single rank's regions can
+     * cover most of the mesh, so its total cell count exceeds INT32_MAX. */
+    int64_t * DcSend;
+    int64_t * DcRecv;
 
     double * BufSend;
     double * BufRecv;
-    int * ibuffer;
+    char * ibuffer;
 };
 
 /* Data which is private to the PetaPM structure. Don't access from outside.*/
