@@ -1245,6 +1245,9 @@ blackhole_make_one_sidm(int index, const double atime, const struct SIDMBHSeedRe
 
     const double parent_mass = P[index].Mass;
     int child = slots_convert(index, 5, -1, PartManager, SlotsManager);
+    /* Type-1 smoothing lengths are not persisted in restart snapshots. */
+    if(P[child].Hsml <= 0 || !isfinite(P[child].Hsml))
+        P[child].Hsml = FORCE_SOFTENING_TYPE(1);
 
     if(P[child].TimeBinHydro == 0)
         P[child].TimeBinHydro = P[child].TimeBinGravity;
