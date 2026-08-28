@@ -249,6 +249,39 @@ static void test_density_random(void ** state) {
     }
 }
 
+static void test_sparse_init_hsml(void ** state) {
+    const int ncbrt = 6;
+    const int numpart = ncbrt * ncbrt * ncbrt;
+    int i;
+
+    #pragma omp parallel for
+    for(i = 0; i < numpart; i++) {
+        P[i].Type = 0;
+        P[i].PI = i;
+        P[i].Mass = 1;
+        P[i].Hsml = 0;
+        P[i].Pos[0] = PartManager->BoxSize / ncbrt * (0.5 + i / ncbrt / ncbrt);
+        P[i].Pos[1] = PartManager->BoxSize / ncbrt * (0.5 + (i / ncbrt) % ncbrt);
+        P[i].Pos[2] = PartManager->BoxSize / ncbrt * (0.5 + i % ncbrt);
+    }
+
+    SlotsManager->info[0].size = numpart;
+    SlotsManager->info[5].size = 0;
+    PartManager->NumPart = numpart;
+
+    struct density_testdata * data = * (struct density_testdata **) state;
+    ForceTree tree = {0};
+    force_tree_rebuild_mask(&tree, &data->ddecomp, GASMASK, NULL);
+    set_init_hsml(&tree, &data->ddecomp, PartManager->BoxSize / ncbrt);
+
+    for(i = 0; i < numpart; i++) {
+        assert_true(isfinite(P[i].Hsml));
+        assert_true(P[i].Hsml > 0);
+        assert_true(P[i].Hsml <= PartManager->BoxSize);
+    }
+    force_tree_free(&tree);
+}
+
 
 /*Make a simple trivial domain for all data on a single processor*/
 void trivial_domain(DomainDecomp * ddecomp)
@@ -333,6 +366,7 @@ int main(void) {
         cmocka_unit_test(test_density_flat),
         cmocka_unit_test(test_density_close),
         cmocka_unit_test(test_density_random),
+        cmocka_unit_test(test_sparse_init_hsml),
     };
     return cmocka_run_group_tests_mpi(tests, setup_density, teardown_density);
 }

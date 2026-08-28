@@ -730,8 +730,10 @@ set_init_hsml(ForceTree * tree, DomainDecomp * ddecomp, const double MeanGasSepa
             no = p;
         } while(10 * DesNumNgb * P[i].Mass > tree->Nodes[no].mom.mass);
 
-        /* Validate the tree node contents*/
-        if(tree->Nodes[no].len > tree->BoxSize || tree->Nodes[no].mom.mass < P[i].Mass)
+        /* The root is deliberately padded to 1.001 * BoxSize. Sparse particle
+         * distributions may legitimately reach it while choosing an initial Hsml. */
+        if((no != tree->firstnode && tree->Nodes[no].len > tree->BoxSize) ||
+                tree->Nodes[no].mom.mass < P[i].Mass)
             endrun(5, "Bad tree moments: i=%d, mass = %g type %d hsml %g no %d len %g treemass %g\n",
                     i, P[i].Mass, P[i].Type, P[i].Hsml, no, tree->Nodes[no].len, tree->Nodes[no].mom.mass);
         P[i].Hsml = MeanGasSeparation;
