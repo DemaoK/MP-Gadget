@@ -176,6 +176,7 @@ petaio_save_snapshot(const char * fname, struct IOTable * IOTable, int verbose, 
     struct conversions conv = {0};
     conv.atime = atime;
     conv.hubble = hubble_function(CP, atime);
+    conv.hubbleparam = CP->HubbleParam;
 
     petaio_write_header(&bf, atime, NTotal, CP, &Header);
 
@@ -290,6 +291,7 @@ petaio_read_snapshot(int num, const char * OutputDir, Cosmology * CP, struct hea
     struct conversions conv = {0};
     conv.atime = header->TimeSnapshot;
     conv.hubble = hubble_function(CP, header->TimeSnapshot);
+    conv.hubbleparam = CP->HubbleParam;
 
     struct IOTable IOTable[1] = {0};
     int missing_mass_from_header[6] = {0};
@@ -842,7 +844,18 @@ SIMPLE_PROPERTY_PI(DelayTime, DelayTime, float, 1, struct sph_particle_data)
 SIMPLE_PROPERTY_TYPE_PI(StarFormationTime, 4, FormationTime, float, 1, struct star_particle_data)
 SIMPLE_PROPERTY_PI(BirthDensity, BirthDensity, float, 1, struct star_particle_data)
 SIMPLE_PROPERTY_TYPE_PI(Metallicity, 4, Metallicity, float, 1, struct star_particle_data)
-SIMPLE_PROPERTY_TYPE_PI(LastEnrichmentMyr, 4, LastEnrichmentMyr, float, 1, struct star_particle_data)
+/* Save LastEnrichmentMyr in Myr/h; the in-memory value is in physical Myr. */
+static void GT4LastEnrichmentMyr(int i, float * out, void * baseptr, void * smanptr, const struct conversions * params) {
+    int PI = ((struct particle_data *) baseptr)[i].PI;
+    struct star_particle_data * stars = (struct star_particle_data *) ((struct slots_manager_type *) smanptr)->info[4].ptr;
+    out[0] = stars[PI].LastEnrichmentMyr * params->hubbleparam;
+}
+
+static void ST4LastEnrichmentMyr(int i, float * out, void * baseptr, void * smanptr, const struct conversions * params) {
+    int PI = ((struct particle_data *) baseptr)[i].PI;
+    struct star_particle_data * stars = (struct star_particle_data *) ((struct slots_manager_type *) smanptr)->info[4].ptr;
+    stars[PI].LastEnrichmentMyr = out[0] / params->hubbleparam;
+}
 SIMPLE_PROPERTY_TYPE_PI(TotalMassReturned, 4, TotalMassReturned, float, 1, struct star_particle_data)
 SIMPLE_PROPERTY_TYPE_PI(Metallicity, 0, Metallicity, float, 1, struct sph_particle_data)
 SIMPLE_PROPERTY_TYPE_PI(Metals, 4, Metals[0], float, NMETALS, struct star_particle_data)
