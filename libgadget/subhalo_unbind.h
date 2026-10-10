@@ -390,16 +390,49 @@ void subhalo_props_baryons(struct SubTrack * rec, const struct SubCandidate * c,
  * frame and the counts. Every result (Index order, Energy, RefPos/RefVel, Mbound, the
  * subsample, the neighbour lists) is defined independently of the thread count:
  *  - the floating sums (the per-type masses of the subsampling, bound_frame) run over fixed
- *    chunks of max(PAR_MIN, ceil(n / 256)) list entries, combined in chunk order;
+ *    chunks of max(CHUNK_MIN, ceil(n / 256)) list entries, combined in chunk order;
  *  - sorts and trees produce the unique result of their strict total order (ties by ID);
- *  - the bound/unbound partition of a list of more than PAR_MIN entries is stable (both parts
+ *  - the bound/unbound partition of a list of more than CHUNK_MIN entries is stable (both parts
  *    keep their relative order; 16 bytes per entry of arena scratch, within
- *    SUBHALO_UNBIND_SCRATCH_BYTES_PER_PART); at most PAR_MIN entries keep the swap loop of
+ *    SUBHALO_UNBIND_SCRATCH_BYTES_PER_PART); at most CHUNK_MIN entries keep the swap loop of
  *    HEAD 9e60f168, whose unbound order differs (decision 34; visible only in a dead
  *    candidate's list).
- * A candidate whose every step is at most PAR_MIN elements is bit-identical to HEAD 9e60f168.
+ * A candidate whose every step is at most CHUNK_MIN elements is bit-identical to HEAD 9e60f168.
  * The seeded shuffle, the subsample mass sum and the early-stopping tracer count of the
- * survival test stay serial. */
-#define SUBHALO_UNBIND_PAR_MIN 16384
+ * survival test stay serial.
+ *
+ * Two thresholds (decision 42.5, second round). SUBHALO_UNBIND_CHUNK_MIN = 16384 defines results
+ * (the chunks of the floating sums and of the gathers, the partition's switch) and must not
+ * change. SUBHALO_UNBIND_PAR_MIN only decides which steps share their work out; any value gives
+ * the same results, because every step it gates gives the serial result at any thread count:
+ *  - the merge sorts (energy order, refinement order, Morton order): the unique order of a
+ *    strict total order, whatever the blocks and the merges;
+ *  - the gravity and neighbour trees: the plan's top nodes and subtree tasks put every node at
+ *    the index of the serial build with the same content (any task size); each node's moment or
+ *    box is its own serial sum over its children or sources, as in the serial pass;
+ *  - the Morton keys, the copies around the sorts and the refinement, the extents (min/max),
+ *    the tracer and positive-energy counts (integers): exact in any split;
+ *  - the energy and neighbour-query loops (each element independent) thread above
+ *    min(4096, PAR_MIN) elements, in dynamic chunks of n / (4 threads) clamped to [16, 256];
+ *  - the chunked steps (subsampling masses and source gather, bound_frame) are a single chunk
+ *    for n <= CHUNK_MIN, i.e. the serial loop, and then run serially; the partition of at most
+ *    CHUNK_MIN entries is the swap loop.
+ * PAR_MIN = 512 (was 16384, which left every step but the energy loops of more than 4096
+ * targets serial below 16384): measured with the timing harness of test_subhalo_unbind on r30
+ * (4 cores x 2 hyperthreads), host + satellite candidates, SampleSize 1000, at 8 threads the
+ * candidates of 1000 / 2000 / 4000 / 14174 particles go from 0.97x / 0.94x / 0.99x / 3.9x to
+ * 3.3x / 4.1x / 4.2x / 4.5x of their 1-thread time (with the adaptive loop chunks); 256 gains
+ * nothing more, 1024 leaves the subsample tree (~1000 sources) and the candidates below 1024
+ * serial (halofinder_parmin_handoff.md). subhalo_unbind_set_par_min changes PAR_MIN at run
+ * time (tests and the timing harness only; called outside any parallel region; n <= 0
+ * restores the default). */
+#define SUBHALO_UNBIND_PAR_MIN 512
+#define SUBHALO_UNBIND_CHUNK_MIN 16384
+void subhalo_unbind_set_par_min(int64_t n);
+int64_t subhalo_unbind_get_par_min(void);
+/* The dynamic chunk of the energy and neighbour-query loops (decision 42.5, second round):
+ * nonzero (the default) n / (4 threads) clamped to [16, 256], zero the fixed 256 of Phase 5b.
+ * Scheduling only, results never depend on it; tests and the timing harness only. */
+void subhalo_unbind_set_loop_chunk(int adaptive);
 
 #endif

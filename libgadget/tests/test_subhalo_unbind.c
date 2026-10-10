@@ -6,8 +6,12 @@
  * cap diagnostics; item 6: core fill, sinking forms, an absent type in a subsample, the always
  * included BH type, mixed masses). Phase 5b: bit-identical results at 1, 3 and 8 threads
  * (test_threads_bitwise) and, Phase 5 audit R7, inside the scheduler's worker region at sizes
- * around SUBHALO_UNBIND_PAR_MIN (test_threads_worker_region). The sampled final pass
- * (test_final_pass_sampled, decision 42.4).
+ * around SUBHALO_UNBIND_CHUNK_MIN (test_threads_worker_region). The sampled final pass
+ * (test_final_pass_sampled, decision 42.4); decision 42.5: the threading threshold
+ * SUBHALO_UNBIND_PAR_MIN (16384, its default 512 and 1) changes no result below
+ * SUBHALO_UNBIND_CHUNK_MIN at 1, 2 and 8 threads (test_threads_par_min). The timing table
+ * (test_timing) can take sizes, thresholds, thread counts and the final-pass mode from the
+ * environment.
  *
  * Haloes are Hernquist (1990) spheres sampled from the exact isotropic distribution function
  * (eq. 17), positions from the inverse cumulative mass profile truncated at 100 scale radii, so
@@ -1671,7 +1675,8 @@ test_threads_bitwise(void ** state)
     }
     assert_true(r[0].alive);
     /* every step in parallel mode, the refinement of 0.1 Nbound included */
-    assert_true(SUBHALO_REFINE_FRACTION * r[0].Nbound > SUBHALO_UNBIND_PAR_MIN);
+    assert_true(SUBHALO_REFINE_FRACTION * r[0].Nbound > SUBHALO_UNBIND_CHUNK_MIN);
+    assert_true(SUBHALO_REFINE_FRACTION * r[0].Nbound > subhalo_unbind_get_par_min());
     for(k = 1; k < 3; k++)
         assert_same_result(&r[0], &r[k]);
     for(k = 0; k < 3; k++)
@@ -1747,7 +1752,7 @@ test_threads_bitwise(void ** state)
  * stay serial (omp_in_parallel) and give the same result as alone. The host + satellite candidate
  * of test_threads_bitwise (the satellite a tenth, unbound in the host frame: several iterations,
  * a non-trivial partition) with 16383, 16384, 16385 and 16500 particles (around
- * SUBHALO_UNBIND_PAR_MIN: the whole-list steps switch to the parallel mode above it), with and
+ * SUBHALO_UNBIND_CHUNK_MIN: the chunked sums and the stable partition start above it), with and
  * without subsampling, from a start frame 150 km/s off (several iterations): unbind + final pass at 1 thread,
  * alone at 4 threads (dynamic adjustment off, the team size checked), and inside an active
  * 4-thread region where two workers run two copies of the candidate concurrently, each compared
@@ -1789,7 +1794,7 @@ test_threads_worker_region(void ** state)
     const int nmax0 = omp_get_max_threads();
     const int dyn0 = omp_get_dynamic();
     const int T = 4;
-    const int64_t sizes[4] = {SUBHALO_UNBIND_PAR_MIN - 1, SUBHALO_UNBIND_PAR_MIN, SUBHALO_UNBIND_PAR_MIN + 1, 16500};
+    const int64_t sizes[4] = {SUBHALO_UNBIND_CHUNK_MIN - 1, SUBHALO_UNBIND_CHUNK_MIN, SUBHALO_UNBIND_CHUNK_MIN + 1, 16500};
     const int samples[2] = {1000, 0};
     /* a start frame 150 km/s off: several iterations, particles unbound on the way */
     const double vel0[3] = {Bulk[0] + 150., Bulk[1], Bulk[2]};
@@ -2070,13 +2075,161 @@ test_final_pass_sampled(void ** state)
     omp_set_num_threads(nmax0);
 }
 
+/* Decision 42.5 (second round): the threading threshold PAR_MIN only shares work out. Keys below
+ * SUBHALO_UNBIND_CHUNK_MIN (1500, 3000 and 10000 particles, the host + satellite candidate of
+ * test_threads_worker_region from a frame 150 km/s off, with and without subsampling, plus a
+ * candidate that dies after its first iteration and the neighbour search over 3000 tracers) give
+ * bit-identical results with PAR_MIN at 16384 (the Phase 5b value), its default and 1 (every
+ * step of more than one element in parallel mode; at 1 also with the fixed 256 loop chunks of
+ * subhalo_unbind_set_loop_chunk(0)), at 1, 2 and 8 threads, all compared with the 1-thread run
+ * at the default (the serial path). */
+static void
+par_min_case(struct CandResult * r, int nth, int64_t pm, int64_t n, const double vel[3],
+             const struct SubhaloUnbindParams * up)
+{
+    struct TestCand t;
+    int64_t npos;
+    omp_set_num_threads(nth);
+    subhalo_unbind_set_par_min(pm);
+    assert_int_equal(subhalo_unbind_get_par_min(), pm);
+    cand_init(&t, 0, n, Centre, vel, 11);
+    struct SubhaloArena a = arena_alloc(n);
+    const int alive = cand_unbind_final(&t, up, &a, &npos);
+    assert_int_equal(a.used, 0);
+    cand_result_take(r, &t, alive, npos);
+    myfree(a.base);
+    cand_free(&t);
+    subhalo_unbind_set_par_min(0);
+    assert_int_equal(subhalo_unbind_get_par_min(), SUBHALO_UNBIND_PAR_MIN);
+}
+
+static void
+test_threads_par_min(void ** state)
+{
+    const int nmax0 = omp_get_max_threads();
+    const int dyn0 = omp_get_dynamic();
+    const int64_t sizes[3] = {1500, 3000, 10000};
+    const int samples[2] = {1000, 0};
+    const int64_t pms[3] = {16384, SUBHALO_UNBIND_PAR_MIN, 1};
+    const int nths[3] = {1, 2, 8};
+    const double vel0[3] = {Bulk[0] + 150., Bulk[1], Bulk[2]};
+    const double badvel[3] = {Bulk[0] + 300., Bulk[1], Bulk[2]};
+    int is, ip, ipm, it, dead;
+    omp_set_dynamic(0);
+    for(is = 0; is < 3; is++) {
+        const int64_t n = sizes[is];
+        assert_true(n <= SUBHALO_UNBIND_CHUNK_MIN);
+        setup_pman(n);
+        make_host_satellite(n - n / 11, n / 11);
+        for(ip = 0; ip < 2; ip++)
+            for(dead = 0; dead < 2; dead++) {
+                struct SubhaloUnbindParams up = default_params();
+                up.SampleSize = samples[ip];
+                if(dead)
+                    up.MinNumPart = (int) (0.9 * n);
+                struct CandResult ref, r;
+                par_min_case(&ref, 1, SUBHALO_UNBIND_PAR_MIN, n, dead ? badvel : vel0, &up);
+                if(dead)
+                    assert_false(ref.alive);
+                else
+                    assert_true(ref.alive && ref.Nbound > 0.5 * n && ref.Iterations > 1);
+                /* ipm 3: PAR_MIN 1 with the fixed 256 loop chunks */
+                for(ipm = 0; ipm < 4; ipm++)
+                    for(it = 0; it < 3; it++) {
+                        subhalo_unbind_set_loop_chunk(ipm != 3);
+                        par_min_case(&r, nths[it], pms[ipm < 3 ? ipm : 2], n, dead ? badvel : vel0, &up);
+                        subhalo_unbind_set_loop_chunk(1);
+                        assert_same_result(&ref, &r);
+                        cand_result_free(&r);
+                    }
+                uint64_t h = 0xcbf29ce484222325ULL;
+                h = fnv1a(h, ref.Index, sizeof(int64_t) * n);
+                h = fnv1a(h, ref.Energy, sizeof(double) * n);
+                message(0, "Par-min fixture N %ld, SampleSize %d, %s: Nbound %ld after %d iterations; PAR_MIN 16384, %d, 1 at 1, 2, 8 threads "
+                           "(and 1 with the fixed 256 loop chunks) bitwise equal (checksum %016lx)\n", (long) n, samples[ip], dead ? "dead" : "survivor", (long) ref.Nbound,
+                        ref.Iterations, SUBHALO_UNBIND_PAR_MIN, (unsigned long) h);
+                cand_result_free(&ref);
+            }
+        teardown_pman();
+    }
+    /* neighbours: 3000 host tracers, 300 satellite queries, k = 8 */
+    {
+        const int64_t nh = 3000, nsat = 300;
+        const int kk = 8;
+        setup_pman(nh + nsat);
+        make_host_satellite(nh, nsat);
+        int64_t * tr = (int64_t *) malloc(sizeof(int64_t) * nh);
+        int64_t * q = (int64_t *) malloc(sizeof(int64_t) * nsat);
+        int64_t * ref = (int64_t *) malloc(sizeof(int64_t) * nsat * kk);
+        int64_t * out = (int64_t *) malloc(sizeof(int64_t) * nsat * kk);
+        int64_t i;
+        for(i = 0; i < nh; i++)
+            tr[i] = i;
+        for(i = 0; i < nsat; i++)
+            q[i] = nh + i;
+        struct SubhaloArena ka = arena_bytes(128 * (size_t) nh + 4096);
+        omp_set_num_threads(1);
+        subhalo_knn_tracers(q, nsat, tr, nh, kk, ref, BOXSIZE, &ka);
+        assert_int_equal(ka.used, 0);
+        for(ipm = 0; ipm < 4; ipm++)
+            for(it = 0; it < 3; it++) {
+                omp_set_num_threads(nths[it]);
+                subhalo_unbind_set_par_min(pms[ipm < 3 ? ipm : 2]);
+                subhalo_unbind_set_loop_chunk(ipm != 3);
+                subhalo_knn_tracers(q, nsat, tr, nh, kk, out, BOXSIZE, &ka);
+                subhalo_unbind_set_loop_chunk(1);
+                subhalo_unbind_set_par_min(0);
+                assert_int_equal(ka.used, 0);
+                assert_memory_equal(ref, out, sizeof(int64_t) * nsat * kk);
+            }
+        message(0, "Par-min kNN, %ld tracers: bitwise equal at every PAR_MIN and thread count\n", (long) nh);
+        myfree(ka.base);
+        free(out);
+        free(ref);
+        free(q);
+        free(tr);
+        teardown_pman();
+    }
+    omp_set_dynamic(dyn0);
+    omp_set_num_threads(nmax0);
+}
+
+/* Comma-separated integers from the environment variable name into v[0, nmax); returns the
+ * count, or 0 when unset or empty. */
+static int
+env_int_list(const char * name, int64_t * v, int nmax)
+{
+    const char * e = getenv(name);
+    int n = 0;
+    while(e && *e && n < nmax) {
+        char * end;
+        const long long x = strtoll(e, &end, 10);
+        if(end == e)
+            break;
+        v[n++] = x;
+        e = *end == ',' ? end + 1 : end;
+    }
+    return n;
+}
+
 /* Timing table of the parallel mode (Phase 5 plan section 4 item 6), run only when
  * SUBHALO_UNBIND_TIMING is set to a repeat count (it takes minutes): unbind + final pass of a
  * Hernquist sphere of 2e4, 2e5 and 1e6 particles with the production SampleSize 1000, at 1, 2,
  * 4 and 8 threads, the minimum time over the repeats, each result checked bitwise against the
- * 1-thread one; first with the exact final pass, then with the sampled one (TIMING SAMPLED
- * lines, SubhaloFinalPass = 0). Run with `mpirun --bind-to none`: by default
- * Open MPI binds a single rank to one core, and every thread then shares it. */
+ * 1-thread one. Run with `mpirun --bind-to none`: by default
+ * Open MPI binds a single rank to one core, and every thread then shares it.
+ * Decision 42.5 (second round) knobs: SUBHALO_UNBIND_TIMING_SIZES (e.g. 2000,4000,8000),
+ * SUBHALO_UNBIND_TIMING_THREADS (e.g. 1,2,4,8) and SUBHALO_UNBIND_TIMING_PARMIN (thresholds set
+ * with subhalo_unbind_set_par_min, e.g. 16384,8192,4096), SUBHALO_UNBIND_TIMING_LOOPCHUNK=0
+ * (subhalo_unbind_set_loop_chunk(0): the fixed 256 energy-loop chunks of Phase 5b; default
+ * adaptive); SUBHALO_UNBIND_TIMING_FIXTURE=sat
+ * times the host + satellite candidate of test_threads_worker_region (start frame 150 km/s off,
+ * several iterations) instead of the sphere. The repeats of one size and thread count
+ * interleave the thresholds (drift on a shared node hits them alike); the thread count changes
+ * only between blocks of repeats, because libgomp's team resizing made a run right after a
+ * change of team size up to 100 ms slower on r30 (an artifact; production keeps one team). The
+ * 1-thread run does not depend on the threshold and is taken once. SUBHALO_UNBIND_TIMING_SAMPLED=1
+ * times the sampled final pass instead of the exact one (TIMING SAMPLED rows, decision 42.4). */
 static void
 test_timing(void ** state)
 {
@@ -2095,49 +2248,78 @@ test_timing(void ** state)
         nrep = 1;
     message(0, "Timing: this process may run on %d logical CPU(s), OMP max threads %d%s\n", ncpu, nmax0,
             ncpu >= 0 && ncpu < 8 ? ": WARNING, fewer CPUs than the largest thread count; the timings are not meaningful (mpirun --bind-to none)" : "");
-    const int64_t sizes[3] = {20000, 200000, 1000000};
-    const int nths[4] = {1, 2, 4, 8};
-    int s, k;
-    for(s = 0; s < 3; s++) {
+    int64_t sizes[16] = {20000, 200000, 1000000}, nthl[8] = {1, 2, 4, 8}, pms[8] = {SUBHALO_UNBIND_PAR_MIN};
+    int nsize = env_int_list("SUBHALO_UNBIND_TIMING_SIZES", sizes, 16);
+    int nth = env_int_list("SUBHALO_UNBIND_TIMING_THREADS", nthl, 8);
+    int npm = env_int_list("SUBHALO_UNBIND_TIMING_PARMIN", pms, 8);
+    if(nsize == 0) nsize = 3;
+    if(nth == 0) nth = 4;
+    if(npm == 0) npm = 1;
+    const char * lc = getenv("SUBHALO_UNBIND_TIMING_LOOPCHUNK");
+    subhalo_unbind_set_loop_chunk(!(lc && *lc && atoi(lc) == 0));
+    message(0, "Timing: energy-loop chunk %s\n", lc && *lc && atoi(lc) == 0 ? "256" : "adaptive");
+    const char * fx = getenv("SUBHALO_UNBIND_TIMING_FIXTURE");
+    const int sat = fx && !strcmp(fx, "sat");
+    const double vel0[3] = {Bulk[0] + 150., Bulk[1], Bulk[2]};
+    const double * vel = sat ? vel0 : Bulk;
+    int s, k, m;
+    for(s = 0; s < nsize; s++) {
         const int64_t n = sizes[s];
         setup_pman(n);
         const double tg = MPI_Wtime();
-        make_hernquist(0, n, HQ_M, HQ_A, HQ_RMAX, Centre, Bulk, 4242, 0);
-        message(0, "Timing: %ld particles sampled in %.1f s\n", (long) n, MPI_Wtime() - tg);
+        if(sat)
+            make_host_satellite(n - n / 11, n / 11);
+        else
+            make_hernquist(0, n, HQ_M, HQ_A, HQ_RMAX, Centre, Bulk, 4242, 0);
+        message(0, "Timing: %ld particles (%s) sampled in %.1f s\n", (long) n, sat ? "host + satellite, frame 150 km/s off" : "sphere", MPI_Wtime() - tg);
         struct SubhaloUnbindParams up = default_params();
         up.SampleSize = 1000;
+        const char * sm = getenv("SUBHALO_UNBIND_TIMING_SAMPLED");
+        up.SampledFinalPass = sm && *sm && atoi(sm) != 0;   /* TIMING SAMPLED rows: the sampled final pass */
         struct SubhaloArena arena = arena_alloc(n);
         struct CandResult r0, r;
-        double t1un = 0, t1fp = 0;
-        int opt;
-        for(opt = 0; opt < 2; opt++) {
-        /* opt 0: the exact final pass; opt 1: the sampled one (SubhaloFinalPass = 0) */
-        up.SampledFinalPass = opt;
-        for(k = 0; k < 4; k++) {
-            double tun = 1e30, tfp = 1e30;
-            for(rep = 0; rep < nrep; rep++) {
-                double a, b;
-                run_threads(k == 0 && rep == 0 ? &r0 : &r, nths[k], n, Centre, Bulk, 7, &up, &arena, &a, &b);
-                if(a < tun) tun = a;
-                if(b < tfp) tfp = b;
-                if(k > 0 || rep > 0) {
-                    assert_same_result(&r0, &r);
-                    cand_result_free(&r);
+        double tun[8][8], tfp[8][8];
+        for(m = 0; m < npm; m++)
+            for(k = 0; k < nth; k++)
+                tun[m][k] = tfp[m][k] = 1e30;
+        int have0 = 0;
+        for(k = 0; k < nth; k++)
+            for(rep = 0; rep < nrep; rep++)
+                for(m = 0; m < npm; m++) {
+                    if(nthl[k] == 1 && m > 0)
+                        continue;
+                    double a, b;
+                    subhalo_unbind_set_par_min(pms[m]);
+                    run_threads(have0 ? &r : &r0, (int) nthl[k], n, Centre, vel, 7, &up, &arena, &a, &b);
+                    subhalo_unbind_set_par_min(0);
+                    if(a < tun[m][k]) tun[m][k] = a;
+                    if(b < tfp[m][k]) tfp[m][k] = b;
+                    if(have0) {
+                        assert_same_result(&r0, &r);
+                        cand_result_free(&r);
+                    }
+                    have0 = 1;
                 }
+        /* the 1-thread time (any threshold) as the reference */
+        double t1un = 0, t1fp = 0;
+        for(k = 0; k < nth; k++)
+            if(nthl[k] == 1) {
+                t1un = tun[0][k];
+                t1fp = tfp[0][k];
             }
-            if(k == 0) {
-                t1un = tun;
-                t1fp = tfp;
+        for(m = 0; m < npm; m++)
+            for(k = 0; k < nth; k++) {
+                const int mm = nthl[k] == 1 ? 0 : m;
+                const double u = tun[mm][k], f = tfp[mm][k];
+                message(0, "TIMING%s N %8ld parmin %6ld threads %d: unbind %8.4f s  final pass %8.4f s  total %8.4f s  speedup %5.2f (unbind %5.2f, final pass %5.2f); Nbound %ld, %d iterations\n",
+                        up.SampledFinalPass ? " SAMPLED" : "", (long) n, (long) pms[m], (int) nthl[k], u, f, u + f, t1un > 0 ? (t1un + t1fp) / (u + f) : 0,
+                        t1un > 0 ? t1un / u : 0, t1fp > 0 ? t1fp / f : 0, (long) r0.Nbound, r0.Iterations);
             }
-            message(0, "TIMING%s N %8ld threads %d: unbind %8.3f s  final pass %8.3f s  total %8.3f s  speedup %5.2f (unbind %5.2f, final pass %5.2f); Nbound %ld, %d iterations\n",
-                    opt ? " SAMPLED" : "", (long) n, nths[k], tun, tfp, tun + tfp, (t1un + t1fp) / (tun + tfp), t1un / tun, t1fp / tfp,
-                    (long) r0.Nbound, r0.Iterations);
-        }
         cand_result_free(&r0);
-        }
         myfree(arena.base);
         teardown_pman();
     }
+    subhalo_unbind_set_loop_chunk(1);
     omp_set_num_threads(nmax0);
 }
 
@@ -2161,6 +2343,7 @@ int main(void) {
         cmocka_unit_test(test_threads_bitwise),
         cmocka_unit_test(test_threads_worker_region),
         cmocka_unit_test(test_final_pass_sampled),
+        cmocka_unit_test(test_threads_par_min),
         cmocka_unit_test(test_timing),
     };
     return cmocka_run_group_tests_mpi(tests, NULL, NULL);

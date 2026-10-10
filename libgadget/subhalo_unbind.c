@@ -45,28 +45,75 @@ arena_left(const struct SubhaloArena * a)
 /* ------------------------------------------------------------------ intra-key threading */
 
 /* Parallel mode (Phase 5 plan section 4 item 6, subhalo_unbind.h "Phase 5b"): an operation on
- * more than SUBHALO_UNBIND_PAR_MIN elements, called outside a parallel region (a key processed
- * alone) with more than one thread available, splits over the OpenMP threads. Every result is
- * defined independently of the thread count: the algorithm of each step depends on the size
- * only (sorts produce the unique order of a strict total order, the tree is the unique tree of
- * its sorted keys, floating sums are taken in fixed chunks of chunk_len(n) combined in chunk
- * order), the threads only share out the work. An operation on at most SUBHALO_UNBIND_PAR_MIN
- * elements is one chunk, i.e. the serial loop of HEAD 9e60f168, bit for bit. */
+ * more than par_min (default SUBHALO_UNBIND_PAR_MIN) elements, called outside a parallel region
+ * (a key processed alone) with more than one thread available, splits over the OpenMP threads.
+ * Every result is defined independently of the thread count and of par_min: the algorithm of
+ * each step depends on the size only (sorts produce the unique order of a strict total order,
+ * the tree is the unique tree of its sorted keys, floating sums are taken in fixed chunks of
+ * chunk_len(n) combined in chunk order, chunk_len and the partition's switch fixed by
+ * SUBHALO_UNBIND_CHUNK_MIN), the threads only share out the work. An operation on at most
+ * SUBHALO_UNBIND_CHUNK_MIN elements is one chunk, i.e. the serial loop of HEAD 9e60f168, bit for
+ * bit. */
+static int64_t par_min = SUBHALO_UNBIND_PAR_MIN;
+
+void
+subhalo_unbind_set_par_min(int64_t n)
+{
+    par_min = n > 0 ? n : SUBHALO_UNBIND_PAR_MIN;
+}
+
+int64_t
+subhalo_unbind_get_par_min(void)
+{
+    return par_min;
+}
+
 static inline int
 par_mode(int64_t n)
 {
-    return n > SUBHALO_UNBIND_PAR_MIN && !omp_in_parallel() && omp_get_max_threads() > 1;
+    return n > par_min && !omp_in_parallel() && omp_get_max_threads() > 1;
 }
 
-/* The fixed chunks of the reductions and of the order-preserving gathers: max(PAR_MIN,
+/* The per-element loops (energies, neighbour queries: each element independent, any split
+ * gives the same result) thread above min(SUBHALO_LOOP_PAR_MIN, par_min) elements. */
+#define SUBHALO_LOOP_PAR_MIN 4096
+static inline int
+loop_par(int64_t n)
+{
+    return n > (par_min < SUBHALO_LOOP_PAR_MIN ? par_min : SUBHALO_LOOP_PAR_MIN) && !omp_in_parallel();
+}
+
+/* The dynamic chunk of those loops: n / (4 threads) clamped to [16, 256] (a candidate of a few
+ * thousand elements then feeds every thread of a 32-thread team instead of n / 256 of them), or
+ * 256 with loop_chunk_adaptive cleared (the Phase 5b chunk). Scheduling only: no result depends
+ * on it. */
+static int loop_chunk_adaptive = 1;
+
+void
+subhalo_unbind_set_loop_chunk(int adaptive)
+{
+    loop_chunk_adaptive = adaptive;
+}
+
+static inline int
+loop_chunk(int64_t n)
+{
+    if(!loop_chunk_adaptive)
+        return 256;
+    int64_t c = n / (4 * (int64_t) omp_get_max_threads());
+    return c < 16 ? 16 : c > 256 ? 256 : (int) c;
+}
+
+/* The fixed chunks of the reductions and of the order-preserving gathers: max(CHUNK_MIN,
  * ceil(n / CHUNK_MAX)) elements, so at most SUBHALO_CHUNK_MAX chunks (per-chunk partials on the
- * stack) and a single chunk for n <= PAR_MIN. */
+ * stack) and a single chunk for n <= CHUNK_MIN. Independent of par_min: the chunks define the
+ * rounding of the sums. */
 #define SUBHALO_CHUNK_MAX 256
 static inline int64_t
 chunk_len(int64_t n)
 {
     const int64_t c = (n + SUBHALO_CHUNK_MAX - 1) / SUBHALO_CHUNK_MAX;
-    return c > SUBHALO_UNBIND_PAR_MIN ? c : SUBHALO_UNBIND_PAR_MIN;
+    return c > SUBHALO_UNBIND_CHUNK_MIN ? c : SUBHALO_UNBIND_CHUNK_MIN;
 }
 
 static inline int
@@ -921,7 +968,7 @@ potential_energies(const int64_t * tgt, int64_t nt, double * E, const int64_t * 
      * within a chunk in list order, the chunk partials in chunk order) */
     const int64_t C = chunk_len(nsrc);
     const int nch = chunk_count(nsrc, C);
-    const int gpar = par_mode(nsrc);
+    const int gpar = par_mode(nsrc) && nch > 1;
     int64_t cpot[SUBHALO_CHUNK_MAX], csub[SUBHALO_CHUNK_MAX], cout[SUBHALO_CHUNK_MAX], crank[SUBHALO_CHUNK_MAX];
     double cM[SUBHALO_CHUNK_MAX][6];
     int ch;
@@ -1026,8 +1073,9 @@ potential_energies(const int64_t * tgt, int64_t nt, double * E, const int64_t * 
     double theta2 = up->OpenAngle * up->OpenAngle;
     if(theta2 > 0.33)
         theta2 = 0.33;
-    const int par = nt > 4096 && !omp_in_parallel();
-    #pragma omp parallel for schedule(dynamic, 256) if(par)
+    const int par = loop_par(nt);
+    const int lch = loop_chunk(nt);
+    #pragma omp parallel for schedule(dynamic, lch) if(par)
     for(i = 0; i < nt; i++) {
         const int64_t p = tgt[i];
         double y[3], K = 0;
@@ -1083,7 +1131,7 @@ bound_frame_chunk(const int64_t * Index, int64_t i0, int64_t i1, const double re
 /* Mass-weighted centre and velocity of P[Index[0, n)] (HBT CentreOfMassReferenceFrame,
  * subhalo_unbind.cpp:150-195: positions relative to the first particle, NEAREST). Pos wrapped
  * into [0, BoxSize). Returns the mass; leaves Pos/Vel untouched if n == 0. The sums run over
- * the fixed chunks of chunk_len(n) (one chunk, HEAD's loop, for n <= PAR_MIN). */
+ * the fixed chunks of chunk_len(n) (one chunk, HEAD's loop, for n <= CHUNK_MIN). */
 static double
 bound_frame(const int64_t * Index, int64_t n, double Pos[3], double Vel[3], double BoxSize)
 {
@@ -1096,7 +1144,7 @@ bound_frame(const int64_t * Index, int64_t n, double Pos[3], double Vel[3], doub
     double M = 0, mx[3] = {0, 0, 0}, mv[3] = {0, 0, 0}, ref[3];
     for(d = 0; d < 3; d++)
         ref[d] = P[Index[0]].Pos[d];
-    if(par_mode(n)) {
+    if(par_mode(n) && nch > 1) {
         #pragma omp parallel for schedule(dynamic, 1)
         for(ch = 0; ch < nch; ch++)
             bound_frame_chunk(Index, ch * C, (ch + 1) * C < n ? (ch + 1) * C : n, ref, BoxSize, part[ch]);
@@ -1146,16 +1194,16 @@ count_tracers_all(const int64_t * Index, int64_t n, int TracerTypes)
 }
 
 /* Bound (Energy < 0) to the front of (Index, Energy)[0, n), returning their number.
- * n <= PAR_MIN: HEAD's swap loop (the bound keep their relative order, the unbound are left in
- * the order of its swaps). n > PAR_MIN: the stable partition (bound and unbound both keep their
- * relative order) by per-chunk counts and prefix offsets through a 16 byte per particle arena
- * buffer (decision 34: the swap loop's unbound order cannot be parallelised; it is visible only
- * in a candidate that dies, whose list seeds the parent's subsample). */
+ * n <= CHUNK_MIN: HEAD's swap loop (the bound keep their relative order, the unbound are left in
+ * the order of its swaps), whatever par_min. n > CHUNK_MIN: the stable partition (bound and
+ * unbound keep their relative order) by per-chunk counts and prefix offsets through a 16 byte per
+ * particle arena buffer (decision 34: the swap loop's unbound order cannot be parallelised; it is
+ * visible only in a candidate that dies, whose list seeds the parent's subsample). */
 static int64_t
 partition_bound(int64_t * Index, double * Energy, int64_t n, struct SubhaloArena * arena)
 {
     int64_t i, j = 0;
-    if(n <= SUBHALO_UNBIND_PAR_MIN) {
+    if(n <= SUBHALO_UNBIND_CHUNK_MIN) {
         for(i = 0; i < n; i++) {
             if(Energy[i] < 0) {
                 if(i != j) {
@@ -1730,8 +1778,9 @@ subhalo_knn_query(const struct SubhaloKnnTree * kt, const int64_t * query, int64
         return;
     }
     const double BoxSize = kt->t.BoxSize;
-    const int par = nq > 4096 && !omp_in_parallel();
-    #pragma omp parallel for schedule(dynamic, 256) if(par)
+    const int par = loop_par(nq);
+    const int lch = loop_chunk(nq);
+    #pragma omp parallel for schedule(dynamic, lch) if(par)
     for(i = 0; i < nq; i++) {
         struct KnnList L;
         double q[3], qa[3];
