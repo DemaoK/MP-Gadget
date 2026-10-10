@@ -713,7 +713,7 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
         /* Subhalo finder (design D6): after the PART write, before the PIG write. It restores
          * the domain itself before returning. */
         if(WriteFOF && subhalo_finder_on())
-            subhalo_find(&fof, ddecomp, SnapshotFileCount, atime, &All.CP, MPI_COMM_WORLD);
+            subhalo_find(&fof, ddecomp, SnapshotFileCount, atime, &All.CP, All.MetalReturnOn, MPI_COMM_WORLD);
 
         /* Save FOF tables after checkpoint so that if there is a FOF save bug we have particle tables available to debug it*/
         if(WriteFOF) {
@@ -864,7 +864,7 @@ runfof(const int RestartSnapNum, const inttime_t Ti_Current, const struct header
     }
     FOFGroups fof = fof_fof(ddecomp, 1, MPI_COMM_WORLD);
     if(subhalo_finder_on())
-        subhalo_find(&fof, ddecomp, RestartSnapNum, header->TimeSnapshot, &All.CP, MPI_COMM_WORLD);
+        subhalo_find(&fof, ddecomp, RestartSnapNum, header->TimeSnapshot, &All.CP, All.MetalReturnOn, MPI_COMM_WORLD);
     fof_save_groups(&fof, All.OutputDir, All.FOFFileBase, RestartSnapNum, &All.CP, header->TimeSnapshot, header->MassTable, All.MetalReturnOn, MPI_COMM_WORLD);
     fof_finish(&fof);
 }

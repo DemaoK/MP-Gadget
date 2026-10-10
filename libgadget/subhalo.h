@@ -92,10 +92,15 @@ const struct SubhaloParams * subhalo_get_params(void);
 #define SUBHALO_NOTRACK (-1L)
 /* Upper bound on SubhaloNumTracerHostFinding: the tracer IDs of step 0 live in the record. */
 #define SUBHALO_MAXTRACERS 16
-/* Provisional TrackId of a newborn candidate with global ordinal g (design 7.2 step 3). */
+/* Provisional TrackId of a newborn candidate with global ordinal g (design 7.2 step 3). The
+ * ordinals are FOF keys, g >= 1, so a provisional id is <= -3: -1 is "no track" and -2 is
+ * reserved for SUBHALO_DESC_PENDING (audit J1), which is never provisional. */
 #define SUBHALO_PROVISIONAL(g) (-(2L + (int64_t)(g)))
-#define SUBHALO_IS_PROVISIONAL(t) ((t) < -1L)
+#define SUBHALO_IS_PROVISIONAL(t) ((t) <= -3L)
 #define SUBHALO_PROVISIONAL_ORDINAL(t) (-(t) - 2L)
+/* A descendant vote whose tracer is not in the dead track's key: looked up after the domain
+ * restore (step 11). Distinct from every TrackId, -1 and every provisional id. */
+#define SUBHALO_DESC_PENDING (-2L)
 
 /* Flags bits (design 8) */
 #define SUBHALO_FLAG_ITERCAP      (1 << 0)
@@ -116,9 +121,13 @@ const struct SubhaloParams * subhalo_get_params(void);
 struct SubTrack {
     /* group A: identity and links */
     int64_t TrackId;
-    int64_t HostGroup;               /* FOF GroupID at this call, -1 field/hostless */
+    int64_t HostGroup;               /* FOF GroupID at this call, -1 field/hostless; for an orphan the group of
+                                      * its tracer at this call (-1 in the field or lost, J8) */
     int64_t NestedParentTrackId;     /* pid, -1 for a central */
-    int64_t CentralTrackId;          /* upid; a central's own TrackId */
+    int64_t CentralTrackId;          /* upid; a central's own TrackId; for an orphan the central of its current
+                                      * host group (-1 when its tracer is in the field or lost); an orphan's
+                                      * NestedParentTrackId, SinkTrackId and DescendantTrackId stay those
+                                      * set at its death (historical) */
     int64_t SinkTrackId;             /* -1 unless sunk */
     int64_t DescendantTrackId;       /* itself while alive; -1 or the descendant when dead/sunk */
     int32_t Rank, Depth;
@@ -244,9 +253,12 @@ void subhalo_init(int RestartSnapNum, int MaxStateSnapNum, const char * OutputDi
 /* One finder call, between write_checkpoint and fof_save_groups. fof->Group[] and P[i].GrNr
  * are those of fof_fof(ddecomp, 1, Comm). On return the domain is restored (the function does
  * its own slots_gc_sorted + domain_maintain), the tags describe this call, and the table
- * holds the new records. Returns 1 if the call completed, 0 if the exchange failed (tags and
- * table untouched). Collective. */
-int subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime, Cosmology * CP, MPI_Comm Comm);
+ * holds the new records, including the field SO of the centrals (step 12, SubhaloFieldSO).
+ * MetalReturnOn (All.MetalReturnOn, as fof_save_groups takes it) enables the metal columns of
+ * the baryonic sums. Returns 1 if the call completed, 0 if the exchange failed or the orphan
+ * lookup did not fit in memory (tags and table untouched; the orphans' tracer state is the
+ * documented exception). Collective over MPI_COMM_WORLD (the field SO's treewalk). */
+int subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime, Cosmology * CP, int MetalReturnOn, MPI_Comm Comm);
 
 /* Status accessors used by the writer. */
 int subhalo_last_call_complete(void);     /* 1 if the most recent subhalo_find completed */

@@ -1224,10 +1224,16 @@ def check_tags(pigdir, ck, ntracers=None, tracer_rank=True, mass_rtol=1e-4, phas
         ck.check(np.all(prefix_ok), "%s: in %d tracks the own-bound rows (BoundTrackId == TrackId) are not exactly "
                  "BindRank 0..NboundExclusive-1 (e.g. %s)" % (tag, len(np.unique(T[o][~prefix_ok])), np.unique(T[o][~prefix_ok])[:5].tolist()))
         if tracer_rank:
-            low = pos < ntracers
-            badt = low & ~istr[o]
-            ck.check(not np.any(badt), "%s: in %d tracks one of the %d lowest BindRanks is not a tracer type %s (e.g. %s)"
-                     % (tag, len(np.unique(T[o][badt])), ntracers, ttypes, np.unique(T[o][badt])[:5].tolist()))
+            # J12: BindRank is the energy order of every own-tag particle; the reservation only
+            # guarantees that the first ntracers tracer-type rows in rank order are bound to T
+            to = o[istr[o]]
+            if to.size:
+                tut, tfirst, tcnt = np.unique(T[to], return_index=True, return_counts=True)
+                tpos = np.arange(to.size) - np.repeat(tfirst, tcnt)
+                badt = (tpos < ntracers) & (B[to] != T[to])
+                ck.check(not np.any(badt), "%s: in %d tracks one of the first %d tracer-type (%s) rows in BindRank order "
+                         "is not bound to the track (e.g. %s)"
+                         % (tag, len(np.unique(T[to][badt])), ntracers, ttypes, np.unique(T[to][badt])[:5].tolist()))
         # per type exclusive and tail counts
         for t in range(NTYPES):
             m = typ[o] == t

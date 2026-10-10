@@ -546,24 +546,31 @@ subhalo_plan_default_cfg(struct SubhaloPlanCfg * cfg, int64_t TotNgroups, int NT
      * The fetch and store move records in batches bounded by subhalo_table_batch_peak_bytes,
      * which is in the reserve together with the constant SUBHALO_RESERVE_BYTES and the
      * NTask-sized vectors. */
-    cfg->PartBytes = SUBHALO_ARENA_BYTES_PER_PART;
-    /* Phase 2a: per member also its result slot and candidate node (a member hosted by the key)
-     * and its share of the remote descendant lookup (SUBHALO_MAXTRACERS ids and hits) */
-    cfg->MemberBytes = 2. * sizeof(struct SubTrack) + sizeof(struct SubhaloResult) + SUBHALO_NODE_BYTES + 6. * sizeof(int64_t)
+    /* the arena allowance of subhalo_run_serial_keys, from the validated SubhaloSourceRelaxFactor (J7) */
+    cfg->PartBytes = (double) subhalo_arena_bytes_per_part();
+    /* Phase 2a: per member also its result slot and candidate node (a member hosted by the key),
+     * its arena node allowance, and its share of the remote descendant lookup
+     * (SUBHALO_MAXTRACERS ids and hits) */
+    cfg->MemberBytes = 2. * sizeof(struct SubTrack) + sizeof(struct SubhaloResult) + SUBHALO_NODE_BYTES + SUBHALO_ARENA_NODE_BYTES + 6. * sizeof(int64_t)
         + SUBHALO_MAXTRACERS * (sizeof(MyIDType) + sizeof(struct SubhaloIdHit) + sizeof(int64_t));
-    cfg->KeyBytes = 2. * sizeof(struct SubhaloResult) + SUBHALO_NODE_BYTES + sizeof(struct SubhaloKeySeg) + sizeof(struct SubTrack) + SUBHALO_KEY_MISC_BYTES;
+    cfg->KeyBytes = 2. * sizeof(struct SubhaloResult) + SUBHALO_NODE_BYTES + SUBHALO_ARENA_NODE_BYTES + sizeof(struct SubhaloKeySeg) + sizeof(struct SubTrack) + SUBHALO_KEY_MISC_BYTES;
     cfg->InplaceKeyBytes = SUBHALO_INPLACE_KEY_BYTES;
     /* exchange.c per departing particle: the particle and slot copies, the exchange list entry
      * and the layout cache (the slot element size is added per rank) */
     cfg->ExchPartBytes = sizeof(struct particle_data) + sizeof(int) + 8;
     /* the local sort (qsort_openmp sorts particle_data indirectly: two pointers per element),
-     * reused later by the newborn request list and the restore's exchange lists */
-    cfg->SortBytesPerPart = 16;
+     * reused later by the newborn request list and the restore's exchange lists, and by the
+     * sorted (ID, index) index of the remote descendant lookup with its sort copy (32 bytes per
+     * particle, the larger of the two; J4) */
+    cfg->SortBytesPerPart = 32;
     /* constant per call: SUBHALO_RESERVE_BYTES, one batch of the record fetch/store, the
      * NTask-sized vectors, and the newborn numbering's directory entries and lookups for the
      * KChunk keys this rank's directory covers (about four 16-byte entries per key) */
     cfg->ReserveBytes = SUBHALO_RESERVE_BYTES + subhalo_table_batch_peak_bytes(NTask) + (double) NTask * SUBHALO_RESERVE_PER_TASK
         + 64. * (double) cfg->KChunk;
+    /* the batch buffers of the remote descendant lookup (J4); the record fetch/store batches and
+     * the lookup batches never coexist, but both are reserved */
+    cfg->ReserveBytes += subhalo_lookup_batch_peak_bytes(NTask);
 }
 
 /* Budget of this rank given the census of its particles in oversized keys (ov, PLAN_NOV) and
@@ -1073,21 +1080,16 @@ cmp_censuspart(const void * a, const void * b)
     return (x->TrackId > y->TrackId) - (x->TrackId < y->TrackId);
 }
 
-/* The key of a field track: (TrackId, Key) pairs, sorted by TrackId. */
-struct TrackKey {
-    int64_t TrackId;
-    int64_t Key;
-};
 
 static int
 cmp_trackkey(const void * a, const void * b)
 {
-    const int64_t x = ((const struct TrackKey *) a)->TrackId, y = ((const struct TrackKey *) b)->TrackId;
+    const int64_t x = ((const struct SubhaloTrackKey *) a)->TrackId, y = ((const struct SubhaloTrackKey *) b)->TrackId;
     return (x > y) - (x < y);
 }
 
 static int64_t
-field_key(const struct TrackKey * map, int64_t n, int64_t T)
+field_key(const struct SubhaloTrackKey * map, int64_t n, int64_t T)
 {
     int64_t lo = 0, hi = n;
     while(lo < hi) {
@@ -1101,7 +1103,7 @@ field_key(const struct TrackKey * map, int64_t n, int64_t T)
 /* The key of a live particle before the exchange: its group, or its track's key if it is a
  * tagged field particle, -1 otherwise. */
 static inline int64_t
-census_key(const struct particle_data * p, const struct TrackKey * map, int64_t nmap)
+census_key(const struct particle_data * p, const struct SubhaloTrackKey * map, int64_t nmap)
 {
     if(p->GrNr >= 0)
         return p->GrNr;
@@ -1113,22 +1115,22 @@ census_key(const struct particle_data * p, const struct TrackKey * map, int64_t 
 /* The keys of the tracks tagging this rank's live field particles, from their home ranks
  * (request/reply). Allocates the map on the bottom of the stack. Collective. */
 static int64_t
-query_field_keys(struct SubTrackTable * tab, struct TrackKey ** mapout, MPI_Comm Comm)
+query_field_keys(struct SubTrackTable * tab, struct SubhaloTrackKey ** mapout, int home_only, MPI_Comm Comm)
 {
     const int NTask = tab->NTask;
     int64_t i, n = 0;
     for(i = 0; i < PartManager->NumPart; i++)
-        if(part_live(&P[i]) && P[i].GrNr < 0 && P[i].TrackId >= 0)
+        if(part_live(&P[i]) && (home_only ? P[i].GrNr == -1 : P[i].GrNr < 0) && P[i].TrackId >= 0)
             n++;
-    struct TrackKey * map = (struct TrackKey *) mymalloc("SubFieldKeys", sizeof(struct TrackKey) * (n + 1));
+    struct SubhaloTrackKey * map = (struct SubhaloTrackKey *) mymalloc("SubFieldKeys", sizeof(struct SubhaloTrackKey) * (n + 1));
     n = 0;
     for(i = 0; i < PartManager->NumPart; i++)
-        if(part_live(&P[i]) && P[i].GrNr < 0 && P[i].TrackId >= 0) {
+        if(part_live(&P[i]) && (home_only ? P[i].GrNr == -1 : P[i].GrNr < 0) && P[i].TrackId >= 0) {
             map[n].TrackId = P[i].TrackId;
             map[n].Key = -1;
             n++;
         }
-    qsort_openmp(map, n, sizeof(struct TrackKey), cmp_trackkey);
+    qsort_openmp(map, n, sizeof(struct SubhaloTrackKey), cmp_trackkey);
     int64_t nu = 0;
     for(i = 0; i < n; i++)
         if(nu == 0 || map[i].TrackId != map[nu-1].TrackId)
@@ -1138,8 +1140,8 @@ query_field_keys(struct SubTrackTable * tab, struct TrackKey ** mapout, MPI_Comm
     memset(sendcounts, 0, sizeof(int64_t) * NTask);
     for(i = 0; i < nu; i++)
         sendcounts[subhalo_table_home_rank(tab, map[i].TrackId)]++;
-    struct TrackKey * in = NULL;
-    int64_t nin = subhalo_alltoallv(map, sendcounts, sizeof(struct TrackKey), (void **) &in, 0, recvcounts, Comm);
+    struct SubhaloTrackKey * in = NULL;
+    int64_t nin = subhalo_alltoallv(map, sendcounts, sizeof(struct SubhaloTrackKey), (void **) &in, 0, recvcounts, Comm);
     int missing = 0;
     for(i = 0; i < nin; i++) {
         const struct SubTrack * rec = subhalo_table_get(tab, in[i].TrackId);
@@ -1149,8 +1151,8 @@ query_field_keys(struct SubTrackTable * tab, struct TrackKey ** mapout, MPI_Comm
     }
     if(missing)
         endrun(5, "Field key query for a track not homed on rank %d.\n", tab->ThisTask);
-    struct TrackKey * back = NULL;
-    int64_t nback = subhalo_alltoallv(in, recvcounts, sizeof(struct TrackKey), (void **) &back, 0, NULL, Comm);
+    struct SubhaloTrackKey * back = NULL;
+    int64_t nback = subhalo_alltoallv(in, recvcounts, sizeof(struct SubhaloTrackKey), (void **) &back, 0, NULL, Comm);
     if(nback != nu)
         endrun(5, "Field key query returned %ld answers for %ld tracks.\n", nback, nu);
     /* answers come back in request order */
@@ -1162,6 +1164,18 @@ query_field_keys(struct SubTrackTable * tab, struct TrackKey ** mapout, MPI_Comm
     ta_free(sendcounts);
     *mapout = map;
     return nu;
+}
+
+int64_t
+subhalo_home_field_keys(struct SubTrackTable * tab, struct SubhaloTrackKey ** map, MPI_Comm Comm)
+{
+    return query_field_keys(tab, map, 1, Comm);
+}
+
+int64_t
+subhalo_track_key_lookup(const struct SubhaloTrackKey * map, int64_t n, int64_t TrackId)
+{
+    return field_key(map, n, TrackId);
 }
 
 void
@@ -1185,8 +1199,8 @@ subhalo_plan_build(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubT
     const int64_t TotKeys = plan->TotKeys;
 
     /* ---- the keys of the field particles (Phase 2a plan step 3) ---- */
-    struct TrackKey * fkmap = NULL;
-    const int64_t nfk = query_field_keys(tab, &fkmap, Comm);
+    struct SubhaloTrackKey * fkmap = NULL;
+    const int64_t nfk = query_field_keys(tab, &fkmap, 0, Comm);
 
     /* ---- local census: (key, type) counts and distinct tags of the particles of the keys ---- */
     struct SubhaloPlanRes res;
@@ -1749,8 +1763,9 @@ cmp_keyorder(const void * a, const void * b)
     return (x->g > y->g) - (x->g < y->g);
 }
 
-void
-subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t bytes_per_part, subhalo_key_fn fn, void * userdata)
+double
+subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t bytes_per_part, const int64_t * extra,
+                        subhalo_key_fn fn, void * userdata)
 {
     int64_t k, ns = 0, total = 0;
     int t;
@@ -1770,6 +1785,8 @@ subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t
             ns++;
         }
     qsort(ord, ns, sizeof(struct KeyOrder), cmp_keyorder);
+#define KEY_ARENA_BYTES(kk) ((size_t) bytes_per_part * (size_t) segs[kk].n + (size_t) (extra ? extra[kk] : 0) + 64)
+    double peakfrac = 0;
 
     /* keys above one thread's share run alone, with every thread inside the key */
     const int64_t share = (total + nthreads - 1) / nthreads;
@@ -1778,22 +1795,32 @@ subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t
         nalone++;
     if(nalone > 0) {
         struct SubhaloArena arena;
-        arena.size = bytes_per_part * ord[0].n + 64;
+        arena.size = 0;
+        for(k = 0; k < nalone; k++)
+            if(KEY_ARENA_BYTES(ord[k].k) > arena.size)
+                arena.size = KEY_ARENA_BYTES(ord[k].k);
         arena.base = (char *) mymalloc2("SubArenaAlone", arena.size);
         for(k = 0; k < nalone; k++) {
             arena.used = 0;
+            arena.peak = 0;
             fn(&segs[ord[k].k], ord[k].k, &arena, nthreads, userdata);
+            const double f = (double) arena.peak / (double) KEY_ARENA_BYTES(ord[k].k);
+            if(f > peakfrac)
+                peakfrac = f;
         }
         myfree(arena.base);
     }
 
     /* the rest: static longest-processing-time-first assignment to threads */
     int64_t * load = (int64_t *) mymalloc("SubThreadLoad", sizeof(int64_t) * nthreads);
-    int64_t * maxn = (int64_t *) mymalloc("SubThreadMaxN", sizeof(int64_t) * nthreads);
+    int64_t * maxb = (int64_t *) mymalloc("SubThreadMaxB", sizeof(int64_t) * nthreads);
     int64_t * count = (int64_t *) mymalloc("SubThreadCount", sizeof(int64_t) * nthreads);
+    double * tpeak = (double *) mymalloc("SubThreadPeak", sizeof(double) * nthreads);
     int * owner = (int *) mymalloc("SubKeyOwner", sizeof(int) * (ns + 1));
-    for(t = 0; t < nthreads; t++)
-        load[t] = maxn[t] = count[t] = 0;
+    for(t = 0; t < nthreads; t++) {
+        load[t] = maxb[t] = count[t] = 0;
+        tpeak[t] = 0;
+    }
     for(k = nalone; k < ns; k++) {
         int best = 0;
         for(t = 1; t < nthreads; t++)
@@ -1802,13 +1829,14 @@ subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t
         owner[k] = best;
         load[best] += ord[k].n;
         count[best]++;
-        if(ord[k].n > maxn[best])
-            maxn[best] = ord[k].n;
+        if((int64_t) KEY_ARENA_BYTES(ord[k].k) > maxb[best])
+            maxb[best] = KEY_ARENA_BYTES(ord[k].k);
     }
     struct SubhaloArena * arenas = (struct SubhaloArena *) mymalloc("SubArenas", sizeof(struct SubhaloArena) * nthreads);
     for(t = 0; t < nthreads; t++) {
-        arenas[t].size = bytes_per_part * maxn[t] + 64;
+        arenas[t].size = maxb[t] > 0 ? maxb[t] : 64;
         arenas[t].used = 0;
+        arenas[t].peak = 0;
         arenas[t].base = (char *) mymalloc2("SubArena", arenas[t].size);
     }
     #pragma omp parallel num_threads(nthreads)
@@ -1822,16 +1850,27 @@ subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t
             for(kk = nalone; kk < ns; kk++) {
                 if(owner[kk] != tt) continue;
                 arenas[tt].used = 0;
+                arenas[tt].peak = 0;
                 fn(&segs[ord[kk].k], ord[kk].k, &arenas[tt], 1, userdata);
+                /* relative to what the key itself was allowed, not the thread's larger arena */
+                const double f = (double) arenas[tt].peak / (double) KEY_ARENA_BYTES(ord[kk].k);
+                if(f > tpeak[tt])
+                    tpeak[tt] = f;
             }
         }
     }
+#undef KEY_ARENA_BYTES
+    for(t = 0; t < nthreads; t++)
+        if(tpeak[t] > peakfrac)
+            peakfrac = tpeak[t];
     for(t = nthreads - 1; t >= 0; t--)
         myfree(arenas[t].base);
     myfree(arenas);
     myfree(owner);
+    myfree(tpeak);
     myfree(count);
-    myfree(maxn);
+    myfree(maxb);
     myfree(load);
     myfree(ord);
+    return peakfrac;
 }

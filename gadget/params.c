@@ -224,10 +224,10 @@ create_gadget_parameter_set()
     param_declare_int(ps, "SubhaloMinNumPart", OPTIONAL, 20, "Minimum number of bound particles of a resolved subhalo.");
     param_declare_int(ps, "SubhaloMinNumTracerPart", OPTIONAL, 10, "Minimum number of bound tracer particles of a resolved subhalo.");
     param_declare_int(ps, "SubhaloNumTracerHostFinding", OPTIONAL, 10, "Tracers used in the host vote and for descendants. Must not exceed SubhaloMinNumTracerPart.");
-    param_declare_double(ps, "SubhaloLookupBatchBytes", OPTIONAL, 64.*1024*1024, "Per-rank bound in bytes on one batch of gathered tracer lookup misses.");
+    param_declare_double(ps, "SubhaloLookupBatchBytes", OPTIONAL, 64.*1024*1024, "Per-rank bound in bytes on one batch of the tracer ID lookups: the gathered IDs plus the outgoing and returning replies (at least one ID per rank and batch).");
     param_declare_double(ps, "SubhaloMajorProgenitorMassRatio", OPTIONAL, 0.8, "Central candidacy mass ratio.");
     param_declare_double(ps, "SubhaloBoundMassPrecision", OPTIONAL, 0.995, "Unbinding convergence criterion.");
-    param_declare_double(ps, "SubhaloSourceRelaxFactor", OPTIONAL, 3, "Source size as a multiple of Nbound.");
+    param_declare_double(ps, "SubhaloSourceRelaxFactor", OPTIONAL, 3, "Source size as a multiple of Nbound, in [1, 10]; the per-thread arena reserves 8 bytes per particle per unit.");
     param_declare_int(ps, "SubhaloPotentialSampleSize", OPTIONAL, 1000, "Potential subsampling size; 0 disables subsampling.");
     param_declare_double(ps, "SubhaloTreeOpenAngle", OPTIONAL, 0.45, "Geometric opening angle of the serial octree and of the in-place walk.");
     param_declare_int(ps, "SubhaloMergeTrapped", OPTIONAL, 1, "Enable sinking of trapped satellites.");

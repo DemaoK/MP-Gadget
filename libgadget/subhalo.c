@@ -27,6 +27,7 @@
 #include "subhalo.h"
 #include "subhalo_internal.h"
 #include "subhalo_unbind.h"
+#include "subhalo_so.h"
 
 /* ------------------------------------------------------------------ parameters */
 
@@ -96,6 +97,9 @@ subhalo_validate_params(const struct SubhaloParams * sp)
     if(sp->SubhaloCoreSize < 1 || sp->SubhaloPotentialSampleSize < 0 || sp->SubhaloMaxUnbindIterations < 1)
         endrun(1, "SubhaloCoreSize = %d and SubhaloMaxUnbindIterations = %d must be at least 1, SubhaloPotentialSampleSize = %d not negative.\n",
                sp->SubhaloCoreSize, sp->SubhaloMaxUnbindIterations, sp->SubhaloPotentialSampleSize);
+    if(!(sp->SubhaloSourceRelaxFactor >= 1 && sp->SubhaloSourceRelaxFactor <= SUBHALO_MAX_RELAX_FACTOR))
+        endrun(1, "SubhaloSourceRelaxFactor = %g must be in [1, %g]: the per-thread arena reserves 8 R bytes per particle "
+                  "for the relaxed sources (J7; HBT finds no change above 3).\n", sp->SubhaloSourceRelaxFactor, SUBHALO_MAX_RELAX_FACTOR);
     if(!(sp->SubhaloSourceRelaxFactor >= 1) || !(sp->SubhaloTreeOpenAngle > 0) || !(sp->SubhaloBoundMassPrecision > 0 && sp->SubhaloBoundMassPrecision <= 1)
        || !(sp->SubhaloMajorProgenitorMassRatio >= 0 && sp->SubhaloMajorProgenitorMassRatio <= 1))
         endrun(1, "SubhaloSourceRelaxFactor = %g must be >= 1, SubhaloTreeOpenAngle = %g positive, SubhaloBoundMassPrecision = %g in (0, 1], "
@@ -112,6 +116,25 @@ subhalo_validate_params(const struct SubhaloParams * sp)
     for(k = 0; k < 5; k++)
         if(!subhalo_isfinite(later[k]))
             endrun(1, "A floating-point Subhalo* parameter is not finite (%g).\n", later[k]);
+}
+
+/* Arena bytes per particle of a serial key (subhalo_internal.h, J7), from the validated
+ * SubhaloSourceRelaxFactor; set with the parameters. */
+static size_t SubArenaBytesPerPart = SUBHALO_ARENA_FIXED_BYTES_PER_PART + 24;
+
+size_t
+subhalo_arena_bytes_per_part(void)
+{
+    return SubArenaBytesPerPart;
+}
+
+static void
+subhalo_set_arena_bytes(const struct SubhaloParams * sp)
+{
+    double R = sp->SubhaloSourceRelaxFactor;
+    if(!(R >= 1)) R = 1;
+    if(R > SUBHALO_MAX_RELAX_FACTOR) R = SUBHALO_MAX_RELAX_FACTOR;
+    SubArenaBytesPerPart = SUBHALO_ARENA_FIXED_BYTES_PER_PART + (size_t) ceil(8. * R);
 }
 
 /* A double parameter that must hold a non-negative integer, checked before the conversion. */
@@ -184,6 +207,7 @@ set_subhalo_params(ParameterSet * ps)
     SubParams.SubhaloCollectiveMinPart = subhalo_int_param(raw[0], "SubhaloCollectiveMinPart");
     SubParams.SubhaloLookupBatchBytes = subhalo_int_param(raw[1], "SubhaloLookupBatchBytes");
     subhalo_validate_params(&SubParams);
+    subhalo_set_arena_bytes(&SubParams);
 }
 
 void
@@ -192,6 +216,7 @@ subhalo_set_testpar(struct SubhaloParams params)
     if(params.SubhaloFinderOn)
         subhalo_validate_params(&params);
     SubParams = params;
+    subhalo_set_arena_bytes(&SubParams);
 }
 
 void
@@ -494,6 +519,59 @@ struct IdReply {
     struct SubhaloIdHit h;
 };
 
+/* Test knob: at most this many ids per rank and batch (0: the byte cap alone). */
+static int64_t SubLookupMaxBatch = 0;
+/* High-water mark of the batch buffers (gathered ids, outgoing and returning replies) of the
+ * last subhalo_lookup_ids call on this rank. */
+static double SubLookupLastPeak = 0;
+
+void
+subhalo_lookup_set_max_batch(int64_t maxbatch)
+{
+    SubLookupMaxBatch = maxbatch > 0 ? maxbatch : 0;
+}
+
+double
+subhalo_lookup_last_peak_bytes(void)
+{
+    return SubLookupLastPeak;
+}
+
+/* Ids per rank and batch (J4): one batch gathers at most NTask * cap ids on every rank, a rank
+ * owning every one of them replies to all (NTask * cap replies out) and receives the replies to
+ * its own cap queries, so the batch buffers peak at
+ *   NTask * cap * (sizeof(MyIDType) + sizeof(struct IdReply)) + cap * sizeof(struct IdReply)
+ * on any rank whatever the pattern (live IDs are unique, init.c). cap is the largest value for
+ * which this stays within SubhaloLookupBatchBytes, at least one id per rank (the floor: a batch
+ * then holds NTask * 88 + 80 bytes with the 64-bit layout). */
+static int64_t
+lookup_cap(int NTask)
+{
+    const double per = (double) NTask * (double) (sizeof(MyIDType) + sizeof(struct IdReply)) + (double) sizeof(struct IdReply);
+    const int64_t bb = SubParams.SubhaloLookupBatchBytes > 0 ? SubParams.SubhaloLookupBatchBytes : 64L * 1024L * 1024L;
+    int64_t cap = (int64_t) ((double) bb / per);
+    if(cap > INT_MAX / NTask)
+        cap = INT_MAX / NTask;
+    if(SubLookupMaxBatch > 0 && cap > SubLookupMaxBatch)
+        cap = SubLookupMaxBatch;
+    return cap > 0 ? cap : 1;
+}
+
+double
+subhalo_lookup_batch_peak_bytes(int NTask)
+{
+    const int64_t cap = lookup_cap(NTask);
+    return (double) NTask * cap * (double) (sizeof(MyIDType) + sizeof(struct IdReply)) + (double) cap * sizeof(struct IdReply)
+        + 3 * 4096.;
+}
+
+double
+subhalo_lookup_index_bytes(int64_t NumPart)
+{
+    /* the (ID, index) index and the direct merge-sort copy of qsort_openmp */
+    return 2. * sizeof(struct IdIndex) * (double) (NumPart + 1) + 4096.;
+}
+
 void
 subhalo_lookup_ids(const MyIDType * ids, int64_t n, struct SubhaloIdHit * out, MPI_Comm Comm)
 {
@@ -518,13 +596,10 @@ subhalo_lookup_ids(const MyIDType * ids, int64_t n, struct SubhaloIdHit * out, M
         }
     qsort_openmp(idx, nl, sizeof(struct IdIndex), cmp_idindex);
 
-    /* batches: every rank contributes at most cap ids, so that a gathered batch holds at most
-     * SubhaloLookupBatchBytes of ids on every rank */
-    int64_t cap = SubParams.SubhaloLookupBatchBytes / ((int64_t) NTask * (int64_t) sizeof(MyIDType));
-    if(cap > INT_MAX / NTask)
-        cap = INT_MAX / NTask;
-    if(cap < 1)
-        cap = 1;
+    /* batches: every rank contributes at most cap ids, so that the ids and both reply buffers
+     * of a batch stay within SubhaloLookupBatchBytes on every rank (lookup_cap) */
+    const int64_t cap = lookup_cap(NTask);
+    SubLookupLastPeak = 0;
     int * counts = ta_malloc("SubLookupCounts", int, NTask);
     int * displs = ta_malloc("SubLookupDispls", int, NTask);
     int64_t * sendcounts = ta_malloc("SubLookupSend", int64_t, NTask);
@@ -589,6 +664,10 @@ subhalo_lookup_ids(const MyIDType * ids, int64_t n, struct SubhaloIdHit * out, M
             }
         struct IdReply * back = NULL;
         int64_t nback = subhalo_alltoallv(rep, sendcounts, sizeof(struct IdReply), (void **) &back, 0, NULL, Comm);
+        const double peak = (double) (tot + 1) * sizeof(MyIDType) + (double) (nhit + 1) * sizeof(struct IdReply)
+            + (double) (nback + 1) * sizeof(struct IdReply);
+        if(peak > SubLookupLastPeak)
+            SubLookupLastPeak = peak;
         /* an ID lives on one rank; if it were duplicated the last answer wins */
         for(i = 0; i < nback; i++)
             out[done + back[i].q] = back[i].h;
@@ -1432,7 +1511,19 @@ struct FieldSum {
     double ref[3];      /* the common reference (identical in every contribution) */
     double mdx[3];      /* sum m * NEAREST(x - ref) */
     double mv[3];       /* sum m * Vel */
+    /* the most-bound particle of the fallback (J3): the lowest (not a tracer type, BindRank, ID) */
+    int64_t mbkey[3];
+    MyIDType mbID;
+    double mbPos[3], mbVel[3];
 };
+
+static int
+fieldsum_mb_less(const int64_t a[3], const int64_t b[3])
+{
+    if(a[0] != b[0]) return a[0] < b[0];
+    if(a[1] != b[1]) return a[1] < b[1];
+    return a[2] < b[2];
+}
 
 static int
 cmp_fieldsum(const void * a, const void * b)
@@ -1516,7 +1607,7 @@ subhalo_update_unhosted(struct SubTrackTable * tab, int SnapNum, double atime, i
     const int TracerTypes = SubParams.SubhaloTracerTypes;
     const double vfac = subhalo_vel_to_kms(atime);
 
-    /* own-tag live field particles, grouped by track (Phase 1 never touches their tags) */
+    /* own-tag live field particles, grouped by track */
     int64_t nf = 0;
     for(i = 0; i < PartManager->NumPart; i++)
         if(subhalo_live(&P[i]) && P[i].GrNr < 0 && P[i].TrackId >= 0)
@@ -1614,6 +1705,15 @@ subhalo_update_unhosted(struct SubTrackTable * tab, int SnapNum, double atime, i
             sums[s].mdx[k] += m * NEAREST(p->Pos[k] - sums[s].ref[k], BoxSize);
             sums[s].mv[k] += m * p->Vel[k];
         }
+        const int64_t mk[3] = {(TracerTypes & (1 << p->Type)) ? 0 : 1, p->BindRank, (int64_t) p->ID};
+        if(sums[s].count == 1 || fieldsum_mb_less(mk, sums[s].mbkey)) {
+            for(k = 0; k < 3; k++) {
+                sums[s].mbkey[k] = mk[k];
+                sums[s].mbPos[k] = p->Pos[k];
+                sums[s].mbVel[k] = p->Vel[k];
+            }
+            sums[s].mbID = p->ID;
+        }
     }
     struct FieldSum * in = NULL;
     int64_t nin = subhalo_alltoallv(sums, sendcounts, sizeof(struct FieldSum), (void **) &in, 0, NULL, Comm);
@@ -1635,11 +1735,15 @@ subhalo_update_unhosted(struct SubTrackTable * tab, int SnapNum, double atime, i
             continue;
         }
         if(b > a) {
-            /* hostless resolved track: keeps its field particles; sums over ranks in rank order */
+            /* hostless resolved track of an oversized pseudo-key: keeps its field particles,
+             * which subhalo_process_inplace normalised to its record (all bound to it, dense
+             * ranks, J3); sums over ranks in rank order */
             int64_t count = 0, ntracer = 0, LenType[6] = {0};
             double MassType[6] = {0}, mass = 0, mdx[3] = {0}, mv[3] = {0};
-            int64_t c;
+            int64_t c, cmb = a;
             for(c = a; c < b; c++) {
+                if(fieldsum_mb_less(in[c].mbkey, in[cmb].mbkey))
+                    cmb = c;
                 count += in[c].count;
                 ntracer += in[c].ntracer;
                 for(k = 0; k < 6; k++) {
@@ -1655,6 +1759,12 @@ subhalo_update_unhosted(struct SubTrackTable * tab, int SnapNum, double atime, i
             /* the i4 count columns: abort rather than wrap (H4) */
             if(count > INT32_MAX || ntracer > INT32_MAX)
                 toolarge = 1;
+            /* identity and history carried, every property of the previous call cleared */
+            {
+                const struct SubTrack old = *t;
+                subhalo_track_carry(t, &old, old.TrackId, SnapNum);
+            }
+            t->Flags = SUBHALO_FLAG_INPLACE;
             t->HostGroup = -1;
             t->Rank = t->Depth = 0;
             t->NestedParentTrackId = -1;
@@ -1674,7 +1784,13 @@ subhalo_update_unhosted(struct SubTrackTable * tab, int SnapNum, double atime, i
                 t->CorePos[k] = t->CoMPos[k] = wrap_box(cen - PartManager->CurrentParticleOffset[k], BoxSize);
                 t->CoreVel[k] = t->CoMVel[k] = (mass > 0 ? mv[k] / mass : 0) * vfac;
             }
-            /* MostBound*: no binding order for hostless particles in Phase 1; the previous values stay. */
+            /* MostBound*: the first tracer-type particle in rank order (the Phase 1 rule has no
+             * binding energies) */
+            t->MostBoundID = in[cmb].mbID;
+            for(k = 0; k < 3; k++) {
+                t->MostBoundPos[k] = wrap_box(in[cmb].mbPos[k] - PartManager->CurrentParticleOffset[k], BoxSize);
+                t->MostBoundVel[k] = in[cmb].mbVel[k] * vfac;
+            }
             t->Alive = 1;
             subhalo_history_update(t, SnapNum, 0);
             nh++;
@@ -1712,7 +1828,7 @@ subhalo_finish_descendants(struct SubhaloResult * res, int64_t nres, MPI_Comm Co
     for(i = 0; i < nres; i++)
         if(res[i].valid)
             for(j = 0; j < res[i].ndesc; j++)
-                if(res[i].DescOwner[j] == -2)
+                if(res[i].DescOwner[j] == SUBHALO_DESC_PENDING)
                     n++;
     MyIDType * ids = (MyIDType *) mymalloc("SubDescIds", sizeof(MyIDType) * (n + 1));
     struct SubhaloIdHit * hit = (struct SubhaloIdHit *) mymalloc("SubDescHits", sizeof(struct SubhaloIdHit) * (n + 1));
@@ -1720,7 +1836,7 @@ subhalo_finish_descendants(struct SubhaloResult * res, int64_t nres, MPI_Comm Co
     for(i = 0; i < nres; i++)
         if(res[i].valid)
             for(j = 0; j < res[i].ndesc; j++)
-                if(res[i].DescOwner[j] == -2)
+                if(res[i].DescOwner[j] == SUBHALO_DESC_PENDING)
                     ids[n++] = res[i].rec.TracerIDs[j];
     subhalo_lookup_ids(ids, n, hit, Comm);
     n = 0;
@@ -1729,7 +1845,7 @@ subhalo_finish_descendants(struct SubhaloResult * res, int64_t nres, MPI_Comm Co
         if(!res[i].valid || res[i].ndesc <= 0)
             continue;
         for(j = 0; j < res[i].ndesc; j++)
-            if(res[i].DescOwner[j] == -2) {
+            if(res[i].DescOwner[j] == SUBHALO_DESC_PENDING) {
                 res[i].DescOwner[j] = hit[n].found ? hit[n].BoundTrackId : -1;
                 nremote++;
                 nfound += hit[n].found;
@@ -1761,15 +1877,99 @@ subhalo_finish_descendants(struct SubhaloResult * res, int64_t nres, MPI_Comm Co
             tot[0], tot[1], tot[2]);
 }
 
+/* ------------------------------------------------------------------ orphan links (J8) */
+
+/* After the store and the unhosted update, on the home records: every orphan's HostGroup is the
+ * group of its tracer at this call (Host: the step-1 lookup, or the vote for a track that died
+ * this call; -1 in the field or for a lost tracer), and its CentralTrackId the central of that
+ * group: the winner of an in-place key (ipl, sorted by g), the central the serial key already
+ * set, -1 in the field. Links fixed at death (parent, sink, descendant) are historical and
+ * kept. Not collective. */
+struct InplaceWinnerEntry {
+    int64_t g;
+    int64_t winner;
+};
+
+static int
+cmp_iplwinner(const void * a, const void * b)
+{
+    const int64_t x = ((const struct InplaceWinnerEntry *) a)->g, y = ((const struct InplaceWinnerEntry *) b)->g;
+    return (x > y) - (x < y);
+}
+
+static int64_t
+subhalo_sync_orphan_links(struct SubTrackTable * tab, const struct InplaceWinnerEntry * ipl, int64_t nipl)
+{
+    int64_t i, nchanged = 0;
+    for(i = 0; i < tab->NLocal; i++) {
+        struct SubTrack * t = &tab->Track[i];
+        if(t->Nbound > 0 || t->SnapDeath < 0)
+            continue;
+        const int64_t host = t->Host >= 0 ? t->Host : -1;
+        if(t->HostGroup != host)
+            nchanged++;
+        t->HostGroup = host;
+        if(host < 0) {
+            t->CentralTrackId = -1;
+            continue;
+        }
+        struct InplaceWinnerEntry key = {host, -1};
+        const struct InplaceWinnerEntry * w = (const struct InplaceWinnerEntry *)
+            bsearch(&key, ipl, nipl, sizeof(key), cmp_iplwinner);
+        if(w)
+            t->CentralTrackId = w->winner;
+    }
+    return nchanged;
+}
+
+/* ------------------------------------------------------------------ diagnostics */
+
+static struct SubhaloCallStats SubLastStats;
+
+const struct SubhaloCallStats *
+subhalo_last_call_stats(void)
+{
+    return &SubLastStats;
+}
+
+/* Global totals of the per-rank statistics (the worst ratio with its TrackId). Collective. */
+static void
+stats_reduce(const struct SubhaloCallStats * loc, struct SubhaloCallStats * tot, MPI_Comm Comm)
+{
+    int64_t a[7] = {loc->NCandidates, loc->NItercap, loc->NFinalPositive, loc->NFinalBound, loc->NTailRejected,
+                    loc->NFallbackField, loc->NFallbackReleased}, b[7];
+    MPI_Allreduce(a, b, 7, MPI_INT64, MPI_SUM, Comm);
+    memset(tot, 0, sizeof(*tot));
+    tot->NCandidates = b[0];
+    tot->NItercap = b[1];
+    tot->NFinalPositive = b[2];
+    tot->NFinalBound = b[3];
+    tot->NTailRejected = b[4];
+    tot->NFallbackField = b[5];
+    tot->NFallbackReleased = b[6];
+    MPI_Allreduce(&loc->ArenaPeakFrac, &tot->ArenaPeakFrac, 1, MPI_DOUBLE, MPI_MAX, Comm);
+    struct { double r; int rank; } in, out;
+    int ThisTask;
+    MPI_Comm_rank(Comm, &ThisTask);
+    in.r = loc->NItercap > 0 ? loc->WorstConvRatio : 2.;
+    in.rank = ThisTask;
+    MPI_Allreduce(&in, &out, 1, MPI_DOUBLE_INT, MPI_MINLOC, Comm);
+    tot->WorstConvRatio = out.r < 2. ? out.r : 1.;
+    int64_t wt = loc->WorstTrackId;
+    MPI_Bcast(&wt, 1, MPI_INT64, out.rank, Comm);
+    tot->WorstTrackId = out.r < 2. ? wt : -1;
+}
+
 /* ------------------------------------------------------------------ the driver */
 
 int
-subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime, Cosmology * CP, MPI_Comm Comm)
+subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime, Cosmology * CP, int MetalReturnOn, MPI_Comm Comm)
 {
     int64_t i;
     int ThisTask;
     MPI_Comm_rank(Comm, &ThisTask);
     struct SubTrackTable * tab = &SubTable;
+    const struct SubhaloParams * sp = &SubParams;
 
     walltime_measure("/Misc");
     if(!tab->initialised)
@@ -1813,7 +2013,27 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     subhalo_previous_frames(tab, Comm);
     walltime_measure("/Subhalo/Vote");
 
-    /* Step 1: orphan tracer lookup (Host, TracerPos, TracerVel, SnapTracerLost). */
+    /* Step 1: orphan tracer lookup (Host, TracerPos, TracerVel, SnapTracerLost). It runs before
+     * the plan can budget anything, so its peak (the ID index with its sort copy, one batch, the
+     * per-orphan ids and hits) is checked against the free memory first (J4); a rank short of it
+     * fails the call cleanly, before anything is modified. */
+    {
+        int64_t norph = 0;
+        for(i = 0; i < tab->NLocal; i++)
+            if(tab->Track[i].NboundPrev <= 0)
+                norph++;
+        const double need = subhalo_lookup_index_bytes(PartManager->NumPart) + subhalo_lookup_batch_peak_bytes(tab->NTask)
+            + (double) (norph + 1) * (sizeof(MyIDType) + sizeof(int64_t) + sizeof(struct SubhaloIdHit)) + 4. * 4096;
+        const double avail = (double) mymalloc_freebytes();
+        if(MPIU_Any(need > avail, Comm)) {
+            message(1, "Subhalo finder: the orphan lookup needs %g bytes, %g free on this rank.\n", need, avail);
+            message(0, "Subhalo finder: not enough memory for the orphan lookup of snapshot %d; the call is skipped. "
+                       "Tags and track table are unchanged; this PIG will be marked incomplete. "
+                       "Lower SubhaloLookupBatchBytes or run with more memory per rank.\n", SnapNum);
+            SubStatus.LastCallComplete = 0;
+            return 0;
+        }
+    }
     int64_t nlook = 0, nfound = 0;
     subhalo_orphan_lookup(tab, SnapNum, atime, &nlook, &nfound, Comm);
     message(0, "Subhalo orphans: %ld tracers looked up, %ld found.\n", nlook, nfound);
@@ -1855,7 +2075,6 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
         sinkwinner[i] = SUBHALO_NOTRACK;
     walltime_measure("/Subhalo/Members");
 
-    const struct SubhaloParams * sp = &SubParams;
     struct SubhaloUnbindParams up;
     memset(&up, 0, sizeof(up));
     up.atime = atime;
@@ -1886,6 +2105,11 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     ctx.Members = members;
     ctx.NMembers = nmembers;
     ctx.SinkWinner = sinkwinner;
+    /* Phase 3: the SO thresholds of this call and the metal switch of the baryonic sums */
+    subhalo_so_thresholds(CP, atime, ctx.rho);
+    ctx.MetalReturnOn = MetalReturnOn;
+    ctx.Stats.WorstConvRatio = 1;
+    ctx.Stats.WorstTrackId = -1;
 
     /* The result slots: the members hosted by every serial key, its newborn, the in-place
      * winners. The results live on the top (they survive the domain restore); the slot index
@@ -1893,16 +2117,20 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     const int64_t nres = subhalo_result_slots(segs, nsegs, &ctx);
     struct SubhaloResult * res = (struct SubhaloResult *) mymalloc2("SubResults", sizeof(struct SubhaloResult) * (nres + 1));
     memset(res, 0, sizeof(struct SubhaloResult) * (nres + 1));
+    for(i = 0; i <= nres; i++)
+        res[i].ipk = -1;
     ctx.Res = res;
     ctx.NRes = nres;
 
     /* Steps 7-8: serial keys, tags written straight into P. */
     subhalo_process_serial(segs, nsegs, &ctx);
-    subhalo_restore_field_grnr();
     walltime_measure("/Subhalo/Serial");
 
-    /* Step 9 (in-place part with the Phase 1 rule, before the restore). */
+    /* Step 9 (in-place part with the Phase 1 rule, before the restore), with the field particles
+     * that stayed home normalised to it (J3): they are told apart from the travelled field
+     * particles by their GrNr == -1, so the field encoding is undone only afterwards. */
     subhalo_process_inplace(segs, nsegs, &plan, &ctx, tab, Comm);
+    subhalo_restore_field_grnr();
     subhalo_free_slots(&ctx);
     walltime_measure("/Subhalo/InPlace");
 
@@ -1911,14 +2139,46 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     walltime_measure("/Subhalo/Restore");
 
     /* In-place sunk members become orphans. Copies of the same member on several ranks receive
-     * the same update, so duplicate stores are identical. */
+     * the same update, so duplicate stores are identical. A track that sinks into the winner of
+     * its group is a satellite at this call (SnapLastIsolation's satellite branch). */
     int64_t nsunk_local = 0;
     for(i = 0; i < nmembers; i++) {
         if(sinkwinner[i] == SUBHALO_NOTRACK)
             continue;
         subhalo_track_make_orphan(&members[i], sinkwinner[i], SnapNum);
         members[i].HostGroup = members[i].Host;
+        if(members[i].SnapLastIsolation < 0)
+            members[i].SnapLastIsolation = SnapNum - 1;
         nsunk_local++;
+    }
+    /* their tracer (the previous most-bound particle) at this call, on the restored layout: the
+     * in-place rule binds nothing, so the record still holds the previous call's position */
+    {
+        MyIDType * ids = (MyIDType *) mymalloc("SubSunkIds", sizeof(MyIDType) * (nsunk_local + 1));
+        int64_t * which = (int64_t *) mymalloc("SubSunkWhich", sizeof(int64_t) * (nsunk_local + 1));
+        struct SubhaloIdHit * hit = (struct SubhaloIdHit *) mymalloc("SubSunkHits", sizeof(struct SubhaloIdHit) * (nsunk_local + 1));
+        int64_t ns = 0;
+        for(i = 0; i < nmembers; i++)
+            if(sinkwinner[i] != SUBHALO_NOTRACK && members[i].MostBoundID != (MyIDType) -1) {
+                ids[ns] = members[i].MostBoundID;
+                which[ns++] = i;
+            }
+        subhalo_lookup_ids(ids, ns, hit, Comm);
+        const double vfac = subhalo_vel_to_kms(atime);
+        int64_t j;
+        for(j = 0; j < ns; j++) {
+            struct SubTrack * t = &members[which[j]];
+            if(!hit[j].found)
+                continue;
+            int d;
+            for(d = 0; d < 3; d++) {
+                t->TracerPos[d] = t->MostBoundPos[d] = wrap_pos(hit[j].Pos[d] - PartManager->CurrentParticleOffset[d], PartManager->BoxSize);
+                t->TracerVel[d] = t->MostBoundVel[d] = hit[j].Vel[d] * vfac;
+            }
+        }
+        myfree(hit);
+        myfree(which);
+        myfree(ids);
     }
 
     /* Step 10: new TrackIds in host order. */
@@ -1927,6 +2187,27 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     tab->NTotal = NTotalBefore + nnew;
     subhalo_table_redistribute(tab, Comm);
     walltime_measure("/Subhalo/Number");
+
+    /* The final TrackId of every in-place winner, on every rank (orphan links, J8). */
+    const int64_t K = plan.NInplace;
+    struct InplaceWinnerEntry * ipl = (struct InplaceWinnerEntry *) mymalloc2("SubIplWinners", sizeof(struct InplaceWinnerEntry) * (K + 1));
+    {
+        int64_t * w = (int64_t *) mymalloc("SubIplW", sizeof(int64_t) * (K + 1));
+        int64_t * gw = (int64_t *) mymalloc("SubIplGW", sizeof(int64_t) * (K + 1));
+        for(i = 0; i < K; i++)
+            w[i] = -1;
+        for(i = 0; i < nres; i++)
+            if(res[i].valid && res[i].ipk >= 0)
+                w[res[i].ipk] = res[i].rec.TrackId;
+        if(K > 0)
+            MPI_Allreduce(w, gw, K, MPI_INT64, MPI_MAX, Comm);
+        for(i = 0; i < K; i++) {
+            ipl[i].g = plan.Inplace[i].g;
+            ipl[i].winner = gw[i];
+        }
+        myfree(gw);
+        myfree(w);
+    }
 
     /* Step 11: descendants of the dead and sunk tracks (remote part and the majority). */
     subhalo_finish_descendants(res, nres, Comm);
@@ -1952,18 +2233,35 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     subhalo_table_store(tab, out, nout, Comm);
     myfree(out);
     /* The per-key buffers are no longer needed: release them (reverse order) before the
-     * update of the unclaimed tracks. */
+     * update of the unclaimed tracks. The in-place winners (ipl) were allocated after them. */
+    struct SubhaloCallStats locstats = ctx.Stats;
+    const int64_t nipl = K;
+    struct InplaceWinnerEntry * iplcopy = (struct InplaceWinnerEntry *) mymalloc("SubIplCopy", sizeof(struct InplaceWinnerEntry) * (nipl + 1));
+    memcpy(iplcopy, ipl, sizeof(struct InplaceWinnerEntry) * nipl);
+    myfree(ipl);
     myfree(res);
     myfree(sinkwinner);
     myfree(members);
     myfree(segs);
     subhalo_plan_free(&plan);
+    qsort(iplcopy, nipl, sizeof(struct InplaceWinnerEntry), cmp_iplwinner);
 
     /* Unclaimed tracks on the home ranks: resolved tracks without a key die; hostless tracks of
      * an oversized pseudo-key keep the Phase 1 hostless rule. */
     int64_t nhostless = 0, ndead = 0;
     subhalo_update_unhosted(tab, SnapNum, atime, &nhostless, &ndead, Comm);
+    /* The orphans' current host and central (J8). */
+    int64_t norphsync = subhalo_sync_orphan_links(tab, iplcopy, nipl), norphsync_tot = 0;
+    MPI_Allreduce(&norphsync, &norphsync_tot, 1, MPI_INT64, MPI_SUM, Comm);
+    myfree(iplcopy);
     walltime_measure("/Subhalo/Update");
+
+    /* Step 12: field SO of the centrals of this call, on the restored domain, from the home
+     * records (every record now describes this call; the PIG writer reads them afterwards). */
+    if(sp->SubhaloFieldSO) {
+        subhalo_field_so(tab->Track, tab->NLocal, ddecomp, atime, CP, sp, Comm);
+        walltime_measure("/Subhalo/FieldSO");
+    }
 
     /* Counts of this call on the home ranks. */
     int64_t loc[4] = {0, 0, 0, 0}, tot[4];
@@ -1977,6 +2275,13 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     MPI_Allreduce(loc, tot, 4, MPI_INT64, MPI_SUM, Comm);
     message(0, "Subhalo finder: snapshot %d done: %ld newborn, %ld sunk, %ld died (%ld without particles), %ld resolved (%ld hostless, %ld by the Phase 1 rule); %ld tracks in total.\n",
             SnapNum, nnew, tot[0], tot[1], ndead, tot[2], tot[3], nhostless, tab->NTotal);
+    stats_reduce(&locstats, &SubLastStats, Comm);
+    message(0, "Subhalo diagnostics: %ld unbindings, %ld at the iteration cap (worst Nbound/Nlast %g, track %ld); "
+               "%ld of %ld final-pass bound particles with E >= 0; %ld tail claims across the final branch dropped; "
+               "fallback field particles %ld (%ld released); %ld orphan hosts updated; arena high water %.3f.\n",
+            SubLastStats.NCandidates, SubLastStats.NItercap, SubLastStats.WorstConvRatio, SubLastStats.WorstTrackId,
+            SubLastStats.NFinalPositive, SubLastStats.NFinalBound, SubLastStats.NTailRejected,
+            SubLastStats.NFallbackField, SubLastStats.NFallbackReleased, norphsync_tot, SubLastStats.ArenaPeakFrac);
     log_tagged("after the call", Comm);
 
     if(SubStatus.StateSnapshot >= 0 && SubStatus.StateTime > 0)

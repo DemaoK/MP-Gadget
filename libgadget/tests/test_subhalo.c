@@ -138,7 +138,9 @@ default_subhalo_params(void)
     sp.SubhaloReassignGas = 1;
     sp.SubhaloNumNeighboursForReassignment = 10;
     sp.SubhaloUnbindWithThermal = 0;
-    sp.SubhaloFieldSO = 1;
+    /* off in the Phase 1 fixtures: their sparse particle sets give the full tree fewer nodes
+     * than the top-level grid; the Phase 2a/3 fixtures (p2_setup) switch it on */
+    sp.SubhaloFieldSO = 0;
     sp.SubhaloSOBins = 64;
     sp.SubhaloSOSearchFactor = 2;
     sp.SubhaloSOMaxDoublings = 3;
@@ -342,7 +344,7 @@ run_finder_call(int snap, Cosmology * CP, int64_t * TotNgroups)
     domain_decompose_full(&ddecomp, MPI_COMM_WORLD);
     FOFGroups fof = fof_fof(&ddecomp, 1, MPI_COMM_WORLD);
     *TotNgroups = fof.TotNgroups;
-    int ret = subhalo_find(&fof, &ddecomp, snap, atime, CP, MPI_COMM_WORLD);
+    int ret = subhalo_find(&fof, &ddecomp, snap, atime, CP, 0, MPI_COMM_WORLD);
     fof_finish(&fof);
     domain_free(&ddecomp);
     return ret;
@@ -2159,7 +2161,7 @@ lifecycle_call(int snap, double atime, Cosmology * CP, int er, const char * dir,
     empty_rank_domain(&ddecomp, er);
     FOFGroups fof = fof_fof(&ddecomp, 1, MPI_COMM_WORLD);
     *TotNgroups = fof.TotNgroups;
-    int ret = subhalo_find(&fof, &ddecomp, snap, atime, CP, MPI_COMM_WORLD);
+    int ret = subhalo_find(&fof, &ddecomp, snap, atime, CP, 0, MPI_COMM_WORLD);
     int64_t nloc = (get_thistask() == er) ? PartManager->NumPart : 0;
     MPI_Allreduce(&nloc, NumPartEmpty, 1, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
     if(dir) {
@@ -2813,6 +2815,7 @@ p2_setup(Cosmology * CP)
     common_physics_setup();
     petaio_init();
     struct SubhaloParams sp = default_subhalo_params();
+    sp.SubhaloFieldSO = 1;
     subhalo_set_testpar(sp);
     *CP = test_cosmology();
     P2_SavedTree = get_gravshort_treepar();
@@ -2851,9 +2854,13 @@ p2_teardown(void)
 }
 
 /* The D10 invariants on the gathered particles against the records: own-tag BindRank dense with
- * the exclusive bound rows first and the SubhaloMinNumTracerPart lowest ranks tracers (type 1);
+ * the exclusive bound rows first; BindRank is the energy order of all own-tag particles (J12),
+ * so the reservation shows only as: the first min(10, own-tag tracers) tracer-type (type 1)
+ * particles in rank order are bound to the track, and MostBoundID is the first of them;
  * BoundTrackId the tag, an ancestor of it or -1, bound owners resolved; Nbound, NboundTracer,
- * NboundExclusive, NtailType from the particles. Returns the number of violations. */
+ * NboundExclusive, NtailType from the particles. Records of the Phase 1 fallback
+ * (SUBHALO_FLAG_INPLACE) obey the same rules with every own-tag particle bound and no tail.
+ * Returns the number of violations. */
 static int
 p2_check_tags(const struct tagrec * r, int64_t n, const struct SubTrack * rec, int64_t nt, const char * what)
 {
@@ -2898,15 +2905,25 @@ p2_check_tags(const struct tagrec * r, int64_t n, const struct SubTrack * rec, i
             if(b < nown && byrank[b] < 0) byrank[b] = order[i];
             else LOCAL_CHECK(bad, 0, "%s: track %ld: BindRank %d duplicated or beyond %ld\n", what, t, b, nown);
         }
+        int64_t ntr = 0, first_tracer = -1;
         for(i = 0; i < nown; i++) {
             if(byrank[i] < 0) continue;
             const struct tagrec * q = &r[byrank[i]];
             LOCAL_CHECK(bad, (q->BoundTrackId == t) == (i < nex), "%s: track %ld: BindRank %ld bound %d, exclusive prefix %ld\n",
                         what, t, i, q->BoundTrackId == t, nex);
-            if(i < 10)
-                LOCAL_CHECK(bad, q->Type == 1, "%s: track %ld: BindRank %ld is a type %d particle, not a tracer\n", what, t, i, q->Type);
+            if(q->Type == 1) {
+                if(ntr == 0)
+                    first_tracer = byrank[i];
+                if(ntr < 10)
+                    LOCAL_CHECK(bad, q->BoundTrackId == t, "%s: track %ld: tracer %ld in rank order (BindRank %ld) is not bound to it\n",
+                                what, t, ntr, i);
+                ntr++;
+            }
         }
-        LOCAL_CHECK(bad, byrank[0] >= 0 && r[byrank[0]].ID == rec[t].MostBoundID, "%s: track %ld: MostBoundID is not BindRank 0\n", what, t);
+        if(rec[t].Flags & SUBHALO_FLAG_INPLACE)
+            LOCAL_CHECK(bad, nex == nown && tl == 0, "%s: fallback track %ld: %ld exclusive of %ld own-tag rows, tail %ld\n", what, t, nex, nown, tl);
+        LOCAL_CHECK(bad, first_tracer >= 0 && r[first_tracer].ID == rec[t].MostBoundID,
+                    "%s: track %ld: MostBoundID %lu is not the first tracer in rank order\n", what, t, (unsigned long) rec[t].MostBoundID);
         free(byrank);
     }
     for(i = 0; i < n; i++) {
@@ -2985,8 +3002,20 @@ test_subhalo_twohalo(void ** state)
     const double cen[2][3] = {{P2_cA[0], P2_cA[1], P2_cA[2]}, {P2_cB[0], P2_cB[1], P2_cB[2]}};
     const double bulk[2][3] = {{0, 0, 0}, {0, 0, 0}};
     int call;
+    /* a cold gas particle at rest at A's centre: the most bound particle of A, but not a tracer */
+    const MyIDType coldgas = 31;
     for(call = 0; call < 3; call++) {
         p2_place(0.5 + 0.05 * call, CP.GravInternal, cen, bulk);
+        {
+            int64_t i;
+            int d;
+            for(i = 0; i < PartManager->NumPart; i++)
+                if(P[i].ID == coldgas)
+                    for(d = 0; d < 3; d++) {
+                        P[i].Pos[d] = cen[0][d] + 0.01;
+                        P[i].Vel[d] = 0;
+                    }
+        }
         int64_t ng, n;
         int ret = run_finder_call(call, &CP, &ng);
         CHECK(ret == 1 && ng == 2, "two haloes, call %d: ret %d, %ld groups\n", call, ret, ng);
@@ -3015,6 +3044,13 @@ test_subhalo_twohalo(void ** state)
         }
         CHECK(bad == 0, "two haloes, call %d: particle tags\n", call);
         CHECK(ntail[0] >= P2_HOT && ntail[1] >= P2_HOT, "two haloes, call %d: tails %ld %ld\n", call, ntail[0], ntail[1]);
+        /* J12: BindRank is the energy order of every own-tag particle, so the cold gas particle
+         * ranks among the first ten (formerly reserved to tracers) while MostBoundID stays a tracer */
+        for(i = 0; i < n; i++)
+            if(r[i].ID == coldgas)
+                CHECK(r[i].Type == 0 && r[i].TrackId == 0 && r[i].BoundTrackId == 0 && r[i].BindRank < 10 && rec[0].MostBoundID != coldgas,
+                      "two haloes, call %d: cold gas particle type %d tagged %ld bound %ld BindRank %d (MostBoundID %lu)\n", call,
+                      r[i].Type, r[i].TrackId, r[i].BoundTrackId, r[i].BindRank, (unsigned long) rec[0].MostBoundID);
         CHECK(p2_check_tags(r, n, rec, 2, "two haloes") == 0, "two haloes, call %d: tag invariants\n", call);
         char what[64];
         snprintf(what, sizeof(what), "two haloes call %d", call);
@@ -3046,6 +3082,43 @@ p2_bound_com(const struct tagrec * r, const double * mass, int64_t n, int64_t t,
         com[d] = p2_wrap(ref[d] + (M > 0 ? s[d] / M : 0));
 }
 
+/* B at 5 kpc/h (physical) from A's centre on a circular orbit, 60 of its particles pulled to
+ * A's centre (the overlap scenario of plan test 6), positions and velocities for atime. */
+static void
+p2_infall(Cosmology * CP, double atime)
+{
+    double cen[2][3] = {{P2_cA[0], P2_cA[1], P2_cA[2]}, {P2_cB[0], P2_cB[1], P2_cB[2]}};
+    double bulk[2][3] = {{0, 0, 0}, {0, 0, 0}};
+    /* B at 5 kpc/h (physical) from A's centre on a circular orbit: its tidal radius (about 3
+     * kpc/h) is inside its truncation radius (6 kpc/h), so its outskirts are stripped */
+    const double dphys = 5.;
+    const double MinA = P2_MA * pow(dphys / (dphys + P2_SA), 2);
+    const double vc = sqrt(CP->GravInternal * MinA / dphys);
+    cen[1][0] = P2_cA[0] + dphys / atime;
+    cen[1][1] = P2_cA[1];
+    cen[1][2] = P2_cA[2];
+    bulk[1][1] = vc;
+    p2_place(atime, CP->GravInternal, cen, bulk);
+    /* 60 of B's particles have been pulled out towards A's centre and move against B: unbound
+     * to B, bound to A (what the satellite passes up and the central binds) */
+    {
+        int64_t i;
+        for(i = 0; i < PartManager->NumPart; i++) {
+            const int64_t k = (int64_t) P[i].ID - P2_NA;
+            if(p2_clump(P[i].ID) != 1 || k < P2_HOT || k >= P2_HOT + 60)
+                continue;
+            double x[3];
+            const double c0[3] = {0, 0, 0};
+            rand_in_ball(P[i].ID, 41, 1.0, c0, x);
+            int d;
+            for(d = 0; d < 3; d++) {
+                P[i].Pos[d] = p2_wrap(P2_cA[d] + (x[d] + (d == 0 ? 1. : 0)) / atime);
+                P[i].Vel[d] = atime * (d == 1 ? -vc : 0);
+            }
+        }
+    }
+}
+
 /* Test 6 of the plan: B falls into A (one FOF group): a satellite with a stripped tail, part of
  * it bound by the central under the satellite's tag; the frames of the next call from the
  * BoundTrackId sums; the restart join keeps BoundTrackId. */
@@ -3065,34 +3138,8 @@ test_subhalo_overlap(void ** state)
     int64_t ng, nempty;
     int ret = lifecycle_call(0, 0.5, &CP, 0, dir, &ng, &nempty);
     CHECK(ret == 1 && ng == 2, "overlap: first call\n");
-    /* B at 5 kpc/h (physical) from A's centre on a circular orbit: its tidal radius (about 3
-     * kpc/h) is inside its truncation radius (6 kpc/h), so its outskirts are stripped */
-    const double atime = 0.55, dphys = 5.;
-    const double MinA = P2_MA * pow(dphys / (dphys + P2_SA), 2);
-    const double vc = sqrt(CP.GravInternal * MinA / dphys);
-    cen[1][0] = P2_cA[0] + dphys / atime;
-    cen[1][1] = P2_cA[1];
-    cen[1][2] = P2_cA[2];
-    bulk[1][1] = vc;
-    p2_place(atime, CP.GravInternal, cen, bulk);
-    /* 60 of B's particles have been pulled out towards A's centre and move against B: unbound
-     * to B, bound to A (what the satellite passes up and the central binds) */
-    {
-        int64_t i;
-        for(i = 0; i < PartManager->NumPart; i++) {
-            const int64_t k = (int64_t) P[i].ID - P2_NA;
-            if(p2_clump(P[i].ID) != 1 || k < P2_HOT || k >= P2_HOT + 60)
-                continue;
-            double x[3];
-            const double c0[3] = {0, 0, 0};
-            rand_in_ball(P[i].ID, 41, 1.0, c0, x);
-            int d;
-            for(d = 0; d < 3; d++) {
-                P[i].Pos[d] = p2_wrap(P2_cA[d] + (x[d] + (d == 0 ? 1. : 0)) / atime);
-                P[i].Vel[d] = atime * (d == 1 ? -vc : 0);
-            }
-        }
-    }
+    const double atime = 0.55;
+    p2_infall(&CP, atime);
     ret = lifecycle_call(1, atime, &CP, 0, dir, &ng, &nempty);
     CHECK(ret == 1 && ng == 1, "overlap: %ld groups after the infall, expected 1\n", ng);
     int64_t n, i;
@@ -3248,6 +3295,865 @@ test_subhalo_sink_orphan(void ** state)
     p2_teardown();
 }
 
+/* ------------------------------------------------------------------ audit regression fixtures (J1-J12) */
+
+/* Synthetic tracking state (halofinder_phase2a_audit_codex.md, regression items 1-5): particles
+ * with chosen positions, velocities and tags, and the records of a previous call injected into
+ * the table, so that one call exercises a chosen hierarchy. Every particle is a DM tracer of
+ * mass SYN_M (1e6 Msun/h): a 100-particle ball of 1 kpc has v_circ ~ 20 km/s. The ids
+ * [SynNTot - SYN_NFIELD, SynNTot) are a 62.5 kpc/h field lattice at rest. */
+#define SYN_M 1e-4
+#define SYN_NFIELD 4096
+static int64_t SynNTot;
+
+struct SynPart {
+    double pos[3];      /* comoving, output frame (syn_place adds CurrentParticleOffset) */
+    double vel[3];      /* internal Vel */
+    double mass;
+    int64_t tag, bound;
+    int32_t rank;
+    int swallowed;
+};
+typedef void (*syn_fn)(MyIDType id, double atime, struct SynPart * s, void * ud);
+
+/* A point of a ball of physical radius Rphys about cen (comoving) with velocity bulk plus an
+ * isotropic offset of at most sigma (physical km/s), as Pos and Vel at atime. */
+static void
+syn_ball(MyIDType id, uint64_t salt, const double cen[3], double Rphys, const double bulk[3], double sigma, double atime, struct SynPart * s)
+{
+    double x[3], v[3];
+    const double c0[3] = {0, 0, 0};
+    rand_in_ball(id, salt, Rphys, c0, x);
+    rand_in_ball(id, salt + 1000, sigma, c0, v);
+    int d;
+    for(d = 0; d < 3; d++) {
+        s->pos[d] = cen[d] + x[d] / atime;
+        s->vel[d] = atime * (bulk[d] + v[d]);
+    }
+}
+
+static void
+syn_setup(Cosmology * CP, int64_t ntot, struct SubhaloParams sp)
+{
+    common_physics_setup();
+    petaio_init();
+    subhalo_set_testpar(sp);
+    *CP = test_cosmology();
+    P2_SavedTree = get_gravshort_treepar();
+    struct gravshort_tree_params tp = P2_SavedTree;
+    tp.FractionalGravitySoftening = 0.006;
+    set_gravshort_treepar(tp);
+    gravshort_set_softenings(50.);
+    int NTask = get_ntask(), ThisTask = get_thistask();
+    setup_pman(4 * ntot, BOXSIZE);
+    MyIDType id;
+    for(id = 0; id < (MyIDType) ntot; id++) {
+        if((int)(id % NTask) != ThisTask)
+            continue;
+        double pos[3] = {0, 0, 0};
+        add_dm_particle(id, pos);
+    }
+    slots_setup_id(PartManager, SlotsManager);
+    subhalo_init(-1, -1, "/nonexistent", MPI_COMM_WORLD);
+    SynNTot = ntot;
+}
+
+static void
+syn_teardown(void)
+{
+    int d;
+    for(d = 0; d < 3; d++)
+        PartManager->CurrentParticleOffset[d] = 0;
+    subhalo_set_units(3.085678e21, 1.989e43, 1e5);
+    p2_teardown();
+}
+
+/* Place every local particle (and, with settags, set its tags) from fn; the lattice ids are
+ * handled here. */
+static void
+syn_place(syn_fn fn, void * ud, double atime, int settags)
+{
+    int64_t i;
+    for(i = 0; i < PartManager->NumPart; i++) {
+        struct particle_data * p = &P[i];
+        struct SynPart s;
+        memset(&s, 0, sizeof(s));
+        s.mass = SYN_M;
+        s.tag = s.bound = -1;
+        s.rank = -1;
+        const int64_t k = (int64_t) p->ID - (SynNTot - SYN_NFIELD);
+        if(k >= 0) {
+            s.pos[0] = 31.25 + 62.5 * (k % 16);
+            s.pos[1] = 31.25 + 62.5 * ((k / 16) % 16);
+            s.pos[2] = 31.25 + 62.5 * (k / 256);
+        }
+        fn(p->ID, atime, &s, ud);
+        int d;
+        for(d = 0; d < 3; d++) {
+            p->Pos[d] = p2_wrap(s.pos[d] + PartManager->CurrentParticleOffset[d]);
+            p->Vel[d] = s.vel[d];
+        }
+        p->Mass = s.mass;
+        p->Swallowed = s.swallowed;
+        if(settags) {
+            p->TrackId = s.tag;
+            p->BoundTrackId = s.bound;
+            p->BindRank = s.rank;
+        }
+    }
+}
+
+/* A resolved record of the previous call (snapshot 0). */
+static struct SubTrack
+syn_rec(int64_t T, int nbound, double mbound, int64_t parent, int64_t central, int rank, int depth)
+{
+    struct SubTrack r;
+    subhalo_track_clear(&r, T);
+    r.Nbound = r.NboundExclusive = r.NboundTracer = nbound;
+    r.NboundType[1] = r.NboundExclusiveType[1] = nbound;
+    r.Mbound = r.MboundType[1] = mbound;
+    r.NestedParentTrackId = parent;
+    r.CentralTrackId = central;
+    r.Rank = rank;
+    r.Depth = depth;
+    r.HostGroup = 1;
+    r.SnapBirth = 0;
+    r.DescendantTrackId = T;
+    r.MboundPeak = mbound;
+    r.SnapMboundPeak = 0;
+    return r;
+}
+
+/* An orphan record with a stale host (HostGroup 99, CentralTrackId 0) and its tracer. */
+static struct SubTrack
+syn_orphan(int64_t T, MyIDType tracer)
+{
+    struct SubTrack r;
+    subhalo_track_clear(&r, T);
+    r.SnapBirth = 0;
+    r.SnapDeath = 0;
+    r.MostBoundID = tracer;
+    r.HostGroup = 99;
+    r.CentralTrackId = 0;
+    r.TracerPos[0] = 11;
+    r.TracerPos[1] = 22;
+    r.TracerPos[2] = 33;
+    r.TracerVel[0] = r.TracerVel[1] = r.TracerVel[2] = 0;
+    r.SnapTracerLost = -1;
+    r.MboundPeak = 0.01;
+    return r;
+}
+
+/* The records of a previous call, into the running finder's table (every rank passes all). */
+static void
+syn_records(const struct SubTrack * recs, int64_t n)
+{
+    struct SubTrackTable * tab = subhalo_get_table();
+    tab->NTotal = n;
+    subhalo_table_redistribute(tab, MPI_COMM_WORLD);
+    int64_t T;
+    for(T = 0; T < n; T++) {
+        struct SubTrack * t = subhalo_table_get(tab, T);
+        if(t)
+            *t = recs[T];
+    }
+}
+
+static int64_t
+tagrec_index(const struct tagrec * r, int64_t n, MyIDType id)
+{
+    int64_t lo = 0, hi = n;
+    while(lo < hi) {
+        int64_t mid = (lo + hi) / 2;
+        if(r[mid].ID < id) lo = mid + 1;
+        else hi = mid;
+    }
+    return (lo < n && r[lo].ID == id) ? lo : -1;
+}
+
+/* ---- regression item 2 and J2: a real nest tree in two groups ----
+ * Group 1, the audit's chain C(0) -> X(1) -> A(2) -> D(3) along x, 5 kpc apart: C is the decided
+ * central (largest previous Mbound) and moves at 1000 km/s; X (2000 particles) becomes the most
+ * massive survivor and is promoted; the 50 particles p, tagged D and unbound to it, sit at rest
+ * in C's frame: D, A and X keep them in their tails, C binds them. The deepest claim (D) is on
+ * another branch than the binding owner C after the promotion, so p must end tagged C.
+ * Group 2: R(4) -> P(5) -> G(6) with G on R's core (it sinks into its grandparent while its
+ * parent survives, and R is re-unbound with G's bound set), and R -> F(7) -> E(8) with F hot (it
+ * dies, E is detached to R). */
+#define NT_C0 0
+#define NT_X0 200
+#define NT_A0 2200
+#define NT_D0 2400
+#define NT_P0 2500
+#define NT_R0 2550
+#define NT_PP0 2850
+#define NT_G0 3000
+#define NT_F0 3060
+#define NT_E0 3100
+#define NT_END 3200
+
+static void
+nest_particle(MyIDType id, double atime, struct SynPart * s, void * ud)
+{
+    if(id >= NT_END)
+        return;
+    const double s5 = 5. / atime;
+    const double ca[3] = {375, 375, 375}, cb[3] = {750, 750, 750};
+    const double zero[3] = {0, 0, 0}, vC[3] = {0, 1000, 0};
+    double c[3];
+    int d;
+    for(d = 0; d < 3; d++)
+        c[d] = ca[d];
+    if(id < NT_X0) {                 /* C */
+        c[0] -= 1.5 * s5;
+        syn_ball(id, 1, c, 1.0, vC, 5, atime, s);
+        s->tag = s->bound = 0; s->rank = id - NT_C0;
+    } else if(id < NT_A0) {          /* X */
+        c[0] -= 0.5 * s5;
+        syn_ball(id, 2, c, 1.0, zero, 5, atime, s);
+        s->tag = s->bound = 1; s->rank = id - NT_X0;
+    } else if(id < NT_D0) {          /* A */
+        c[0] += 0.5 * s5;
+        syn_ball(id, 3, c, 1.0, zero, 5, atime, s);
+        s->tag = s->bound = 2; s->rank = id - NT_A0;
+    } else if(id < NT_P0) {          /* D */
+        c[0] += 1.5 * s5;
+        syn_ball(id, 4, c, 1.0, zero, 5, atime, s);
+        s->tag = s->bound = 3; s->rank = id - NT_D0;
+    } else if(id < NT_R0) {          /* p: D's unbound tail, at rest in C's frame */
+        c[0] -= 1.5 * s5;
+        syn_ball(id, 5, c, 0.5, vC, 5, atime, s);
+        s->tag = 3; s->bound = -1; s->rank = 100 + (id - NT_P0);
+    } else if(id < NT_PP0) {         /* R */
+        syn_ball(id, 6, cb, 1.0, zero, 5, atime, s);
+        s->tag = s->bound = 4; s->rank = id - NT_R0;
+    } else if(id < NT_G0) {          /* P */
+        double cp[3] = {cb[0] + s5, cb[1], cb[2]};
+        syn_ball(id, 7, cp, 1.0, zero, 5, atime, s);
+        s->tag = s->bound = 5; s->rank = id - NT_PP0;
+    } else if(id < NT_F0) {          /* G, on R's core */
+        syn_ball(id, 8, cb, 0.5, zero, 5, atime, s);
+        s->tag = s->bound = 6; s->rank = id - NT_G0;
+    } else if(id < NT_E0) {          /* F, hot */
+        double cf[3] = {cb[0] - s5, cb[1], cb[2]};
+        syn_ball(id, 9, cf, 1.0, zero, 3000, atime, s);
+        s->tag = s->bound = 7; s->rank = id - NT_F0;
+    } else {                         /* E */
+        double ce[3] = {cb[0] - s5, cb[1], cb[2]};
+        syn_ball(id, 10, ce, 1.0, zero, 5, atime, s);
+        s->tag = s->bound = 8; s->rank = id - NT_E0;
+    }
+}
+
+static void
+test_subhalo_nest_tree(void ** state)
+{
+    Cosmology CP;
+    struct SubhaloParams sp = default_subhalo_params();
+    sp.SubhaloFieldSO = 1;
+    syn_setup(&CP, NT_END + SYN_NFIELD, sp);
+    const double atime = 0.55;
+    struct SubTrack recs[9];
+    recs[0] = syn_rec(0, 250, 1.0, -1, 0, 0, 0);
+    recs[1] = syn_rec(1, 2000, 0.2, 0, 0, 1, 1);
+    recs[2] = syn_rec(2, 200, 0.02, 1, 0, 2, 2);
+    recs[3] = syn_rec(3, 100, 0.01, 2, 0, 3, 3);
+    recs[4] = syn_rec(4, 300, 0.03, -1, 4, 0, 0);
+    recs[5] = syn_rec(5, 150, 0.015, 4, 4, 1, 1);
+    recs[6] = syn_rec(6, 60, 0.006, 5, 4, 3, 2);
+    recs[7] = syn_rec(7, 40, 0.004, 4, 4, 4, 1);
+    recs[8] = syn_rec(8, 100, 0.01, 7, 4, 2, 2);
+    syn_records(recs, 9);
+    syn_place(nest_particle, NULL, atime, 1);
+    int64_t ng, nempty, n, i;
+    int ret = lifecycle_call(1, atime, &CP, 0, NULL, &ng, &nempty);
+    CHECK(ret == 1 && ng == 2, "nest: ret %d, %ld groups (expected 2)\n", ret, ng);
+    CHECK(subhalo_get_table()->NTotal == 9, "nest: NTotal %ld\n", subhalo_get_table()->NTotal);
+    struct tagrec * r = gather_tags(&n);
+    struct SubTrack * rec = fetch_all_tracks(9);
+    /* group 1: X promoted, C under X, the chain below X unchanged */
+    CHECK(rec[1].Rank == 0 && rec[1].Depth == 0 && rec[1].NestedParentTrackId == -1 && rec[1].CentralTrackId == 1,
+          "nest: X Rank %d Depth %d pid %ld upid %ld\n", rec[1].Rank, rec[1].Depth, rec[1].NestedParentTrackId, rec[1].CentralTrackId);
+    CHECK(rec[0].Nbound >= 240 && rec[0].NestedParentTrackId == 1 && rec[0].Depth == 1 && rec[0].CentralTrackId == 1,
+          "nest: C Nbound %d pid %ld Depth %d upid %ld\n", rec[0].Nbound, rec[0].NestedParentTrackId, rec[0].Depth, rec[0].CentralTrackId);
+    CHECK(rec[2].NestedParentTrackId == 1 && rec[2].Depth == 1 && rec[3].NestedParentTrackId == 2 && rec[3].Depth == 2,
+          "nest: A pid %ld Depth %d, D pid %ld Depth %d\n", rec[2].NestedParentTrackId, rec[2].Depth, rec[3].NestedParentTrackId, rec[3].Depth);
+    int bad = 0;
+    for(i = 0; i < n; i++) {
+        const MyIDType id = r[i].ID;
+        if(id >= NT_P0 && id < NT_R0)
+            LOCAL_CHECK(bad, r[i].TrackId == 0 && r[i].BoundTrackId == 0, "nest: tail particle %lu tagged %ld bound %ld, expected C (0)\n",
+                        (unsigned long) id, r[i].TrackId, r[i].BoundTrackId);
+        if(id >= NT_G0 && id < NT_F0)
+            LOCAL_CHECK(bad, r[i].TrackId == 4 && r[i].BoundTrackId == 4, "nest: G's particle %lu tagged %ld bound %ld, expected R (4)\n",
+                        (unsigned long) id, r[i].TrackId, r[i].BoundTrackId);
+        if(id >= NT_PP0 && id < NT_G0)
+            LOCAL_CHECK(bad, r[i].BoundTrackId == 5, "nest: P's particle %lu bound %ld\n", (unsigned long) id, r[i].BoundTrackId);
+        if(id >= NT_E0 && id < NT_END)
+            LOCAL_CHECK(bad, r[i].BoundTrackId == 8, "nest: E's particle %lu bound %ld\n", (unsigned long) id, r[i].BoundTrackId);
+        if(id >= NT_F0 && id < NT_E0)
+            LOCAL_CHECK(bad, r[i].BoundTrackId == -1 && r[i].TrackId != 7, "nest: F's hot particle %lu tagged %ld bound %ld\n",
+                        (unsigned long) id, r[i].TrackId, r[i].BoundTrackId);
+    }
+    CHECK(bad == 0, "nest: per-particle binding owners\n");
+    /* (up to ten of p are among C's reserved most-bound tracers, which no tail claims) */
+    CHECK(subhalo_last_call_stats()->NTailRejected >= 40, "nest: %ld tail claims across the final branch rejected, expected >= 40\n",
+          subhalo_last_call_stats()->NTailRejected);
+    /* group 2: G sank into its grandparent R and R took its bound set; F died, E detached to R */
+    CHECK(rec[4].Rank == 0 && rec[4].Nbound >= 350, "nest: R Rank %d Nbound %d\n", rec[4].Rank, rec[4].Nbound);
+    CHECK(rec[5].Nbound > 0 && rec[5].NestedParentTrackId == 4, "nest: P Nbound %d pid %ld\n", rec[5].Nbound, rec[5].NestedParentTrackId);
+    CHECK(rec[6].Nbound == 0 && rec[6].SinkTrackId == 4 && rec[6].SnapSink == 1 && rec[6].DescendantTrackId == 4,
+          "nest: G Nbound %d SinkTrackId %ld SnapSink %d Desc %ld\n", rec[6].Nbound, rec[6].SinkTrackId, rec[6].SnapSink, rec[6].DescendantTrackId);
+    CHECK(rec[7].Nbound == 0 && rec[7].SnapDeath == 1 && rec[7].SinkTrackId == -1 && rec[7].NestedParentTrackId == 4
+          && rec[7].SnapLastIsolation == 0 && rec[7].HostGroup == rec[4].HostGroup && rec[7].CentralTrackId == 4,
+          "nest: F Nbound %d SnapDeath %d Sink %ld pid %ld SnapLastIsolation %d HostGroup %ld upid %ld\n", rec[7].Nbound, rec[7].SnapDeath,
+          rec[7].SinkTrackId, rec[7].NestedParentTrackId, rec[7].SnapLastIsolation, rec[7].HostGroup, rec[7].CentralTrackId);
+    CHECK(rec[8].Nbound > 0 && rec[8].NestedParentTrackId == 4 && rec[8].Depth == 1, "nest: E Nbound %d pid %ld Depth %d\n",
+          rec[8].Nbound, rec[8].NestedParentTrackId, rec[8].Depth);
+    CHECK(p2_check_tags(r, n, rec, 9, "nest") == 0, "nest: tag invariants\n");
+    /* the Phase 3 hooks ran: bound SO, Rockstar Vmax, field SO of the two centrals */
+    CHECK(rec[1].MBoundSO[0] > 0 && rec[1].VmaxVir > 0 && rec[1].MSO[2] > 0 && rec[4].MSO[2] > 0 && rec[0].MSO[2] == -1,
+          "nest: Phase 3 columns MBoundSO %g VmaxVir %g MSO200c %g / %g (satellite %g)\n", rec[1].MBoundSO[0], rec[1].VmaxVir,
+          rec[1].MSO[2], rec[4].MSO[2], rec[0].MSO[2]);
+    free(rec);
+    free(r);
+    syn_teardown();
+}
+
+/* ---- J7: deep chains, the arena high-water mark at R = 3 and R = 10, sinking on and off ----
+ * A 30-node chain T0 -> T1 -> ... -> T29 (5 kpc apart, 25 bound particles each, 40 for T0) and
+ * 300 hot particles in T29's tail that every node rejects: each survivor keeps up to R * 25 of
+ * them, the audit's worst case for the persistent lists. */
+#define DC_L 30
+#define DC_N0 40
+#define DC_N 25
+#define DC_HOT 300
+#define DC_END (DC_N0 + (DC_L - 1) * DC_N + DC_HOT)
+
+static int
+dc_node(MyIDType id)
+{
+    if(id < DC_N0) return 0;
+    if(id < DC_N0 + (DC_L - 1) * DC_N) return 1 + (id - DC_N0) / DC_N;
+    return -1;
+}
+
+static void
+dc_particle(MyIDType id, double atime, struct SynPart * s, void * ud)
+{
+    if(id >= DC_END)
+        return;
+    const double s5 = 5. / atime;
+    const double zero[3] = {0, 0, 0};
+    const int v = dc_node(id);
+    if(v >= 0) {
+        double c[3] = {375 - 14.5 * s5 + v * s5, 375, 375};
+        syn_ball(id, 21, c, 0.5, zero, 2, atime, s);
+        s->tag = s->bound = v;
+        s->rank = v == 0 ? id : (id - DC_N0) % DC_N;
+        return;
+    }
+    const int64_t j = id - (DC_N0 + (DC_L - 1) * DC_N);
+    double c[3] = {375 - 14.5 * s5 + (j % DC_L) * s5, 375, 375};
+    syn_ball(id, 22, c, 0.5, zero, 3000, atime, s);
+    s->tag = DC_L - 1;
+    s->bound = -1;
+    s->rank = DC_N + j;
+}
+
+static void
+test_subhalo_deep_chain(void ** state)
+{
+    const double Rs[2] = {3, 10};
+    int ir, merge;
+    for(ir = 0; ir < 2; ir++)
+        for(merge = 0; merge < 2; merge++) {
+            Cosmology CP;
+            struct SubhaloParams sp = default_subhalo_params();
+            sp.SubhaloSourceRelaxFactor = Rs[ir];
+            sp.SubhaloMergeTrapped = merge;
+            syn_setup(&CP, DC_END + SYN_NFIELD, sp);
+            CHECK(subhalo_arena_bytes_per_part() == (size_t) (SUBHALO_ARENA_FIXED_BYTES_PER_PART + 8 * Rs[ir]),
+                  "deep chain: arena %lu bytes per particle at R = %g\n", (unsigned long) subhalo_arena_bytes_per_part(), Rs[ir]);
+            struct SubTrack recs[DC_L];
+            int v;
+            recs[0] = syn_rec(0, DC_N0, 1.0, -1, 0, 0, 0);
+            for(v = 1; v < DC_L; v++)
+                recs[v] = syn_rec(v, DC_N, 0.0025, v - 1, 0, v, v);
+            syn_records(recs, DC_L);
+            const double atime = 0.55;
+            syn_place(dc_particle, NULL, atime, 1);
+            int64_t ng, nempty, n, i;
+            int ret = lifecycle_call(1, atime, &CP, 0, NULL, &ng, &nempty);
+            CHECK(ret == 1 && ng == 1, "deep chain R %g merge %d: ret %d, %ld groups\n", Rs[ir], merge, ret, ng);
+            const struct SubhaloCallStats * st = subhalo_last_call_stats();
+            message(0, "Deep chain R = %g, sinking %d: arena high water %.3f of the key's allowance\n", Rs[ir], merge, st->ArenaPeakFrac);
+            CHECK(st->ArenaPeakFrac > 0 && st->ArenaPeakFrac <= 1, "deep chain: arena high water %g\n", st->ArenaPeakFrac);
+            struct tagrec * r = gather_tags(&n);
+            struct SubTrack * rec = fetch_all_tracks(DC_L);
+            int nalive = 0;
+            for(i = 0; i < DC_L; i++)
+                if(rec[i].Nbound > 0) nalive++;
+            CHECK(nalive == DC_L && rec[0].Rank == 0 && rec[DC_L - 1].Depth == DC_L - 1,
+                  "deep chain: %d survivors of %d, T0 Rank %d, T29 Depth %d\n", nalive, DC_L, rec[0].Rank, rec[DC_L - 1].Depth);
+            int64_t ntail = 0;
+            for(i = 0; i < n; i++)
+                if(r[i].ID >= DC_N0 + (DC_L - 1) * DC_N && r[i].ID < DC_END && r[i].TrackId == DC_L - 1)
+                    ntail++;
+            CHECK(ntail == (int64_t) (Rs[ir] * DC_N) - DC_N, "deep chain: T29 keeps %ld hot particles, expected %g\n", ntail, Rs[ir] * DC_N - DC_N);
+            CHECK(p2_check_tags(r, n, rec, DC_L, "deep chain") == 0, "deep chain: tag invariants\n");
+            free(rec);
+            free(r);
+            syn_teardown();
+        }
+}
+
+/* ---- regression item 1, J1 and J8: lifecycle events in one call, with an empty rank, a nonzero
+ *      particle offset and a non-default velocity unit ----
+ * S (0) hosts the dying D (1): D's ten tracers are six cold particles at S's centre (S binds
+ * them), one cold and one hot particle in U's group (2; found remotely: bound to U, unbound) and
+ * two hot ones; a newborn N in its own group numbers while those votes are pending (J1). V (3)
+ * is an oversized group processed in place. Orphans: O1 (4) follows an S particle, O2 (5) a
+ * swallowed field particle, O3 (6) an ID that does not exist, O4 (7) a moving field particle,
+ * O5 (8) a V particle. Calls 2 and 3 move O1's tracer to the field, then into V. */
+#define MX_S0 0
+#define MX_D0 300
+#define MX_U0 340
+#define MX_V0 490
+#define MX_N0 1190
+#define MX_END 1290
+#define MX_O2 (MX_END + 5)
+#define MX_O4 (MX_END + 77)
+#define MX_O3 ((MyIDType) 999999999)
+
+struct MixUd {
+    int call;
+};
+
+static void
+mix_particle(MyIDType id, double atime, struct SynPart * s, void * ud)
+{
+    const struct MixUd * m = (const struct MixUd *) ud;
+    const double cS[3] = {750, 250, 250}, cU[3] = {250, 750, 250}, cV[3] = {750, 750, 750}, cN[3] = {250, 250, 250};
+    const double zero[3] = {0, 0, 0}, vU[3] = {0, 0, 300};
+    if(id == MX_O2) {
+        s->swallowed = 1;
+        return;
+    }
+    if(id == MX_O4) {
+        s->vel[0] = 10 * atime;
+        s->vel[1] = -20 * atime;
+        s->vel[2] = 5 * atime;
+        return;
+    }
+    if(id >= MX_END)
+        return;
+    if(id == 5 && m->call >= 2) {
+        /* O1's tracer: into the field at call 2, into V at call 3 */
+        if(m->call == 2) {
+            const double far[3] = {500, 500, 875};
+            syn_ball(id, 39, far, 0.1, zero, 0, atime, s);
+        }
+        else
+            syn_ball(id, 39, cV, 0.5, zero, 5, atime, s);
+        s->tag = s->bound = 0;
+        s->rank = id;
+        return;
+    }
+    if(id < MX_D0) {
+        syn_ball(id, 31, cS, 1.0, zero, 5, atime, s);
+        s->tag = s->bound = 0; s->rank = id - MX_S0;
+    } else if(id < MX_U0) {
+        const int r = id - MX_D0;
+        s->tag = s->bound = 1;
+        s->rank = r;
+        if(r < 6)
+            syn_ball(id, 32, cS, 0.5, zero, 5, atime, s);
+        else if(r == 6)
+            syn_ball(id, 32, cU, 0.5, vU, 5, atime, s);
+        else if(r == 7)
+            syn_ball(id, 32, cU, 0.5, zero, 3000, atime, s);
+        else
+            syn_ball(id, 32, cS, 1.0, zero, 3000, atime, s);
+    } else if(id < MX_V0) {
+        syn_ball(id, 33, cU, 1.0, vU, 5, atime, s);
+        s->tag = s->bound = 2; s->rank = id - MX_U0;
+    } else if(id < MX_N0) {
+        syn_ball(id, 34, cV, 1.0, zero, 5, atime, s);
+        s->tag = s->bound = 3; s->rank = id - MX_V0;
+    } else
+        syn_ball(id, 35, cN, 1.0, zero, 5, atime, s);
+}
+
+static void
+test_subhalo_mixed_call(void ** state)
+{
+    Cosmology CP;
+    const int NTask = get_ntask();
+    struct SubhaloParams sp = default_subhalo_params();
+    /* V (700 particles) is the only key above the threshold */
+    sp.SubhaloCollectiveMinPart = 500;
+    /* the field SO anchors its queries on local particles: off with an empty rank */
+    sp.SubhaloFieldSO = 0;
+    syn_setup(&CP, MX_END + SYN_NFIELD, sp);
+    const double UV = 2e5;
+    subhalo_set_units(3.085678e21, 1.989e43, UV);
+    const double off[3] = {3.5, -2.25, 7.0};
+    int d;
+    for(d = 0; d < 3; d++)
+        PartManager->CurrentParticleOffset[d] = off[d];
+    struct SubTrack recs[9];
+    recs[0] = syn_rec(0, 300, 0.03, -1, 0, 0, 0);
+    recs[1] = syn_rec(1, 40, 0.004, 0, 0, 1, 1);
+    recs[2] = syn_rec(2, 150, 0.015, -1, 2, 0, 0);
+    recs[3] = syn_rec(3, 700, 0.07, -1, 3, 0, 0);
+    recs[4] = syn_orphan(4, 5);
+    recs[5] = syn_orphan(5, MX_O2);
+    recs[6] = syn_orphan(6, MX_O3);
+    recs[7] = syn_orphan(7, MX_O4);
+    recs[8] = syn_orphan(8, MX_V0 + 5);
+    syn_records(recs, 9);
+    const int er = NTask > 2 ? 2 : 0;
+    struct MixUd ud = {1};
+    int call;
+    for(call = 1; call <= 3; call++) {
+        const double atime = 0.5 + 0.05 * call;
+        ud.call = call;
+        syn_place(mix_particle, &ud, atime, call == 1);
+        int64_t ng, nempty, n, i;
+        int ret = lifecycle_call(call, atime, &CP, er, NULL, &ng, &nempty);
+        CHECK(ret == 1 && ng == 4, "mixed call %d: ret %d, %ld groups\n", call, ret, ng);
+        CHECK(er == 0 || nempty == 0, "mixed call %d: the emptied rank holds %ld particles\n", call, nempty);
+        CHECK(subhalo_get_table()->NTotal == 10, "mixed call %d: NTotal %ld\n", call, subhalo_get_table()->NTotal);
+        struct tagrec * r = gather_tags(&n);
+        struct SubTrack * rec = fetch_all_tracks(10);
+        const int64_t gS = r[tagrec_index(r, n, MX_S0 + 1)].GrNr, gV = r[tagrec_index(r, n, MX_V0 + 1)].GrNr;
+        const int64_t gN = r[tagrec_index(r, n, MX_N0 + 1)].GrNr;
+        /* the newborn: final TrackId 9 on its particles and record */
+        int bad = 0;
+        for(i = 0; i < n; i++) {
+            LOCAL_CHECK(bad, r[i].TrackId >= -1 && r[i].BoundTrackId >= -1, "mixed: particle %lu keeps a provisional tag %ld/%ld\n",
+                        (unsigned long) r[i].ID, r[i].TrackId, r[i].BoundTrackId);
+            if(r[i].ID >= MX_N0 && r[i].ID < MX_END)
+                LOCAL_CHECK(bad, r[i].TrackId == 9 && r[i].BoundTrackId == 9, "mixed: newborn particle %lu tagged %ld bound %ld\n",
+                            (unsigned long) r[i].ID, r[i].TrackId, r[i].BoundTrackId);
+        }
+        CHECK(bad == 0, "mixed call %d: tags\n", call);
+        CHECK(rec[9].Nbound >= 95 && rec[9].HostGroup == gN && rec[9].CentralTrackId == 9 && rec[9].SnapBirth == 1,
+              "mixed call %d: newborn Nbound %d HostGroup %ld (group %ld) upid %ld SnapBirth %d\n", call, rec[9].Nbound,
+              rec[9].HostGroup, gN, rec[9].CentralTrackId, rec[9].SnapBirth);
+        /* D died at call 1 inside S's group: six local votes for S, one remote for U, three unbound */
+        CHECK(rec[1].Nbound == 0 && rec[1].SnapDeath == 1 && rec[1].DescendantTrackId == 0 && rec[1].SinkTrackId == -1
+              && rec[1].SnapLastIsolation == 0,
+              "mixed call %d: D Nbound %d SnapDeath %d Desc %ld Sink %ld SnapLastIsolation %d\n", call, rec[1].Nbound,
+              rec[1].SnapDeath, rec[1].DescendantTrackId, rec[1].SinkTrackId, rec[1].SnapLastIsolation);
+        /* V in place */
+        CHECK(rec[3].Nbound > 0 && (rec[3].Flags & SUBHALO_FLAG_INPLACE) && rec[3].HostGroup == gV,
+              "mixed call %d: V Nbound %d Flags %d HostGroup %ld\n", call, rec[3].Nbound, rec[3].Flags, rec[3].HostGroup);
+        /* orphans (J8): current host and central, misses sticky with the last position */
+        const int64_t t1 = tagrec_index(r, n, 5);
+        const int64_t h1 = call == 1 ? gS : (call == 2 ? -1 : gV);
+        const int64_t c1 = call == 1 ? 0 : (call == 2 ? -1 : 3);
+        CHECK(rec[4].Nbound == 0 && r[t1].GrNr == h1 && rec[4].HostGroup == h1 && rec[4].CentralTrackId == c1 && rec[4].SnapTracerLost == -1,
+              "mixed call %d: O1 HostGroup %ld (expected %ld, tracer in %ld) upid %ld (expected %ld) lost %d\n", call,
+              rec[4].HostGroup, h1, r[t1].GrNr, rec[4].CentralTrackId, c1, rec[4].SnapTracerLost);
+        int o;
+        for(o = 5; o <= 6; o++)
+            CHECK(rec[o].SnapTracerLost == 1 && rec[o].HostGroup == -1 && rec[o].CentralTrackId == -1 && rec[o].TracerPos[0] == 11
+                  && rec[o].TracerPos[1] == 22 && rec[o].TracerPos[2] == 33,
+                  "mixed call %d: lost orphan %d SnapTracerLost %d HostGroup %ld upid %ld TracerPos %g %g %g\n", call, o,
+                  rec[o].SnapTracerLost, rec[o].HostGroup, rec[o].CentralTrackId, rec[o].TracerPos[0], rec[o].TracerPos[1], rec[o].TracerPos[2]);
+        const int64_t t4 = tagrec_index(r, n, MX_O4);
+        CHECK(rec[7].HostGroup == -1 && rec[7].CentralTrackId == -1 && rec[7].SnapTracerLost == -1,
+              "mixed call %d: field orphan HostGroup %ld upid %ld lost %d\n", call, rec[7].HostGroup, rec[7].CentralTrackId, rec[7].SnapTracerLost);
+        for(d = 0; d < 3; d++) {
+            const double phys = p2_wrap(r[t4].Pos[d] - off[d]);
+            const double v = (d == 0 ? 10 : (d == 1 ? -20 : 5)) * UV / 1e5;
+            CHECK(fabs(rec[7].TracerPos[d] - phys) < 1e-9 && fabs(rec[7].TracerVel[d] - v) < 1e-4,
+                  "mixed call %d: field orphan TracerPos[%d] %.12g (expected %.12g) TracerVel %g (expected %g)\n", call, d,
+                  rec[7].TracerPos[d], phys, rec[7].TracerVel[d], v);
+        }
+        CHECK(rec[8].HostGroup == gV && rec[8].CentralTrackId == 3, "mixed call %d: O5 HostGroup %ld (V's group %ld) upid %ld\n", call,
+              rec[8].HostGroup, gV, rec[8].CentralTrackId);
+        CHECK(p2_check_tags(r, n, rec, 10, "mixed") == 0, "mixed call %d: tag invariants\n", call);
+        free(rec);
+        free(r);
+    }
+    syn_teardown();
+}
+
+/* ---- regression item 3 and J3: the serial/fallback boundary with populated state ----
+ * Stage 0-1 serial (the overlap scenario: B a satellite of A with a tail partly bound by A);
+ * stage 2 the group is oversized, 40 of A's and 20 of B's particles are in the field: B sinks
+ * in place and its field particles go to A, A's record counts its field particles; stage 3 the
+ * same (B's orphan now hosted by an oversized key); stage 4 every clump particle dispersed: A
+ * is hostless with an oversized pseudo-key; stage 5 serial again. Tag invariants, the restart
+ * round trip of the PIG and the orphan links at every stage. SUBHALO_TEST_KEEP keeps the PIGs
+ * for tools/subhalo_check.py. */
+static void
+fb_disperse(int stage)
+{
+    int64_t i;
+    for(i = 0; i < PartManager->NumPart; i++) {
+        struct particle_data * p = &P[i];
+        const int c = p2_clump(p->ID);
+        if(c < 0)
+            continue;
+        int64_t k = -1;
+        if(stage == 4)
+            k = (int64_t) p->ID;
+        else if(c == 0 && p->ID % 50 == 7)
+            k = 3000 + p->ID / 50;
+        else if(c == 1 && (p->ID - P2_NA) % 30 == 11)
+            k = 3100 + (p->ID - P2_NA) / 30;
+        if(k < 0)
+            continue;
+        if(k >= 3000) {
+            k -= 3000;
+            p->Pos[0] = 100 + 40 * (k % 20);
+            p->Pos[1] = 100 + 40 * (k / 20);
+            p->Pos[2] = 875;
+        }
+        else {
+            p->Pos[0] = 20 + 40 * (k % 14);
+            p->Pos[1] = 20 + 40 * ((k / 14) % 14);
+            p->Pos[2] = 20 + 40 * (k / 196);
+        }
+        p->Vel[0] = p->Vel[1] = p->Vel[2] = 0;
+    }
+}
+
+static void
+test_subhalo_fallback(void ** state)
+{
+    Cosmology CP;
+    p2_setup(&CP);
+    const char * dir = getenv("SUBHALO_TEST_DIR") ? getenv("SUBHALO_TEST_DIR") : "test_subhalo_fb";
+    rm_tree(dir);
+    if(get_thistask() == 0 && mkdir(dir, 0755) != 0 && errno != EEXIST)
+        endrun(1, "test: cannot create %s\n", dir);
+    MPI_Barrier(MPI_COMM_WORLD);
+    const double cen[2][3] = {{P2_cA[0], P2_cA[1], P2_cA[2]}, {P2_cB[0], P2_cB[1], P2_cB[2]}};
+    const double bulk[2][3] = {{0, 0, 0}, {0, 0, 0}};
+    int stage;
+    for(stage = 0; stage <= 5; stage++) {
+        const double atime = 0.5 + 0.05 * stage;
+        struct SubhaloParams sp = default_subhalo_params();
+        sp.SubhaloFieldSO = 1;
+        sp.SubhaloCollectiveMinPart = (stage >= 2 && stage <= 4) ? 100 : 0;
+        subhalo_set_testpar(sp);
+        if(stage == 0 || stage == 5)
+            p2_place(atime, CP.GravInternal, cen, bulk);
+        else
+            p2_infall(&CP, atime);
+        if(stage >= 2 && stage <= 4)
+            fb_disperse(stage == 4 ? 4 : 2);
+        int64_t ng, nempty, n, i;
+        int ret = lifecycle_call(stage, atime, &CP, 0, dir, &ng, &nempty);
+        CHECK(ret == 1, "fallback stage %d: ret %d\n", stage, ret);
+        const int64_t NT = subhalo_get_table()->NTotal;
+        struct tagrec * r = gather_tags(&n);
+        struct SubTrack * rec = fetch_all_tracks(NT);
+        const struct SubhaloCallStats * st = subhalo_last_call_stats();
+        message(0, "Fallback stage %d: %ld groups, %ld tracks; A Nbound %d Flags %d HostGroup %ld; B Nbound %d Sink %ld HostGroup %ld upid %ld; "
+                   "fallback field %ld (released %ld)\n", stage, ng, NT, rec[0].Nbound, rec[0].Flags, rec[0].HostGroup, rec[1].Nbound,
+                rec[1].SinkTrackId, rec[1].HostGroup, rec[1].CentralTrackId, st->NFallbackField, st->NFallbackReleased);
+        char what[64];
+        snprintf(what, sizeof(what), "fallback stage %d", stage);
+        if(stage == 1)
+            CHECK(rec[1].Nbound > 0 && rec[1].Rank == 1 && rec[0].Nbound > rec[0].NboundExclusive,
+                  "fallback stage 1: no satellite with overlap (B Nbound %d Rank %d, A %d/%d)\n", rec[1].Nbound, rec[1].Rank,
+                  rec[0].Nbound, rec[0].NboundExclusive);
+        if(stage == 2 || stage == 3) {
+            int bad = 0;
+            for(i = 0; i < n; i++) {
+                const int c = p2_clump(r[i].ID);
+                const int moved = (c == 0 && r[i].ID % 50 == 7) || (c == 1 && (r[i].ID - P2_NA) % 30 == 11);
+                if(moved && r[i].GrNr < 0 && stage == 2)
+                    LOCAL_CHECK(bad, r[i].TrackId == -1 || (r[i].TrackId == 0 && r[i].BoundTrackId == 0),
+                                "%s: field particle %lu tagged %ld bound %ld\n", what, (unsigned long) r[i].ID, r[i].TrackId, r[i].BoundTrackId);
+            }
+            CHECK(bad == 0, "%s: field particles of the oversized key\n", what);
+            CHECK((rec[0].Flags & SUBHALO_FLAG_INPLACE) && rec[0].Nbound == rec[0].NboundExclusive && rec[1].Nbound == 0
+                  && rec[1].SinkTrackId == 0 && rec[1].SnapSink == 2,
+                  "%s: A Flags %d Nbound %d/%d, B Nbound %d Sink %ld SnapSink %d\n", what, rec[0].Flags, rec[0].Nbound,
+                  rec[0].NboundExclusive, rec[1].Nbound, rec[1].SinkTrackId, rec[1].SnapSink);
+            if(stage == 2)
+                CHECK(st->NFallbackField >= 50, "%s: %ld field particles normalised\n", what, st->NFallbackField);
+        }
+        if(stage == 4)
+            CHECK(rec[0].Nbound > 0 && rec[0].HostGroup == -1 && rec[0].Rank == 0 && (rec[0].Flags & SUBHALO_FLAG_INPLACE)
+                  && rec[0].Nbound == rec[0].NboundExclusive && rec[0].Vmax == -1,
+                  "%s: hostless A Nbound %d/%d HostGroup %ld Rank %d Flags %d Vmax %g\n", what, rec[0].Nbound, rec[0].NboundExclusive,
+                  rec[0].HostGroup, rec[0].Rank, rec[0].Flags, rec[0].Vmax);
+        /* the orphan B: its current host from its tracer */
+        if(stage >= 2 && rec[1].Nbound == 0) {
+            const int64_t t = tagrec_index(r, n, rec[1].MostBoundID);
+            const int64_t h = t >= 0 ? r[t].GrNr : -1;
+            CHECK(rec[1].HostGroup == h && (h < 0 ? rec[1].CentralTrackId == -1 : rec[1].CentralTrackId >= 0),
+                  "%s: orphan B HostGroup %ld (tracer in %ld) upid %ld\n", what, rec[1].HostGroup, h, rec[1].CentralTrackId);
+            if(stage == 3 && h >= 0)
+                CHECK(rec[1].CentralTrackId == 0, "%s: orphan B in the oversized key has central %ld\n", what, rec[1].CentralTrackId);
+        }
+        CHECK(p2_check_tags(r, n, rec, NT, what) == 0, "%s: tag invariants\n", what);
+        free(rec);
+        free(r);
+        check_restart_roundtrip(dir, stage, what);
+    }
+    p2_teardown();
+    if(!getenv("SUBHALO_TEST_KEEP"))
+        rm_tree(dir);
+}
+
+/* ---- J11: the iteration cap and the final-pass diagnostics; J4: the orphan lookup's memory
+ *      check fails the call cleanly ---- */
+static void
+test_subhalo_itercap(void ** state)
+{
+    Cosmology CP;
+    p2_setup(&CP);
+    struct SubhaloParams sp = default_subhalo_params();
+    sp.SubhaloFieldSO = 1;
+    sp.SubhaloMaxUnbindIterations = 1;
+    subhalo_set_testpar(sp);
+    const double cen[2][3] = {{P2_cA[0], P2_cA[1], P2_cA[2]}, {P2_cB[0], P2_cB[1], P2_cB[2]}};
+    const double bulk[2][3] = {{0, 0, 0}, {0, 0, 0}};
+    int call;
+    for(call = 0; call < 2; call++) {
+        p2_place(0.5 + 0.05 * call, CP.GravInternal, cen, bulk);
+        int64_t ng;
+        int ret = run_finder_call(call, &CP, &ng);
+        CHECK(ret == 1 && ng == 2, "itercap call %d: ret %d groups %ld\n", call, ret, ng);
+        const struct SubhaloCallStats * st = subhalo_last_call_stats();
+        struct SubTrack * rec = fetch_all_tracks(2);
+        const int nflag = !!(rec[0].Flags & SUBHALO_FLAG_ITERCAP) + !!(rec[1].Flags & SUBHALO_FLAG_ITERCAP);
+        message(0, "Itercap call %d: %ld unbindings, %ld capped (worst %g, track %ld), %ld of %ld final-pass E >= 0\n", call,
+                st->NCandidates, st->NItercap, st->WorstConvRatio, st->WorstTrackId, st->NFinalPositive, st->NFinalBound);
+        CHECK(st->NCandidates == 2 && st->NItercap == 2 && nflag == 2 && st->WorstConvRatio < sp.SubhaloBoundMassPrecision
+              && st->NFinalBound == rec[0].Nbound + rec[1].Nbound && st->NFinalPositive >= 0,
+              "itercap call %d: %ld unbindings, %ld capped, %d flagged records, worst %g, final bound %ld (records %d + %d)\n", call,
+              st->NCandidates, st->NItercap, nflag, st->WorstConvRatio, st->NFinalBound, rec[0].Nbound, rec[1].Nbound);
+        if(call == 1)
+            CHECK(st->WorstTrackId == 0 || st->WorstTrackId == 1, "itercap: worst track %ld\n", st->WorstTrackId);
+        else
+            CHECK(SUBHALO_IS_PROVISIONAL(st->WorstTrackId), "itercap: worst track %ld at the first call (a newborn)\n", st->WorstTrackId);
+        free(rec);
+    }
+    /* J4: a lookup batch that cannot fit: the call is skipped before anything changes */
+    int64_t n0, n1, i;
+    struct tagrec * r0 = gather_tags(&n0);
+    sp.SubhaloLookupBatchBytes = 10000000000000L;
+    subhalo_set_testpar(sp);
+    int64_t ng;
+    int ret = run_finder_call(2, &CP, &ng);
+    CHECK(ret == 0 && !subhalo_last_call_complete() && subhalo_state_snapshot() == 1,
+          "lookup memory check: ret %d complete %d state %d\n", ret, subhalo_last_call_complete(), subhalo_state_snapshot());
+    struct tagrec * r1 = gather_tags(&n1);
+    int bad = 0;
+    for(i = 0; i < n0 && i < n1; i++)
+        LOCAL_CHECK(bad, r0[i].ID == r1[i].ID && r0[i].TrackId == r1[i].TrackId && r0[i].BindRank == r1[i].BindRank
+                    && r0[i].BoundTrackId == r1[i].BoundTrackId, "lookup memory check: particle %lu changed\n", (unsigned long) r0[i].ID);
+    CHECK(bad == 0 && n0 == n1, "lookup memory check: tags changed\n");
+    free(r1);
+    free(r0);
+    p2_teardown();
+}
+
+/* ---- J4: the batched ID lookup under skewed hits, repeated ids, zero-query ranks, tiny
+ *      batches and the byte cap ---- */
+#define LK_N0 20000
+static void
+lk_expect(MyIDType id, double pos[3], int64_t * bt)
+{
+    pos[0] = 0.001 * id;
+    pos[1] = 0.5 + 0.002 * id;
+    pos[2] = 7;
+    *bt = (int64_t) (id % 5) - 1;
+}
+
+static void
+test_subhalo_lookup(void ** state)
+{
+    common_physics_setup();
+    const int NTask = get_ntask(), ThisTask = get_thistask();
+    struct SubhaloParams sp = default_subhalo_params();
+    sp.SubhaloLookupBatchBytes = 1024L * 1024L;
+    subhalo_set_testpar(sp);
+    setup_pman(LK_N0 + 1000, BOXSIZE);
+    /* rank 0 holds every id below LK_N0 (skew); rank r > 0 holds 100 ids of its own */
+    MyIDType id;
+    if(ThisTask == 0)
+        for(id = 0; id < LK_N0; id++) {
+            double pos[3];
+            int64_t bt;
+            lk_expect(id, pos, &bt);
+            add_dm_particle(id, pos);
+            P[PartManager->NumPart - 1].BoundTrackId = bt;
+        }
+    else
+        for(id = LK_N0 + 100 * ThisTask; id < LK_N0 + 100 * ThisTask + 100; id++) {
+            double pos[3];
+            int64_t bt;
+            lk_expect(id, pos, &bt);
+            add_dm_particle(id, pos);
+            P[PartManager->NumPart - 1].BoundTrackId = bt;
+        }
+    /* queries: rank 0 none; rank 1 15000 ids of rank 0, 300 copies of one id and 50 missing;
+     * rank 2 the ids of every other rank twice; every rank > 0 thousands of rank 0's ids, so that
+     * full batches concentrate their replies on rank 0 */
+    int64_t nq = 0, i;
+    MyIDType * q = malloc(sizeof(MyIDType) * (20000 + 200 * NTask));
+    if(ThisTask == 1) {
+        for(i = 0; i < 15000; i++) q[nq++] = (MyIDType) ((i * 7) % LK_N0);
+        for(i = 0; i < 300; i++) q[nq++] = 42;
+        for(i = 0; i < 50; i++) q[nq++] = 5000000 + i;
+    }
+    else if(ThisTask == 2) {
+        int rr;
+        for(rr = 1; rr < NTask; rr++)
+            for(i = 0; i < 200; i++) q[nq++] = LK_N0 + 100 * rr + (i % 100);
+        for(i = 0; i < 5000; i++) q[nq++] = (MyIDType) ((i * 13) % LK_N0);
+    }
+    else if(ThisTask >= 3) {
+        for(i = 0; i < 3; i++) q[nq++] = 17 + i;
+        for(i = 0; i < 5000; i++) q[nq++] = (MyIDType) ((i * 11) % LK_N0);
+    }
+    struct SubhaloIdHit * out = malloc(sizeof(struct SubhaloIdHit) * (nq + 1));
+    int mode;
+    for(mode = 0; mode < 2; mode++) {
+        /* mode 0: three ids per rank and batch; mode 1: the 1 MB byte cap alone */
+        subhalo_lookup_set_max_batch(mode == 0 ? 3 : 0);
+        subhalo_lookup_ids(q, nq, out, MPI_COMM_WORLD);
+        int bad = 0;
+        for(i = 0; i < nq; i++) {
+            const int exists = q[i] < LK_N0 || (q[i] >= LK_N0 + 100 && q[i] < LK_N0 + 100 * NTask);
+            LOCAL_CHECK(bad, out[i].found == exists, "lookup mode %d: id %lu found %d\n", mode, (unsigned long) q[i], out[i].found);
+            if(!exists || !out[i].found) continue;
+            double pos[3];
+            int64_t bt;
+            lk_expect(q[i], pos, &bt);
+            LOCAL_CHECK(bad, out[i].Pos[0] == pos[0] && out[i].Pos[1] == pos[1] && out[i].BoundTrackId == bt && out[i].GrNr == -1,
+                        "lookup mode %d: id %lu answered Pos %g %g bound %ld GrNr %ld\n", mode, (unsigned long) q[i], out[i].Pos[0],
+                        out[i].Pos[1], out[i].BoundTrackId, out[i].GrNr);
+        }
+        assert_all_true(bad == 0);
+        double peak = subhalo_lookup_last_peak_bytes(), gpeak = 0;
+        MPI_Allreduce(&peak, &gpeak, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        message(0, "Lookup mode %d: batch high water %g bytes (bound %g, SubhaloLookupBatchBytes %ld)\n", mode, gpeak,
+                subhalo_lookup_batch_peak_bytes(NTask), sp.SubhaloLookupBatchBytes);
+        CHECK(gpeak <= subhalo_lookup_batch_peak_bytes(NTask), "lookup mode %d: batch high water %g above the bound %g\n", mode, gpeak,
+              subhalo_lookup_batch_peak_bytes(NTask));
+        if(mode == 1)
+            /* with three querying ranks the batches nearly fill the cap */
+            CHECK(gpeak <= sp.SubhaloLookupBatchBytes + 16384 && (NTask < 4 || gpeak > 0.5 * sp.SubhaloLookupBatchBytes),
+                  "lookup: byte cap %ld, high water %g\n", sp.SubhaloLookupBatchBytes, gpeak);
+    }
+    subhalo_lookup_set_max_batch(0);
+    free(out);
+    free(q);
+    teardown_pman();
+}
+
 int main(void) {
     if(getenv("SUBHALO_TEST_SORTKEY_OVERFLOW")) {
         const struct CMUnitTest overflow[] = {
@@ -3269,6 +4175,12 @@ int main(void) {
         cmocka_unit_test(test_subhalo_twohalo),
         cmocka_unit_test(test_subhalo_overlap),
         cmocka_unit_test(test_subhalo_sink_orphan),
+        cmocka_unit_test(test_subhalo_nest_tree),
+        cmocka_unit_test(test_subhalo_deep_chain),
+        cmocka_unit_test(test_subhalo_mixed_call),
+        cmocka_unit_test(test_subhalo_fallback),
+        cmocka_unit_test(test_subhalo_itercap),
+        cmocka_unit_test(test_subhalo_lookup),
     };
     /* SUBHALO_TEST_ONLY=<substring> runs only the tests whose name contains it */
     const char * only = getenv("SUBHALO_TEST_ONLY");
