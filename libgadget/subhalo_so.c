@@ -376,7 +376,9 @@ so2_ngbiter(TreeWalkQuerySO2 * I, TreeWalkResultSO2 * O, TreeWalkNgbIterBase * i
  * data_index entries) are elastic, not a requirement of the field SO. Every walk replaces them
  * in the main allocator's low-water mark by the free bytes it would have had without them, so
  * that the finder's per-stage high water measures its own needs; the true low-water mark of the
- * walks (the absolute high water, SubhaloPeakBytes) and the largest tables are kept here. */
+ * walks (the absolute high water, SubhaloPeakBytes) and the largest tables are kept here. A
+ * table counts with its whole allocator charge (payload rounded up to the allocator's alignment,
+ * plus the block header), so nothing of it stays in the increment (audit 5d R2). */
 static size_t SOWalkMinFree = (size_t) -1;
 static double SOWalkElastic = 0;
 
@@ -434,7 +436,8 @@ so_walk(int pass, struct so_priv * pv, int64_t nq, ForceTree * tree)
     treewalk_run(tw, (int *) pv->anchor, nq);
     if(!A_MAIN->use_malloc) {
         const size_t lowwalk = allocator_get_min_free(A_MAIN);
-        const double elastic = (double) tw->NThread * (double) tw->BunchSize * sizeof(data_index);
+        /* the tables' allocator charge, as treewalk.c's alloc_export_memory allocates them */
+        const double elastic = (double) tw->NThread * (double) allocator_charge(A_MAIN, sizeof(data_index) * tw->BunchSize);
         if(lowwalk < SOWalkMinFree)
             SOWalkMinFree = lowwalk;
         if(elastic > SOWalkElastic)

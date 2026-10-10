@@ -3154,12 +3154,16 @@ subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t
     if(nalone > 0) {
         const double ta = MPI_Wtime();
         struct SubhaloArena arena;
-        arena.size = 0;
+        size_t amax = 0;
         for(k = 0; k < nalone; k++)
-            if(KEY_ARENA_BYTES(ord[k].k) > arena.size)
-                arena.size = KEY_ARENA_BYTES(ord[k].k);
-        arena.base = (char *) mymalloc2("SubArenaAlone", arena.size);
+            if(KEY_ARENA_BYTES(ord[k].k) > amax)
+                amax = KEY_ARENA_BYTES(ord[k].k);
+        arena.base = (char *) mymalloc2("SubArenaAlone", amax);
         for(k = 0; k < nalone; k++) {
+            /* the key sees exactly its own allowance, never the larger buffer: the tree node
+             * budget (and so the leaf size and the potentials) is a pure function of the key,
+             * whichever keys share the buffer (audit 5d R1) */
+            arena.size = KEY_ARENA_BYTES(ord[k].k);
             arena.used = 0;
             arena.peak = 0;
             const double t0 = MPI_Wtime();
@@ -3220,13 +3224,16 @@ subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t
             int64_t kk;
             for(kk = nalone; kk < ns; kk++) {
                 if(owner[kk] != tt) continue;
+                /* the key's own allowance; the queue's buffer is the maximum over its keys
+                 * (audit 5d R1) */
+                arenas[tt].size = KEY_ARENA_BYTES(ord[kk].k);
                 arenas[tt].used = 0;
                 arenas[tt].peak = 0;
                 const double t0 = omp_get_wtime();
                 fn(&segs[ord[kk].k], ord[kk].k, &arenas[tt], 1, userdata);
                 kt[kk] = omp_get_wtime() - t0;
                 tbusy[tid] += kt[kk];
-                /* relative to what the key itself was allowed, not the thread's larger arena */
+                /* relative to what the key itself was allowed (the arena's logical size) */
                 const double f = (double) arenas[tt].peak / (double) KEY_ARENA_BYTES(ord[kk].k);
                 if(f > tpeak[tt])
                     tpeak[tt] = f;
@@ -3249,20 +3256,6 @@ subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t
     }
     for(k = nalone; k < ns; k++)
         serial_stats_key(kt[k], ord[k].n, 0);
-    {
-        /* DBG Phase 5d calibration dump (scratch build only) */
-        const char * dp = getenv("SUBHALO_KEYTIME_DUMP");
-        if(dp) {
-            int rank;
-            MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-            char fn[1024];
-            snprintf(fn, sizeof(fn), "%s.%d", dp, rank);
-            FILE * fp = fopen(fn, "a");
-            for(k = nalone; k < ns; k++)
-                fprintf(fp, "%ld %ld %g %d\n", ord[k].n, segs[ord[k].k].Tracks, kt[k], nthreads);
-            fclose(fp);
-        }
-    }
     for(t = 0; t < nthreads; t++)
         if(tpeak[t] > peakfrac)
             peakfrac = tpeak[t];

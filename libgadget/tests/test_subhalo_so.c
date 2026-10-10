@@ -638,6 +638,20 @@ test_subhalo_field_so(void ** state)
             subhalo_so_walk_bytes(1, 64, 1), subhalo_so_walk_bytes(2, 64, 1), subhalo_so_walk_bytes(1, 64, 6),
             subhalo_so_walk_bytes(2, 64, 6));
     subhalo_so_set_import_buffer_boost(0);
+    /* Phase 5d audit R2: the export tables leave the stage increment with their allocator charge;
+     * the charge is exactly what an allocation takes from the free space */
+    if(!A_MAIN->use_malloc) {
+        const size_t req[6] = {1, 4095, 4096, 4097, 12 * 1000, 12 * 4096 + 5};
+        int r;
+        for(r = 0; r < 6; r++) {
+            const size_t f0 = mymalloc_freebytes();
+            void * blk = mymalloc("SOchargetest", req[r]);
+            const size_t took = f0 - mymalloc_freebytes();
+            myfree(blk);
+            CHECK(took == allocator_charge(A_MAIN, req[r]) && mymalloc_freebytes() == f0,
+                  "allocator charge of %zu bytes: took %zu, allocator_charge %zu\n", req[r], took, allocator_charge(A_MAIN, req[r]));
+        }
+    }
 
     Cosmology CP = test_cosmology();
     double rho[SUBHALO_NSO], rhoA3[SUBHALO_NSO];

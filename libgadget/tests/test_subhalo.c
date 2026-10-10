@@ -409,8 +409,10 @@ check_call_stats(const char * what, int complete)
           && st->PeakIncrementRank < NTask && st->EntryBytes > 0 && st->EntryBytes < st->PeakBytes,
           "%s: own increment %ld bytes (largest stage %g) on rank %d in stage %d; entry %g, high water %ld\n", what,
           st->PeakIncrementBytes, imax, st->PeakIncrementRank, st->PeakIncrementStage, st->EntryBytes, st->PeakBytes);
+    /* the tables count with their allocator charge (audit 5d R2): whole 4096-byte allocator blocks */
     if(complete && st->FieldSOPass1Walks > 0)
-        CHECK(st->FieldSOElasticBytes > 0 && st->StageIncrBytes[SUBHALO_STAGE_FIELDSO] < st->StagePeakBytes[SUBHALO_STAGE_FIELDSO],
+        CHECK(st->FieldSOElasticBytes > 0 && fmod(st->FieldSOElasticBytes, 4096.) == 0
+              && st->StageIncrBytes[SUBHALO_STAGE_FIELDSO] < st->StagePeakBytes[SUBHALO_STAGE_FIELDSO],
               "%s: field SO elastic export tables %g bytes, stage increment %g, high water %g\n", what, st->FieldSOElasticBytes,
               st->StageIncrBytes[SUBHALO_STAGE_FIELDSO], st->StagePeakBytes[SUBHALO_STAGE_FIELDSO]);
     if(complete) {
@@ -2165,8 +2167,26 @@ test_subhalo_plan_pack(void ** state)
 /* subhalo_local_sort (the record sort with the threaded permutation, and the indirect sort of P
  * it falls back to) leaves the same particle table at 1 to 4 threads: garbage last, then by key
  * (group, encoded travelling key, -1 first), TrackId, BindRank, ID, and the input order for full
- * ties (duplicated records). The reference is the indirect sort at one thread (glibc's merge sort,
- * the pre-5d code path). */
+ * ties (duplicated records). The reference is built independently of the code under test (audit
+ * 5d R4): libc qsort of the input indices on the comparator below, made a total order by the
+ * input index, then an out-of-place gather; every byte of the table is compared. */
+static const struct particle_data * LocalSortIn;
+
+static int
+cmp_localsort_ref(const void * a, const void * b)
+{
+    const int64_t ia = *(const int64_t *) a, ib = *(const int64_t *) b;
+    const struct particle_data * x = &LocalSortIn[ia], * y = &LocalSortIn[ib];
+    const int64_t kx = subhalo_particle_key(x), ky = subhalo_particle_key(y);
+    int c = (x->IsGarbage > y->IsGarbage) - (x->IsGarbage < y->IsGarbage);
+    if(!c) c = (kx > ky) - (kx < ky);
+    if(!c) c = (x->TrackId > y->TrackId) - (x->TrackId < y->TrackId);
+    if(!c) c = (x->BindRank > y->BindRank) - (x->BindRank < y->BindRank);
+    if(!c) c = (x->ID > y->ID) - (x->ID < y->ID);
+    if(!c) c = (ia > ib) - (ia < ib);
+    return c;
+}
+
 static void
 test_subhalo_local_sort(void ** state)
 {
@@ -2202,23 +2222,22 @@ test_subhalo_local_sort(void ** state)
     struct particle_data * ref = malloc(sizeof(struct particle_data) * N);
     memcpy(in, P, sizeof(struct particle_data) * N);
     const int saved = omp_get_max_threads();
-    omp_set_num_threads(1);
-    subhalo_local_sort_set_mode(1);
-    subhalo_local_sort();
-    memcpy(ref, P, sizeof(struct particle_data) * N);
-    int64_t bad = 0;
-    /* the reference is sorted and stable */
-    for(i = 1; i < N; i++) {
-        const struct particle_data * a = &ref[i - 1], * b = &ref[i];
-        const int64_t ka = subhalo_particle_key(a), kb = subhalo_particle_key(b);
-        int c = (a->IsGarbage > b->IsGarbage) - (a->IsGarbage < b->IsGarbage);
-        if(!c) c = (ka > kb) - (ka < kb);
-        if(!c) c = (a->TrackId > b->TrackId) - (a->TrackId < b->TrackId);
-        if(!c) c = (a->BindRank > b->BindRank) - (a->BindRank < b->BindRank);
-        if(!c) c = (a->ID > b->ID) - (a->ID < b->ID);
-        if(!c) c = (a->Hsml > b->Hsml) - (a->Hsml < b->Hsml);
-        LOCAL_CHECK(bad, c < 0, "local sort reference: entries %ld and %ld out of order\n", i - 1, i);
-    }
+    int64_t * idx = malloc(sizeof(int64_t) * N);
+    for(i = 0; i < N; i++)
+        idx[i] = i;
+    LocalSortIn = in;
+    qsort(idx, N, sizeof(int64_t), cmp_localsort_ref);
+    for(i = 0; i < N; i++)
+        memcpy(&ref[i], &in[idx[i]], sizeof(struct particle_data));
+    int64_t bad = 0, ndup = 0;
+    /* the fixture has full ties (resolved by the input index only) */
+    for(i = 1; i < N; i++)
+        if(ref[i - 1].ID == ref[i].ID && ref[i - 1].TrackId == ref[i].TrackId
+           && ref[i - 1].BindRank == ref[i].BindRank && ref[i - 1].IsGarbage == ref[i].IsGarbage
+           && subhalo_particle_key(&ref[i - 1]) == subhalo_particle_key(&ref[i]))
+            ndup++;
+    LOCAL_CHECK(bad, ndup > 100, "local sort reference: %ld full ties\n", ndup);
+    free(idx);
     int mode, T;
     for(mode = 0; mode < 2; mode++)
         for(T = 1; T <= 4; T++) {
@@ -2226,15 +2245,17 @@ test_subhalo_local_sort(void ** state)
             subhalo_local_sort_set_mode(mode);
             memcpy(P, in, sizeof(struct particle_data) * N);
             subhalo_local_sort();
+            /* every byte of the whole table */
             int64_t first = -1;
-            for(i = 0; i < N && first < 0; i++)
-                if(memcmp(&P[i], &ref[i], sizeof(struct particle_data)))
-                    first = i;
+            if(memcmp(P, ref, sizeof(struct particle_data) * N))
+                for(i = 0; i < N && first < 0; i++)
+                    if(memcmp(&P[i], &ref[i], sizeof(struct particle_data)))
+                        first = i;
             LOCAL_CHECK(bad, first < 0, "local sort, mode %d, %d threads: the table differs from the reference at %ld\n", mode, T, first);
         }
     subhalo_local_sort_set_mode(0);
     omp_set_num_threads(saved);
-    message(0, "local sort: %ld particles, record and indirect sorts at 1-4 threads equal the reference\n", N);
+    message(0, "local sort: %ld particles (%ld full ties), record and indirect sorts at 1-4 threads equal the independent reference\n", N, ndup);
     assert_all_true(bad == 0);
     free(ref);
     free(in);
@@ -2253,11 +2274,15 @@ struct sk_ud {
     int64_t nlog;
     int64_t * done;
     uint64_t * result;
+    size_t * asize;         /* the logical arena size key k saw */
+    const int64_t * extra;
     int64_t bad;
 };
 
 /* Writes a per-key sequence into the arena (bytes_per_part 8) and records which queue (arena,
- * alone or not) ran key k, in the order of the calls. */
+ * alone or not) ran key k, in the order of the calls. Then takes the key's extra allowance and
+ * the rest of the arena, writing all of it, and checks that the arena refuses anything beyond
+ * (audit 5d R1: the key sees exactly its own allowance, not the larger buffer of its queue). */
 static void
 sk_fn(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloArena * arena, int nthreads, void * userdata)
 {
@@ -2268,14 +2293,25 @@ sk_fn(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloArena * arena, 
     u->log[slot].base = arena->base;
     u->log[slot].k = k;
     u->log[slot].nthreads = nthreads;
+    u->asize[k] = arena->size;
     #pragma omp atomic
     u->done[k]++;
     uint64_t * buf = (uint64_t *) subhalo_arena_get(arena, sizeof(uint64_t) * seg->n);
-    if(!buf) {
+    char * xb = (char *) subhalo_arena_get(arena, (size_t) u->extra[k]);
+    if(!buf || !xb) {
         #pragma omp atomic
         u->bad++;
         return;
     }
+    memset(xb, 0x5a, (size_t) u->extra[k]);
+    const size_t rest = (arena->size - arena->used) & ~((size_t) 15);
+    char * rb = (char *) subhalo_arena_get(arena, rest);
+    if(!rb || arena->used + 16 <= arena->size || subhalo_arena_get(arena, 16)) {
+        #pragma omp atomic
+        u->bad++;
+        return;
+    }
+    memset(rb, 0xa5, rest);
     uint64_t h = 0;
     int64_t i;
     for(i = 0; i < seg->n; i++) {
@@ -2290,6 +2326,7 @@ sk_fn(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloArena * arena, 
 struct sk_timed {
     int * worker;
     double * dt;
+    size_t * asize;
 };
 
 static void
@@ -2297,8 +2334,8 @@ sk_fn_timed(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloArena * a
 {
     struct sk_timed * u = (struct sk_timed *) userdata;
     const double t0 = omp_get_wtime();
-    (void) arena;
     (void) nthreads;
+    u->asize[k] = arena->size;
     while(omp_get_wtime() - t0 < 2e-4 + 1e-8 * seg->n)
         ;
     u->worker[k] = omp_get_thread_num();
@@ -2326,6 +2363,11 @@ test_subhalo_serial_keys(void ** state)
                 largest = segs[k].n;
         }
     }
+    /* a non-trivial extra allowance per key (the hosted-candidate records in the finder) */
+    int64_t * extra = calloc(nsegs, sizeof(int64_t));
+    for(k = 0; k < nsegs; k++)
+        extra[k] = (k % 4) * 1000 + 64 * (segs[k].Tracks + 1) + k % 3;
+#define SK_KEY_BYTES(kk) (sizeof(uint64_t) * (size_t) segs[kk].n + (size_t) extra[kk] + 64)
     uint64_t * ref = calloc(nsegs, sizeof(uint64_t));
     const int saved = omp_get_max_threads();
     int T;
@@ -2336,10 +2378,29 @@ test_subhalo_serial_keys(void ** state)
         u.log = calloc(nsegs, sizeof(struct sk_log));
         u.done = calloc(nsegs, sizeof(int64_t));
         u.result = calloc(nsegs, sizeof(uint64_t));
+        u.asize = calloc(nsegs, sizeof(size_t));
+        u.extra = extra;
         subhalo_serial_reset_stats();
-        subhalo_run_serial_keys(segs, nsegs, sizeof(uint64_t), NULL, sk_fn, &u);
+        const double peakfrac = subhalo_run_serial_keys(segs, nsegs, sizeof(uint64_t), extra, sk_fn, &u);
         const struct SubhaloSerialStats * ss = subhalo_serial_last_stats();
         int64_t bad = u.bad, i, j;
+        LOCAL_CHECK(bad, u.bad == 0, "serial keys, %d threads: %ld keys could not take their allowance or got more\n", T, u.bad);
+        /* each key saw exactly its own allowance, whichever keys shared its queue (audit 5d R1);
+         * every key filled its arena, so the high-water fraction is 1 up to the alignment */
+        for(k = 0; k < nsegs; k++)
+            if(!segs[k].inplace)
+                LOCAL_CHECK(bad, u.asize[k] == SK_KEY_BYTES(k), "serial keys, %d threads: key %ld saw an arena of %lu bytes, its allowance %lu\n", T,
+                            k, (unsigned long) u.asize[k], (unsigned long) SK_KEY_BYTES(k));
+        LOCAL_CHECK(bad, peakfrac <= 1 && peakfrac > 0.99, "serial keys, %d threads: peak fraction %g\n", T, peakfrac);
+        /* the threaded queues' buffers (one per queue, live together) do not overlap, each as long
+         * as the largest allowance of its keys */
+        for(i = 0; i < u.nlog; i++)
+            for(j = 0; j < u.nlog; j++) {
+                if(u.log[i].nthreads > 1 || u.log[j].nthreads > 1 || u.log[i].base >= u.log[j].base)
+                    continue;
+                LOCAL_CHECK(bad, u.log[i].base + SK_KEY_BYTES(u.log[i].k) <= u.log[j].base,
+                            "serial keys, %d threads: the arena of key %ld overlaps the queue of key %ld\n", T, u.log[i].k, u.log[j].k);
+            }
         /* every serial key once, no in-place segment */
         for(k = 0; k < nsegs; k++)
             LOCAL_CHECK(bad, u.done[k] == (segs[k].inplace ? 0 : 1), "serial keys, %d threads: key %ld run %ld times\n", T, k, u.done[k]);
@@ -2410,6 +2471,7 @@ test_subhalo_serial_keys(void ** state)
         message(0, "serial keys, %d threads: %ld keys, %ld alone, %d threaded queues, longest key %g s (%ld particles)\n", T, ss->NKeys,
                 ss->NAlone, nq, ss->KeyTimeMax, ss->KeyTimeMaxN);
         assert_all_true(bad == 0);
+        free(u.asize);
         free(u.result);
         free(u.done);
         free(u.log);
@@ -2428,6 +2490,7 @@ test_subhalo_serial_keys(void ** state)
         struct sk_timed u;
         u.worker = calloc(nsegs, sizeof(int));
         u.dt = calloc(nsegs, sizeof(double));
+        u.asize = calloc(nsegs, sizeof(size_t));
         for(k = 0; k < nsegs; k++)
             u.worker[k] = -1;
         int outer = 0, inner_max = 0;
@@ -2438,7 +2501,7 @@ test_subhalo_serial_keys(void ** state)
             {
                 outer = omp_get_num_threads();
                 inner_max = omp_get_max_threads();
-                subhalo_run_serial_keys(segs, nsegs, sizeof(uint64_t), NULL, sk_fn_timed, &u);
+                subhalo_run_serial_keys(segs, nsegs, sizeof(uint64_t), extra, sk_fn_timed, &u);
             }
         }
         omp_set_max_active_levels(savedlev);
@@ -2457,6 +2520,11 @@ test_subhalo_serial_keys(void ** state)
             wsum += u.dt[k];
             LOCAL_CHECK(bad, u.worker[k] == 0, "serial keys, reduced team: key %ld ran on worker %d\n", k, u.worker[k]);
         }
+        /* one worker covering every queue: each key still sees exactly its own allowance */
+        for(k = 0; k < nsegs; k++)
+            if(!segs[k].inplace)
+                LOCAL_CHECK(bad, u.asize[k] == SK_KEY_BYTES(k), "serial keys, reduced team: key %ld saw an arena of %lu bytes, its allowance %lu\n",
+                            k, (unsigned long) u.asize[k], (unsigned long) SK_KEY_BYTES(k));
         message(0, "serial keys, reduced team: outer team %d, %d queues requested, %d worker(s); %ld threaded keys, their summed time %g s; "
                    "reported max %g s, sum %g s, mean %g s, threaded wall %g s\n", outer, inner_max, ss->NThreads, nthr, wsum,
                 ss->ThreadMax, ss->ThreadSum, ss->ThreadMeanSum, ss->ThreadedWall);
@@ -2468,10 +2536,13 @@ test_subhalo_serial_keys(void ** state)
                     "serial keys, reduced team: max %g sum %g mean %g, keys %g s, wall %g s\n", ss->ThreadMax, ss->ThreadSum,
                     ss->ThreadMeanSum, wsum, ss->ThreadedWall);
         assert_all_true(bad == 0);
+        free(u.asize);
         free(u.dt);
         free(u.worker);
     }
+#undef SK_KEY_BYTES
     omp_set_num_threads(saved);
+    free(extra);
     free(ref);
     free(segs);
 }
@@ -4706,6 +4777,42 @@ lk_expect(MyIDType id, double pos[3], int64_t * bt)
     *bt = (int64_t) (id % 5) - 1;
 }
 
+/* A particle with id but answers that are not lk_expect's (a later duplicate), or a garbage /
+ * swallowed one (Phase 5d audit R4). */
+static void
+lk_add_other(MyIDType id, int garbage, int swallowed)
+{
+    double pos[3];
+    int64_t bt;
+    lk_expect(id, pos, &bt);
+    pos[0] += 1;
+    add_dm_particle(id, pos);
+    P[PartManager->NumPart - 1].BoundTrackId = bt + 1000;
+    P[PartManager->NumPart - 1].IsGarbage = garbage;
+    P[PartManager->NumPart - 1].Swallowed = swallowed;
+}
+
+/* Every query that exists is answered with lk_expect's values (the lowest live P index of a
+ * duplicated ID; garbage and swallowed particles never answer), the others are misses. */
+static int
+lk_verify(const MyIDType * q, int64_t nq, const struct SubhaloIdHit * out, int NTask, const char * what, int mode)
+{
+    int bad = 0;
+    int64_t i;
+    for(i = 0; i < nq; i++) {
+        const int exists = q[i] < LK_N0 || (q[i] >= LK_N0 + 100 && q[i] < LK_N0 + 100 * NTask);
+        LOCAL_CHECK(bad, out[i].found == exists, "%s mode %d: id %lu found %d\n", what, mode, (unsigned long) q[i], out[i].found);
+        if(!exists || !out[i].found) continue;
+        double pos[3];
+        int64_t bt;
+        lk_expect(q[i], pos, &bt);
+        LOCAL_CHECK(bad, out[i].Pos[0] == pos[0] && out[i].Pos[1] == pos[1] && out[i].BoundTrackId == bt && out[i].GrNr == -1,
+                    "%s mode %d: id %lu answered Pos %g %g bound %ld GrNr %ld\n", what, mode, (unsigned long) q[i], out[i].Pos[0],
+                    out[i].Pos[1], out[i].BoundTrackId, out[i].GrNr);
+    }
+    return bad;
+}
+
 static void
 test_subhalo_lookup(void ** state)
 {
@@ -4733,6 +4840,30 @@ test_subhalo_lookup(void ** state)
             add_dm_particle(id, pos);
             P[PartManager->NumPart - 1].BoundTrackId = bt;
         }
+    /* Phase 5d audit R4: duplicated live IDs, answered by the lowest P index in every mode (7 on
+     * rank 0, one id per other rank); ids whose lowest copies are garbage (11) or swallowed (13),
+     * answered by their first live copy; ids held only by garbage (5000100) or swallowed
+     * (5000101) particles, which are misses */
+    if(ThisTask == 0) {
+        lk_add_other(7, 0, 0);
+        lk_add_other(7, 0, 0);
+        P[11].IsGarbage = 1;
+        P[13].Swallowed = 1;
+        double pos[3];
+        int64_t bt;
+        for(id = 11; id <= 13; id += 2) {
+            lk_expect(id, pos, &bt);
+            add_dm_particle(id, pos);
+            P[PartManager->NumPart - 1].BoundTrackId = bt;
+            lk_add_other(id, 0, 0);
+        }
+        lk_add_other(5000100, 1, 0);
+    }
+    else {
+        lk_add_other(LK_N0 + 100 * ThisTask + 5, 0, 0);
+        lk_add_other(5000100, 1, 0);
+        lk_add_other(5000101, 0, 1);
+    }
     /* queries: rank 0 none; rank 1 15000 ids of rank 0, 300 copies of one id and 50 missing;
      * rank 2 the ids of every other rank twice; every rank > 0 thousands of rank 0's ids, so that
      * full batches concentrate their replies on rank 0 */
@@ -4742,6 +4873,9 @@ test_subhalo_lookup(void ** state)
         for(i = 0; i < 15000; i++) q[nq++] = (MyIDType) ((i * 7) % LK_N0);
         for(i = 0; i < 300; i++) q[nq++] = 42;
         for(i = 0; i < 50; i++) q[nq++] = 5000000 + i;
+        for(i = 0; i < 3; i++) {
+            q[nq++] = 7; q[nq++] = 11; q[nq++] = 13; q[nq++] = 5000100; q[nq++] = 5000101;
+        }
     }
     else if(ThisTask == 2) {
         int rr;
@@ -4754,6 +4888,7 @@ test_subhalo_lookup(void ** state)
         for(i = 0; i < 5000; i++) q[nq++] = (MyIDType) ((i * 11) % LK_N0);
     }
     struct SubhaloIdHit * out = malloc(sizeof(struct SubhaloIdHit) * (nq + 1));
+    struct SubhaloIdHit * out0 = malloc(sizeof(struct SubhaloIdHit) * (nq + 1));
     int mode;
     int lmode;
     for(lmode = 0; lmode < 3; lmode++)
@@ -4763,18 +4898,12 @@ test_subhalo_lookup(void ** state)
         subhalo_lookup_set_max_batch(mode == 0 ? 3 : 0);
         subhalo_lookup_set_mode(lmode);
         subhalo_lookup_ids(q, nq, out, MPI_COMM_WORLD);
-        int bad = 0;
-        for(i = 0; i < nq; i++) {
-            const int exists = q[i] < LK_N0 || (q[i] >= LK_N0 + 100 && q[i] < LK_N0 + 100 * NTask);
-            LOCAL_CHECK(bad, out[i].found == exists, "lookup mode %d: id %lu found %d\n", mode, (unsigned long) q[i], out[i].found);
-            if(!exists || !out[i].found) continue;
-            double pos[3];
-            int64_t bt;
-            lk_expect(q[i], pos, &bt);
-            LOCAL_CHECK(bad, out[i].Pos[0] == pos[0] && out[i].Pos[1] == pos[1] && out[i].BoundTrackId == bt && out[i].GrNr == -1,
-                        "lookup mode %d: id %lu answered Pos %g %g bound %ld GrNr %ld\n", mode, (unsigned long) q[i], out[i].Pos[0],
-                        out[i].Pos[1], out[i].BoundTrackId, out[i].GrNr);
-        }
+        int bad = lk_verify(q, nq, out, NTask, "lookup", mode);
+        /* the three answer modes and both batchings agree exactly */
+        if(lmode == 0 && mode == 0)
+            memcpy(out0, out, sizeof(struct SubhaloIdHit) * nq);
+        else
+            LOCAL_CHECK(bad, memcmp(out0, out, sizeof(struct SubhaloIdHit) * nq) == 0, "lookup mode %d / %d: answers differ from auto\n", lmode, mode);
         assert_all_true(bad == 0);
         double peak = subhalo_lookup_last_peak_bytes(), gpeak = 0;
         MPI_Allreduce(&peak, &gpeak, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
@@ -4787,8 +4916,47 @@ test_subhalo_lookup(void ** state)
             CHECK(gpeak <= sp.SubhaloLookupBatchBytes + 16384 && (NTask < 4 || gpeak > 0.5 * sp.SubhaloLookupBatchBytes),
                   "lookup: byte cap %ld, high water %g\n", sp.SubhaloLookupBatchBytes, gpeak);
     }
+    /* a call so small that the auto mode differs between the ranks (audit 5d R4): rank 0's
+     * ~20000 live particles answer by the scan (ntot <= nlive / 16), the ~100 of the other ranks
+     * by the index; the answers equal those of the forced modes */
+    {
+        int64_t n2 = 0;
+        if(ThisTask == 1) {
+            q[n2++] = 7; q[n2++] = 11; q[n2++] = 13; q[n2++] = 5000100; q[n2++] = 5000101; q[n2++] = 42;
+            if(NTask > 2) q[n2++] = LK_N0 + 100 * 2 + 5;
+        }
+        else if(ThisTask == 2) {
+            q[n2++] = LK_N0 + 100 + 5; q[n2++] = 7; q[n2++] = 99999999;
+        }
+        else
+            q[n2++] = 13;
+        int64_t ntot = 0, nlive = 0, lo, hi;
+        for(i = 0; i < PartManager->NumPart; i++)
+            nlive += !P[i].IsGarbage && !P[i].Swallowed;
+        MPI_Allreduce(&n2, &ntot, 1, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
+        const int64_t scan = ntot <= nlive / 16;
+        MPI_Allreduce(&scan, &lo, 1, MPI_INT64, MPI_MIN, MPI_COMM_WORLD);
+        MPI_Allreduce(&scan, &hi, 1, MPI_INT64, MPI_MAX, MPI_COMM_WORLD);
+        CHECK(NTask < 2 || (lo == 0 && hi == 1), "lookup mixed modes: %ld queries, auto scan on rank %d: %ld (ranks min %ld max %ld)\n", ntot,
+              ThisTask, scan, lo, hi);
+        for(lmode = 0; lmode < 3; lmode++)
+        for(mode = 0; mode < 2; mode++) {
+            subhalo_lookup_set_max_batch(mode == 0 ? 2 : 0);
+            subhalo_lookup_set_mode(lmode);
+            subhalo_lookup_ids(q, n2, out, MPI_COMM_WORLD);
+            int bad = lk_verify(q, n2, out, NTask, "lookup mixed", mode);
+            if(lmode == 0 && mode == 0)
+                memcpy(out0, out, sizeof(struct SubhaloIdHit) * n2);
+            else
+                LOCAL_CHECK(bad, memcmp(out0, out, sizeof(struct SubhaloIdHit) * n2) == 0, "lookup mixed %d / %d: answers differ from auto\n", lmode,
+                            mode);
+            assert_all_true(bad == 0);
+        }
+        message(0, "Lookup mixed modes: %ld queries, auto mode scan on some ranks and index on others; the three modes agree\n", ntot);
+    }
     subhalo_lookup_set_max_batch(0);
     subhalo_lookup_set_mode(0);
+    free(out0);
     free(out);
     free(q);
     teardown_pman();

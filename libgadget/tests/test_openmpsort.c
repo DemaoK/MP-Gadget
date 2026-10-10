@@ -203,12 +203,122 @@ static void test_permute_openmp(void ** state) {
     free(src);
 }
 
+/* Explicit permute_openmp layouts (audit 5d R4). The units are S = max(1024, nmemb / (16
+ * threads) + 1) consecutive positions of the cycle listing (the non-fixed positions, cycles in
+ * the order of their smallest element): a first cycle of exactly S (or 2 S) non-fixed positions,
+ * plain or with fixed points between them, so that the next cycle starts exactly at a unit
+ * boundary; a long cycle spanning several units followed by 2-cycles and fixed points; a 3-cycle
+ * followed by 2-cycles, so that a 2-cycle straddles each boundary. Every byte of the result is
+ * compared with the out-of-place gather, for records of 16 and 184 bytes at 1 to 4 threads. */
+static void make_cycle(int * src, const int * pos, int m) {
+    /* pos[0] -> pos[1] -> ... -> pos[m-1] -> pos[0] in the traversal j = src[j] */
+    int c;
+    for(c = 0; c < m; c++)
+        src[pos[c]] = pos[(c + 1) % m];
+}
+static void test_permute_layouts(void ** state) {
+    const int sizes[7] = {1023, 1024, 1025, 2047, 2048, 2049, 5121};
+    const int recsize[2] = {16, 184};
+    const int maxt = omp_get_max_threads();
+    int si, r, layout, t, i;
+    for(si = 0; si < 7; si++) {
+        const int n = sizes[si];
+        int * src = (int *) malloc(n * sizeof(int));
+        int * order = (int *) malloc(n * sizeof(int));
+        int * pos = (int *) malloc(n * sizeof(int));
+        for(layout = 0; layout < 5; layout++)
+        for(t = 1; t <= 4; t++) {
+            const int S = n / (16 * t) + 1 > 1024 ? n / (16 * t) + 1 : 1024;
+            int m = 0, p = 0;
+            for(i = 0; i < n; i++)
+                src[i] = i;
+            if(layout <= 2) {
+                /* 0: positions 0..S-1; 1: S non-fixed positions with every 7th position fixed
+                 * between them; 2: 2 S positions. Their order is scrambled after the first */
+                const int len = layout == 2 ? 2 * S : S;
+                for(p = 0; p < n && m < len; p++)
+                    if(layout != 1 || p % 7 != 3)
+                        pos[m++] = p;
+                int c;
+                srand48(31 + layout);
+                for(c = m - 1; c > 1; c--) {
+                    int j = 1 + (int) (c * drand48());
+                    int x = pos[c]; pos[c] = pos[j]; pos[j] = x;
+                }
+                make_cycle(src, pos, m);
+                /* the next cycle starts at cycle position m: a rotation of up to 300 positions,
+                 * then 2-cycles, every 5th pair left fixed */
+                m = 0;
+                while(p < n && m < 300)
+                    pos[m++] = p++;
+                if(m > 1)
+                    make_cycle(src, pos, m);
+            }
+            else if(layout == 3) {
+                /* a long cycle over 70% of the positions (several units for the larger sizes),
+                 * scrambled, then 2-cycles and fixed points */
+                const int len = (int) (0.7 * n);
+                for(p = 0; p < len; p++)
+                    pos[m++] = p;
+                int c;
+                srand48(57);
+                for(c = m - 1; c > 1; c--) {
+                    int j = 1 + (int) (c * drand48());
+                    int x = pos[c]; pos[c] = pos[j]; pos[j] = x;
+                }
+                make_cycle(src, pos, m);
+            }
+            else {
+                /* a 3-cycle, then 2-cycles: with S even, one 2-cycle straddles every boundary */
+                pos[0] = 0; pos[1] = 2; pos[2] = 1;
+                make_cycle(src, pos, 3);
+                p = 3;
+            }
+            int npair = 0;
+            while(p + 1 < n) {
+                if(npair++ % 5 != 4) {
+                    pos[0] = p; pos[1] = p + 1;
+                    make_cycle(src, pos, 2);
+                }
+                p += 2;
+            }
+            for(r = 0; r < 2; r++) {
+                const int sz = recsize[r];
+                unsigned char * a = (unsigned char *) malloc((size_t) n * sz);
+                unsigned char * in = (unsigned char *) malloc((size_t) n * sz);
+                unsigned char * ref = (unsigned char *) malloc((size_t) n * sz);
+                int b;
+                for(i = 0; i < n; i++)
+                    for(b = 0; b < sz; b++)
+                        in[(size_t) i * sz + b] = (unsigned char) ((i * 131 + b * 7 + (i >> 8) * 13) & 0xff);
+                for(i = 0; i < n; i++)
+                    memcpy(ref + (size_t) i * sz, in + (size_t) src[i] * sz, sz);
+                memcpy(a, in, (size_t) n * sz);
+                omp_set_num_threads(t);
+                permute_openmp(a, n, sz, src, order);
+                omp_set_num_threads(maxt);
+                if(memcmp(a, ref, (size_t) n * sz))
+                    message(1, "permute layout %d, n %d, record %d bytes, %d threads (S %d): differs from the gather\n", layout, n, sz, t, S);
+                assert_true(memcmp(a, ref, (size_t) n * sz) == 0);
+                free(ref);
+                free(in);
+                free(a);
+            }
+        }
+        free(pos);
+        free(order);
+        free(src);
+    }
+    omp_set_num_threads(maxt);
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_openmpsort),
         cmocka_unit_test(test_openmpsort_struct),
         cmocka_unit_test(test_openmpsort_stable),
         cmocka_unit_test(test_permute_openmp),
+        cmocka_unit_test(test_permute_layouts),
     };
     return cmocka_run_group_tests_mpi(tests, NULL, NULL);
 }

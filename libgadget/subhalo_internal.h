@@ -638,8 +638,10 @@ typedef void (*subhalo_key_fn)(const struct SubhaloKeySeg * seg, int64_t k, stru
  * the rest assigned longest-processing-time first on cost to the least loaded thread and processed
  * by each thread in that order; one arena per thread (mymalloc2 in thread order, freed in
  * reverse). Key k needs an arena of bytes_per_part * segs[k].n + extra[k] + 64 bytes (extra may
- * be NULL). Every fn() call is timed into the statistics below. Returns the largest arena
- * high-water mark of a key as a fraction of its arena (diagnostic). */
+ * be NULL), and its fn() call sees an arena of exactly that logical size, whatever the size of the
+ * shared buffer (so a key's results do not depend on the keys it shares a thread with). Every
+ * fn() call is timed into the statistics below. Returns the largest arena high-water mark of a
+ * key as a fraction of its arena (diagnostic). */
 double subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t bytes_per_part, const int64_t * extra,
                                subhalo_key_fn fn, void * userdata);
 /* This rank's measured key times, summed over the subhalo_run_serial_keys calls since the last

@@ -261,6 +261,15 @@ allocator_reset_min_free(Allocator * alloc)
 }
 
 size_t
+allocator_charge(const Allocator * alloc, const size_t request_size)
+{
+    /* as allocator_alloc_va: the request rounded up to the alignment, plus the header */
+    if(alloc->use_malloc)
+        return ALIGNMENT;
+    return ((request_size + ALIGNMENT - 1) / ALIGNMENT) * ALIGNMENT + ALIGNMENT;
+}
+
+size_t
 allocator_get_free_size(Allocator * alloc)
 {
     /*For malloc, return a fixed 2GB */

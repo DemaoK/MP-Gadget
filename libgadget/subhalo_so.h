@@ -110,7 +110,7 @@ size_t subhalo_so_walk_bytes(int pass, int NB, int NT);
 /* Phase 5d: the field SO walks' elastic export tables (sized by the treewalk from the free
  * memory) are taken out of the main allocator's low-water mark after every walk; these give the
  * true low-water mark of the walks since the last reset (SIZE_MAX if none) and their largest
- * export tables (bytes). */
+ * export tables (bytes of allocator charge: payload, alignment padding and block headers). */
 void subhalo_so_elastic_reset(void);
 size_t subhalo_so_elastic_min_free(void);
 double subhalo_so_elastic_bytes(void);

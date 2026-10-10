@@ -87,6 +87,11 @@ allocator_dealloc (Allocator * alloc, void * ptr);
 size_t
 allocator_get_free_size(Allocator * alloc);
 
+/* The bytes an allocation of request_size takes from the allocator's free space (the request
+ * rounded up to the alignment, plus the block header). */
+size_t
+allocator_charge(const Allocator * alloc, const size_t request_size);
+
 size_t
 allocator_get_used_size(Allocator * alloc, int dir);
 
