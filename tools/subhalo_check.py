@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Scripted integration checks for the runtime subhalo finder: Phase 1
-(halofinder_phase1_plan.md section 6) and Phase 2a (halofinder_phase2a_plan.md section 6).
+(halofinder_phase1_plan.md section 6), Phase 2a (halofinder_phase2a_plan.md section 6) and Phase 3
+(halofinder_phase3_plan.md section 6).
 Every subcommand exits 0 on success and 1 on a failed check, printing each failure; 2 means the
 input could not be read.
 
@@ -37,6 +38,23 @@ input could not be read.
   orphans PIGDIR [...]        Orphan/*: TracerPos inside the box, SnapTracerLost -1 or <= the
                               snapshot, Snap* ordering, SinkTrackId / DescendantTrackId /
                               NestedParentTrackId / CentralTrackId refer to existing tracks.
+  props PIGDIR [...]          Phase 3: the property columns. Bound SO (MBoundSO, RBoundSO) and field
+                              SO (MSO, RSO) defined for a looser threshold whenever for a tighter one,
+                              non-increasing with the threshold density (Header SOThresholds, else the
+                              design 7.10 formulas), R = (3 M / 4 pi rho)^(1/3); MBoundSO <= Mbound,
+                              VmaxVir <= Vmax, RmaxVir <= RBoundSO[vir], Rhalf <= Renclose; axis ratios
+                              in (0, 1] with c <= b, AxisA unit vectors (all -1 when undefined); MSO,
+                              RSO, MTypeSO* -1 off centrals, sum(MTypeSO200c) = MSO[200c],
+                              sum(MTypeSOVir) = MSO[vir]; Flags bits 3 and 4 only on centrals, bit 4
+                              set exactly when an MSO definition is -1; group C zero for absent types,
+                              MostMassiveBHID set exactly when a black hole is bound; no NaN. Only defined values (!= -1) are tested, so a catalogue written
+                              before Phase 3 passes. MSO below MBoundSO is a warning.
+  tree OUTPUTDIR|PIG...       Phase 4: the track history over a PIG sequence. Tracks present at every
+                              output after birth; resolved nodes their own descendant; deaths with
+                              SnapDeath = the first orphan output, DescendantTrackId / SinkTrackId
+                              resolved there, unchanged afterwards; MboundPeak / VmaxPeak running
+                              maxima; SnapAcc, SnapFirstAcc, SnapLastIsolation, SnapLastMajorMerger
+                              against the Rank history (subhalo_history_update).
   compare PIG_A PIG_B         check 5: every Subhalo/* and Orphan/* column equal after sorting by
                               TrackId, and the per-particle tags equal when matched by ID.
   markincomplete PIGDIR       check 6 helper: set Header SubhaloStateComplete (default 0).
@@ -55,6 +73,8 @@ Examples (from the directory holding the run outputs):
   python3 tools/subhalo_check.py tags --phase1 on/output/PIG_00?               (Phase 1)
   python3 tools/subhalo_check.py orphans output/PIG_00?
   python3 tools/subhalo_check.py tracking output/PIG_003 output/PIG_004
+  python3 tools/subhalo_check.py props output/PIG_00?                         (Phase 3)
+  python3 tools/subhalo_check.py tree output                                  (Phase 4)
 
 The Header attribute file format (BigFile attr-v2), used by the markincomplete fallback when the
 Python bigfile module cannot rewrite attributes: one attribute per line,
@@ -1353,6 +1373,404 @@ def cmd_orphans(args):
     return rc
 
 
+# ---------------------------------------------------------------------------------- props (Phase 3)
+GCGS = 6.674e-8
+SO_NAMES = ("vir", "200b", "200c", "500c", "2500c")
+# Phase 3 float columns whose defined values are positive (> 0) or, second set, non-negative
+_PROPS_POSITIVE = ("MBoundSO", "RBoundSO", "VmaxVir", "RmaxVir", "Rhalf", "Renclose", "RsKlypin", "MSO", "RSO")
+_PROPS_NONNEG = ("SpinPeebles", "SpinBullock", "Xoff", "Voff")
+_PROPS_FINITE = _PROPS_POSITIVE + _PROPS_NONNEG + (
+    "J", "JVir", "BtoA", "CtoA", "BtoA500", "CtoA500", "AxisA", "AxisA500", "InertiaTensor",
+    "MTypeSO200c", "MTypeSOVir", "StarFormationRate", "GasMetalMass", "StellarMetalMass", "BlackholeMass",
+    "BlackholeAccretionRate", "MassHeIonized", "GasMetalElemMass", "StellarMetalElemMass")
+FLAG_SOCUTOFF = 1 << 3
+FLAG_SONOCROSS = 1 << 4
+
+
+def so_thresholds(header):
+    """(rho[5], source): Header SOThresholds (design 7.10, internal comoving densities) or, when absent,
+    the formulas of design 7.10 from the Header cosmology without radiation (ordering and a 1e-2 check)."""
+    thr = header.get("SOThresholds")
+    if thr is not None and np.atleast_1d(thr).size == 5:
+        return np.atleast_1d(thr).astype(np.float64), "Header SOThresholds"
+    g = lambda k, d: float(attr(header, k, d))  # noqa: E731
+    a, Om, OL = g("Time", 1.0), g("Omega0", 0.3), g("OmegaLambda", 0.7)
+    ul, um, uv = g("UnitLength_in_cm", 3.085678e21), g("UnitMass_in_g", 1.989e43), g("UnitVelocity_in_cm_per_s", 1e5)
+    ut = ul / uv
+    G = GCGS * um * ut ** 2 / ul ** 3
+    H0 = 100e5 / 3.085678e24 * ut
+    E2 = Om / a ** 3 + OL + (1 - Om - OL) / a ** 2
+    rhoc = 3 * H0 ** 2 * E2 * a ** 3 / (8 * np.pi * G)
+    rhom = Om * 3 * H0 ** 2 / (8 * np.pi * G)
+    x = Om / a ** 3 / E2 - 1
+    dvir = 18 * np.pi ** 2 + 82 * x - 39 * x ** 2
+    return np.array([dvir * rhoc, 200 * rhom, 200 * rhoc, 500 * rhoc, 2500 * rhoc]), "computed from the Header cosmology"
+
+
+def _rows2d(v):
+    """A column as [rows, items] (items = 1 for scalar columns), also for an empty table."""
+    return v.reshape(v.shape[0], int(np.prod(v.shape[1:]))) if v.ndim > 1 else v[:, None]
+
+
+def _defined(v):
+    """Rows (or row-items) holding a value, i.e. not the -1 'not computed' sentinel."""
+    return v != -1
+
+
+def _check_so_set(ck, tag, tid, M, R, rho, rtol_r, name_m, name_r, rows):
+    """Outermost-crossing rules for one SO set over the given rows: definedness and M, R
+    non-increasing with increasing threshold density; R = (3 M / 4 pi rho)^(1/3)."""
+    order = np.argsort(rho)
+    Mo, Ro = M[rows][:, order], R[rows][:, order]
+    t = tid[rows]
+    dm, dr = _defined(Mo), _defined(Ro)
+    bad = np.any(dm != dr, axis=1)
+    ck.check(not np.any(bad), "%s: %d subhalos with %s and %s defined for different definitions (e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), name_m, name_r, t[bad][:5].tolist()))
+    # a looser threshold (lower density) has a crossing whenever a tighter one has
+    bad = np.any(dm[:, 1:] & ~dm[:, :-1], axis=1)
+    ck.check(not np.any(bad), "%s: %d subhalos where %s is defined for a higher threshold but not a lower one "
+             "(e.g. TrackId %s)" % (tag, np.count_nonzero(bad), name_m, t[bad][:5].tolist()))
+    both = dm[:, 1:] & dm[:, :-1]
+    bad = np.any(both & (Mo[:, 1:] > Mo[:, :-1] * (1 + 1e-5)), axis=1)
+    ck.check(not np.any(bad), "%s: %d subhalos with %s increasing with the threshold density (order %s; e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), name_m, " < ".join(SO_NAMES[k] for k in order), t[bad][:5].tolist()))
+    both = dr[:, 1:] & dr[:, :-1]
+    bad = np.any(both & (Ro[:, 1:] > Ro[:, :-1] * (1 + 1e-5)), axis=1)
+    ck.check(not np.any(bad), "%s: %d subhalos with %s increasing with the threshold density (order %s; e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), name_r, " < ".join(SO_NAMES[k] for k in order), t[bad][:5].tolist()))
+    d = dm & dr
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mr = 4.0 / 3 * np.pi * Ro ** 3 * rho[order][None, :] / Mo
+    bad = np.any(d & (np.abs(mr - 1) > rtol_r), axis=1)
+    ck.check(not np.any(bad), "%s: %d subhalos with %s != (3 %s / 4 pi rho)^(1/3) beyond %.0e in mass (e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), name_r, name_m, rtol_r, t[bad][:5].tolist()))
+
+
+def check_props(pigdir, ck, vmax_rtol=1e-3, field_warn=0.02):
+    """Phase 3 (halofinder_phase3_plan.md section 6): internal consistency of the property columns.
+    Every rule applies to defined values only, so a catalogue before Phase 3 (all -1) passes."""
+    try:
+        cat = SubhaloCatalogue(pigdir)
+    except SubhaloFormatError as e:
+        ck.fail(str(e))
+        return
+    tag = os.path.basename(pigdir.rstrip("/"))
+    S = cat.subhalos
+    tid = S["TrackId"]
+    n = tid.size
+    rho, src = so_thresholds(cat.header)
+    rtol_r = 1e-3 if src.startswith("Header") else 1e-2
+    central = (S["Rank"] == 0) & (S["HostGroup"] >= 0)
+    flags = S["Flags"].astype(np.int64)
+    # finite, -1 or in range
+    for c in _PROPS_FINITE:
+        v = S[c]
+        bad = ~np.all(np.isfinite(_rows2d(v)), axis=1)
+        ck.check(not np.any(bad), "%s: %d subhalos with non-finite %s (e.g. TrackId %s)"
+                 % (tag, np.count_nonzero(bad), c, tid[bad][:5].tolist()))
+    for c in _PROPS_POSITIVE + _PROPS_NONNEG:
+        v = _rows2d(S[c])
+        lo = 0.0 if c in _PROPS_NONNEG else np.nextafter(np.float32(0), np.float32(1))
+        bad = np.any(_defined(v) & np.isfinite(v) & (v < lo), axis=1)
+        ck.check(not np.any(bad), "%s: %d subhalos with %s neither -1 nor %s (e.g. TrackId %s)"
+                 % (tag, np.count_nonzero(bad), c, ">= 0" if lo == 0 else "> 0", tid[bad][:5].tolist()))
+    allrows = np.arange(n)
+    _check_so_set(ck, tag, tid, S["MBoundSO"].astype(np.float64), S["RBoundSO"].astype(np.float64), rho, rtol_r,
+                  "MBoundSO", "RBoundSO", allrows)
+    mb = S["Mbound"].astype(np.float64)
+    bad = np.any(_defined(S["MBoundSO"]) & (S["MBoundSO"] > mb[:, None] * (1 + 1e-5)), axis=1)
+    ck.check(not np.any(bad), "%s: %d subhalos with MBoundSO > Mbound (e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    vv, v = S["VmaxVir"], S["Vmax"]
+    bad = _defined(vv) & _defined(v) & (vv > v * (1 + vmax_rtol))
+    ck.check(not np.any(bad), "%s: %d subhalos with VmaxVir > Vmax (rtol %g; e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), vmax_rtol, tid[bad][:5].tolist()))
+    rv = S["RBoundSO"][:, 0]
+    bad = _defined(S["RmaxVir"]) & (~_defined(rv) | (S["RmaxVir"] > rv * (1 + 1e-5)))
+    ck.check(not np.any(bad), "%s: %d subhalos with RmaxVir defined beyond RBoundSO[vir] or without it (e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    bad = _defined(vv) != _defined(S["RmaxVir"])
+    ck.check(not np.any(bad), "%s: %d subhalos with only one of VmaxVir, RmaxVir defined" % (tag, np.count_nonzero(bad)))
+    bad = _defined(S["Rhalf"]) & _defined(S["Renclose"]) & (S["Rhalf"] > S["Renclose"] * (1 + 1e-6))
+    ck.check(not np.any(bad), "%s: %d subhalos with Rhalf > Renclose (e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    for suffix, rcol in (("", 0), ("500", 3)):
+        b, c, ax = S["BtoA" + suffix], S["CtoA" + suffix], S["AxisA" + suffix].astype(np.float64)
+        bad = _defined(b) != _defined(c)
+        ck.check(not np.any(bad), "%s: %d subhalos with only one of BtoA%s, CtoA%s defined" % (tag, np.count_nonzero(bad), suffix, suffix))
+        for name, r in (("BtoA" + suffix, b), ("CtoA" + suffix, c)):
+            bad = _defined(r) & ~((r > 0) & (r <= 1 + 1e-6))
+            ck.check(not np.any(bad), "%s: %d subhalos with %s outside (0, 1] (e.g. TrackId %s)"
+                     % (tag, np.count_nonzero(bad), name, tid[bad][:5].tolist()))
+        bad = _defined(b) & _defined(c) & (c > b * (1 + 1e-6))
+        ck.check(not np.any(bad), "%s: %d subhalos with CtoA%s > BtoA%s (e.g. TrackId %s)"
+                 % (tag, np.count_nonzero(bad), suffix, suffix, tid[bad][:5].tolist()))
+        norm = np.sqrt((ax ** 2).sum(axis=1))
+        bad = _defined(b) & (np.abs(norm - 1) > 1e-3)
+        ck.check(not np.any(bad), "%s: %d subhalos with AxisA%s not a unit vector (e.g. TrackId %s)"
+                 % (tag, np.count_nonzero(bad), suffix, tid[bad][:5].tolist()))
+        bad = ~_defined(b) & ~np.all(ax == -1, axis=1)
+        ck.check(not np.any(bad), "%s: %d subhalos with AxisA%s set but BtoA%s -1 (e.g. TrackId %s)"
+                 % (tag, np.count_nonzero(bad), suffix, suffix, tid[bad][:5].tolist()))
+        bad = _defined(b) & ~_defined(S["RBoundSO"][:, rcol])
+        ck.check(not np.any(bad), "%s: %d subhalos with BtoA%s but no RBoundSO[%s] aperture"
+                 % (tag, np.count_nonzero(bad), suffix, SO_NAMES[rcol]))
+    it = S["InertiaTensor"]
+    dit = ~np.all(it == -1, axis=1)
+    bad = dit & np.any(it[:, :3] < 0, axis=1)
+    ck.check(not np.any(bad), "%s: %d subhalos with a negative InertiaTensor diagonal (e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    # field SO: centrals only
+    fieldcols = ("MSO", "RSO", "MTypeSO200c", "MTypeSOVir")
+    for c in fieldcols:
+        bad = ~central & ~np.all(S[c] == -1, axis=1)
+        ck.check(not np.any(bad), "%s: %d non-central subhalos (satellites or hostless) with %s != -1 (e.g. TrackId %s)"
+                 % (tag, np.count_nonzero(bad), c, tid[bad][:5].tolist()))
+    _check_so_set(ck, tag, tid, S["MSO"].astype(np.float64), S["RSO"].astype(np.float64), rho, rtol_r, "MSO", "RSO",
+                  np.nonzero(central)[0])
+    bad = ~central & ((flags & (FLAG_SOCUTOFF | FLAG_SONOCROSS)) != 0)
+    ck.check(not np.any(bad), "%s: %d non-central subhalos with Flags bit 3 or 4 (field SO) set" % (tag, np.count_nonzero(bad)))
+    anyso = np.any(_defined(S["MSO"]), axis=1)
+    queried = central & anyso
+    nocross = queried & np.any(~_defined(S["MSO"]), axis=1)
+    bad = queried & (nocross != ((flags & FLAG_SONOCROSS) != 0))
+    ck.check(not np.any(bad), "%s: %d centrals where Flags bit 4 disagrees with an MSO definition being -1 (e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    bad = central & ~anyso & ((flags & FLAG_SOCUTOFF) != 0)
+    ck.check(not np.any(bad), "%s: %d centrals with Flags bit 3 but no MSO" % (tag, np.count_nonzero(bad)))
+    for c, k in (("MTypeSO200c", 2), ("MTypeSOVir", 0)):
+        mt = S[c].astype(np.float64)
+        dm = _defined(S["MSO"][:, k])
+        bad = central & dm & (np.abs(mt.sum(axis=1) - S["MSO"][:, k]) > 1e-4 * np.abs(S["MSO"][:, k]) + 1e-12)
+        ck.check(not np.any(bad), "%s: %d centrals with sum(%s) != MSO[%s] (e.g. TrackId %s)"
+                 % (tag, np.count_nonzero(bad), c, SO_NAMES[k], tid[bad][:5].tolist()))
+        bad = central & ~dm & ~np.all(mt == -1, axis=1)
+        ck.check(not np.any(bad), "%s: %d centrals with %s set but MSO[%s] -1" % (tag, np.count_nonzero(bad), c, SO_NAMES[k]))
+    # field >= bound up to the pass-1 bin resolution: a warning
+    both = central[:, None] & _defined(S["MSO"]) & _defined(S["MBoundSO"])
+    low = np.any(both & (S["MSO"] < S["MBoundSO"] * (1 - field_warn)), axis=1)
+    if np.any(low):
+        ck.warn("%s: %d centrals with MSO more than %.0f%% below MBoundSO for some definition (the sphere holds the "
+                "bound set; e.g. TrackId %s)" % (tag, np.count_nonzero(low), 100 * field_warn, tid[low][:5].tolist()))
+    # group C: sums of absent types are zero
+    nbt = S["NboundType"]
+    for c, t in (("StarFormationRate", 0), ("GasMetalMass", 0), ("MassHeIonized", 0), ("StellarMetalMass", 4),
+                 ("BlackholeMass", 5), ("BlackholeAccretionRate", 5)):
+        v = S[c]
+        bad = _defined(v) & ((v < 0) | ((v > 0) & (nbt[:, t] == 0)))
+        ck.check(not np.any(bad), "%s: %d subhalos with %s negative or non-zero without bound type-%d particles"
+                 % (tag, np.count_nonzero(bad), c, t))
+    # MostMassiveBHID: (MyIDType) -1 without a bound black hole (subhalo_props_baryons; 0 accepted too)
+    bhid = S["MostMassiveBHID"]
+    none = (bhid == np.iinfo(bhid.dtype).max) | (bhid == 0)
+    bad = ~none & (nbt[:, 5] == 0)
+    ck.check(not np.any(bad), "%s: %d subhalos with a MostMassiveBHID but no bound black hole (e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    bad = none & (nbt[:, 5] > 0) & _defined(S["BlackholeMass"])
+    ck.check(not np.any(bad), "%s: %d subhalos with bound black holes and group C filled but no MostMassiveBHID (e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    cnt = lambda c: int(np.count_nonzero(np.any(_defined(_rows2d(S[c])), axis=1)))  # noqa: E731
+    print("  %s: %d subhalos (%d centrals); thresholds %s; defined: MBoundSO %d, VmaxVir %d, Rhalf %d, SpinPeebles %d, "
+          "SpinBullock %d, RsKlypin %d, BtoA %d, BtoA500 %d, InertiaTensor %d, MSO %d (centrals), Flags bit 3 %d, bit 4 %d"
+          % (tag, n, np.count_nonzero(central), src, cnt("MBoundSO"), cnt("VmaxVir"), cnt("Rhalf"), cnt("SpinPeebles"),
+             cnt("SpinBullock"), cnt("RsKlypin"), cnt("BtoA"), cnt("BtoA500"), int(np.count_nonzero(dit)), cnt("MSO"),
+             np.count_nonzero(flags & FLAG_SOCUTOFF), np.count_nonzero(flags & FLAG_SONOCROSS)))
+
+
+def cmd_props(args):
+    rc = 0
+    for p in args.pigdirs:
+        ck = Checker("props %s" % p)
+        check_props(p, ck, vmax_rtol=args.vmax_rtol)
+        rc |= ck.report()
+    return rc
+
+
+# ---------------------------------------------------------------------------------- tree (Phase 4)
+def check_tree(inputs, ck, show=5):
+    """Phase 4 plan item 4: consistency of the track history over a PIG sequence (design 7.7 and
+    subhalo_history_update). A node is (TrackId, output); `prev` is the same track's node at the
+    previous output of the sequence."""
+    from subhalo_reader import SubhaloSequence
+    seq = SubhaloSequence(inputs[0] if len(inputs) == 1 and not os.path.basename(inputs[0].rstrip("/")).startswith("PIG_")
+                          else inputs)
+    if len(seq) == 0:
+        ck.fail("no PIG with subhalo finder blocks in %s" % " ".join(inputs))
+        return
+    if seq.skipped:
+        ck.note("skipped (no finder blocks): %s" % ", ".join(seq.skipped))
+    N = seq.nodes()
+    if "TrackId" not in N or N["TrackId"].size == 0:
+        ck.note("no tracks in the sequence")
+        return
+    tid = N["TrackId"].astype(np.int64)
+    out = N["Output"].astype(np.int64)
+    snap = N["Snapshot"].astype(np.int64)
+    res = N["Resolved"]
+    nout = len(seq)
+    first = np.ones(tid.size, bool)
+    first[1:] = tid[1:] != tid[:-1]
+    last = np.ones(tid.size, bool)
+    last[:-1] = tid[1:] != tid[:-1]
+    hasprev = np.zeros(tid.size, bool)
+    hasprev[1:] = ~first[1:] & (out[1:] == out[:-1] + 1)
+    pv = np.maximum(np.arange(tid.size) - 1, 0)
+    prev_res = hasprev & res[pv]
+    sat = res & (N["Rank"] > 0) & (N["HostGroup"] >= 0)
+    cen = res & ~sat
+    prev_snap_of = np.array([-1] + seq.snapshots[:-1], dtype=np.int64)
+    print("  %d outputs (SnapshotIndex %s), %d tracks, %d nodes (%d resolved, %d orphan)" % (
+        nout, seq.snapshots, np.unique(tid).size, tid.size, np.count_nonzero(res), np.count_nonzero(~res)))
+    if np.any(np.diff(np.array(seq.snapshots)) != 1):
+        ck.warn("the SnapshotIndex values are not consecutive: SnapLastIsolation = SnapNum - 1 at the first "
+                "satellite output then differs from the previous output")
+
+    def rule(mask, msg):
+        bad = np.nonzero(mask)[0]
+        ex = ", ".join("%d@%d" % (tid[k], snap[k]) for k in bad[:show])
+        ck.check(bad.size == 0, "%s: %d nodes (TrackId@Snapshot %s)" % (msg, bad.size, ex))
+
+    def resolved_at(o, t):
+        """Is track t resolved at output o (arrays)."""
+        key = out[res] * (int(tid.max()) + 2) + tid[res]
+        ks = np.sort(key)
+        q = np.asarray(o) * (int(tid.max()) + 2) + np.asarray(t)
+        p = np.clip(np.searchsorted(ks, q), 0, max(ks.size - 1, 0))
+        return (ks.size > 0) & (ks[p] == q) if ks.size else np.zeros(np.shape(q), bool)
+
+    # -- presence: a track appears at consecutive outputs up to the last one, born resolved
+    gap = ~first & ~hasprev
+    rule(gap, "track missing at an output between two of its nodes")
+    rule(last & (out != nout - 1), "track absent from the last output (tracks are never deleted)")
+    born_inside = first & (out > 0)
+    rule(born_inside & ~res, "track first appears as an orphan after the first output")
+    sb = N["SnapBirth"].astype(np.int64)
+    rule(born_inside & res & (sb != snap), "SnapBirth differs from the output of the track's first appearance")
+    rule(hasprev & (sb != sb[pv]), "SnapBirth changes along the branch")
+    rule((sb < 0) | (sb > snap), "SnapBirth outside [0, Snapshot]")
+    # -- resolved rows: identity
+    rule(res & (N["DescendantTrackId"] != tid), "resolved node whose DescendantTrackId is not itself")
+    rule(res & ((N["SnapDeath"] != -1) | (N["SnapSink"] != -1) | (N["SinkTrackId"] != -1)),
+         "resolved node with SnapDeath, SnapSink or SinkTrackId set")
+    # -- orphan rows: death episode
+    death = N["SnapDeath"].astype(np.int64)
+    ssink = N["SnapSink"].astype(np.int64)
+    sinkt = N["SinkTrackId"].astype(np.int64)
+    desct = N["DescendantTrackId"].astype(np.int64)
+    dies = ~res & prev_res  # first orphan node after a resolved one
+    cont = ~res & hasprev & ~res[pv]
+    rule(dies & (death != snap), "SnapDeath is not the first output at which the track is an orphan")
+    rule(cont & ((death != death[pv]) | (ssink != ssink[pv]) | (sinkt != sinkt[pv]) | (desct != desct[pv])),
+         "SnapDeath, SnapSink, SinkTrackId or DescendantTrackId changes while the track stays an orphan")
+    rule(~res & ((death < 0) | (death > snap)), "orphan with SnapDeath outside [0, Snapshot]")
+    rule(~res & ~((ssink == -1) | (ssink == death)), "orphan with SnapSink neither -1 nor SnapDeath")
+    rule(~res & ((sinkt >= 0) != (ssink >= 0)), "orphan with SinkTrackId and SnapSink inconsistent")
+    rule(~res & (sinkt == tid), "orphan sunk into itself")
+    # links at the death output (the value at output n describes the transition n-1 -> n)
+    dout = np.full(tid.size, -1, np.int64)
+    pos = np.clip(np.searchsorted(np.array(seq.snapshots), death), 0, nout - 1)
+    inseq = ~res & (np.array(seq.snapshots)[pos] == death)
+    dout[inseq] = pos[inseq]
+    m = inseq & (desct >= 0)
+    ok = resolved_at(dout[m], desct[m])
+    bad = np.zeros(tid.size, bool)
+    bad[np.nonzero(m)[0][~ok]] = True
+    rule(bad, "DescendantTrackId not resolved at the SnapDeath output")
+    m = inseq & (sinkt >= 0)
+    ok = resolved_at(dout[m], sinkt[m])
+    bad = np.zeros(tid.size, bool)
+    bad[np.nonzero(m)[0][~ok]] = True
+    rule(bad, "SinkTrackId not resolved at the SnapSink output")
+    rule(dies & (desct == tid), "dead track whose DescendantTrackId is itself")
+    nsunk = np.count_nonzero(dies & (sinkt >= 0))
+    ndiff = np.count_nonzero(dies & (sinkt >= 0) & (desct != sinkt))
+    if ndiff:
+        ck.note("%d of %d sunk tracks have DescendantTrackId != SinkTrackId (allowed, as in HBT)" % (ndiff, nsunk))
+    # -- peaks: running maxima over the branch (subhalo_history_update)
+    mb, vm = N["Mbound"], N["Vmax"]
+    mp, vp = N["MboundPeak"], N["VmaxPeak"]
+    smp, svp = N["SnapMboundPeak"].astype(np.int64), N["SnapVmaxPeak"].astype(np.int64)
+    vamp = N["VmaxAtMboundPeak"]
+    up = res & hasprev & (mb > mp[pv])
+    keep = hasprev & ~up
+    rule(up & ((mp != mb) | (smp != snap) | (vamp != vm)), "MboundPeak not raised to Mbound (or SnapMboundPeak/VmaxAtMboundPeak not set) when Mbound exceeds the previous peak")
+    rule(keep & ((mp != mp[pv]) | (smp != smp[pv]) | (vamp != vamp[pv])), "MboundPeak, SnapMboundPeak or VmaxAtMboundPeak changed without a new maximum")
+    up = res & hasprev & (vm > vp[pv])
+    keep = hasprev & ~up
+    rule(up & ((vp != vm) | (svp != snap)), "VmaxPeak not raised to Vmax when Vmax exceeds the previous peak")
+    rule(keep & ((vp != vp[pv]) | (svp != svp[pv])), "VmaxPeak or SnapVmaxPeak changed without a new maximum")
+    rule(res & ((mp < mb) | (vp < vm)), "peak below the current value")
+    rule((smp > snap) | (svp > snap) | (smp < sb) | (svp < sb), "SnapMboundPeak or SnapVmaxPeak outside [SnapBirth, Snapshot]")
+    b = born_inside & res
+    rule(b & ((mp != mb) | (smp != snap) | (vp != vm) | (svp != snap)), "newborn whose peaks are not its current values")
+    # -- accretion and isolation history against the Rank history
+    sacc = N["SnapAcc"].astype(np.int64)
+    sfa = N["SnapFirstAcc"].astype(np.int64)
+    sli = N["SnapLastIsolation"].astype(np.int64)
+    slmm = N["SnapLastMajorMerger"].astype(np.int64)
+    macc, vacc = N["MboundAcc"], N["VmaxAcc"]
+    mfa, vfa = N["MboundFirstAcc"], N["VmaxFirstAcc"]
+    rule(cen & ((sacc != snap) | (macc != mb) | (vacc != vm)), "central or hostless node whose SnapAcc/MboundAcc/VmaxAcc are not its current state")
+    rule(sat & hasprev & ((sacc != sacc[pv]) | (macc != macc[pv]) | (vacc != vacc[pv])), "satellite whose accretion state changed")
+    rule(~res & hasprev & ((sacc != sacc[pv]) | (sfa != sfa[pv]) | (sli != sli[pv]) | (slmm != slmm[pv])),
+         "orphan whose SnapAcc, SnapFirstAcc, SnapLastIsolation or SnapLastMajorMerger changed")
+    newsat = sat & hasprev & (sfa[pv] < 0)
+    rule(newsat & ((sfa != sacc[pv]) | (mfa != macc[pv]) | (vfa != vacc[pv])), "first satellite output whose SnapFirstAcc state is not the previous accretion state")
+    rule(hasprev & (sfa[pv] >= 0) & ((sfa != sfa[pv]) | (mfa != mfa[pv]) | (vfa != vfa[pv])), "SnapFirstAcc state changed after it was set")
+    rule(cen & hasprev & (sfa != sfa[pv]), "central whose SnapFirstAcc changed")
+    rule(born_inside & res & (sfa != -1), "newborn with SnapFirstAcc set")
+    rule((sfa >= 0) & ((sfa > snap) | (sfa < sb)), "SnapFirstAcc outside [SnapBirth, Snapshot]")
+    # SnapAcc against the Rank history: the last output at which the track was a central
+    last_cen = np.full(tid.size, -1, np.int64)
+    cur = -1
+    for k in range(tid.size):
+        if first[k]:
+            cur = -1
+        if cen[k]:
+            cur = snap[k]
+        last_cen[k] = cur
+    known = np.zeros(tid.size, bool)  # the track's whole past is in the sequence
+    kn = False
+    for k in range(tid.size):
+        if first[k]:
+            kn = born_inside[k] or (out[k] == 0 and sb[k] == snap[k])
+        known[k] = kn
+    rule(known & (last_cen >= 0) & (sacc != last_cen), "SnapAcc is not the last output at which the track was a central (Rank history)")
+    # SnapLastIsolation (HBT): -1 while only ever central; the previous output at the first
+    # satellite output; the current output whenever the track is central again
+    rule(sat & hasprev & (sli[pv] < 0) & (sli != prev_snap_of[out]), "first satellite output whose SnapLastIsolation is not the previous output")
+    rule(sat & hasprev & (sli[pv] >= 0) & (sli != sli[pv]), "satellite whose SnapLastIsolation changed")
+    rule(cen & hasprev & (sli[pv] >= 0) & (sli != snap), "central (after a satellite phase) whose SnapLastIsolation is not the current output")
+    rule(cen & hasprev & (sli[pv] < 0) & (sli != -1), "central (never a satellite) with SnapLastIsolation set")
+    rule(sat & hasprev & (slmm != slmm[pv]), "satellite whose SnapLastMajorMerger changed")
+    rule(cen & hasprev & (slmm != slmm[pv]) & (slmm != snap), "central whose SnapLastMajorMerger moved to an earlier output")
+    rule((slmm > snap), "SnapLastMajorMerger after the output")
+    # HBT sets SnapshotOfLastIsolation for a track that dies as a member of another host (an
+    # orphan is ranked as a satellite there); the finder leaves the death record's history alone.
+    hosted_by_other = dies & (N["HostGroup"] >= 0) & (N["CentralTrackId"] >= 0) & (N["CentralTrackId"] != tid)
+    n_hbt = int(np.count_nonzero(hosted_by_other & (sli == -1)))
+    if n_hbt:
+        ck.warn("%d of %d tracks that died inside another track's host keep SnapLastIsolation = -1; HBT would set "
+                "it to the previous output (an orphan is ranked as a satellite at its death)" % (
+                    n_hbt, np.count_nonzero(hosted_by_other)))
+    nres = int(np.count_nonzero(res & hasprev & ~res[pv]))
+    print("  %d deaths (%d sunk, %d with DescendantTrackId -1), %d resurrections, %d first-satellite events" % (
+        np.count_nonzero(dies), nsunk, np.count_nonzero(dies & (desct < 0)), nres, np.count_nonzero(newsat)))
+
+
+def cmd_tree(args):
+    ck = Checker("tree %s" % " ".join(args.inputs))
+    check_tree(args.inputs, ck, show=args.show)
+    return ck.report()
+
+
+def _add_tree_parser(sub):
+    s = sub.add_parser("tree", help="Phase 4: track history consistency over a PIG sequence")
+    s.add_argument("inputs", nargs="+", help="output directory holding PIG_* (or the PIG directories in order)")
+    s.add_argument("--show", type=int, default=5, help="example nodes printed per failed rule (default 5)")
+
+
 # ---------------------------------------------------------------------------------- compare
 def _compare_tables(ck, name, ta, tb, rtol, atol, ignore, mask_inplace):
     if "TrackId" not in ta or "TrackId" not in tb:
@@ -1546,6 +1964,9 @@ def main(argv=None):
     s.add_argument("pigdirs", nargs="+")
     s.add_argument("--tracer-pos", action="store_true",
                    help="fail when TracerPos differs from the saved tracer's Position (Phase 2a; a warning otherwise)")
+    s = sub.add_parser("props", help="Phase 3: consistency of the property and field SO columns")
+    s.add_argument("pigdirs", nargs="+")
+    s.add_argument("--vmax-rtol", type=float, default=1e-3, help="tolerance of VmaxVir <= Vmax (default 1e-3)")
     s = sub.add_parser("compare", help="check 5: two PIGs of the same snapshot are equal")
     s.add_argument("pig_a")
     s.add_argument("pig_b")
@@ -1560,10 +1981,12 @@ def main(argv=None):
     s.add_argument("--value", type=int, default=0)
     s = sub.add_parser("tagcounts", help="tagged particles per type")
     s.add_argument("pigdir")
+    _add_tree_parser(sub)
     args = p.parse_args(argv)
     cmds = dict(offon=cmd_offon, consistency=cmd_consistency, tracking=cmd_tracking, compare=cmd_compare,
                 markincomplete=cmd_markincomplete, tagcounts=cmd_tagcounts, hierarchy=cmd_hierarchy,
-                tags=cmd_tags, orphans=cmd_orphans)
+                tags=cmd_tags, orphans=cmd_orphans, props=cmd_props)
+    cmds["tree"] = cmd_tree
     if args.cmd not in cmds:
         p.print_help()
         return 2

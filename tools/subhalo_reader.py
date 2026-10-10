@@ -424,6 +424,79 @@ class SubhaloCatalogue(object):
             parts.append(idx[bound[s] == trackid])
         return np.concatenate(parts) if parts else np.zeros(0, dtype=np.int64)
 
+    # ------------------------------------------------------------------ bound ID lists (Phase 4)
+    @property
+    def snapshot(self):
+        """SnapshotIndex of the Header (the PIG number)."""
+        return int(np.atleast_1d(self.header.get("SnapshotIndex", -1))[0])
+
+    @property
+    def scale_factor(self):
+        return float(np.atleast_1d(self.header.get("Time", np.nan))[0])
+
+    def tagged_types(self):
+        """Particle types with saved rows and the three tag blocks."""
+        return [t for t in range(NTYPES) if self.nsaved(t) > 0 and self.has_particle_tags(t)]
+
+    def full_bound_ids(self, trackid, return_types=False):
+        """Particle IDs of the track's full bound list over every type, in binding order:
+
+        1. the exclusive bound list (rows tagged with the track and bound to it: the bound prefixes
+           of its in-group and field slices, every type) ordered by BindRank, which is the exact
+           energy order of the final unbinding pass (BindRank is dense over the track's own-tag
+           rows, bound first);
+        2. then the overlap particles: rows of the key's range (key_ranges) bound to the track but
+           tagged with a descendant in the nest tree (a child's tail). Their position in the
+           track's own energy order is not recorded; they follow in (BindRank in their tag's list,
+           ID) order.
+
+        The first entries (the most-bound tracers, reserved for the track by the D10 tag rule) are
+        therefore exact. Returns an int64/uint64 ID array, and with return_types the type of each.
+        """
+        rank, ids, types, overlap = [], [], [], []
+        for t in self.tagged_types():
+            rows = self.full_bound(trackid, t)
+            if rows.size == 0:
+                continue
+            rank.append(self.read(t, "BindRank")[rows].astype(np.int64))
+            ids.append(self.read(t, "ID")[rows])
+            types.append(np.full(rows.size, t, np.int8))
+            overlap.append(self.read(t, "TrackId")[rows] != trackid)
+        if not ids:
+            e = np.zeros(0, np.uint64)
+            return (e, np.zeros(0, np.int8)) if return_types else e
+        rank, ids, types, overlap = (np.concatenate(v) for v in (rank, ids, types, overlap))
+        o = np.lexsort((ids, rank, overlap))
+        return (ids[o], types[o]) if return_types else ids[o]
+
+    def all_full_bound_ids(self):
+        """full_bound_ids for every resolved track at once (vectorised; same order as
+        full_bound_ids). Selects rows by BoundTrackId over the whole file rather than over each
+        key's range; the two agree when the `tags` check passes (every row bound to T lies in T's
+        key). Returns (trackids, offsets, ids, types): the list of trackids[k] is
+        ids[offsets[k]:offsets[k + 1]]; trackids is Subhalo/TrackId (sorted)."""
+        B, R, I, T, OV = [], [], [], [], []
+        for t in self.tagged_types():
+            bt = self.read(t, "BoundTrackId").astype(np.int64)
+            m = bt >= 0
+            B.append(bt[m])
+            R.append(self.read(t, "BindRank")[m].astype(np.int64))
+            I.append(self.read(t, "ID")[m])
+            T.append(np.full(np.count_nonzero(m), t, np.int8))
+            OV.append(self.read(t, "TrackId")[m].astype(np.int64) != bt[m])
+        tids = self.subhalos.get("TrackId", np.zeros(0, np.int64)).astype(np.int64)
+        if not B:
+            return tids, np.zeros(tids.size + 1, np.int64), np.zeros(0, np.uint64), np.zeros(0, np.int8)
+        B, R, I, T, OV = (np.concatenate(v) for v in (B, R, I, T, OV))
+        o = np.lexsort((I, R, OV, B))
+        B, I, T = B[o], I[o], T[o]
+        keep = np.isin(B, tids)
+        B, I, T = B[keep], I[keep], T[keep]
+        counts = np.bincount(np.searchsorted(tids, B), minlength=tids.size) if tids.size else np.zeros(0, np.int64)
+        offsets = np.zeros(tids.size + 1, np.int64)
+        offsets[1:] = np.cumsum(counts)
+        return tids, offsets, I, T
+
     # ------------------------------------------------------------------ report
     def tag_counts(self):
         """Per type: saved rows, rows in groups, tagged rows (TrackId >= 0) in groups and in the
@@ -499,6 +572,216 @@ class SubhaloCatalogue(object):
                 t, s.start, s.stop, self.subhalos["SliceNboundByType"][row, t],
                 f.start, f.stop, self.subhalos["FieldSliceNboundByType"][row, t],
                 len(self.exclusive_bound(trackid, t)), full), file=out)
+
+
+def _fill_value(name, dtype):
+    """Value of a Subhalo-only column on an orphan node: 0 for counts and bound masses (an orphan
+    binds nothing), -1 otherwise (the finder's 'not available')."""
+    if name.startswith("Nbound") or name in ("Mbound", "MboundType", "NtailType"):
+        return 0
+    if np.dtype(dtype).kind == "u":
+        return np.iinfo(np.dtype(dtype)).max
+    return -1
+
+
+# Orphan columns standing in for Subhalo columns on orphan nodes: the tracer is the most-bound
+# particle of the track's last bound set.
+ORPHAN_AS_SUBHALO = {"MostBoundPos": "TracerPos", "MostBoundVel": "TracerVel"}
+
+
+class SubhaloSequence(object):
+    """The PIG_xxx outputs of one run in SnapshotIndex order: the tree of tracks is implicit in
+    the persistent TrackIds (design 7.7), a node being (TrackId, output).
+
+        seq = SubhaloSequence("output")              # every PIG_* holding finder blocks
+        for cat in seq: ...                          # SubhaloCatalogue per output (cached)
+        br = seq.branch(17)                          # the rows of track 17 over time
+        snaps, m = seq.history(17, "Mbound")
+
+    Catalogues are opened lazily and kept. `outputdir` is a directory of PIG_* or a list of
+    PIG directories; PIGs without finder blocks are skipped with a note in `skipped`.
+    """
+
+    def __init__(self, outputdir, strict=True, pattern="PIG_*"):
+        import glob
+        if isinstance(outputdir, (list, tuple)):
+            dirs = list(outputdir)
+        else:
+            dirs = sorted(glob.glob(os.path.join(outputdir, pattern)))
+        self.strict = strict
+        self.skipped = []
+        entries = []
+        for d in dirs:
+            if not os.path.isdir(d):
+                continue
+            try:
+                f = bigfile.File(d)
+                blocks = set(f.blocks)
+                if "Subhalo/TrackId" not in blocks and "Orphan/TrackId" not in blocks:
+                    self.skipped.append(d)
+                    continue
+                h = header_attrs(f)
+            except Exception:  # unreadable directory: skip, reported in `skipped`
+                self.skipped.append(d)
+                continue
+            snap = int(np.atleast_1d(h.get("SnapshotIndex", -1))[0])
+            entries.append((snap, float(np.atleast_1d(h.get("Time", np.nan))[0]), d))
+        entries.sort()
+        if len(set(e[0] for e in entries)) != len(entries):
+            raise SubhaloFormatError("two PIGs with the same SnapshotIndex in %s" % (outputdir,))
+        self.snapshots = [e[0] for e in entries]
+        self.scale_factors = np.array([e[1] for e in entries], dtype=np.float64)
+        self.paths = [e[2] for e in entries]
+        self._cats = {}
+        self._nodes = None
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, i):
+        """Catalogue of the i-th output of the sequence (not the SnapshotIndex)."""
+        if i not in self._cats:
+            self._cats[i] = SubhaloCatalogue(self.paths[i], strict=self.strict)
+        return self._cats[i]
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
+    def index_of(self, snapshot):
+        """Position in the sequence of a SnapshotIndex, -1 if absent."""
+        try:
+            return self.snapshots.index(int(snapshot))
+        except ValueError:
+            return -1
+
+    def catalogue(self, snapshot):
+        i = self.index_of(snapshot)
+        if i < 0:
+            raise KeyError("SnapshotIndex %d is not in the sequence" % snapshot)
+        return self[i]
+
+    def scale_of(self, snapshot, default=-1.0):
+        """Scale factor of SnapshotIndex values (array-like; default where absent or < 0)."""
+        snap = np.atleast_1d(np.asarray(snapshot, dtype=np.int64))
+        out = np.full(snap.shape, default, dtype=np.float64)
+        if not self.snapshots:
+            return out
+        s = np.array(self.snapshots, dtype=np.int64)
+        pos = np.clip(np.searchsorted(s, snap), 0, s.size - 1)
+        hit = s[pos] == snap
+        out[hit] = self.scale_factors[pos[hit]]
+        return out
+
+    # ------------------------------------------------------------------ the node table
+    def node_columns(self):
+        """Column names of the node table: the union of Subhalo/* and Orphan/* columns over the
+        sequence, plus TrackId, Output, Snapshot, ScaleFactor, Resolved."""
+        sub, orph = [], []
+        for cat in self:
+            for k in cat.subhalos:
+                if k not in sub:
+                    sub.append(k)
+            for k in cat.orphans:
+                if k not in orph:
+                    orph.append(k)
+        return sub + [k for k in orph if k not in sub]
+
+    def nodes(self):
+        """Every (track, output) node of the sequence as a dict of arrays sorted by
+        (TrackId, Output): Output (position in the sequence), Snapshot, ScaleFactor, Resolved
+        (True for a Subhalo/* row, False for an Orphan/* row), and every column of node_columns().
+        On orphan nodes Subhalo-only columns are 0 for counts and bound masses and -1 (or the u8
+        maximum) otherwise, except MostBoundPos/MostBoundVel which take TracerPos/TracerVel; on
+        resolved nodes Orphan-only columns are -1 except TracerPos/TracerVel, which take
+        MostBoundPos/MostBoundVel. Cached."""
+        if self._nodes is not None:
+            return self._nodes
+        cols = self.node_columns()
+        parts = {k: [] for k in cols}
+        meta = {"Output": [], "Snapshot": [], "ScaleFactor": [], "Resolved": []}
+        proto = {}
+        for i, cat in enumerate(self):
+            for tab in (cat.subhalos, cat.orphans):
+                for k, v in tab.items():
+                    proto.setdefault(k, (v.dtype, v.shape[1:]))
+        inverse = {v: k for k, v in ORPHAN_AS_SUBHALO.items()}
+        for i, cat in enumerate(self):
+            for tab, resolved in ((cat.subhalos, True), (cat.orphans, False)):
+                n = len(tab.get("TrackId", []))
+                if n == 0:
+                    continue
+                for k in cols:
+                    dt, shp = proto[k]
+                    if k in tab:
+                        v = tab[k]
+                    elif not resolved and k in ORPHAN_AS_SUBHALO and ORPHAN_AS_SUBHALO[k] in tab:
+                        v = tab[ORPHAN_AS_SUBHALO[k]].astype(dt)
+                    elif resolved and k in inverse and inverse[k] in tab:
+                        v = tab[inverse[k]].astype(dt)
+                    else:
+                        v = np.full((n,) + shp, _fill_value(k, dt), dtype=dt)
+                    parts[k].append(v)
+                meta["Output"].append(np.full(n, i, np.int32))
+                meta["Snapshot"].append(np.full(n, self.snapshots[i], np.int32))
+                meta["ScaleFactor"].append(np.full(n, self.scale_factors[i], np.float64))
+                meta["Resolved"].append(np.full(n, resolved, bool))
+        out = {}
+        for k, v in list(meta.items()) + list(parts.items()):
+            if v:
+                out[k] = np.concatenate(v)
+            else:
+                dt, shp = proto.get(k, (np.dtype("i8"), ()))
+                out[k] = np.zeros((0,) + tuple(shp), dtype=dt if k not in meta else np.int64)
+        if "TrackId" in out and out["TrackId"].size:
+            o = np.lexsort((out["Output"], out["TrackId"]))
+            out = {k: v[o] for k, v in out.items()}
+        self._nodes = out
+        return out
+
+    def track_ids(self):
+        """Every TrackId that appears in the sequence (resolved or orphan), sorted."""
+        n = self.nodes()
+        return np.unique(n["TrackId"]) if "TrackId" in n else np.zeros(0, np.int64)
+
+    def branch(self, trackid):
+        """The rows of a track over time: a dict of arrays (one entry per output at which the
+        track is in Subhalo/* or Orphan/*, in output order) with the node_columns() plus Output,
+        Snapshot, ScaleFactor and Resolved. Empty arrays if the track never appears."""
+        n = self.nodes()
+        tid = n.get("TrackId", np.zeros(0, np.int64))
+        lo, hi = np.searchsorted(tid, trackid, "left"), np.searchsorted(tid, trackid, "right")
+        return {k: v[lo:hi] for k, v in n.items()}
+
+    def history(self, trackid, column, resolved_only=False):
+        """(SnapshotIndex values, column values) of a track over the sequence."""
+        b = self.branch(trackid)
+        m = b["Resolved"] if resolved_only else np.ones(b["Snapshot"].size, bool)
+        return b["Snapshot"][m], b[column][m]
+
+    def resolved_snapshots(self, trackid):
+        return self.history(trackid, "TrackId", resolved_only=True)[0]
+
+    def first_resolved(self, trackid):
+        """SnapshotIndex of the first output at which the track is resolved, -1 if never."""
+        s = self.resolved_snapshots(trackid)
+        return int(s[0]) if s.size else -1
+
+    def last_resolved(self, trackid):
+        s = self.resolved_snapshots(trackid)
+        return int(s[-1]) if s.size else -1
+
+    def merger_descendant(self, trackid):
+        """The merger relation of design 7.7 for a track that stops being resolved: (SnapshotIndex
+        of the first output at which it is an orphan after its last resolved output,
+        DescendantTrackId read from that output's row). (-1, -1) for a track resolved at the last
+        output or never resolved."""
+        b = self.branch(trackid)
+        res = np.nonzero(b["Resolved"])[0]
+        if res.size == 0 or res[-1] == b["Resolved"].size - 1:
+            return -1, -1
+        k = res[-1] + 1
+        return int(b["Snapshot"][k]), int(b["DescendantTrackId"][k])
 
 
 def main(argv=None):
