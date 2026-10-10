@@ -23,7 +23,8 @@ TESTED = hci \
 	cooling_rates \
 	density \
 	gravity \
-	exchange
+	exchange \
+	subhalo_unbind
 
 MPI_TESTED = exchange fof subhalo
 
@@ -47,6 +48,7 @@ GADGET_OBJS =  \
 	 gdbtools.o hci.o\
 	 fof.o fofpetaio.o petaio.o \
 	 subhalo.o subhalo_gather.o subhalo_track.o subhalo_io.o \
+	 subhalo_unbind.o subhalo_props.o \
 	 domain.o exchange.o slotsmanager.o partmanager.o \
 	 blackhole.o bhinfo.o bhdynfric.o \
 	 timebinmgr.o \
@@ -123,6 +125,9 @@ all: libgadget.a libgadget-utils.a
 	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
 
 .objs/test_subhalo: tests/test_subhalo.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
+	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
+
+.objs/test_subhalo_unbind: tests/test_subhalo_unbind.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
 	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
 
 .objs/test_forcetree: tests/test_forcetree.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a

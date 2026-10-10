@@ -166,21 +166,18 @@ apply_accn_to_output(TreeWalkResultGravShort * output, const double dx[3], const
 
     if(r2 < h*h)
     {
-        double wp;
         const double h3_inv = 1.0 / h / h / h;
         const double u = r / h;
         if(u < 0.5) {
             fac = mass * h3_inv * (10.666666666667 + u * u * (32.0 * u - 38.4));
-            wp = -2.8 + u * u * (5.333333333333 + u * u * (6.4 * u - 9.6));
         }
         else {
             fac =
                 mass * h3_inv * (21.333333333333 - 48.0 * u +
                         38.4 * u * u - 10.666666666667 * u * u * u - 0.066666666667 / (u * u * u));
-            wp =
-                -3.2 + 0.066666666667 / u + u * u * (10.666666666667 +
-                        u * (-16.0 + u * (9.6 - 2.133333333333 * u)));
         }
+        /* the spline potential polynomial, shared with the subhalo unbinding kernel (gravshort.h) */
+        const double wp = grav_spline_wp(u);
         facpot = mass / h * wp;
     }
 
