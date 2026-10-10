@@ -53,7 +53,15 @@
  *     query, the local particle order reversed and a rank emptied (a checksum is logged, "SO
  *     profile checksum", identical with any number of ranks: fixed-point sums); the memory rule:
  *     with only pass 1's reserve free the four columns are -1 (MSO still set), with pass 3's but
- *     not pass 2's they are set. */
+ *     not pass 2's they are set. The bitwise identity holds because these layouts give the same
+ *     f4 MSO[vir] / RSO[vir] (pass 3's guarantee is conditional on its inputs, audit 5e R3).
+ *  9. Audit 5e R1 (test_subhalo_so_prof_unit): pass 3's 128-bit fixed-point unit for a synthetic
+ *     2^31 particles, no particle allocated: overflow bound, maximality, exact quantisation of
+ *     masses down to 2^-70 of the largest (1e-6 included), sums of 2^31 copies.
+ * 10. Audit 5e R2 (test_subhalo_field_so_shell): thin shells of 100 particles at 0.99 RSO[vir]: the
+ *     four columns -1 with >= 100 particles where the f4 RSO[vir] rounded at or above the density
+ *     crossing, set where below, and the diagnostics count the particles, not VmaxSO; the call's
+ *     unit is subhalo_so_prof_unit of the global live count and largest mass. */
 
 #include <stdarg.h>
 #include <stddef.h>
@@ -1561,11 +1569,220 @@ test_subhalo_field_so_profile(void ** state)
     PartManager->NumPart = 0;
 }
 
+/* ------------------------------------------------------------------ audit 5e R1: the unit */
+
+/* Pass 3's fixed-point unit (subhalo_so_prof_unit) for a synthetic global count of 2^31 live
+ * particles, no particle allocated: for largest masses 1, 0.75, 3.1e-3 and 1e3 the unit is the
+ * largest power of two with N m_max unit <= 2^126 (2^31 quantised largest masses do not overflow,
+ * twice the unit would exceed the bound); masses 1e-6, 1e-6 (1 + 2^-20), 0.3 and 2^-70 of the
+ * largest (as float, the particles' type) are quantised exactly, where the former 64-bit unit
+ * (2^(62 - emax - 31)) rounded 1e-6 by 2.4e-4 relative; the sum of 2^31 copies of each, as one
+ * 128-bit product, converts back to 2^31 m to 1e-15. Also the unit at 2^31 + 1 particles (one more
+ * bit), without mass, and the warning bound 0.5 / (unit m) <= 1e-9 for a 2^-60 mass ratio. */
+static void
+test_subhalo_so_prof_unit(void ** state)
+{
+    const int64_t N = (int64_t) 1 << 31;
+    const double mmaxs[4] = {1., 0.75, 3.1e-3, 1e3};
+    const double ratios[5] = {1., 1e-6, 1e-6 * (1 + 0x1p-20), 0.3, 0x1p-70};
+    const subhalo_so_q bound = (subhalo_so_q) 1 << 126;
+    int a, k;
+    for(a = 0; a < 4; a++) {
+        const double mmax = (float) mmaxs[a];
+        const double u = subhalo_so_prof_unit(N, mmax);
+        int emax, eu;
+        frexp(mmax, &emax);
+        CHECK(frexp(u, &eu) == 0.5 && eu - 1 == 126 - emax - 31, "unit %g for m_max %g: not 2^(126 - emax - 31)\n", u, mmax);
+        const subhalo_so_q qmax = subhalo_so_prof_quantise(mmax, u);
+        const subhalo_so_q tot = qmax * (subhalo_so_q) N;
+        CHECK(qmax > 0 && tot > 0 && tot <= bound, "m_max %g: 2^31 quantised largest masses overflow the bound\n", mmax);
+        CHECK(subhalo_so_prof_quantise(mmax, 2 * u) * (subhalo_so_q) N >= bound, "m_max %g: the unit is not the largest\n", mmax);
+        const double uold = ldexp(1.0, 62 - emax - 31);
+        for(k = 0; k < 5; k++) {
+            const double m = (float) (mmax * ratios[k]);
+            const subhalo_so_q q = subhalo_so_prof_quantise(m, u);
+            const double back = (double) q / u;
+            const double eold = fabs((double) llrint(m * uold) / uold - m) / m;
+            const double sum = (double) (q * (subhalo_so_q) N) / u;
+            message(0, "unit: m_max %g, m %.9g (%.3g m_max): quantised %.17g, error %.3g (64-bit unit: %.3g); 2^31 of them %.17g\n",
+                    mmax, m, m / mmax, back, fabs(back - m) / m, eold, sum);
+            CHECK(back == m, "m_max %g: mass %.9g quantised to %.17g\n", mmax, m, back);
+            CHECK(fabs(sum / ((double) N * m) - 1) < 1e-15, "m_max %g: 2^31 masses %.9g sum to %.17g\n", mmax, m, sum);
+            if(a == 0 && k == 1)
+                CHECK(eold > 1e-4, "the former unit's error at 1e-6 is %g, not the audit's 2.4e-4\n", eold);
+        }
+    }
+    CHECK(subhalo_so_prof_unit(N + 1, 1.) == 0.5 * subhalo_so_prof_unit(N, 1.) && subhalo_so_prof_unit(N - 1, 1.) == subhalo_so_prof_unit(N, 1.)
+          && subhalo_so_prof_unit(N, 0) == 1, "unit: the particle count's bits\n");
+    /* the smallest mass's bound (the call's warning): 2^-60 of the largest is still within 1e-9 */
+    const double u = subhalo_so_prof_unit(N, 1.);
+    CHECK(0.5 / (u * 0x1p-60) <= 1e-9, "unit: a 2^-60 mass ratio is quantised to %g\n", 0.5 / (u * 0x1p-60));
+}
+
+/* ------------------------------------------------------------------ audit 5e R2: a thin shell */
+
+#define SH_N 16                    /* shells */
+#define SH_P 100                   /* particles per shell: SUBHALO_NFW_MINPART */
+#define SH_NB 64                   /* pass-1 bins */
+
+/* Thin shells (audit 5e R2): 16 centrals, each the only matter within 200 kpc/h, 100 particles of
+ * mass (64 + k) / 65536 (float exact) on a sphere of radius 0.99 RSO_k, RSO_k = (3 M_k /
+ * (4 pi rho_vir))^(1/3), so the shell is in the last profile bin (0.944 RSO, RSO]. Each record's
+ * Mbound sets its search radius so that a pass-1 edge lies at 0.995 RSO_k: the crossing bin
+ * starts above the shell and is refined (MSO[vir] = M_k, the flat-profile interpolation). Then the
+ * only profile edge holding mass is the published f4 RSO[vir]: where it rounded at or above the
+ * crossing (M_k <= 4/3 pi rho_vir R^3) the sphere has 100 particles but no edge above rho[vir], and
+ * all four columns must be -1; where it rounded below, VmaxSO is set with RmaxSO = RSO[vir]. Both
+ * cases must occur among the 16 masses (checked). The diagnostics: Nprofile (the particle count)
+ * counts all 16, NprofileVmax only the defined ones. */
+static void
+test_subhalo_field_so_shell(void ** state)
+{
+    walltime_init(&CT);
+    struct DomainParams dp = {0};
+    dp.DomainOverDecompositionFactor = 1;
+    dp.DomainUseGlobalSorting = 0;
+    dp.TopNodeAllocFactor = 1.;
+    dp.SetAsideFactor = 1;
+    set_domain_par(dp);
+    init_forcetree_params(0.7);
+    struct gravshort_tree_params tp = get_gravshort_treepar();
+    tp.FractionalGravitySoftening = 1. / 50;
+    set_gravshort_treepar(tp);
+    gravshort_set_softenings(50.);       /* GravitySoftening = 1 kpc/h */
+    subhalo_so_set_import_buffer_boost(0);
+    Cosmology CP = test_cosmology();
+    const double soft = FORCE_SOFTENING() / 2.8;
+    const double M0 = SH_P * (64. / 65536);
+    const double rhov = M0 / (4. / 3 * M_PI * 20. * 20. * 20.);   /* RSO_0 = 20 kpc/h */
+    const double rho[SUBHALO_NSO] = {rhov, 0.7 * rhov, 1.5 * rhov, 4 * rhov, 20 * rhov};
+    struct SubhaloParams par;
+    memset(&par, 0, sizeof(par));
+    par.SubhaloSOBins = SH_NB;
+    par.SubhaloSOSearchFactor = 2;
+    par.SubhaloSOMaxDoublings = 3;
+    par.SubhaloSORefineMinPart = 50;
+    int NTask, ThisTask, k, j, d;
+    MPI_Comm_size(MPI_COMM_WORLD, &NTask);
+    MPI_Comm_rank(MPI_COMM_WORLD, &ThisTask);
+    double cen[SH_N][3], Msh[SH_N], Rt[SH_N];
+    for(k = 0; k < SH_N; k++) {
+        cen[k][0] = 100 + 200 * (k % 4);
+        cen[k][1] = 100 + 200 * (k / 4);
+        cen[k][2] = 500;
+        Msh[k] = SH_P * ((64. + k) / 65536);
+        Rt[k] = cbrt(Msh[k] / (4. / 3 * M_PI * rhov));
+    }
+    particle_alloc_memory(PartManager, BOX, SH_N * SH_P / NTask + 1000);
+    PartManager->NumPart = 0;
+    for(d = 0; d < 3; d++)
+        PartManager->CurrentParticleOffset[d] = Offset[d];
+    slots_init(0.01 * PartManager->MaxPart, SlotsManager);
+    slots_set_enabled(0, sizeof(struct sph_particle_data), SlotsManager);
+    slots_set_enabled(4, sizeof(struct star_particle_data), SlotsManager);
+    slots_set_enabled(5, sizeof(struct bh_particle_data), SlotsManager);
+    int64_t atleast[6] = {16, 0, 0, 0, 16, 16};
+    slots_reserve(1, atleast, SlotsManager);
+    for(k = 0; k < SH_N; k++)
+        for(j = 0; j < SH_P; j++) {
+            const int64_t id = (int64_t) k * SH_P + j;
+            if((int)(id % NTask) != ThisTask)
+                continue;
+            struct particle_data * p = &P[PartManager->NumPart++];
+            memset(p, 0, sizeof(*p));
+            /* a Fibonacci sphere */
+            const double z = 1 - (2. * j + 1) / SH_P, rxy = sqrt(1 - z * z), ph = j * M_PI * (3 - sqrt(5.));
+            const double u[3] = {rxy * cos(ph), rxy * sin(ph), z};
+            p->ID = id;
+            p->Type = 1;
+            p->Mass = (64. + k) / 65536;
+            p->GrNr = -1;
+            p->TrackId = p->BoundTrackId = -1;
+            p->BindRank = -1;
+            for(d = 0; d < 3; d++)
+                p->Pos[d] = wrap(cen[k][d] + 0.99 * Rt[k] * u[d] + Offset[d]);
+        }
+    slots_setup_id(PartManager, SlotsManager);
+    DomainDecomp ddecomp = {0};
+    domain_decompose_full(&ddecomp, MPI_COMM_WORLD);
+
+    struct SubTrack loc[SH_N];
+    int idx[SH_N], n = 0;
+    for(k = 0; k < SH_N; k++) {
+        if(k % NTask != ThisTask)
+            continue;
+        struct SubTrack * t = &loc[n];
+        subhalo_track_clear(t, k);
+        t->Rank = 0;
+        t->HostGroup = k;
+        t->Nbound = SH_P;
+        /* the search radius R with the pass-1 edge (SH_NB - 8 of SH_NB) at 0.995 RSO_k */
+        const double R = soft * pow(0.995 * Rt[k] / soft, (double) SH_NB / (SH_NB - 8));
+        t->Mbound = 4. / 3 * M_PI * 0.7 * rhov * pow(R / par.SubhaloSOSearchFactor, 3);
+        for(d = 0; d < 3; d++)
+            t->CorePos[d] = cen[k][d];
+        idx[n++] = k;
+    }
+    struct SubhaloSOStats st;
+    subhalo_field_so_full(loc, n, &ddecomp, 1.0, &CP, &par, rho, NULL, &st, MPI_COMM_WORLD);
+    double res[SH_N][6], mine[SH_N][6];
+    memset(mine, 0, sizeof(mine));
+    for(k = 0; k < n; k++) {
+        double * c = mine[idx[k]];
+        c[0] = loc[k].MSO[0];
+        c[1] = loc[k].RSO[0];
+        c[2] = loc[k].RsSO;
+        c[3] = loc[k].RsKlypinSO;
+        c[4] = loc[k].VmaxSO;
+        c[5] = loc[k].RmaxSO;
+    }
+    MPI_Allreduce(mine, res, SH_N * 6, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    int nminus = 0, ndef = 0, nvmax = 0;
+    for(k = 0; k < SH_N; k++) {
+        const double * c = res[k];
+        const double R = c[1];
+        const double margin = (Msh[k] - 4. / 3 * M_PI * rhov * R * R * R) / Msh[k];
+        message(0, "shell %d: M %.9g MSO[vir] %.9g RSO[vir] %.9g (crossing %.9g, %+.3g relative): RsSO %g RsKlypinSO %g VmaxSO %g RmaxSO %g\n",
+                k, Msh[k], c[0], R, Rt[k], R / Rt[k] - 1, c[2], c[3], c[4], c[5]);
+        CHECK(fabs(c[0] / Msh[k] - 1) < 1e-6 && fabs(R / Rt[k] - 1) < 1e-6, "shell %d: MSO %g RSO %g, expected %g %g\n", k, c[0], R,
+              Msh[k], Rt[k]);
+        nvmax += c[4] > 0;
+        if(margin < -1e-9) {
+            nminus++;
+            for(j = 2; j < 6; j++)
+                CHECK(c[j] == -1, "shell %d: RSO[vir] at or above the crossing but column %d is %g\n", k, j, c[j]);
+        }
+        else if(margin > 1e-9) {
+            ndef++;
+            CHECK(c[4] > 0 && c[5] == (float) R, "shell %d: RSO[vir] below the crossing but VmaxSO %g RmaxSO %g\n", k, c[4],
+                  c[5]);
+        }
+    }
+    message(0, "shells: %d with RSO[vir] at or above the crossing (all -1), %d below (defined); pass 3: %ld profiled, %ld with >= %d "
+               "particles, %ld with an edge above rho[vir]\n", nminus, ndef, st.Nprofiled, st.Nprofile, SUBHALO_NFW_MINPART,
+            st.NprofileVmax);
+    CHECK(nminus >= 1 && ndef >= 1, "shells: %d all -1, %d defined: the fixture does not exercise both cases\n", nminus, ndef);
+    /* the call's unit is the function's for the global live count and the largest mass */
+    CHECK(st.ProfUnit == subhalo_so_prof_unit(SH_N * SH_P, (64. + SH_N - 1) / 65536), "shells: unit %g, expected %g\n", st.ProfUnit,
+          subhalo_so_prof_unit(SH_N * SH_P, (64. + SH_N - 1) / 65536));
+    CHECK(st.Pass3 && st.Nprofiled == SH_N && st.Nprofile == SH_N && st.NprofileVmax == nvmax && nvmax < SH_N,
+          "shells: pass 3 %d, %ld profiled, %ld with >= 100 particles, %ld with Vmax (%d)\n", st.Pass3, st.Nprofiled, st.Nprofile,
+          st.NprofileVmax, nvmax);
+
+    domain_free(&ddecomp);
+    slots_free(SlotsManager);
+    myfree(PartManager->Base);
+    PartManager->Base = NULL;
+    PartManager->NumPart = 0;
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_subhalo_field_so),
         cmocka_unit_test(test_subhalo_field_so_mixed),
         cmocka_unit_test(test_subhalo_field_so_profile),
+        cmocka_unit_test(test_subhalo_so_prof_unit),
+        cmocka_unit_test(test_subhalo_field_so_shell),
     };
     return cmocka_run_group_tests_mpi(tests, NULL, NULL);
 }

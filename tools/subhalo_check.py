@@ -60,18 +60,20 @@ input could not be read.
                               when a black hole is bound; no NaN. Only defined values (!= -1) are
                               tested, so a catalogue written before Phase 3 passes. MSO below MBoundSO
                               is a warning. Phase 5: Vrms, BulkVel, RockstarCoreVel defined only with
-                              RBoundSO[vir] (Vrms >= 0), and with it unless the bound virial mass is
-                              about one particle (Rockstar's aperture excludes the crossing particle);
+                              RBoundSO[vir] (Vrms >= 0); Vrms -1 with it where MBoundSO[vir] exceeds
+                              1.5 mean particle masses a warning (Rockstar's aperture excludes the
+                              crossing particle; the per-type mean is no bound on one particle's mass);
                               Rs -1 below 102 bound particles, else > 0 and below 1.5 RBoundSO[vir]
                               (-1 there is a warning); |RockstarCoreVel - CoreVel| > Vrms a warning;
                               skipped when all -1. Decision 44 (RsSO, RsKlypinSO, VmaxSO, RmaxSO, the
                               field-SO virial sphere's profile): -1 off centrals and without MSO/RSO[vir];
                               VmaxSO, RmaxSO, RsKlypinSO defined together, RsSO only with them;
-                              RmaxSO and RsSO in (0, RSO[vir]]; -1 for a central with MSO[vir] above
-                              200 particle masses (when the call profiled any central) an error,
-                              defined below 50 a warning; VmaxSO >= 10^-0.0125 VmaxVir where RmaxVir
-                              <= RSO[vir] / 2 (the same centre, a superset of the particles, one
-                              profile bin of resolution); skipped when the columns are absent.
+                              RmaxSO and RsSO in (0, RSO[vir]]; warnings (mass-derived, not counts):
+                              -1 for a central with MSO[vir] above 100 mean particle masses, defined
+                              below 50; VmaxSO < 10^-0.0125 VmaxVir where RmaxVir <= RSO[vir] / 2
+                              (the typical bound for a peak between two profile edges; a compact core
+                              peaking inside the first bin legitimately gives less); skipped when the
+                              columns are absent.
   tree OUTPUTDIR|PIG...       Phase 4: the track history over a PIG sequence. Tracks present at every
                               output after birth; resolved nodes their own descendant; deaths with
                               SnapDeath = the first orphan output, DescendantTrackId resolved there,
@@ -1720,11 +1722,16 @@ def _check_props_deferred(ck, tag, S, tid, corevel_warn=1.0):
     ck.check(not np.any(bad), "%s: %d subhalos with Vrms defined without RBoundSO[vir] (e.g. TrackId %s)"
              % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
     # Rockstar's aperture (decision 44) excludes the crossing particle: Vrms is -1 with RBoundSO[vir]
-    # only when the crossing is the innermost bound particle, i.e. MBoundSO[vir] is one particle
+    # only when the crossing is the innermost bound particle, i.e. MBoundSO[vir] is one particle.
+    # The catalogue has no particle count inside RBoundSO[vir], only per-type MEAN masses, which do
+    # not bound one particle's mass (stars, black holes, any type with one massive particle): a
+    # warning (audit 5e R5)
     mpart = _max_particle_mass(S)
     bad = hasr & ~_defined(vrms) & (S["MBoundSO"][:, 0].astype(np.float64) > 1.5 * mpart)
-    ck.check(not np.any(bad), "%s: %d subhalos with RBoundSO[vir] (MBoundSO[vir] above one particle) but Vrms -1 (e.g. TrackId %s)"
-             % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    if np.any(bad):
+        ck.warn("%s: %d subhalos with RBoundSO[vir] but Vrms -1 although MBoundSO[vir] exceeds 1.5 of the largest per-type mean "
+                "particle mass %.4g (expected only for a one-particle aperture; legitimate if the crossing particle is a heavy "
+                "one; e.g. TrackId %s)" % (tag, np.count_nonzero(bad), mpart, tid[bad][:5].tolist()))
     aper = deferred_velocity_aperture(vrms)
     for name, v in (("BulkVel", bv), ("RockstarCoreVel", rcv)):
         fin = np.all(np.isfinite(v), axis=1)
@@ -1784,6 +1791,8 @@ def _type_masses(S):
 
 
 def _max_particle_mass(S):
+    """The largest per-subhalo per-type MEAN particle mass: a typical particle mass, not an upper
+    bound on any particle's mass (audit 5e R5), so only warnings may rest on it."""
     m = _type_masses(S)
     return float(m.max()) if m.size else np.inf
 
@@ -1800,14 +1809,21 @@ def _check_props_so_profile(ck, tag, S, tid, central, rtol=1e-5):
      - VmaxSO, RmaxSO and RsKlypinSO defined together (fewer than 100 particles inside RSO[vir] or no
        pass 3 leaves all four -1); RsSO only with them (-1 alone when the fit fails);
      - 0 < RmaxSO <= RSO[vir] and 0 < RsSO <= RSO[vir] (the fit is bounded by the outer bin edge);
-     - the particle count inside RSO[vir] is not in the catalogue: -1 for a central whose MSO[vir] holds
-       more than 200 of the largest particle mass is an error when the snapshot profiled any central
-       (pass 3 ran), 100-200 a warning; defined with MSO[vir] below 50 of the smallest mass a warning;
-     - VmaxSO >= 10^(-SO_PROF_DEX / 2) VmaxVir (1 - 1e-3) where both are defined and RmaxVir <= RSO[vir] / 2:
-       the same centre and a superset of the bound particles give M_SO(< e) >= M_bound(< r) for every
-       edge e >= r, so between two edges G M / r can exceed the edge maximum by at most one bin's
-       ratio in r (VmaxVir^2 <= VmaxSO^2 10^SO_PROF_DEX); the RSO[vir] / 2 margin keeps the edge above
-       the density threshold. The ratio's distribution is printed."""
+     - the particle count inside RSO[vir] is not in the catalogue, and the per-type mean masses do not
+       bound single particles (audit 5e R5), so the missing-value rules are warnings: -1 for a central
+       whose MSO[vir] holds more than 100 of the largest mean particle mass (a variable-mass type, a
+       sphere of fewer than 100 massive particles, or a sphere of 100 or more particles without a
+       profile edge above rho[vir], subhalo_so.h; MSO[vir] is interpolated, not a count); defined
+       with MSO[vir] below 50 of the smallest mean mass;
+     - VmaxSO >= 10^(-SO_PROF_DEX / 2) VmaxVir (1 - 1e-3) where both are defined and RmaxVir <= RSO[vir] / 2,
+       a warning (audit 5e R4): the same centre and a superset of the bound particles give
+       M_SO(< e) >= M_bound(< r) for every edge e >= r, so when the peak lies between two edges at
+       or above the first, G M / r can exceed the edge maximum by at most one bin's ratio in r
+       (VmaxVir^2 <= VmaxSO^2 10^SO_PROF_DEX). That is the typical case, not an invariant: the first
+       bin spans [0, 1.06e-3 RSO[vir]], so a compact core peaking inside it (a baryonic core at the
+       softening) legitimately gives sqrt(r_peak / e_1), e.g. 0.31 for a peak at 1e-4 RSO[vir]; and in
+       a nonmonotone profile the next edge need not satisfy the density cut. The ratio's
+       distribution is printed."""
     if any(c not in S for c in SO_PROFILE_COLS):
         ck.note("%s: no decision-44 SO profile columns (%s); rules skipped"
                 % (tag, ", ".join(c for c in SO_PROFILE_COLS if c not in S)))
@@ -1840,17 +1856,18 @@ def _check_props_so_profile(ck, tag, S, tid, central, rtol=1e-5):
     if tm.size and np.any(hasso):
         mmax, mmin = float(tm.max()), float(tm.min())
         miss = hasso & ~dv
-        hard = miss & (mso > 200 * mmax)
-        soft = miss & (mso > 100 * mmax) & ~hard
-        if np.any(dv):
-            ck.check(not np.any(hard), "%s: %d centrals with MSO[vir] above 200 particle masses but VmaxSO -1 (e.g. TrackId %s)"
-                     % (tag, np.count_nonzero(hard), tid[hard][:5].tolist()))
-        elif np.any(hard):
-            ck.warn("%s: no central profiled (pass 3 skipped for memory?): %d centrals with MSO[vir] above 200 particle "
-                    "masses have VmaxSO -1" % (tag, np.count_nonzero(hard)))
-        if np.any(soft):
-            ck.warn("%s: %d centrals with MSO[vir] of 100-200 particle masses but VmaxSO -1 (fewer than 100 particles "
-                    "inside RSO[vir]?; e.g. TrackId %s)" % (tag, np.count_nonzero(soft), tid[soft][:5].tolist()))
+        big = miss & (mso > 200 * mmax)
+        mid = miss & (mso > 100 * mmax) & ~big
+        if np.any(big) and not np.any(dv):
+            ck.warn("%s: no central profiled (pass 3 skipped for memory?): %d centrals with MSO[vir] above 200 mean particle "
+                    "masses have VmaxSO -1" % (tag, np.count_nonzero(big)))
+        elif np.any(big):
+            ck.warn("%s: %d centrals with MSO[vir] above 200 mean particle masses but VmaxSO -1 (fewer than 100 particles "
+                    "inside RSO[vir] if they are heavy, or no profile edge above rho[vir]; e.g. TrackId %s)"
+                    % (tag, np.count_nonzero(big), tid[big][:5].tolist()))
+        if np.any(mid):
+            ck.warn("%s: %d centrals with MSO[vir] of 100-200 mean particle masses but VmaxSO -1 (fewer than 100 particles "
+                    "inside RSO[vir]?; e.g. TrackId %s)" % (tag, np.count_nonzero(mid), tid[mid][:5].tolist()))
         low = dv & (mso < 50 * mmin)
         if np.any(low):
             ck.warn("%s: %d centrals with VmaxSO defined but MSO[vir] below 50 particle masses (e.g. TrackId %s)"
@@ -1861,8 +1878,10 @@ def _check_props_so_profile(ck, tag, S, tid, central, rtol=1e-5):
         inner = both & (rv <= 0.5 * rso)
         lim = 10 ** (-SO_PROF_DEX / 2) * (1 - 1e-3)
         bad = inner & (vm < lim * vv)
-        ck.check(not np.any(bad), "%s: %d centrals with VmaxSO below %.4f VmaxVir (RmaxVir <= RSO[vir] / 2; e.g. TrackId %s)"
-                 % (tag, np.count_nonzero(bad), lim, tid[bad][:5].tolist()))
+        if np.any(bad):
+            ck.warn("%s: %d centrals with VmaxSO below %.4f VmaxVir, the typical bound for a peak between two profile edges "
+                    "(RmaxVir <= RSO[vir] / 2; a compact core peaking inside the first profile bin gives less; min ratio %.4f; "
+                    "e.g. TrackId %s)" % (tag, np.count_nonzero(bad), lim, float((vm[bad] / vv[bad]).min()), tid[bad][:5].tolist()))
         if np.any(both):
             q = vm[both] / vv[both]
             print("  %s: VmaxSO / VmaxVir median %.4f, 10th / 90th percentile %.4f / %.4f, min %.4f over %d centrals"

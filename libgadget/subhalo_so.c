@@ -35,24 +35,30 @@
  *    sums are exact); test_subhalo_so.c checks both. The SO columns of the catalogues compare
  *    bitwise across layouts in practice because these double errors almost never move an f4
  *    rounding.
- *  - Pass 3 (decision 44) does not rely on that: its masses are 64-bit fixed-point integers
- *    (subhalo_so.h), its count an integer and its largest mass a max, so its profile is
- *    bitwise independent of the partition, the traversal, the threads and the merge order for
- *    any masses; the analysis is a serial function of that profile and of the published f4
- *    MSO[vir] / RSO[vir]. Its NFW fit, a Newton iteration with comparisons, would not be robust
- *    against the last-bit differences that passes 1 and 2 tolerate.
+ *  - Pass 3 (decision 44) does not add its own rounding to that: its masses are 128-bit
+ *    fixed-point integers (subhalo_so.h, exact for every particle mass in practice), its count an
+ *    integer and its largest mass a max, so its profile is bitwise independent of the partition,
+ *    the traversal, the threads and the merge order for any masses, GIVEN its inputs: the centre,
+ *    the published f4 MSO[vir] / RSO[vir] and the live particle data; the analysis is a serial
+ *    function of that profile and of those f4 values. Its NFW fit, a Newton iteration with
+ *    comparisons, would not be robust against the last-bit differences that passes 1 and 2
+ *    tolerate. Those passes' double sums do set its inputs, though: where their layout-dependent
+ *    rounding moves a published f4 MSO[vir] or RSO[vir] (rare, as above; never for dyadic
+ *    masses), the pass-3 sphere and its four columns move with it (audit 5e R3).
  *
  * Memory (per rank): 456 bytes per central for the whole call (struct so_row) plus 8 for the
  * pending list, and per query slot of a batch 4 + 8 + 4 NThreads bytes of index (the last for the
- * treewalk's queue copy when black holes exist) and max(NB NT 8, (3 + 2 NT) 64 x 8, 976) bytes of
- * accumulator (each term only for the passes that run; 976 = pass 3's (2 + SUBHALO_SO_NPROF) x 8), the batch capped at 1/8 of the free bytes after the tree build and at what
- * leaves the treewalk its reserve. Results: pass 1 NB NT 8 bytes, pass 2 (3 + 2 NT) 512 bytes
- * (+ 8 each with DEBUG), pass 3 976 bytes; queries 64 / 168 / 64 bytes. treewalk.c's ev_begin wants
+ * treewalk's queue copy when black holes exist) and max(NB NT 8, (3 + 2 NT) 64 x 8, 1936) bytes of
+ * accumulator (each term only for the passes that run; 1936 = pass 3's 16 + 16 SUBHALO_SO_NPROF),
+ * the batch capped at 1/8 of the free bytes after the tree build and at what leaves the treewalk
+ * its reserve. Results: pass 1 NB NT 8 bytes, pass 2 (3 + 2 NT) 512 bytes (+ 8 each with DEBUG),
+ * pass 3 1936 bytes (1944 with DEBUG); queries 64 / 168 / 64 bytes. treewalk.c's ev_begin wants
  * (40960 + max(4097, 100 NThreads)) x (24 + (1 + ImportBufferBoost) (query + result)) free bytes
  * (subhalo_so_walk_bytes): with the defaults (64 bins, boost 2, <= 40 threads) and NT = 1,
  * 75 MiB for pass 1 and 353 MiB for pass 2; with NT = 6, 405 MiB and 1013 MiB (before the type
  * compaction pass 1 always needed the NT = 6 figure; the float pass 2 needed 254 and 584 MiB);
- * pass 3, 3144 bytes per buffer whatever NB and NT, 135 MiB. Pass 3 is admitted on its own
+ * pass 3, 6024 bytes per buffer whatever NB and NT, 259 MiB (271,423,368 bytes; 135 MiB with the
+ * former 64-bit masses, audit 5e R1), below pass 2's 353 MiB. Pass 3 is admitted on its own
  * (its columns -1 if it does not fit) and the batch cap keeps the largest reserve of the passes
  * that run.
  * Before the walks the call checks that requirement against the free memory after the tree
@@ -63,6 +69,7 @@
 
 #include <mpi.h>
 #include <math.h>
+#include <float.h>
 #include <string.h>
 #include <stdint.h>
 #include <omp.h>
@@ -155,6 +162,7 @@ struct so_priv {
      * unit ln r, and the constants of the analysis */
     double qscale, pscale;
     double G, atime, vu, soft, rhovir;
+    int64_t nprofile;              /* pass-3 rows with >= SUBHALO_NFW_MINPART particles (this rank) */
 };
 
 #define SO_PRIV(tw) ((struct so_priv *) ((tw)->priv))
@@ -192,13 +200,14 @@ typedef struct {
 
 /* Pass 3 (decision 44): the total-mass profile of the virial sphere r <= RSO[vir], in
  * SUBHALO_SO_NPROF logarithmic bins between Rin = SUBHALO_SO_PROF_RIN RSO[vir] and RSO[vir]
- * (r <= Rin in bin 0), the masses as 64-bit fixed-point integers (qscale = 2^s units per mass
- * unit), so that every sum is exact and associative: the profile is the same integer vector
- * whatever the particle partition, the traversal and the merge order. */
+ * (r <= Rin in bin 0), the masses as 128-bit fixed-point integers (qscale = 2^s units per mass
+ * unit, subhalo_so_prof_unit), so that every sum is exact and associative: for the same sphere
+ * and particles the profile is the same integer vector whatever the particle partition, the
+ * traversal and the merge order. */
 struct so3_acc {
     int64_t N;                     /* particles inside RSO[vir] */
     double mmax;                   /* their largest mass (merged by max) */
-    int64_t Q[SUBHALO_SO_NPROF];   /* fixed-point mass per bin */
+    subhalo_so_q Q[SUBHALO_SO_NPROF];   /* fixed-point mass per bin */
 };
 
 typedef struct {
@@ -413,6 +422,32 @@ so2_ngbiter(TreeWalkQuerySO2 * I, TreeWalkResultSO2 * O, TreeWalkNgbIterBase * i
 
 /* ------------------------------------------------------------------ pass 3 */
 
+double
+subhalo_so_prof_unit(int64_t nlive, double mmax)
+{
+    if(!(mmax > 0))
+        return 1;
+    int emax, bits = 0;
+    frexp(mmax, &emax);                        /* mmax < 2^emax */
+    while(bits < 63 && ((uint64_t) 1 << bits) < (uint64_t) nlive)
+        bits++;
+    return ldexp(1.0, 126 - emax - bits);
+}
+
+/* m qscale is exact (a power-of-two scaling); rint rounds it to the nearest integer (a no-op from
+ * 2^52 on), below 2^127, which converts to the 128-bit integer exactly */
+static inline subhalo_so_q
+so_prof_q(double m, double qscale)
+{
+    return (subhalo_so_q) rint(m * qscale);
+}
+
+subhalo_so_q
+subhalo_so_prof_quantise(double m, double qscale)
+{
+    return so_prof_q(m, qscale);
+}
+
 /* The profile bin of radius r for inner edge Rin (bins per unit ln r pscale). Not inlined, so
  * that the walk and any later use classify with the same instructions. */
 static int __attribute__((noinline))
@@ -473,27 +508,32 @@ so3_ngbiter(TreeWalkQuerySO3 * I, TreeWalkResultSO3 * O, TreeWalkNgbIterBase * i
         return;
     const struct so_priv * pv = SO_PRIV(lv->tw);
     const double m = P[other].Mass;
-    O->A.Q[so_prof_bin(iter->r, I->Rin, pv->pscale)] += (int64_t) llrint(m * pv->qscale);
+    O->A.Q[so_prof_bin(iter->r, I->Rin, pv->pscale)] += so_prof_q(m, pv->qscale);
     O->A.N++;
     if(m > O->A.mmax)
         O->A.mmax = m;
 }
 
 /* The pass-3 columns of a row from its profile (decision 44): RsSO, RsKlypinSO, VmaxSO, RmaxSO,
- * all -1 first and -1 with fewer than SUBHALO_NFW_MINPART particles inside RSO[vir].
+ * all -1 first and -1 with fewer than SUBHALO_NFW_MINPART particles inside RSO[vir]. Returns 1
+ * when the row has at least SUBHALO_NFW_MINPART particles (the diagnostic count), 0 otherwise.
  *  - Edges e[j], j = 1..NPROF: Rin exp(j / pscale), the last one RSO[vir]; e[0] = 0. Cumulative
- *    mass C[j] = M(<= e[j]) (the exact integer prefix sum, converted once to double).
+ *    mass C[j] = M(<= e[j]) (the exact integer prefix sum, converted once to double). The
+ *    columns are a function of this profile and of the f4 MSO[vir] / RSO[vir] only, so bitwise
+ *    layout independent given those (audit 5e R3).
  *  - VmaxSO / RmaxSO: the largest C[j] / r over the edges with r = max(e[j], softening) whose
  *    enclosed density C[j] / (4/3 pi r^3) exceeds rho[vir] (Rockstar's vmax rule at the edges;
  *    the first edge attaining it); VmaxSO = sqrt(G C / (a r)) in km/s. Resolution: one bin,
- *    ln(1000) / NPROF in ln r.
+ *    ln(1000) / NPROF in ln r. No such edge leaves all four columns -1 although the sphere has
+ *    enough particles (audit 5e R2; subhalo_so.h): the mass is in the last bin, just inside
+ *    RSO[vir], and the f4 RSO[vir] is at or above the density crossing.
  *  - RsKlypinSO: subhalo_klypin_rs(RSO[vir], MSO[vir], that maximum, RmaxSO).
  *  - RsSO: subhalo_nfw_fit from RsKlypinSO on the equal-mass bins of subhalo_nfw_bin_plan (N
  *    particles, the mass inside RSO[vir], the largest mass): bin b closes where M(<r) reaches
  *    b mpbin (subhalo_nfw_threshold picks the profile bin), its edge interpolated inside that
  *    profile bin linearly in ln r (in r^3 in bin 0, which reaches r = 0): the histogram form of
  *    nfw.c's excess-mass edge interpolation. */
-static void
+static int
 so_profile_finish(const struct so_row * row, const struct so3_acc * A, const struct so_priv * pv)
 {
     struct SubTrack * rec = row->rec;
@@ -501,11 +541,11 @@ so_profile_finish(const struct so_row * row, const struct so3_acc * A, const str
     int j, b;
     rec->RsSO = rec->RsKlypinSO = rec->VmaxSO = rec->RmaxSO = -1;
     if(A->N < SUBHALO_NFW_MINPART)
-        return;
+        return 0;
     const double R = rec->RSO[SO_DEF_VIR], Mso = rec->MSO[SO_DEF_VIR];
     const double Rin = SUBHALO_SO_PROF_RIN * R;
     double e[SUBHALO_SO_NPROF + 1], C[SUBHALO_SO_NPROF + 1];
-    int64_t cq = 0;
+    subhalo_so_q cq = 0;
     e[0] = C[0] = 0;
     for(j = 1; j <= NP; j++) {
         cq += A->Q[j - 1];
@@ -522,7 +562,7 @@ so_profile_finish(const struct so_row * row, const struct so3_acc * A, const str
         }
     }
     if(!(best > 0))
-        return;
+        return 1;
     rec->VmaxSO = (float) (sqrt(pv->G * best / pv->atime) * pv->vu);
     rec->RmaxSO = (float) rbest;
     const double rk = subhalo_klypin_rs(R, Mso, best, rbest);
@@ -546,6 +586,7 @@ so_profile_finish(const struct so_row * row, const struct so3_acc * A, const str
     }
     const double rs = subhalo_nfw_fit(rk, edge, b - 1, 3 * pv->soft);
     rec->RsSO = (float) (rs > 0 ? rs : -1);
+    return 1;
 }
 
 /* ------------------------------------------------------------------ the walks */
@@ -872,7 +913,8 @@ so_run_batches(int pass, struct so_priv * pv, int64_t * batchbuf, const int64_t 
         so_walk(pass, pv, nq, tree);
         const int NB = pv->NB;
         const int NT = pv->ty.NT;
-        #pragma omp parallel for
+        int64_t nprof = 0;
+        #pragma omp parallel for reduction(+: nprof)
         for(s = 0; s < nq; s++) {
             struct so_row * row = &pv->rows[batchbuf[s]];
             if(pass == 1) {
@@ -880,7 +922,7 @@ so_run_batches(int pass, struct so_priv * pv, int64_t * batchbuf, const int64_t 
                 row->redo = so_pass1_analyse(row, M, NB, &pv->ty, rho, rhomin, par->SubhaloSOMaxDoublings, BoxSize, soft);
             }
             else if(pass == 3)
-                so_profile_finish(row, (const struct so3_acc *) (pv->acc + s * pv->accsize), pv);
+                nprof += so_profile_finish(row, (const struct so3_acc *) (pv->acc + s * pv->accsize), pv);
             else {
                 const double * acc = (const double *) (pv->acc + s * pv->accsize);
                 int d;
@@ -908,6 +950,7 @@ so_run_batches(int pass, struct so_priv * pv, int64_t * batchbuf, const int64_t 
                 }
             }
         }
+        pv->nprofile += nprof;
     }
     return (int) nbatch_max;
 }
@@ -1078,25 +1121,30 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
         tmask |= 1 << P[i].Type;
     }
     MPI_Allreduce(MPI_IN_PLACE, &tmask, 1, MPI_INT, MPI_BOR, Comm);
-    /* pass 3's fixed-point unit: qscale = 2^s with N_live m_max qscale < 2^62, so that no sum of
-     * quantised masses can overflow (N_live and the largest mass are exact global reductions,
-     * so every rank and every layout picks the same s); the quantisation error is at most half
-     * a unit, 2^-(63 - bits(N_live)) of the largest mass, far below the f4 output */
-    double mmaxg = 0;
+    /* pass 3's fixed-point unit (subhalo_so_prof_unit, audit 5e R1): qscale = 2^s with
+     * N_live m_max qscale <= 2^126, so that no 128-bit sum of quantised masses can overflow (N_live
+     * and the largest mass are exact global reductions, so every rank and every layout picks the
+     * same s). A mass m is rounded by at most 0.5 / (qscale m) relative, and not at all for
+     * m >= 2^(bits(N_live) - 102) m_max (subhalo_so.h); the smallest positive mass is checked
+     * against 1e-9 */
+    double mmmg[2] = {0, -DBL_MAX};                /* the largest mass, minus the smallest positive */
     int64_t nliveg = 0;
-    for(i = 0; i < PartManager->NumPart; i++)
-        if(!P[i].IsGarbage && !P[i].Swallowed && P[i].Mass > mmaxg)
-            mmaxg = P[i].Mass;
-    MPI_Allreduce(MPI_IN_PLACE, &mmaxg, 1, MPI_DOUBLE, MPI_MAX, Comm);
-    MPI_Allreduce(&nlive, &nliveg, 1, MPI_INT64, MPI_SUM, Comm);
-    double qscale = 1;
-    if(mmaxg > 0) {
-        int emax, bits = 0;
-        frexp(mmaxg, &emax);                       /* mmaxg < 2^emax */
-        while(bits < 62 && ((int64_t) 1 << bits) < nliveg)
-            bits++;
-        qscale = ldexp(1.0, 62 - emax - bits);
+    for(i = 0; i < PartManager->NumPart; i++) {
+        if(P[i].IsGarbage || P[i].Swallowed)
+            continue;
+        if(P[i].Mass > mmmg[0])
+            mmmg[0] = P[i].Mass;
+        if(P[i].Mass > 0 && -P[i].Mass > mmmg[1])
+            mmmg[1] = -P[i].Mass;
     }
+    MPI_Allreduce(MPI_IN_PLACE, mmmg, 2, MPI_DOUBLE, MPI_MAX, Comm);
+    MPI_Allreduce(&nlive, &nliveg, 1, MPI_INT64, MPI_SUM, Comm);
+    const double mmaxg = mmmg[0], mming = -mmmg[1];
+    const double qscale = subhalo_so_prof_unit(nliveg, mmaxg);
+    if(mmaxg > 0 && 0.5 / (qscale * mming) > 1e-9)
+        message(0, "WARNING: subhalo field SO pass 3: the smallest particle mass %g (largest %g, %ld live particles) is "
+                   "quantised to %g relative in the fixed-point profile (unit %g).\n", mming, mmaxg, nliveg,
+                0.5 / (qscale * mming), 1 / qscale);
     struct so_types ty = {0};
     for(t = 0; t < SO_NT; t++) {
         ty.slot[t] = -1;
@@ -1303,6 +1351,8 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
     pv.accsize = acc3;
     if(dopass3)
         npass3 = so_run_batches(3, &pv, batchbuf, list, nprof, bcap, &tree, rho, rhomin, par, BoxSize, soft, Comm);
+    /* the rows with an edge above rho[vir] (VmaxSO set); pv.nprofile counts those with enough
+     * particles, some of which may have none (audit 5e R2) */
     int64_t nprofdef = 0;
     for(c = 0; c < nprof; c++)
         nprofdef += rows[list[c]].rec->VmaxSO > 0;
@@ -1334,15 +1384,16 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
     myfree(rows);
     so_route_back(&rt, recs, Rsearch, Comm);
 
-    int64_t tot[8];
-    int64_t cnt6[8] = {cnt[0], cnt[1], cnt[2], cnt[3], cnt[4], nguest, nprof, nprofdef};
-    MPI_Allreduce(cnt6, tot, 8, MPI_INT64, MPI_SUM, Comm);
+    int64_t tot[9];
+    int64_t cnt6[9] = {cnt[0], cnt[1], cnt[2], cnt[3], cnt[4], nguest, nprof, pv.nprofile, nprofdef};
+    MPI_Allreduce(cnt6, tot, 9, MPI_INT64, MPI_SUM, Comm);
     message(0, "Subhalo field SO: %ld centrals (%ld routed from ranks without particles), %ld refined, %ld doubled, "
                "%ld cut off at the cap, %ld without a crossing; %d bins, %d types; %d + %d walks, %.3g s.\n",
                tot[0], tot[5], tot[1], tot[2], tot[3], tot[4], NB, ty.NT, npass1, npass2, MPI_Wtime() - tstart);
     if(dopass3)
-        message(0, "Subhalo field SO pass 3: %ld centrals profiled inside RSO[vir], %ld with >= %d particles (RsSO, VmaxSO); "
-                   "%d walks.\n", tot[6], tot[7], SUBHALO_NFW_MINPART, npass3);
+        message(0, "Subhalo field SO pass 3: %ld centrals profiled inside RSO[vir], %ld with >= %d particles, %ld of them "
+                   "with a profile edge above rho[vir] (VmaxSO, RsSO); %d walks.\n", tot[6], tot[7], SUBHALO_NFW_MINPART,
+                tot[8], npass3);
     if(stats) {
         stats->Ncentral = tot[0];
         stats->Nrefined = tot[1];
@@ -1358,6 +1409,8 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
         stats->Pass3 = dopass3;
         stats->Nprofiled = tot[6];
         stats->Nprofile = tot[7];
+        stats->NprofileVmax = tot[8];
+        stats->ProfUnit = dopass3 ? qscale : 0;
         stats->Npass3Walks = npass3;
         stats->Skipped = skip;
         stats->FreeBytes = freemin;
