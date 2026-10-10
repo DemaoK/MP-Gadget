@@ -34,9 +34,12 @@ size_t subhalo_arena_bytes_per_part(void);
 /* Main-stack bytes per candidate node of a serial key (struct SubNode in subhalo_track.c;
  * checked there by a static assertion), charged by the plan per member track. */
 #define SUBHALO_NODE_BYTES 512
-/* Bytes every rank holds per in-place key (global vectors of subhalo_process_inplace and the
- * plan's in-place list; checked by a static assertion in subhalo_track.c). */
-#define SUBHALO_INPLACE_KEY_BYTES 512
+/* Bytes every rank holds per in-place key and per in-place candidate (the plan's in-place list,
+ * the candidate table and the per-candidate vectors of the rounds, subhalo_collective.c; checked
+ * by static assertions there), and per member track of an oversized group (the member table that
+ * every rank holds, Phase 2b). */
+#define SUBHALO_INPLACE_KEY_BYTES 4096
+#define SUBHALO_INPLACE_MEMBER_BYTES 768
 
 /* ------------------------------------------------------------------ shared helpers (subhalo.c) */
 
@@ -93,11 +96,11 @@ void subhalo_track_make_orphan(struct SubTrack * t, int64_t winner, int SnapNum)
 
 /* The tracks no key processed this call, on the home ranks (H6/H7): a resolved track without
  * live particles dies (not sunk); a resolved track with own-tag field particles but no
- * processed key (its pseudo-key was oversized) keeps the Phase 1 hostless rule: Nbound = its
- * field particles, which subhalo_process_inplace has normalised to it (all bound, dense ranks,
- * J3), periodic centre about a common reference, MostBound* the first tracer-type particle in
- * rank order, SUBHALO_FLAG_INPLACE, every property of the previous call cleared. Returns the
- * global counts. Collective. Exposed for the unit tests. */
+ * processed key keeps the Phase 1 hostless rule: Nbound = its field particles (all bound),
+ * periodic centre about a common reference, MostBound* the first tracer-type particle in rank
+ * order, SUBHALO_FLAG_INPLACE, every property of the previous call cleared. Since Phase 2b
+ * processes an oversized pseudo-key in place, subhalo_find never leaves such a track (the
+ * branch is kept for the direct unit test). Returns the global counts. Collective. */
 void subhalo_update_unhosted(struct SubTrackTable * tab, int SnapNum, double atime, int64_t * nhostless, int64_t * ndead, MPI_Comm Comm);
 
 /* subhalo_read_state without the abort on a validation failure (duplicate or missing TrackIds,
@@ -119,15 +122,92 @@ struct SubhaloLocalKey {
     double ref[3];          /* FirstPos of the group, translated frame */
 };
 
-/* Global list of the oversized keys, identical on every rank, sorted by g. Length counts the
- * FOF particles only: field particles of an oversized key stay home with their tags (Phase 1
- * behaviour until Phase 2b), so they are not part of its in-place segments. */
+/* Global list of the oversized keys, identical on every rank, sorted by g: the FOF groups and the
+ * pseudo-keys processed in place (Phase 2b). Length counts the FOF particles that stay in the
+ * key g after the sub-tree keys were cut (informative). The key centre (cen, vel) is the
+ * mass-weighted centre and mean Vel of the key's FOF particles (all particles of a pseudo-key),
+ * periodic about ref, translated frame and internal Vel: the frame of a newborn candidate and of
+ * a member without a previous-bound frame, as the serial key centre. */
 struct SubhaloInplaceKey {
     int64_t g;
     int64_t Length;
-    int decider;
-    int pad;
+    int decider;            /* the owner of the key's candidate records: lowest rank holding its particles */
+    int central;            /* index of its depth-0 candidate in plan->Cands */
     double ref[3];
+    double cen[3], vel[3];
+    double mass;
+    int64_t NMembers;       /* member tracks of the key in plan->Members */
+};
+
+/* ---- Phase 2b: oversized groups (plan in subhalo_gather.c, rounds in subhalo_collective.c) ---- */
+
+enum { SUBHALO_MEM_RESOLVED = 0, SUBHALO_MEM_ORPHAN = 1, SUBHALO_MEM_NEWBORN = 2 };
+/* Processing states, shared by the serial key nodes (subhalo_track.c) and the in-place
+ * candidates: NONE not unbound (an orphan that stays one), FAILED an orphan central that was not
+ * resurrected or a newborn that did not survive. */
+enum { SUBHALO_ST_NONE = 0, SUBHALO_ST_ALIVE = 1, SUBHALO_ST_DIED = 2, SUBHALO_ST_SUNK = 3, SUBHALO_ST_FAILED = 4 };
+
+/* A member track of an oversized key, identical on every rank (the member table of design 7.8,
+ * the one broadcast of the call), sorted by TrackId. Members are the resolved tracks keyed to it
+ * (Key == g), the orphans hosted by it (Host == g) and, for a key without any member, the newborn
+ * central (provisional TrackId). The processing tree is the serial key's nest tree of the whole
+ * group: Parent is the member index of the processing parent (-1 for the central); the central is
+ * decided in the plan exactly as the serial key decides it. A resolved member is either an
+ * in-place candidate (cand >= 0) or in a serial sub-tree key (SubKey >= 0), cut from the tree
+ * below an in-place candidate; orphans are neither. */
+struct SubhaloMember {
+    int64_t TrackId;
+    int64_t g;
+    int64_t PrevParent;      /* NestedParentTrackId of the previous record */
+    int64_t PrevCentral;     /* CentralTrackId of the previous record */
+    int64_t SubKey;          /* serial sub-tree key holding it, -1 */
+    int32_t Parent;          /* member index of the processing parent, -1 */
+    int32_t kind;            /* SUBHALO_MEM_* */
+    int32_t cand;            /* in-place candidate index, -1 */
+    int32_t depth;           /* depth in the processing tree (the central 0) */
+    int32_t root;            /* 1: the root of SubKey (its processing parent is an in-place candidate) */
+    int32_t PrevRank;
+    int32_t NboundPrev;
+    int32_t SnapTracerLost;
+    float MboundPrev, VmaxPrev;
+    int64_t NPrev;
+    double RefPos[3], RefVel[3];         /* previous-bound frame (translated frame, internal Vel) */
+    double TracerPos[3], TracerVel[3];   /* an orphan's tracer as in the record (output frame, km/s) */
+    /* this call: the serial sub-tree results (gathered after the serial keys) and the rounds */
+    int32_t state;           /* SUBHALO_ST_* */
+    int32_t Nbound;
+    int32_t NboundExclusive;
+    int32_t Keep;            /* a sub-tree root: own-tag remainder particles inside its relaxed source */
+    int32_t has_core;
+    int32_t frank, fdepth;   /* the group's final hierarchy (survivors), -1 otherwise */
+    int32_t pad;
+    float Mbound, Vmax;
+    MyIDType MostBoundID;
+    int64_t SinkTrackId;     /* the member it sank into, -1 */
+    int64_t FinalParent;     /* NestedParentTrackId after the group's hierarchy (nearest surviving ancestor) */
+    int64_t Central;         /* the group's central after the hierarchy, -1 if nothing survived */
+    double CorePos[3], CoreVel[3], SigmaX, SigmaV;   /* the sinking core (translated frame, Vel units) */
+};
+
+/* An in-place candidate, identical on every rank, sorted by (round, g, TrackId): the rounds are
+ * contiguous ranges plan->RoundStart[r] .. RoundStart[r + 1], and the dense label of a candidate
+ * in its round is its index minus RoundStart[round]. */
+struct SubhaloInplaceCand {
+    int64_t TrackId;
+    int64_t g;               /* its oversized key */
+    int32_t member;          /* index in plan->Members */
+    int32_t parent;          /* the parent candidate, -1 for a depth-0 candidate */
+    int32_t depth, round;
+    int32_t owner;           /* rank that writes its record (its key's decider) */
+    int32_t gidx;            /* its key in plan->Inplace */
+    double RefPos[3], RefVel[3];   /* initial frame (translated, Vel units) */
+};
+
+/* A serial sub-tree key: keys g in [SubKeyBase, SubKeyBase + NSubKeys). */
+struct SubhaloSubKey {
+    int64_t g;               /* its oversized group */
+    int64_t gidx;            /* the group in plan->Inplace (final plan) */
+    int64_t root;            /* member index of its root */
 };
 
 /* A serial key assigned to this rank. */
@@ -153,9 +233,22 @@ struct SubhaloPlanStats {
 struct SubhaloPlan {
     int NTask, ThisTask;
     /* Keys: the FOF groups g in [1, TotNgroups], then the pseudo-keys of the hostless resolved
-     * tracks, g in [TotNgroups + 1, TotKeys] (Phase 2a plan step 3). KChunk partitions
+     * tracks, g in [TotNgroups + 1, TotKeys0] (Phase 2a plan step 3), then the serial sub-tree
+     * keys of the oversized groups, g in [SubKeyBase, TotKeys] (Phase 2b). KChunk partitions
      * [1, TotKeys] for the key directory. */
     int64_t TotNgroups, TotKeys, KChunk;
+    int64_t TotKeys0, SubKeyBase;
+    /* Phase 2b, on the top of the main stack before the four below, in this order: the member
+     * table, the candidates, the rounds and the sub-tree keys (identical on every rank) */
+    struct SubhaloMember * Members;          /* sorted by TrackId */
+    int64_t NMembers;
+    struct SubhaloInplaceCand * Cands;       /* sorted by (round, g, TrackId) */
+    int64_t NCands;
+    int64_t * RoundStart;                    /* [NRounds + 1] */
+    int NRounds;
+    int SplitPasses;                         /* census passes that cut sub-tree keys */
+    struct SubhaloSubKey * SubKeys;          /* [NSubKeys] */
+    int64_t NSubKeys;
     /* all four on the top of the main stack, allocated in this order */
     struct SubhaloLocalKey * LocalKeys;     /* sorted by g */
     int64_t NLocalKeys;
@@ -198,6 +291,8 @@ struct SubhaloDirKey {
     int oversized;          /* 1: processed in place */
     int decider;            /* lowest rank holding particles of the key */
     int has_group;
+    int forced;             /* Phase 2b: in place whatever its size (a split group, an earlier pass's in-place key) */
+    int pad;
 };
 
 /* This rank's resources at plan time (inputs of the budget, design 7.3). */
@@ -222,6 +317,7 @@ struct SubhaloPlanCfg {
     double MemberBytes;         /* per member track of a key */
     double KeyBytes;            /* per key processed on the rank (serial or local part in place) */
     double InplaceKeyBytes;     /* per in-place key, on every rank (global vectors) */
+    double InplaceMemberBytes;  /* per member track (bounded by the census tags) of the in-place keys, on every rank */
     double ExchPartBytes;       /* per departing particle, exchange buffers (capped at one batch) */
     double SortBytesPerPart;    /* per MaxPart, the local sort and the restore's per-particle lists */
     double ReserveBytes;        /* the constant terms */
@@ -280,11 +376,19 @@ int64_t subhalo_assign_keys(struct SubTrackTable * tab, int64_t TotNgroups, MPI_
  * the target rank of every particle and encodes the key of every field particle that travels
  * with a serial key as GrNr = -(2 + key) (subhalo_restore_field_grnr undoes it). Collective. */
 void subhalo_plan_build(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubTrackTable * tab, int64_t NHostless, MPI_Comm Comm);
+/* The kinematic constants of the plan-step central decision (the serial key's kinetic distance):
+ * set by the driver before subhalo_plan_build (a, H(a) in internal units). */
+void subhalo_plan_set_frame(double atime, double Hubble);
+/* Binary search of the member table, NULL if absent. */
+const struct SubhaloMember * subhalo_plan_member(const struct SubhaloPlan * plan, int64_t TrackId);
+/* The in-place key g in plan->Inplace, -1 if g is not in place. */
+int64_t subhalo_plan_inplace_index(const struct SubhaloPlan * plan, int64_t g);
 /* The processing key of a particle after subhalo_plan_build: GrNr for a group particle, the
  * encoded key of a travelling field particle, -1 otherwise. */
+#define SUBHALO_KEY_FOFBIT (1LL << 52)
 static inline int64_t subhalo_particle_key(const struct particle_data * p) {
     if(p->GrNr >= 0) return p->GrNr;
-    if(p->GrNr < -1) return -(p->GrNr + 2);
+    if(p->GrNr < -1) return (-(p->GrNr + 2)) & (SUBHALO_KEY_FOFBIT - 1);
     return -1;
 }
 /* The processing key of a track (its record's Key) for the tracks tagging this rank's live
@@ -293,14 +397,9 @@ struct SubhaloTrackKey {
     int64_t TrackId;
     int64_t Key;
 };
-/* After the exchange and before subhalo_restore_field_grnr: the Key of every track tagging a
- * live field particle that stayed home (GrNr == -1, not encoded: its track's key is oversized
- * or -1), from the home ranks. Allocates *map on the bottom of the stack. Collective. */
-int64_t subhalo_home_field_keys(struct SubTrackTable * tab, struct SubhaloTrackKey ** map, MPI_Comm Comm);
-/* The Key of TrackId in such a map, -1 if absent. */
-int64_t subhalo_track_key_lookup(const struct SubhaloTrackKey * map, int64_t n, int64_t TrackId);
-/* GrNr = -1 again for every field particle (after the serial keys, and on the failure path). */
-void subhalo_restore_field_grnr(void);
+/* GrNr = -1 again for every field particle and the group number again for the group particles
+ * of the serial sub-tree keys (after the serial keys, and on the failure path). */
+void subhalo_restore_field_grnr(const struct SubhaloPlan * plan);
 /* Step 4: the exchange. Returns this rank's failure flag (not reduced). Collective. */
 int subhalo_plan_exchange(struct SubhaloPlan * plan, MPI_Comm Comm);
 /* Frees what subhalo_plan_build allocated (reverse order). */
@@ -391,7 +490,16 @@ struct SubhaloResult {
     int history;             /* 1: resolved this call, apply subhalo_history_update */
     int ndesc;               /* descendant votes (a track resolved at the previous call that died or sank) */
     int64_t DescOwner[SUBHALO_MAXTRACERS];  /* per tracer: its BoundTrackId, -1 if unbound or lost, SUBHALO_DESC_PENDING still to be looked up (step 11) */
-    int64_t ipk;             /* in-place winner: index of its key in plan->Inplace, else -1 */
+    int64_t ipk;             /* the central of an oversized key (in place or a sub-tree survivor promoted to
+                              * Rank 0): index of its key in plan->Inplace, else -1 */
+    /* Phase 2b: the node's state for the rounds (serial sub-tree keys) */
+    int64_t subkey;          /* the sub-tree key it was processed in, -1 */
+    int32_t state;           /* SUBHALO_ST_* */
+    int32_t Keep;            /* a sub-tree root: own-tag remainder particles inside its relaxed source */
+    int32_t has_core;
+    int32_t pad;
+    double CorePos[3], CoreVel[3], SigmaX, SigmaV;   /* the sinking core (translated frame, Vel units) */
+    int64_t SinkTo;          /* the node it sank into in the key (TrackId), -1 */
 };
 
 /* Diagnostics of one call (local during the call, global totals after subhalo_find). */
@@ -403,8 +511,8 @@ struct SubhaloCallStats {
     int64_t NFinalPositive;  /* final-pass bound particles with E >= 0, summed over the survivors */
     int64_t NFinalBound;     /* bound particles of the final passes */
     int64_t NTailRejected;   /* tail claims crossing the binding owner's final branch (J2) */
-    int64_t NFallbackField;  /* field particles normalised by the Phase 1 fallback (J3) */
-    int64_t NFallbackReleased; /* of which released (stale tags of orphans, J3) */
+    int64_t NFallbackField;  /* Phase 2b: particles of the oversized keys whose tags the final pass of the rounds wrote */
+    int64_t NFallbackReleased; /* of which released (stale tags of orphans in the field) */
     double ArenaPeakFrac;    /* largest arena high-water mark of a key / its arena size */
 };
 /* The statistics of the last completed subhalo_find (global; for the tests and the log). */
@@ -420,16 +528,17 @@ struct SubhaloCallCtx {
     int TracerTypes;
     int ThisTask;
     int64_t TotNgroups;      /* keys above are pseudo-keys */
+    const struct SubhaloPlan * plan;   /* Phase 2b: keys above plan->TotKeys0 are serial sub-tree keys */
+    int64_t IpResStart;      /* first result slot of the in-place candidates owned by this rank */
+    int64_t NIpRes;
     const struct SubhaloUnbindParams * up;
     struct SubTrack * Members;   /* sorted by TrackId, read-only during the key loop */
     int64_t NMembers;
-    int64_t * SinkWinner;        /* [NMembers]: winner a member sinks into in an in-place key, -1 if none */
     struct SubhaloResult * Res;  /* [NRes] */
     int64_t NRes;
     int64_t * ResStart;          /* [nsegs]: first result slot of each segment */
     int64_t * Hosted;            /* member indices grouped by segment (serial: the members hosted by the key) */
     int64_t * HostedStart;       /* [nsegs + 1] */
-    int64_t NInplaceWarn;        /* in-place keys processed with the Phase 1 rule (diagnostic) */
     /* Phase 3 */
     double rho[SUBHALO_NSO];     /* subhalo_so_thresholds at atime */
     int MetalReturnOn;           /* All.MetalReturnOn: metal columns of subhalo_props_baryons */
@@ -439,20 +548,19 @@ struct SubhaloCallCtx {
 /* Binary search of a member record; NULL if absent. */
 struct SubTrack * subhalo_find_member(const struct SubhaloCallCtx * ctx, int64_t TrackId);
 /* The members hosted by every serial segment (resolved: Key == g; orphan: Host == g), the
- * result slots of every segment (hosted members + 1 for a serial key, 1 for an in-place
- * segment). Allocates ctx->Hosted, HostedStart, ResStart on the bottom of the stack (freed by
- * subhalo_free_slots) and returns the number of result slots. */
+ * result slots of every segment (hosted members + 1 for a serial key, none for an in-place
+ * segment), then one slot per in-place candidate owned by this rank (ctx->IpResStart, NIpRes;
+ * ctx->plan must be set). Allocates ctx->Hosted, HostedStart, ResStart on the bottom of the stack
+ * (freed by subhalo_free_slots) and returns the number of result slots. */
 int64_t subhalo_result_slots(const struct SubhaloKeySeg * segs, int64_t nsegs, struct SubhaloCallCtx * ctx);
 void subhalo_free_slots(struct SubhaloCallCtx * ctx);
-/* Steps 7a-7h and 8 for every serial segment (OpenMP through subhalo_run_serial_keys). */
+/* Steps 7a-7h and 8 for every serial segment (OpenMP through subhalo_run_serial_keys). A serial
+ * sub-tree key of an oversized group (g > plan->TotKeys0, Phase 2b plan steps 7 and 8) is
+ * processed with its root as the top of the hierarchy (no central decision, no FeedCentrals,
+ * the group's key centre) and provisional tags: the root's whole list keeps the root's tag
+ * (untruncated, BoundTrackId -1 for its unbound part, ranks after its exclusive bound set) and
+ * the result carries Keep, the state and the sinking core for the rounds; every descendant vote
+ * is left to the remote lookup; the hierarchy columns are written by the rounds. */
 void subhalo_process_serial(const struct SubhaloKeySeg * segs, int64_t nsegs, struct SubhaloCallCtx * ctx);
-/* Step 9 in-place variant for every oversized key (the Phase 1 rule: every FOF particle bound
- * to the winner, the largest previous member, the other candidates sink into it), and the field
- * particles that stayed home (J3): those of the tracks keyed to an oversized FOF key go to its
- * winner (counted in its record), those of an oversized pseudo-key stay with their hostless
- * track (all bound, dense ranks), stale tags of orphans are released. Must run after the serial
- * keys and before subhalo_restore_field_grnr (the travelled field particles still carry their
- * encoded GrNr). Collective (every rank calls it, with or without in-place segments). */
-void subhalo_process_inplace(const struct SubhaloKeySeg * segs, int64_t nsegs, const struct SubhaloPlan * plan, struct SubhaloCallCtx * ctx, struct SubTrackTable * tab, MPI_Comm Comm);
 
 #endif

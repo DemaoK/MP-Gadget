@@ -31,7 +31,12 @@
  * move fast and are its unbound tail), B landing on A as a full ball at stage 4 and sinking into
  * A (the central chosen by the kinetic distance), the dispersed hostless tracks on a 40 kpc/h
  * lattice (bound, unambiguous centre), and thresholds of 5 particles for the 6..10-particle
- * clumps of test 10. Tests 6 to 8 are unchanged (the in-place keys keep the Phase 1 rule).
+ * clumps of test 10. Tests 6 to 8 are unchanged. Phase 2b (halofinder_phase2b_plan.md) unbinds
+ * the oversized keys in place with the HBT recipe: test 6 expects the serial outcome with the
+ * in-place flag, the mixed call's V and the fallback test's stages 2-4 (A and B's sub-tree key both
+ * in place, two rounds; the hostless pseudo-key in place) assert the HBT outcome, and
+ * p2_check_tags applies the D10 invariants to in-place records too.
+ * test_subhalo_nocentral: Phase 3 audit P2 (no surviving central: CentralTrackId -1).
  * 11. test_subhalo_twohalo        plan test 5: two Hernquist clumps over three calls: persistent
  *                                 tracks, HBT properties, unbound tails, the D10 tag invariants.
  * 12. test_subhalo_overlap        plan test 6: B falls into A: satellite (Rank 1, Depth 1, parent
@@ -1352,20 +1357,17 @@ check_hosted_record(const struct SubTrack * rec, int64_t t, int64_t grnr, const 
     CHECK(rec->SnapLastIsolation == -1, "stage %d track %ld: SnapLastIsolation %d, expected -1 (never a satellite)\n", stage, t, rec->SnapLastIsolation);
     for(d = 0; d < 3; d++) {
         CHECK(fabs(rec->CoMPos[d] - mean[d]) < 1e-4, "stage %d track %ld: CoMPos[%d] %.8g, mean %.8g\n", stage, t, d, rec->CoMPos[d], mean[d]);
-        if(inplace)
-            CHECK(fabs(rec->CorePos[d] - rec->CoMPos[d]) < 1e-4, "stage %d track %ld: CorePos[%d] %.8g != CoMPos %.8g\n", stage, t, d, rec->CorePos[d], rec->CoMPos[d]);
-        else
-            /* Phase 2a: the core of the 20 most bound lies near the centre of a cold clump */
-            CHECK(fabs(rec->CorePos[d] - rec->CoMPos[d]) < 5, "stage %d track %ld: CorePos[%d] %.8g far from CoMPos %.8g\n", stage, t, d, rec->CorePos[d], rec->CoMPos[d]);
+        /* Phase 2a: the core of the 20 most bound lies near the centre of a cold clump (Phase 2b:
+         * in place too, the same HBT recipe) */
+        CHECK(fabs(rec->CorePos[d] - rec->CoMPos[d]) < 5, "stage %d track %ld: CorePos[%d] %.8g far from CoMPos %.8g\n", stage, t, d, rec->CorePos[d], rec->CoMPos[d]);
         /* the particles have zero velocity */
         CHECK(fabs(rec->CoMVel[d]) < 1e-6, "stage %d track %ld: CoMVel[%d] = %g\n", stage, t, d, rec->CoMVel[d]);
     }
     CHECK(mb != NULL, "stage %d track %ld: no particle with BindRank 0\n", stage, t);
-    if(inplace) {
+    if(inplace)
         CHECK(rec->Flags & SUBHALO_FLAG_INPLACE, "stage %d track %ld: in-place key without SUBHALO_FLAG_INPLACE (Flags %d)\n", stage, t, rec->Flags);
-        return;
-    }
-    CHECK(!(rec->Flags & SUBHALO_FLAG_INPLACE), "stage %d track %ld: serial key flagged in place (Flags %d)\n", stage, t, rec->Flags);
+    else
+        CHECK(!(rec->Flags & SUBHALO_FLAG_INPLACE), "stage %d track %ld: serial key flagged in place (Flags %d)\n", stage, t, rec->Flags);
     CHECK(rec->MostBoundID == mb->ID, "stage %d track %ld: MostBoundID %lu, BindRank-0 particle %lu\n",
             stage, t, (unsigned long) rec->MostBoundID, (unsigned long) mb->ID);
     for(d = 0; d < 3; d++)
@@ -2858,9 +2860,8 @@ p2_teardown(void)
  * so the reservation shows only as: the first min(10, own-tag tracers) tracer-type (type 1)
  * particles in rank order are bound to the track, and MostBoundID is the first of them;
  * BoundTrackId the tag, an ancestor of it or -1, bound owners resolved; Nbound, NboundTracer,
- * NboundExclusive, NtailType from the particles. Records of the Phase 1 fallback
- * (SUBHALO_FLAG_INPLACE) obey the same rules with every own-tag particle bound and no tail.
- * Returns the number of violations. */
+ * NboundExclusive, NtailType from the particles. Records processed in place
+ * (SUBHALO_FLAG_INPLACE, Phase 2b) obey the same rules. Returns the number of violations. */
 static int
 p2_check_tags(const struct tagrec * r, int64_t n, const struct SubTrack * rec, int64_t nt, const char * what)
 {
@@ -2920,8 +2921,6 @@ p2_check_tags(const struct tagrec * r, int64_t n, const struct SubTrack * rec, i
                 ntr++;
             }
         }
-        if(rec[t].Flags & SUBHALO_FLAG_INPLACE)
-            LOCAL_CHECK(bad, nex == nown && tl == 0, "%s: fallback track %ld: %ld exclusive of %ld own-tag rows, tail %ld\n", what, t, nex, nown, tl);
         LOCAL_CHECK(bad, first_tracer >= 0 && r[first_tracer].ID == rec[t].MostBoundID,
                     "%s: track %ld: MostBoundID %lu is not the first tracer in rank order\n", what, t, (unsigned long) rec[t].MostBoundID);
         free(byrank);
@@ -3793,7 +3792,9 @@ test_subhalo_mixed_call(void ** state)
     struct SubhaloParams sp = default_subhalo_params();
     /* V (700 particles) is the only key above the threshold */
     sp.SubhaloCollectiveMinPart = 500;
-    /* the field SO anchors its queries on local particles: off with an empty rank */
+    /* the field SO routes the centrals of the empty rank to a rank with particles, but its full
+     * tree cannot be built on a rank without particles (forcetree.c sizes the node block by
+     * NumPart: "Not enough force nodes to topnode grid"), so it stays off with an empty rank */
     sp.SubhaloFieldSO = 0;
     syn_setup(&CP, MX_END + SYN_NFIELD, sp);
     const double UV = 2e5;
@@ -3882,12 +3883,63 @@ test_subhalo_mixed_call(void ** state)
     syn_teardown();
 }
 
-/* ---- regression item 3 and J3: the serial/fallback boundary with populated state ----
+/* ---- Phase 3 audit P2: the current central of a group in which nothing survives ----
+ * K (0) held its own group at the previous call; its 100 particles are now hot (3000 km/s) and
+ * K dies in its serial key with no survivor; the orphan O (1, stale host 99 and central 0)
+ * follows one of K's particles into the same group. After the store and the orphan link
+ * synchronisation both have HostGroup = the group and CentralTrackId = -1 (no central). */
+#define NC_END 100
+
+static void
+nc_particle(MyIDType id, double atime, struct SynPart * s, void * ud)
+{
+    const double c[3] = {500, 500, 500}, zero[3] = {0, 0, 0};
+    (void) ud;
+    if(id >= NC_END)
+        return;
+    syn_ball(id, 81, c, 1.0, zero, 3000, atime, s);
+    s->tag = s->bound = 0;
+    s->rank = id;
+}
+
+static void
+test_subhalo_nocentral(void ** state)
+{
+    Cosmology CP;
+    struct SubhaloParams sp = default_subhalo_params();
+    sp.SubhaloFieldSO = 1;
+    syn_setup(&CP, NC_END + SYN_NFIELD, sp);
+    struct SubTrack recs[2];
+    recs[0] = syn_rec(0, 100, 0.01, -1, 0, 0, 0);
+    recs[1] = syn_orphan(1, 7);
+    syn_records(recs, 2);
+    syn_place(nc_particle, NULL, 0.55, 1);
+    int64_t ng, nempty, n;
+    const int ret = lifecycle_call(1, 0.55, &CP, 0, NULL, &ng, &nempty);
+    CHECK(ret == 1 && ng == 1, "no central: ret %d, %ld groups\n", ret, ng);
+    struct tagrec * r = gather_tags(&n);
+    struct SubTrack * rec = fetch_all_tracks(2);
+    const int64_t g = r[tagrec_index(r, n, 7)].GrNr;
+    message(0, "no central: K Nbound %d SnapDeath %d HostGroup %ld CentralTrackId %ld; O HostGroup %ld CentralTrackId %ld (group %ld)\n",
+            rec[0].Nbound, rec[0].SnapDeath, rec[0].HostGroup, rec[0].CentralTrackId, rec[1].HostGroup, rec[1].CentralTrackId, g);
+    CHECK(g >= 1 && rec[0].Nbound == 0 && rec[0].SnapDeath == 1 && rec[0].HostGroup == g && rec[0].CentralTrackId == -1,
+          "no central: K Nbound %d SnapDeath %d HostGroup %ld (group %ld) CentralTrackId %ld\n", rec[0].Nbound, rec[0].SnapDeath,
+          rec[0].HostGroup, g, rec[0].CentralTrackId);
+    CHECK(rec[1].Nbound == 0 && rec[1].HostGroup == g && rec[1].CentralTrackId == -1,
+          "no central: O HostGroup %ld (group %ld) CentralTrackId %ld\n", rec[1].HostGroup, g, rec[1].CentralTrackId);
+    CHECK(p2_check_tags(r, n, rec, 2, "no central") == 0, "no central: tag invariants\n");
+    free(rec);
+    free(r);
+    syn_teardown();
+}
+
+/* ---- regression item 3 and J3: the serial/in-place boundary with populated state ----
  * Stage 0-1 serial (the overlap scenario: B a satellite of A with a tail partly bound by A);
- * stage 2 the group is oversized, 40 of A's and 20 of B's particles are in the field: B sinks
- * in place and its field particles go to A, A's record counts its field particles; stage 3 the
- * same (B's orphan now hosted by an oversized key); stage 4 every clump particle dispersed: A
- * is hostless with an oversized pseudo-key; stage 5 serial again. Tag invariants, the restart
+ * stage 2 the group is oversized (SubhaloCollectiveMinPart 100), 40 of A's and 20 of B's
+ * particles are in the field: Phase 2b unbinds B's sub-tree key in place (round 0) and then A
+ * (round 1), B stays A's satellite, the moved particles stay in their tracks' in-place sources;
+ * stage 3 the same; stage 4 every clump particle dispersed: A and B are hostless with oversized
+ * pseudo-keys, unbound in place; stage 5 serial again. Tag invariants, the restart
  * round trip of the PIG and the orphan links at every stage. SUBHALO_TEST_KEEP keeps the PIGs
  * for tools/subhalo_check.py. */
 static void
@@ -3969,21 +4021,28 @@ test_subhalo_fallback(void ** state)
             for(i = 0; i < n; i++) {
                 const int c = p2_clump(r[i].ID);
                 const int moved = (c == 0 && r[i].ID % 50 == 7) || (c == 1 && (r[i].ID - P2_NA) % 30 == 11);
-                if(moved && r[i].GrNr < 0 && stage == 2)
-                    LOCAL_CHECK(bad, r[i].TrackId == -1 || (r[i].TrackId == 0 && r[i].BoundTrackId == 0),
+                /* Phase 2b: the moved particles stayed home with their tracks' tags and are in the
+                 * in-place sources: B's unbound tail (bound by A or not), A's own, or untagged */
+                if(moved && r[i].GrNr < 0)
+                    LOCAL_CHECK(bad, r[i].TrackId == -1 || ((r[i].TrackId == 0 || r[i].TrackId == 1)
+                                && (r[i].BoundTrackId == -1 || r[i].BoundTrackId == 0 || r[i].BoundTrackId == r[i].TrackId)),
                                 "%s: field particle %lu tagged %ld bound %ld\n", what, (unsigned long) r[i].ID, r[i].TrackId, r[i].BoundTrackId);
             }
             CHECK(bad == 0, "%s: field particles of the oversized key\n", what);
-            CHECK((rec[0].Flags & SUBHALO_FLAG_INPLACE) && rec[0].Nbound == rec[0].NboundExclusive && rec[1].Nbound == 0
-                  && rec[1].SinkTrackId == 0 && rec[1].SnapSink == 2,
-                  "%s: A Flags %d Nbound %d/%d, B Nbound %d Sink %ld SnapSink %d\n", what, rec[0].Flags, rec[0].Nbound,
-                  rec[0].NboundExclusive, rec[1].Nbound, rec[1].SinkTrackId, rec[1].SnapSink);
-            if(stage == 2)
-                CHECK(st->NFallbackField >= 50, "%s: %ld field particles normalised\n", what, st->NFallbackField);
+            /* both A and B's sub-tree key are above SubhaloCollectiveMinPart: two rounds, B (depth 1)
+             * then A, B stays A's satellite as in the serial stage 1 */
+            CHECK((rec[0].Flags & SUBHALO_FLAG_INPLACE) && rec[0].Rank == 0 && rec[0].Nbound > rec[0].NboundExclusive
+                  && rec[1].Nbound > 0 && (rec[1].Flags & SUBHALO_FLAG_INPLACE) && rec[1].Rank == 1 && rec[1].NestedParentTrackId == 0
+                  && rec[1].CentralTrackId == 0,
+                  "%s: A Flags %d Rank %d Nbound %d/%d, B Nbound %d Flags %d Rank %d pid %ld upid %ld\n", what, rec[0].Flags, rec[0].Rank,
+                  rec[0].Nbound, rec[0].NboundExclusive, rec[1].Nbound, rec[1].Flags, rec[1].Rank, rec[1].NestedParentTrackId,
+                  rec[1].CentralTrackId);
+            CHECK(st->NFallbackField >= 2000, "%s: %ld particle tags written by the in-place pass\n", what, st->NFallbackField);
         }
         if(stage == 4)
+            /* Phase 2b: the hostless pseudo-key is unbound in place with the HBT recipe */
             CHECK(rec[0].Nbound > 0 && rec[0].HostGroup == -1 && rec[0].Rank == 0 && (rec[0].Flags & SUBHALO_FLAG_INPLACE)
-                  && rec[0].Nbound == rec[0].NboundExclusive && rec[0].Vmax == -1,
+                  && rec[0].Vmax > 0,
                   "%s: hostless A Nbound %d/%d HostGroup %ld Rank %d Flags %d Vmax %g\n", what, rec[0].Nbound, rec[0].NboundExclusive,
                   rec[0].HostGroup, rec[0].Rank, rec[0].Flags, rec[0].Vmax);
         /* the orphan B: its current host from its tracer */
@@ -4178,6 +4237,7 @@ int main(void) {
         cmocka_unit_test(test_subhalo_nest_tree),
         cmocka_unit_test(test_subhalo_deep_chain),
         cmocka_unit_test(test_subhalo_mixed_call),
+        cmocka_unit_test(test_subhalo_nocentral),
         cmocka_unit_test(test_subhalo_fallback),
         cmocka_unit_test(test_subhalo_itercap),
         cmocka_unit_test(test_subhalo_lookup),

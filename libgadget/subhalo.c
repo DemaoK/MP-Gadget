@@ -26,6 +26,7 @@
 #include "gravity.h"
 #include "subhalo.h"
 #include "subhalo_internal.h"
+#include "subhalo_collective.h"
 #include "subhalo_unbind.h"
 #include "subhalo_so.h"
 
@@ -154,7 +155,10 @@ set_subhalo_params(ParameterSet * ps)
     int checks[2] = {0, 0};
     /* the two integer-valued doubles, converted on every rank after validation */
     double raw[2] = {0, 0};
+    /* the treewalk's import buffer factor (the memory checks of the field SO and the in-place walk) */
+    double boost = 2;
     if(ThisTask == 0) {
+        boost = param_get_double(ps, "ImportBufferBoost");
         SubParams.SubhaloFinderOn = param_get_int(ps, "SubhaloFinderOn");
         SubParams.SubhaloMaxGatherFraction = param_get_double(ps, "SubhaloMaxGatherFraction");
         raw[0] = param_get_double(ps, "SubhaloCollectiveMinPart");
@@ -192,6 +196,9 @@ set_subhalo_params(ParameterSet * ps)
     MPI_Bcast(&SubParams, sizeof(struct SubhaloParams), MPI_BYTE, 0, MPI_COMM_WORLD);
     MPI_Bcast(checks, 2, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(raw, 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&boost, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    subhalo_so_set_import_buffer_boost(boost);
+    subhalo_collective_set_import_buffer_boost(boost);
     MPI_Bcast(SubhaloFOFFileBase, sizeof(SubhaloFOFFileBase), MPI_CHAR, 0, MPI_COMM_WORLD);
 
     if(!SubParams.SubhaloFinderOn) {
@@ -1735,9 +1742,9 @@ subhalo_update_unhosted(struct SubTrackTable * tab, int SnapNum, double atime, i
             continue;
         }
         if(b > a) {
-            /* hostless resolved track of an oversized pseudo-key: keeps its field particles,
-             * which subhalo_process_inplace normalised to its record (all bound to it, dense
-             * ranks, J3); sums over ranks in rank order */
+            /* hostless resolved track whose pseudo-key was not processed (unreachable from
+             * subhalo_find since Phase 2b: oversized pseudo-keys are unbound in place): keeps its
+             * field particles, all bound; sums over ranks in rank order */
             int64_t count = 0, ntracer = 0, LenType[6] = {0};
             double MassType[6] = {0}, mass = 0, mdx[3] = {0}, mv[3] = {0};
             int64_t c, cmb = a;
@@ -2042,6 +2049,7 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     /* Step 3: keys (pseudo-keys of the hostless tracks) and the plan. */
     const int64_t NHostless = subhalo_assign_keys(tab, fof->TotNgroups, Comm);
     struct SubhaloPlan plan = {0};
+    subhalo_plan_set_frame(atime, hubble_function(CP, atime));
     subhalo_plan_build(&plan, fof, tab, NHostless, Comm);
     walltime_measure("/Subhalo/Plan");
 
@@ -2054,7 +2062,7 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     if(MPIU_Any(failure, Comm)) {
         message(0, "Subhalo finder: the particle exchange failed for snapshot %d; restoring the domain. "
                    "Tags and track table are unchanged; this PIG will be marked incomplete.\n", SnapNum);
-        subhalo_restore_field_grnr();
+        subhalo_restore_field_grnr(&plan);
         subhalo_plan_free(&plan);
         subhalo_restore_domain(ddecomp);
         walltime_measure("/Subhalo/Restore");
@@ -2070,9 +2078,6 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     /* Step 7a: member records (with the transient fields), fetched from the home ranks. */
     struct SubTrack * members = NULL;
     const int64_t nmembers = subhalo_fetch_members(segs, nsegs, plan.OrphanIds, plan.NOrphanIds, tab, &members, Comm);
-    int64_t * sinkwinner = (int64_t *) mymalloc2("SubSinkWinner", sizeof(int64_t) * (nmembers + 1));
-    for(i = 0; i < nmembers; i++)
-        sinkwinner[i] = SUBHALO_NOTRACK;
     walltime_measure("/Subhalo/Members");
 
     struct SubhaloUnbindParams up;
@@ -2101,10 +2106,10 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     ctx.TracerTypes = sp->SubhaloTracerTypes;
     ctx.ThisTask = ThisTask;
     ctx.TotNgroups = fof->TotNgroups;
+    ctx.plan = &plan;
     ctx.up = &up;
     ctx.Members = members;
     ctx.NMembers = nmembers;
-    ctx.SinkWinner = sinkwinner;
     /* Phase 3: the SO thresholds of this call and the metal switch of the baryonic sums */
     subhalo_so_thresholds(CP, atime, ctx.rho);
     ctx.MetalReturnOn = MetalReturnOn;
@@ -2112,13 +2117,15 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     ctx.Stats.WorstTrackId = -1;
 
     /* The result slots: the members hosted by every serial key, its newborn, the in-place
-     * winners. The results live on the top (they survive the domain restore); the slot index
-     * on the bottom is freed before the restore. */
+     * candidates owned here. The results live on the top (they survive the domain restore); the
+     * slot index on the bottom is freed before the restore. */
     const int64_t nres = subhalo_result_slots(segs, nsegs, &ctx);
     struct SubhaloResult * res = (struct SubhaloResult *) mymalloc2("SubResults", sizeof(struct SubhaloResult) * (nres + 1));
     memset(res, 0, sizeof(struct SubhaloResult) * (nres + 1));
-    for(i = 0; i <= nres; i++)
+    for(i = 0; i <= nres; i++) {
         res[i].ipk = -1;
+        res[i].subkey = -1;
+    }
     ctx.Res = res;
     ctx.NRes = nres;
 
@@ -2126,60 +2133,18 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     subhalo_process_serial(segs, nsegs, &ctx);
     walltime_measure("/Subhalo/Serial");
 
-    /* Step 9 (in-place part with the Phase 1 rule, before the restore), with the field particles
-     * that stayed home normalised to it (J3): they are told apart from the travelled field
-     * particles by their GrNr == -1, so the field encoding is undone only afterwards. */
-    subhalo_process_inplace(segs, nsegs, &plan, &ctx, tab, Comm);
-    subhalo_restore_field_grnr();
+    /* The travelled field particles and the group particles of the sub-tree keys get their GrNr
+     * back; the slot index is freed before the restore. */
+    subhalo_restore_field_grnr(&plan);
     subhalo_free_slots(&ctx);
-    walltime_measure("/Subhalo/InPlace");
 
-    /* Step 9: restore the domain. */
+    /* Step 9: restore the domain, then the oversized candidates in place, deepest round first
+     * (Phase 2b): their records, the hierarchy of the sub-tree results, the final tags of every
+     * particle of an oversized key. */
     subhalo_restore_domain(ddecomp);
     walltime_measure("/Subhalo/Restore");
-
-    /* In-place sunk members become orphans. Copies of the same member on several ranks receive
-     * the same update, so duplicate stores are identical. A track that sinks into the winner of
-     * its group is a satellite at this call (SnapLastIsolation's satellite branch). */
-    int64_t nsunk_local = 0;
-    for(i = 0; i < nmembers; i++) {
-        if(sinkwinner[i] == SUBHALO_NOTRACK)
-            continue;
-        subhalo_track_make_orphan(&members[i], sinkwinner[i], SnapNum);
-        members[i].HostGroup = members[i].Host;
-        if(members[i].SnapLastIsolation < 0)
-            members[i].SnapLastIsolation = SnapNum - 1;
-        nsunk_local++;
-    }
-    /* their tracer (the previous most-bound particle) at this call, on the restored layout: the
-     * in-place rule binds nothing, so the record still holds the previous call's position */
-    {
-        MyIDType * ids = (MyIDType *) mymalloc("SubSunkIds", sizeof(MyIDType) * (nsunk_local + 1));
-        int64_t * which = (int64_t *) mymalloc("SubSunkWhich", sizeof(int64_t) * (nsunk_local + 1));
-        struct SubhaloIdHit * hit = (struct SubhaloIdHit *) mymalloc("SubSunkHits", sizeof(struct SubhaloIdHit) * (nsunk_local + 1));
-        int64_t ns = 0;
-        for(i = 0; i < nmembers; i++)
-            if(sinkwinner[i] != SUBHALO_NOTRACK && members[i].MostBoundID != (MyIDType) -1) {
-                ids[ns] = members[i].MostBoundID;
-                which[ns++] = i;
-            }
-        subhalo_lookup_ids(ids, ns, hit, Comm);
-        const double vfac = subhalo_vel_to_kms(atime);
-        int64_t j;
-        for(j = 0; j < ns; j++) {
-            struct SubTrack * t = &members[which[j]];
-            if(!hit[j].found)
-                continue;
-            int d;
-            for(d = 0; d < 3; d++) {
-                t->TracerPos[d] = t->MostBoundPos[d] = wrap_pos(hit[j].Pos[d] - PartManager->CurrentParticleOffset[d], PartManager->BoxSize);
-                t->TracerVel[d] = t->MostBoundVel[d] = hit[j].Vel[d] * vfac;
-            }
-        }
-        myfree(hit);
-        myfree(which);
-        myfree(ids);
-    }
+    subhalo_collective_run(&plan, &ctx, ddecomp, tab, Comm);
+    walltime_measure("/Subhalo/InPlace");
 
     /* Step 10: new TrackIds in host order. */
     const int64_t NTotalBefore = tab->NTotal;
@@ -2218,7 +2183,7 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     for(i = 0; i < nres; i++)
         if(res[i].valid)
             nout++;
-    struct SubTrack * out = (struct SubTrack *) mymalloc("SubOutRecs", sizeof(struct SubTrack) * (nout + nsunk_local + 1));
+    struct SubTrack * out = (struct SubTrack *) mymalloc("SubOutRecs", sizeof(struct SubTrack) * (nout + 1));
     nout = 0;
     for(i = 0; i < nres; i++) {
         if(!res[i].valid)
@@ -2227,9 +2192,6 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
             subhalo_history_update(&res[i].rec, SnapNum, res[i].MaxMergerMbound);
         out[nout++] = res[i].rec;
     }
-    for(i = 0; i < nmembers; i++)
-        if(sinkwinner[i] != SUBHALO_NOTRACK)
-            out[nout++] = members[i];
     subhalo_table_store(tab, out, nout, Comm);
     myfree(out);
     /* The per-key buffers are no longer needed: release them (reverse order) before the
@@ -2240,14 +2202,14 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     memcpy(iplcopy, ipl, sizeof(struct InplaceWinnerEntry) * nipl);
     myfree(ipl);
     myfree(res);
-    myfree(sinkwinner);
     myfree(members);
     myfree(segs);
     subhalo_plan_free(&plan);
     qsort(iplcopy, nipl, sizeof(struct InplaceWinnerEntry), cmp_iplwinner);
 
-    /* Unclaimed tracks on the home ranks: resolved tracks without a key die; hostless tracks of
-     * an oversized pseudo-key keep the Phase 1 hostless rule. */
+    /* Unclaimed tracks on the home ranks: resolved tracks without a key die (the hostless rule
+     * of an unprocessed pseudo-key is unreachable since Phase 2b processes oversized pseudo-keys
+     * in place). */
     int64_t nhostless = 0, ndead = 0;
     subhalo_update_unhosted(tab, SnapNum, atime, &nhostless, &ndead, Comm);
     /* The orphans' current host and central (J8). */
@@ -2273,12 +2235,12 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
         if(t->Nbound > 0 && t->HostGroup < 0) loc[3]++;
     }
     MPI_Allreduce(loc, tot, 4, MPI_INT64, MPI_SUM, Comm);
-    message(0, "Subhalo finder: snapshot %d done: %ld newborn, %ld sunk, %ld died (%ld without particles), %ld resolved (%ld hostless, %ld by the Phase 1 rule); %ld tracks in total.\n",
+    message(0, "Subhalo finder: snapshot %d done: %ld newborn, %ld sunk, %ld died (%ld without particles), %ld resolved (%ld hostless, %ld by the unprocessed-pseudo-key rule); %ld tracks in total.\n",
             SnapNum, nnew, tot[0], tot[1], ndead, tot[2], tot[3], nhostless, tab->NTotal);
     stats_reduce(&locstats, &SubLastStats, Comm);
     message(0, "Subhalo diagnostics: %ld unbindings, %ld at the iteration cap (worst Nbound/Nlast %g, track %ld); "
                "%ld of %ld final-pass bound particles with E >= 0; %ld tail claims across the final branch dropped; "
-               "fallback field particles %ld (%ld released); %ld orphan hosts updated; arena high water %.3f.\n",
+               "in-place tags written %ld (%ld stale field tags released); %ld orphan hosts updated; arena high water %.3f.\n",
             SubLastStats.NCandidates, SubLastStats.NItercap, SubLastStats.WorstConvRatio, SubLastStats.WorstTrackId,
             SubLastStats.NFinalPositive, SubLastStats.NFinalBound, SubLastStats.NTailRejected,
             SubLastStats.NFallbackField, SubLastStats.NFallbackReleased, norphsync_tot, SubLastStats.ArenaPeakFrac);

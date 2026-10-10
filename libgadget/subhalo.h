@@ -10,7 +10,9 @@
  * (halofinder_phase2a_plan.md) replaces the rule for every serial key by the HBT-HERONS recipe:
  * tracer host vote, orphan lookup, previous-bound frames, pseudo-keys for hostless tracks, the
  * post-order unbinding with sinking, the D10 tag rule, descendants and the HBT properties.
- * Oversized keys keep the Phase 1 in-place rule until Phase 2b.
+ * Phase 2b (halofinder_phase2b_plan.md) processes the oversized keys with the same recipe in
+ * place: the satellites' sub-trees as serial keys, the oversized candidates unbound with the
+ * global tree in rounds (subhalo_collective.c).
  *
  * Conventions:
  *  - every communicating function takes the communicator explicitly;

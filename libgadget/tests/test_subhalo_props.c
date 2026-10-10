@@ -13,6 +13,9 @@
  *     and velocity: Xoff and Voff equal to the known shift times M_disc / M_total.
  *  4. subhalo_so_thresholds at a = 1 and a = 0.1 against the formulas of design 7.10.
  *  5. subhalo_props_baryons on a handful of gas, star and BH particles.
+ *  7. Units (Phase 3 audit P4): the disc of test 3 at a = 0.5 with H(a) set, in kpc/h and km/s
+ *     and again in Mpc/h with a 2 km/s velocity unit (the same physical system): J and JVir in
+ *     physical kpc/h km/s, the spins, Vmax and the SO masses identical.
  *  6. The HBT Vmax / Rmax of subhalo_props_hbt against a sorted cumulative-mass oracle: the
  *     multi-peak profile of the Phase 2a audit (J9; the former bounded histogram search lost
  *     its maximum), a flat profile of equal-radius pairs (Rmax is the smallest radius attaining
@@ -40,6 +43,7 @@
 #include <libgadget/partmanager.h>
 #include <libgadget/slotsmanager.h>
 #include <libgadget/cosmology.h>
+#include <libgadget/subhalo.h>
 #include <libgadget/subhalo_unbind.h>
 #include <libgadget/utils/mymalloc.h>
 #include "stub.h"
@@ -128,9 +132,19 @@ teardown_pman(void)
 /* Final pass, HBT and Rockstar properties of the candidate P[0, n) with every particle bound.
  * The final pass gets the kernel's scratch budget, subhalo_props_rockstar exactly its own. */
 static void
+run_props_up(int64_t n, const double ref[3], const double rho[SUBHALO_NSO], struct SubTrack * rec, int64_t * Index, double * Energy,
+             struct SubhaloUnbindParams up);
+
+static void
 run_props(int64_t n, const double ref[3], const double rho[SUBHALO_NSO], struct SubTrack * rec, int64_t * Index, double * Energy)
 {
-    struct SubhaloUnbindParams up = default_params();
+    run_props_up(n, ref, rho, rec, Index, Energy, default_params());
+}
+
+static void
+run_props_up(int64_t n, const double ref[3], const double rho[SUBHALO_NSO], struct SubTrack * rec, int64_t * Index, double * Energy,
+             struct SubhaloUnbindParams up)
+{
     struct SubCandidate c;
     memset(&c, 0, sizeof(c));
     int64_t i;
@@ -567,6 +581,87 @@ test_disc(void ** state)
     teardown_pman();
 }
 
+/* ------------------------------------------------------------------ 7. units (Phase 3 audit P4) */
+
+/* The disc with its central clump at a = 0.5 in the length unit UL and velocity unit UV (the
+ * mass unit 1e10 Msun/h): positions, softening and box in UL, Vel = a v_pec in UV, G and H(a)
+ * from the unit system. */
+static void
+units_props(double UL, double UV, struct SubTrack * rec)
+{
+    const double atime = 0.5, UM = 1.989e43;
+    const double L = UL / 3.085678e21, V = UV / 1e5;
+    Cosmology CP;
+    memset(&CP, 0, sizeof(CP));
+    CP.CMBTemperature = 2.7255;
+    CP.Omega0 = 0.3;
+    CP.OmegaLambda = 0.7;
+    CP.OmegaBaryon = 0.045;
+    CP.HubbleParam = 0.7;
+    CP.w0_fld = -1;
+    struct UnitSystem units = get_unitsystem(UL, UM, UV);
+    init_cosmology(&CP, 0.01, units);
+    subhalo_set_units(UL, UM, UV);
+    double rho[SUBHALO_NSO];
+    subhalo_so_thresholds(&CP, atime, rho);
+    struct SubhaloUnbindParams up = default_params();
+    up.atime = atime;
+    up.Hubble = hubble_function(&CP, atime);
+    up.G = CP.GravInternal;
+    up.h = 2.8 * EPS / L;
+    up.BoxSize = BOXSIZE / L;
+    const int64_t nclump = 500, n = DISC_N + nclump;
+    setup_pman(n);
+    gsl_rng * rng = gsl_rng_alloc(gsl_rng_mt19937);
+    gsl_rng_set(rng, 77);
+    make_disc(rng);
+    make_clump(rng, DISC_N, nclump, 0.2 * DISC_M, 2., 30.);
+    gsl_rng_free(rng);
+    int64_t i;
+    int d;
+    double ref[3];
+    for(i = 0; i < n; i++)
+        for(d = 0; d < 3; d++) {
+            P[i].Pos[d] /= L;
+            P[i].Vel[d] = atime * P[i].Vel[d] / V;
+        }
+    for(d = 0; d < 3; d++)
+        ref[d] = Centre[d] / L;
+    PartManager->BoxSize = BOXSIZE / L;
+    int64_t * Index = (int64_t *) mymalloc("Index", sizeof(int64_t) * n);
+    double * Energy = (double *) mymalloc("Energy", sizeof(double) * n);
+    run_props_up(n, ref, rho, rec, Index, Energy, up);
+    myfree(Energy);
+    myfree(Index);
+    PartManager->BoxSize = BOXSIZE;
+    teardown_pman();
+}
+
+static void
+test_units(void ** state)
+{
+    struct SubTrack a, b;
+    units_props(3.085678e21, 1e5, &a);
+    units_props(3.085678e24, 2e5, &b);
+    subhalo_set_units(3.085678e21, 1.989e43, 1e5);
+    message(0, "Units: J (%g %g %g) / (%g %g %g) kpc/h km/s, JVir.x %g / %g, SpinPeebles %g / %g, SpinBullock %g / %g, "
+               "Vmax %g / %g (internal), VmaxVir %g / %g km/s, MBoundSO[vir] %g / %g, RBoundSO[vir] %g kpc/h / %g Mpc/h\n", a.J[0], a.J[1], a.J[2], b.J[0], b.J[1], b.J[2],
+            a.JVir[0], b.JVir[0], a.SpinPeebles, b.SpinPeebles, a.SpinBullock, b.SpinBullock, a.Vmax, b.Vmax, a.VmaxVir, b.VmaxVir,
+            a.MBoundSO[0], b.MBoundSO[0], a.RBoundSO[0], b.RBoundSO[0]);
+    int d;
+    for(d = 0; d < 3; d++) {
+        assert_true(fabs(a.J[d] - b.J[d]) <= 1e-4 * fabs(a.J[d]) + 1e-6 * sqrt(a.J[0] * a.J[0] + a.J[1] * a.J[1] + a.J[2] * a.J[2]));
+        assert_true(fabs(a.JVir[d] - b.JVir[d]) <= 1e-4 * fabs(a.JVir[d]) + 1e-6 * sqrt(a.JVir[0] * a.JVir[0] + a.JVir[1] * a.JVir[1] + a.JVir[2] * a.JVir[2]));
+    }
+    assert_true(fabs(a.SpinPeebles / b.SpinPeebles - 1) < 1e-4);
+    assert_true(fabs(a.SpinBullock / b.SpinBullock - 1) < 1e-4);
+    /* the HBT columns are in internal velocity units here (the key loop converts them) */
+    assert_true(fabs(a.Vmax / (2 * b.Vmax) - 1) < 1e-4);
+    assert_true(fabs(a.VmaxVir / b.VmaxVir - 1) < 1e-4);
+    assert_true(fabs(a.MBoundSO[0] / b.MBoundSO[0] - 1) < 1e-4);
+    assert_true(fabs(a.RBoundSO[0] / (1000 * b.RBoundSO[0]) - 1) < 1e-4);
+}
+
 /* ------------------------------------------------------------------ 4. thresholds */
 
 static void
@@ -920,6 +1015,7 @@ int main(void) {
         cmocka_unit_test(test_baryons),
         cmocka_unit_test(test_absent),
         cmocka_unit_test(test_vmax),
+        cmocka_unit_test(test_units),
     };
     return cmocka_run_group_tests_mpi(tests, NULL, NULL);
 }

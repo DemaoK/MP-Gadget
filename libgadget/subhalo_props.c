@@ -400,8 +400,8 @@ klypin_c_to_f(double c)
     return c * cp1 / (log1p(c) * cp1 - c);
 }
 
-static double
-klypin_f_to_c(double f)
+double
+subhalo_klypin_f_to_c(double f)
 {
     double c = f, tc = klypin_c_to_f(c);
     int it;
@@ -435,6 +435,11 @@ subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c, con
     const double rfloor = up->h / 2.8;               /* GravitySoftening, Plummer-equivalent */
     const double vu = subhalo_vel_to_kms(1.0);       /* internal velocity unit -> km/s */
     const double vkms = subhalo_vel_to_kms(a);       /* internal Vel -> physical peculiar km/s */
+    /* J and JVir are exported in physical kpc/h km/s whatever the run's length unit (design 7.10,
+     * Phase 3 audit P4); the spins use the internal sums */
+    double ULen, UMass, UVel;
+    subhalo_get_units(&ULen, &UMass, &UVel);
+    const double lenfac = ULen / 3.085678e21;
     int64_t i, k;
     int d, s;
     (void) Offset;
@@ -542,7 +547,7 @@ subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c, con
     for(d = 0; d < 3; d++) {
         J[d] /= Mtot;
         jmag += J[d] * J[d];
-        rec->J[d] = (float) (J[d] * vu);
+        rec->J[d] = (float) (J[d] * vu * lenfac);
     }
     jmag = sqrt(jmag);
     for(d = 0; d < 6; d++)
@@ -577,7 +582,7 @@ subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c, con
         for(d = 0; d < 3; d++) {
             Jv[d] /= Mvir;
             jv += Jv[d] * Jv[d];
-            rec->JVir[d] = (float) (Jv[d] * vu);
+            rec->JVir[d] = (float) (Jv[d] * vu * lenfac);
             xo += (xs[d] / Mvir) * (xs[d] / Mvir);
             vo += (vs[d] / Mvir) * (vs[d] / Mvir);
         }
@@ -590,7 +595,7 @@ subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c, con
             const double f = Rvir * best / (Mvir * KLYPIN_RS_CONSTANT);
             double rs = rbest / KLYPIN_RMAX_TO_RS;
             if(f >= 4.625) {
-                const double conc = klypin_f_to_c(f);
+                const double conc = subhalo_klypin_f_to_c(f);
                 if(conc > 0)
                     rs = Rvir / conc;
             }

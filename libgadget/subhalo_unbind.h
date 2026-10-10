@@ -214,12 +214,16 @@ void subhalo_so_thresholds(const Cosmology * CP, double atime, double rho[SUBHAL
  * rho from subhalo_so_thresholds at up->atime. The core is recomputed with subhalo_core (the
  * same CorePos/CoreVel as subhalo_props_hbt), so rec's other columns are not read and the call
  * may come before or after the caller's unit conversion of the HBT columns. Lengths comoving
- * in the run's unit, velocities km/s (subhalo_vel_to_kms), J and JVir physical length unit x
- * km/s. Scratch: SUBHALO_PROPS_BYTES_PER_PART * Nbound from the arena, rewound on return;
+ * in the run's unit, velocities km/s (subhalo_vel_to_kms), J and JVir in physical kpc/h km/s
+ * (the run's length unit converted with subhalo_get_units; the spins are unit-free). Scratch: SUBHALO_PROPS_BYTES_PER_PART * Nbound from the arena, rewound on return;
  * endrun if the arena is short. Offset is unused (the core is in the translated frame). */
 void subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c,
                             const struct SubhaloUnbindParams * up, const double rho[SUBHALO_NSO],
                             int CoreSize, const double Offset[3], struct SubhaloArena * arena);
+
+/* Rockstar f_to_c (nfw.c:19-32): the NFW concentration with c / (ln(1 + c) - c / (1 + c)) = f,
+ * -1 if the Newton iteration fails (subhalo_props_rockstar and the in-place recipes). */
+double subhalo_klypin_f_to_c(double f);
 
 /* Group C baryonic sums over the bound set, add_particle_to_group style (fof.c): SFR, HeIII mass
  * (gas), BH subgrid mass and Mdot, MostMassiveBHID (largest BHP(i).Mass, ties to the smaller ID;

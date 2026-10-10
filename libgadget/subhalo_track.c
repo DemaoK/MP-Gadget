@@ -5,9 +5,10 @@
  * sources (ConstrainToSingleHost, FeedCentrals), ReassignParticles, post-order unbinding with the
  * remainder passed up, sinking and re-unbinding, the final pass and the HBT properties, ranks
  * and hierarchy, the D10 tag rule written into P, and the local part of the descendants.
- * Oversized keys keep the Phase 1 in-place rule ("every FOF particle to one track, no
- * unbinding", Phase 1 plan step 9) until Phase 2b. Unclaimed tracks are handled on the home
- * ranks in subhalo.c. */
+ * Phase 2b (halofinder_phase2b_plan.md steps 7 and 8): the serial sub-tree keys of the oversized
+ * groups are processed here with provisional tags; the oversized candidates themselves are
+ * unbound in place by subhalo_collective.c. Unclaimed tracks are handled on the home ranks in
+ * subhalo.c. */
 
 #include <mpi.h>
 #include <stdio.h>
@@ -42,136 +43,6 @@ subhalo_find_member(const struct SubhaloCallCtx * ctx, int64_t TrackId)
     return (struct SubTrack *) bsearch(&key, ctx->Members, ctx->NMembers, sizeof(struct SubTrack), cmp_member_trackid);
 }
 
-/* A member may win or sink only in the key its host vote chose, and only if it is not
- * already an orphan (Phase 1 carries orphans but never resurrects them). */
-static int
-member_is_candidate(const struct SubTrack * m, int64_t g)
-{
-    return m->Host == g && m->SnapDeath < 0;
-}
-
-static double
-wrap_box(double x, double BoxSize)
-{
-    while(x >= BoxSize) x -= BoxSize;
-    while(x < 0) x += BoxSize;
-    return x;
-}
-
-/* Sums over the particles of a key (or of its local part). Positions relative to ref. */
-struct KeySums {
-    double count;
-    double mass;
-    double ntracer;
-    double LenType[6];
-    double MassType[6];
-    double mdx[3];
-    double mv[3];
-};
-#define KEYSUMS_NDOUBLE (sizeof(struct KeySums) / sizeof(double))
-/* subhalo_process_inplace holds, on every rank and for every in-place key, two KeySums, seven
- * 8-byte vectors and the plan's SubhaloInplaceKey: the plan charges SUBHALO_INPLACE_KEY_BYTES. */
-_Static_assert(2 * sizeof(struct KeySums) + 7 * sizeof(int64_t) + sizeof(struct SubhaloInplaceKey) <= SUBHALO_INPLACE_KEY_BYTES,
-               "SUBHALO_INPLACE_KEY_BYTES does not cover the in-place vectors");
-
-static void
-key_sums(struct KeySums * s, int64_t start, int64_t n, const double ref[3], int TracerTypes, double BoxSize)
-{
-    int64_t i;
-    int d;
-    memset(s, 0, sizeof(struct KeySums));
-    /* sequential: the order (and the result) is that of the local sort */
-    for(i = start; i < start + n; i++) {
-        const struct particle_data * p = &P[i];
-        const double m = p->Mass;
-        s->count += 1;
-        s->mass += m;
-        s->LenType[p->Type] += 1;
-        s->MassType[p->Type] += m;
-        if(TracerTypes & (1 << p->Type))
-            s->ntracer += 1;
-        for(d = 0; d < 3; d++) {
-            s->mdx[d] += m * NEAREST(p->Pos[d] - ref[d], BoxSize);
-            s->mv[d] += m * p->Vel[d];
-        }
-    }
-}
-
-/* Step 7e: the winner's new record. old is the winner's previous record (NULL for a newborn).
- * cen is the mass-weighted centre in the translated frame; mb the index of the rank-0
- * particle in P (or -1 if it is not on this rank, not used in Phase 1). */
-static void
-fill_winner_record(struct SubTrack * rec, const struct SubTrack * old, int64_t winner, int64_t g, const struct KeySums * s,
-                   const double cen[3], int64_t mb, int inplace, const struct SubhaloCallCtx * ctx)
-{
-    int d, t;
-    subhalo_track_clear(rec, winner);
-    if(old) {
-        /* identity and history carry over; every property column is recomputed or -1 */
-        rec->SnapBirth = old->SnapBirth;
-        rec->SnapLastIsolation = old->SnapLastIsolation;
-        rec->MboundPeak = old->MboundPeak;
-        rec->VmaxAtMboundPeak = old->VmaxAtMboundPeak;
-        rec->VmaxPeak = old->VmaxPeak;
-        rec->MboundAcc = old->MboundAcc;
-        rec->VmaxAcc = old->VmaxAcc;
-        rec->MboundFirstAcc = old->MboundFirstAcc;
-        rec->VmaxFirstAcc = old->VmaxFirstAcc;
-        rec->SnapMboundPeak = old->SnapMboundPeak;
-        rec->SnapVmaxPeak = old->SnapVmaxPeak;
-        rec->SnapAcc = old->SnapAcc;
-        rec->SnapFirstAcc = old->SnapFirstAcc;
-        rec->SnapLastMajorMerger = old->SnapLastMajorMerger;
-        rec->GeomParentTrackId = old->GeomParentTrackId;
-        rec->GeomUpParentTrackId = old->GeomUpParentTrackId;
-        for(d = 0; d < 3; d++) {
-            rec->TracerPos[d] = old->TracerPos[d];
-            rec->TracerVel[d] = old->TracerVel[d];
-        }
-        rec->SnapTracerLost = old->SnapTracerLost;
-        rec->NboundPrev = old->NboundPrev;
-    }
-    else {
-        rec->SnapBirth = ctx->SnapNum;
-        rec->NboundPrev = 0;
-    }
-    rec->Host = g;
-    rec->HostGroup = g;
-    rec->Rank = rec->Depth = 0;
-    rec->NestedParentTrackId = -1;
-    rec->CentralTrackId = winner;
-    rec->SinkTrackId = -1;
-    rec->DescendantTrackId = winner;
-    rec->SnapDeath = rec->SnapSink = -1;
-    /* the i4 count columns: abort rather than wrap (H4) */
-    if(s->count > INT32_MAX || s->ntracer > INT32_MAX)
-        endrun(1, "Key %ld has %g particles, more than the i4 count columns of the catalogue hold.\n", g, s->count);
-    rec->Nbound = rec->NboundExclusive = (int32_t) s->count;
-    rec->NboundTracer = (int32_t) s->ntracer;
-    rec->Flags = inplace ? SUBHALO_FLAG_INPLACE : 0;
-    rec->Mbound = s->mass;
-    for(t = 0; t < 6; t++) {
-        rec->NboundType[t] = rec->NboundExclusiveType[t] = (int32_t) s->LenType[t];
-        rec->NtailType[t] = 0;
-        rec->MboundType[t] = s->MassType[t];
-    }
-    /* physical peculiar km/s (design 7.10): Vel * UnitVelocity_in_cm_per_s / (1e5 a) */
-    const double vfac = subhalo_vel_to_kms(ctx->atime);
-    for(d = 0; d < 3; d++) {
-        const double pos = wrap_box(cen[d] - ctx->Offset[d], ctx->BoxSize);
-        rec->CorePos[d] = rec->CoMPos[d] = pos;
-        const double v = (s->mass > 0 ? s->mv[d] / s->mass : 0) * vfac;
-        rec->CoreVel[d] = rec->CoMVel[d] = v;
-    }
-    if(mb >= 0) {
-        rec->MostBoundID = P[mb].ID;
-        for(d = 0; d < 3; d++) {
-            rec->MostBoundPos[d] = wrap_box(P[mb].Pos[d] - ctx->Offset[d], ctx->BoxSize);
-            rec->MostBoundVel[d] = P[mb].Vel[d] * vfac;
-        }
-    }
-    rec->Alive = 1;
-}
 
 /* ------------------------------------------------------------------ result slots */
 
@@ -227,9 +98,17 @@ subhalo_result_slots(const struct SubhaloKeySeg * segs, int64_t nsegs, struct Su
     int64_t nres = 0;
     for(s = 0; s < nsegs; s++) {
         ctx->ResStart[s] = nres;
-        nres += segs[s].inplace ? 1 : ctx->HostedStart[s + 1] - ctx->HostedStart[s] + 1;
+        nres += segs[s].inplace ? 0 : ctx->HostedStart[s + 1] - ctx->HostedStart[s] + 1;
     }
     ctx->ResStart[nsegs] = nres;
+    /* Phase 2b: one slot per in-place candidate whose record this rank writes */
+    ctx->IpResStart = nres;
+    ctx->NIpRes = 0;
+    if(ctx->plan)
+        for(i = 0; i < ctx->plan->NCands; i++)
+            if(ctx->plan->Cands[i].owner == ctx->ThisTask)
+                ctx->NIpRes++;
+    nres += ctx->NIpRes;
     return nres;
 }
 
@@ -594,7 +473,11 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
     const struct SubhaloUnbindParams * up = ctx->up;
     const struct SubhaloParams * sp = subhalo_get_params();
     const int64_t g = seg->g, start = seg->start, n = seg->n;
-    const int pseudo = g > ctx->TotNgroups;
+    /* Phase 2b: a serial sub-tree key of the oversized group gfof (its particles' GrNr is encoded) */
+    const int subkey = ctx->plan && g >= ctx->plan->SubKeyBase;
+    const struct SubhaloSubKey * skey = subkey ? &ctx->plan->SubKeys[g - ctx->plan->SubKeyBase] : NULL;
+    const int64_t gfof = subkey ? skey->g : g;
+    const int pseudo = !subkey && g > ctx->TotNgroups;
     const int TracerTypes = ctx->TracerTypes;
     const int CoreSize = sp->SubhaloCoreSize;
     const int MergeTrapped = sp->SubhaloMergeTrapped;
@@ -623,8 +506,8 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
         u->kind = m->NboundPrev > 0 ? NODE_RESOLVED : NODE_ORPHAN;
     }
     if(nn == 0) {
-        if(pseudo)
-            endrun(5, "Pseudo-key %ld has no hostless track on rank %d.\n", g, ctx->ThisTask);
+        if(pseudo || subkey)
+            endrun(5, "%s %ld has no member track on rank %d.\n", pseudo ? "Pseudo-key" : "Sub-tree key", g, ctx->ThisTask);
         memset(&nd[0], 0, sizeof(nd[0]));
         nd[0].TrackId = SUBHALO_PROVISIONAL(g);
         nd[0].kind = NODE_NEWBORN;
@@ -640,7 +523,15 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
     /* ---- the key's centre: mass-weighted over its FOF particles (all particles of a
      *      pseudo-key), periodic about the first one; computed locally (plan section 8) ---- */
     double xg[3] = {0, 0, 0}, vg[3] = {0, 0, 0};
-    {
+    if(subkey) {
+        /* the whole group's key centre, from the plan */
+        const struct SubhaloInplaceKey * ik = &ctx->plan->Inplace[skey->gidx];
+        for(d = 0; d < 3; d++) {
+            xg[d] = ik->cen[d];
+            vg[d] = ik->vel[d];
+        }
+    }
+    else {
         int64_t first = -1;
         double M = 0, mx[3] = {0, 0, 0}, mv[3] = {0, 0, 0};
         for(i = start; i < start + n; i++) {
@@ -665,9 +556,15 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
             }
     }
 
-    /* ---- b: the central (DecideCentrals, subhalo_tracking.cpp:767-800) ---- */
+    /* ---- b: the central (DecideCentrals, subhalo_tracking.cpp:767-800); a sub-tree key's
+     *      root is the top of its hierarchy (not a central) ---- */
     int ci = 0;
-    {
+    if(subkey) {
+        ci = node_index(nd, nn, ctx->plan->Members[skey->root].TrackId);
+        if(ci < 0)
+            endrun(5, "Sub-tree key %ld on rank %d does not hold its root %ld.\n", g, ctx->ThisTask, ctx->plan->Members[skey->root].TrackId);
+    }
+    else {
         double Mmax = -1;
         int nres = 0;
         for(v = 0; v < nn; v++)
@@ -959,8 +856,9 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
             u = nd[u].parent;
         }
     }
-    /* the root's own list to its relaxed size too (nothing above it gathers its remainder) */
-    if(nd[ci].state == ST_ALIVE)
+    /* the root's own list to its relaxed size too (nothing above it gathers its remainder);
+     * a sub-tree key's root keeps its whole list (provisional tags, Phase 2b plan step 8) */
+    if(nd[ci].state == ST_ALIVE && !subkey)
         nd[ci].c.N = nd[ci].keep;
     for(v = 0; v < nn; v++)
         if(nd[v].state == ST_ALIVE && v != ci)
@@ -1003,7 +901,45 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
     /* ---- f: ranks by mass and the final hierarchy (UpdateTracks: SortMemberLists,
      *      ExtendCentralNest, AssignRanks, FillDepth, subhalo_tracking.cpp:1489-1492) ---- */
     int X = -1;
-    if(nalive > 0) {
+    if(nalive > 0 && subkey) {
+        /* the processing tree as it stands (no promotion: the root's parent is an in-place
+         * candidate); Rank, Depth, NestedParentTrackId and CentralTrackId are written by the
+         * rounds from the group's hierarchy */
+        for(v = 0; v < nn; v++) {
+            if(nd[v].state != ST_ALIVE)
+                continue;
+            int u = nd[v].parent;
+            while(u >= 0 && nd[u].state != ST_ALIVE)
+                u = nd[u].parent;
+            nd[v].fparent = u;
+        }
+        for(v = 0; v < nn; v++) {
+            if(nd[v].state != ST_ALIVE)
+                continue;
+            int u = v, dd = 0;
+            while(nd[u].fparent >= 0 && dd <= nn) {
+                u = nd[u].fparent;
+                dd++;
+            }
+            nd[v].fdepth = dd;
+            nd[v].rank = -1;
+            struct SubTrack * rec = &res[v].rec;
+            rec->HostGroup = gfof;
+            rec->Host = gfof;
+            rec->Rank = 0;
+            rec->Depth = dd;
+            rec->NestedParentTrackId = nd[v].fparent >= 0 ? nd[nd[v].fparent].TrackId : -1;
+            rec->CentralTrackId = -1;
+            rec->SinkTrackId = -1;
+            rec->DescendantTrackId = nd[v].TrackId;
+            rec->SnapDeath = rec->SnapSink = -1;
+            rec->Alive = 1;
+        }
+    }
+    /* a dead sub-tree root still claims its whole list, below every survivor */
+    if(subkey && nd[ci].state != ST_ALIVE)
+        nd[ci].fdepth = -1;
+    if(nalive > 0 && !subkey) {
         /* ranks: insertion by CompareMass (a key has few members) */
         int r = 0;
         for(v = 0; v < nn; v++)
@@ -1106,7 +1042,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
     int64_t nrejected = 0;
     for(v = 0; v < nn; v++) {
         struct SubNode * x = &nd[v];
-        if(x->state != ST_ALIVE)
+        if(x->state != ST_ALIVE && !(subkey && v == ci))
             continue;
         for(j = 0; j < x->c.N; j++) {
             const int64_t li = x->c.Index[j] - start;
@@ -1123,11 +1059,18 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
             tagnode[li] = v;
         }
     }
+    int32_t rootkeep = 0;
     for(v = 0; v < nn; v++) {
         struct SubNode * x = &nd[v];
-        if(x->state != ST_ALIVE)
+        const int alive = x->state == ST_ALIVE;
+        if(!alive && !(subkey && v == ci))
             continue;
-        struct SubTrack * rec = &res[v].rec;
+        struct SubTrack dummy;
+        struct SubTrack * rec = alive ? &res[v].rec : &dummy;
+        if(!alive)
+            memset(&dummy, 0, sizeof(dummy));
+        /* the provisional root: its tail counts only the part inside its relaxed source */
+        const int64_t relaxed = (subkey && v == ci) ? (alive ? x->keep : 0) : x->c.N;
         int64_t r = 0, nex = 0, ntl = 0;
         /* Index[0, Nbound) is in final-pass energy order, Index[Nbound, N) the tail in the energy
          * order of its unbinding: one pass gives the own-tag energy order */
@@ -1145,12 +1088,14 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
                 rec->NboundExclusiveType[P[pi].Type]++;
                 nex++;
             }
-            else {
+            else if(j < relaxed) {
                 rec->NtailType[P[pi].Type]++;
                 ntl++;
             }
         }
         rec->NboundExclusive = (int32_t) nex;
+        if(subkey && v == ci)
+            rootkeep = (int32_t) ntl;
     }
     /* everything else in the key is untagged (swallowed particles keep their tags, H6) */
     for(i = 0; i < n; i++) {
@@ -1166,7 +1111,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
     arena->used = 0;
     int ndead = 0;
     for(v = 0; v < nn; v++)
-        if(nd[v].kind == NODE_RESOLVED && (nd[v].state == ST_DIED || nd[v].state == ST_SUNK) && nd[v].old->NTracers > 0)
+        if(!subkey && nd[v].kind == NODE_RESOLVED && (nd[v].state == ST_DIED || nd[v].state == ST_SUNK) && nd[v].old->NTracers > 0)
             ndead++;
     struct IdLocal * ids = NULL;
     if(ndead > 0) {
@@ -1187,6 +1132,18 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
         rs->history = 0;
         rs->newborn = 0;
         rs->MaxMergerMbound = 0;
+        /* Phase 2b: the node's state for the rounds */
+        rs->subkey = subkey ? g : -1;
+        rs->state = x->state;
+        rs->Keep = (subkey && v == ci) ? rootkeep : 0;
+        rs->has_core = x->has_core;
+        for(d = 0; d < 3; d++) {
+            rs->CorePos[d] = x->has_core ? x->CorePos[d] : 0;
+            rs->CoreVel[d] = x->has_core ? x->CoreVel[d] : 0;
+        }
+        rs->SigmaX = x->has_core ? x->SigmaX : 0;
+        rs->SigmaV = x->has_core ? x->SigmaV : 0;
+        rs->SinkTo = x->state == ST_SUNK ? nd[x->sinkinto].TrackId : -1;
         if(x->state == ST_ALIVE) {
             rs->valid = 1;
             rs->history = 1;
@@ -1204,9 +1161,10 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
         struct SubTrack * rec = &rs->rec;
         *rec = *x->old;
         rs->valid = 1;
-        rec->HostGroup = pseudo ? -1 : g;
-        if(X >= 0)
-            rec->CentralTrackId = nd[X].TrackId;
+        rec->HostGroup = pseudo ? -1 : gfof;
+        /* the central of the current host, -1 when nothing in the key survived (Phase 3 audit
+         * P2); a sub-tree key's members get theirs from the rounds */
+        rec->CentralTrackId = X >= 0 ? nd[X].TrackId : SUBHALO_NOTRACK;
         /* a track that dies or sinks inside a group with another central is a satellite at its
          * death: the satellite branch of the SnapLastIsolation rule (subhalo_history_update; HBT
          * ranks the new orphan as a satellite). Orphans of earlier calls keep their history. */
@@ -1224,9 +1182,14 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
             rec->NestedParentTrackId = u >= 0 ? nd[u].TrackId : (X >= 0 && X != v ? nd[X].TrackId : -1);
             if(x->state == ST_SUNK && x->sinkinto == X && x->old->Mbound > maxmerge)
                 maxmerge = x->old->Mbound;
-            /* descendant votes: the tracers in this key, the others pending */
+            /* descendant votes: the tracers in this key, the others pending (every one in a
+             * sub-tree key: the provisional tags are final only after the rounds) */
             int t;
             for(t = 0; t < x->old->NTracers && t < SUBHALO_MAXTRACERS; t++) {
+                if(subkey) {
+                    rs->DescOwner[t] = SUBHALO_DESC_PENDING;
+                    continue;
+                }
                 struct IdLocal key = {x->old->TracerIDs[t], -1};
                 int64_t lo = 0, hi = n;
                 while(lo < hi) {
@@ -1266,358 +1229,4 @@ subhalo_process_serial(const struct SubhaloKeySeg * segs, int64_t nsegs, struct 
         ctx->Stats.ArenaPeakFrac = peak;
     myfree(extra);
     myfree(sc.Nodes);
-}
-
-/* ------------------------------------------------------------------ in place (step 9) */
-
-static void
-keysum_add(struct KeySums * s, const struct particle_data * p, const double ref[3], int TracerTypes, double BoxSize)
-{
-    int d;
-    const double m = p->Mass;
-    s->count += 1;
-    s->mass += m;
-    s->LenType[p->Type] += 1;
-    s->MassType[p->Type] += m;
-    if(TracerTypes & (1 << p->Type))
-        s->ntracer += 1;
-    for(d = 0; d < 3; d++) {
-        s->mdx[d] += m * NEAREST(p->Pos[d] - ref[d], BoxSize);
-        s->mv[d] += m * p->Vel[d];
-    }
-}
-
-static int
-cmp_inplace_key_g(const void * a, const void * b)
-{
-    const int64_t x = ((const struct SubhaloInplaceKey *) a)->g, y = ((const struct SubhaloInplaceKey *) b)->g;
-    return (x > y) - (x < y);
-}
-
-/* A home field particle of the fallback: in-place key index, new tag, old rank and ID. */
-struct HomeField {
-    int64_t k;
-    int64_t tag;
-    int64_t oldrank;
-    MyIDType ID;
-    int64_t i;
-};
-
-static int
-cmp_homefield(const void * a, const void * b)
-{
-    const struct HomeField * x = (const struct HomeField *) a, * y = (const struct HomeField *) b;
-    if(x->k != y->k) return (x->k > y->k) - (x->k < y->k);
-    if(x->oldrank != y->oldrank) return (x->oldrank > y->oldrank) - (x->oldrank < y->oldrank);
-    return (x->ID > y->ID) - (x->ID < y->ID);
-}
-
-/* The field half of the Phase 1 fallback (audit J3). A live field particle that did not travel
- * (GrNr == -1 after the serial keys) is tagged by a track whose key is oversized, or by an
- * orphan (Key -1, a stale tag of an earlier fallback). Under the Phase 1 rule the processed
- * record and the particle tags must describe the same set:
- *  - oversized FOF key g with winner W: every such particle of a track keyed to g (W's own,
- *    those of the members that sink into W, those of a non-member keyed to g) goes to W as
- *    bound (TrackId = BoundTrackId = W), ranked after W's FOF particles; fsum[k] returns their
- *    sums for W's record (in the frame of plan->Inplace[k].ref);
- *  - oversized pseudo-key of a hostless track T: T keeps its field particles, all bound to T,
- *    dense ranks from 0 (subhalo_update_unhosted then counts exactly this set);
- *  - Key -1 (an orphan or dead track): released (untagged).
- * Ranks are dense per key over the ranks in rank order (MPI_Exscan), locally by (old BindRank,
- * ID). Collective. */
-static void
-normalise_home_field(const struct SubhaloPlan * plan, const int64_t * winner, struct KeySums * fsum,
-                     struct SubhaloCallCtx * ctx, struct SubTrackTable * tab, struct SubhaloCallStats * ks, MPI_Comm Comm)
-{
-    const int64_t K = plan->NInplace;
-    int64_t i, k;
-    if(K > 0)
-        memset(fsum, 0, sizeof(struct KeySums) * K);
-    int64_t nh = 0;
-    for(i = 0; i < PartManager->NumPart; i++)
-        if(part_live(&P[i]) && P[i].GrNr == -1 && P[i].TrackId >= 0)
-            nh++;
-    if(!MPIU_Any(nh > 0, Comm))
-        return;
-    struct SubhaloTrackKey * map = NULL;
-    const int64_t nmap = subhalo_home_field_keys(tab, &map, Comm);
-    struct HomeField * hf = (struct HomeField *) mymalloc("SubHomeField", sizeof(struct HomeField) * (nh + 1));
-    int64_t n = 0, nrel = 0;
-    int bad = 0;
-    for(i = 0; i < PartManager->NumPart; i++) {
-        struct particle_data * p = &P[i];
-        if(!(part_live(p) && p->GrNr == -1 && p->TrackId >= 0))
-            continue;
-        const int64_t key = subhalo_track_key_lookup(map, nmap, p->TrackId);
-        if(key < 0) {
-            p->TrackId = -1;
-            p->BindRank = -1;
-            p->BoundTrackId = -1;
-            nrel++;
-            continue;
-        }
-        struct SubhaloInplaceKey ikey;
-        ikey.g = key;
-        const struct SubhaloInplaceKey * ip = (const struct SubhaloInplaceKey *)
-            bsearch(&ikey, plan->Inplace, K, sizeof(ikey), cmp_inplace_key_g);
-        if(!ip) {
-            bad = 1;
-            continue;
-        }
-        struct HomeField * e = &hf[n++];
-        e->k = ip - plan->Inplace;
-        e->tag = key <= ctx->TotNgroups ? winner[e->k] : p->TrackId;
-        e->oldrank = p->BindRank;
-        e->ID = p->ID;
-        e->i = i;
-    }
-    if(bad)
-        endrun(5, "A field particle on rank %d stayed home although its track's key is serial.\n", ctx->ThisTask);
-    qsort(hf, n, sizeof(struct HomeField), cmp_homefield);
-    int64_t * cnt = (int64_t *) mymalloc("SubHomeCnt", sizeof(int64_t) * (K + 1));
-    int64_t * off = (int64_t *) mymalloc("SubHomeOff", sizeof(int64_t) * (K + 1));
-    for(k = 0; k < K; k++)
-        cnt[k] = off[k] = 0;
-    for(i = 0; i < n; i++)
-        cnt[hf[i].k]++;
-    MPI_Exscan(cnt, off, K, MPI_INT64, MPI_SUM, Comm);
-    if(ctx->ThisTask == 0)
-        for(k = 0; k < K; k++)
-            off[k] = 0;
-    struct KeySums * ls = (struct KeySums *) mymalloc("SubHomeSums", sizeof(struct KeySums) * (K + 1));
-    memset(ls, 0, sizeof(struct KeySums) * (K + 1));
-    int64_t a = 0;
-    int toolarge = 0;
-    for(i = 0; i < n; i++) {
-        k = hf[i].k;
-        if(i == 0 || hf[i].k != hf[i-1].k)
-            a = 0;
-        struct particle_data * p = &P[hf[i].i];
-        const int64_t base = plan->Inplace[k].g <= ctx->TotNgroups ? plan->Inplace[k].Length : 0;
-        const int64_t r = base + off[k] + (a++);
-        if(r > INT32_MAX)
-            toolarge = 1;
-        p->TrackId = hf[i].tag;
-        p->BoundTrackId = hf[i].tag;
-        p->BindRank = (int32_t) r;
-        if(plan->Inplace[k].g <= ctx->TotNgroups)
-            keysum_add(&ls[k], p, plan->Inplace[k].ref, ctx->TracerTypes, ctx->BoxSize);
-    }
-    if(toolarge)
-        endrun(5, "In-place key on rank %d: BindRank beyond the int32 range.\n", ctx->ThisTask);
-    if(K > 0)
-        MPI_Allreduce(ls, fsum, K * KEYSUMS_NDOUBLE, MPI_DOUBLE, MPI_SUM, Comm);
-    ks->NFallbackField += n;
-    ks->NFallbackReleased += nrel;
-    myfree(ls);
-    myfree(off);
-    myfree(cnt);
-    myfree(hf);
-    myfree(map);
-}
-
-void
-subhalo_process_inplace(const struct SubhaloKeySeg * segs, int64_t nsegs, const struct SubhaloPlan * plan, struct SubhaloCallCtx * ctx, struct SubTrackTable * tab, MPI_Comm Comm)
-{
-    const int64_t K = plan->NInplace;
-    int64_t i, k, s;
-    int d;
-    const int ThisTask = plan->ThisTask;
-    struct SubhaloCallStats ks;
-    memset(&ks, 0, sizeof(ks));
-    ks.WorstConvRatio = 1;
-    ks.WorstTrackId = -1;
-    /* every rank has the same list, so these branches are collective-safe */
-    if(K > 0)
-        message(0, "WARNING: Subhalo finder: %ld oversized key(s) processed in place with the Phase 1 rule "
-                   "(every FOF particle and the field particles of their tracks to one track, no unbinding) until Phase 2b.\n", K);
-
-    struct KeySums * ls = (struct KeySums *) mymalloc("SubIplSums", sizeof(struct KeySums) * (K + 1));
-    struct KeySums * gs = (struct KeySums *) mymalloc("SubIplSumsG", sizeof(struct KeySums) * (K + 1));
-    struct KeySums * fs = (struct KeySums *) mymalloc("SubIplSumsF", sizeof(struct KeySums) * (K + 1));
-    int64_t * cnt = (int64_t *) mymalloc("SubIplCnt", sizeof(int64_t) * (K + 1));
-    int64_t * off = (int64_t *) mymalloc("SubIplOff", sizeof(int64_t) * (K + 1));
-    int64_t * best = (int64_t *) mymalloc("SubIplBest", sizeof(int64_t) * (K + 1));
-    int64_t * gbest = (int64_t *) mymalloc("SubIplBestG", sizeof(int64_t) * (K + 1));
-    double * msink = (double *) mymalloc("SubIplSink", sizeof(double) * (K + 1));
-    double * gmsink = (double *) mymalloc("SubIplSinkG", sizeof(double) * (K + 1));
-    int64_t * winner = (int64_t *) mymalloc("SubIplWinner", sizeof(int64_t) * (K + 1));
-    memset(ls, 0, sizeof(struct KeySums) * (K + 1));
-    for(k = 0; k < K; k++) {
-        cnt[k] = 0;
-        best[k] = -1;
-        msink[k] = 0;
-    }
-
-    /* local sums and the local best candidate (largest previous Nbound) */
-    for(s = 0; s < nsegs; s++) {
-        const struct SubhaloKeySeg * seg = &segs[s];
-        if(!seg->inplace) continue;
-        k = seg->ipindex;
-        cnt[k] = seg->n;
-        key_sums(&ls[k], seg->start, seg->n, seg->ref, ctx->TracerTypes, ctx->BoxSize);
-        for(i = seg->start; i < seg->start + seg->n; i++) {
-            const int64_t T = P[i].TrackId;
-            if(T < 0 || (i > seg->start && T == P[i-1].TrackId))
-                continue;
-            const struct SubTrack * m = subhalo_find_member(ctx, T);
-            if(!m)
-                endrun(5, "Member %ld of in-place key %ld has no fetched record.\n", T, seg->g);
-            if(member_is_candidate(m, seg->g) && m->NboundPrev > best[k])
-                best[k] = m->NboundPrev;
-        }
-    }
-    if(K > 0)
-        MPI_Allreduce(best, gbest, K, MPI_INT64, MPI_MAX, Comm);
-    /* among the candidates with the largest previous Nbound, the smallest TrackId */
-    for(k = 0; k < K; k++)
-        best[k] = INT64_MAX;
-    for(s = 0; s < nsegs; s++) {
-        const struct SubhaloKeySeg * seg = &segs[s];
-        if(!seg->inplace) continue;
-        k = seg->ipindex;
-        for(i = seg->start; i < seg->start + seg->n; i++) {
-            const int64_t T = P[i].TrackId;
-            if(T < 0 || (i > seg->start && T == P[i-1].TrackId))
-                continue;
-            const struct SubTrack * m = subhalo_find_member(ctx, T);
-            if(member_is_candidate(m, seg->g) && m->NboundPrev == gbest[k] && T < best[k])
-                best[k] = T;
-        }
-    }
-    if(K > 0)
-        MPI_Allreduce(best, winner, K, MPI_INT64, MPI_MIN, Comm);
-    for(k = 0; k < K; k++)
-        if(gbest[k] < 0)
-            winner[k] = SUBHALO_PROVISIONAL(plan->Inplace[k].g);
-
-    /* sinking: every holder marks its copies; the copies are identical */
-    for(s = 0; s < nsegs; s++) {
-        const struct SubhaloKeySeg * seg = &segs[s];
-        if(!seg->inplace) continue;
-        k = seg->ipindex;
-        for(i = seg->start; i < seg->start + seg->n; i++) {
-            const int64_t T = P[i].TrackId;
-            if(T < 0 || T == winner[k] || (i > seg->start && T == P[i-1].TrackId))
-                continue;
-            const struct SubTrack * m = subhalo_find_member(ctx, T);
-            if(!member_is_candidate(m, seg->g))
-                continue;
-            ctx->SinkWinner[m - ctx->Members] = winner[k];
-            if(m->Mbound > msink[k])
-                msink[k] = m->Mbound;
-        }
-    }
-    if(K > 0)
-        MPI_Allreduce(msink, gmsink, K, MPI_DOUBLE, MPI_MAX, Comm);
-
-    /* two-stage centre and the global rank prefix (vector exclusive scan in rank order) */
-    if(K > 0) {
-        MPI_Allreduce(ls, gs, K * KEYSUMS_NDOUBLE, MPI_DOUBLE, MPI_SUM, Comm);
-        MPI_Exscan(cnt, off, K, MPI_INT64, MPI_SUM, Comm);
-    }
-    if(ThisTask == 0)
-        for(k = 0; k < K; k++)
-            off[k] = 0;
-
-    /* tags of the FOF particles: all bound to the winner, ranks in the local sort order */
-    for(s = 0; s < nsegs; s++) {
-        const struct SubhaloKeySeg * seg = &segs[s];
-        if(!seg->inplace) continue;
-        k = seg->ipindex;
-        if(off[k] + seg->n > INT32_MAX)
-            endrun(5, "In-place key %ld too large for 32-bit ranks.\n", seg->g);
-        for(i = 0; i < seg->n; i++) {
-            struct particle_data * p = &P[seg->start + i];
-            p->TrackId = winner[k];
-            p->BoundTrackId = winner[k];
-            p->BindRank = off[k] + i;
-        }
-    }
-
-    /* the field particles of the oversized keys' tracks, and stale orphan tags (J3); every rank */
-    normalise_home_field(plan, winner, fs, ctx, tab, &ks, Comm);
-    stats_merge(&ctx->Stats, &ks);
-    if(K == 0) {
-        myfree(winner); myfree(gmsink); myfree(msink); myfree(gbest); myfree(best); myfree(off); myfree(cnt);
-        myfree(fs); myfree(gs); myfree(ls);
-        return;
-    }
-
-    /* the winner's record on the deciding (lowest holding) rank; fetch the previous record of
-     * a winner whose copy this rank does not hold (collective) */
-    int64_t nneed = 0;
-    for(s = 0; s < nsegs; s++) {
-        const struct SubhaloKeySeg * seg = &segs[s];
-        if(!seg->inplace || seg->decider != ThisTask) continue;
-        k = seg->ipindex;
-        if(!SUBHALO_IS_PROVISIONAL(winner[k]) && !subhalo_find_member(ctx, winner[k]))
-            nneed++;
-    }
-    int64_t * needids = (int64_t *) mymalloc("SubIplNeed", sizeof(int64_t) * (nneed + 1));
-    struct SubTrack * needrec = (struct SubTrack *) mymalloc("SubIplNeedRec", sizeof(struct SubTrack) * (nneed + 1));
-    nneed = 0;
-    for(s = 0; s < nsegs; s++) {
-        const struct SubhaloKeySeg * seg = &segs[s];
-        if(!seg->inplace || seg->decider != ThisTask) continue;
-        k = seg->ipindex;
-        if(!SUBHALO_IS_PROVISIONAL(winner[k]) && !subhalo_find_member(ctx, winner[k]))
-            needids[nneed++] = winner[k];
-    }
-    subhalo_table_fetch(tab, needids, nneed, needrec, Comm);
-
-    int64_t j = 0;
-    for(s = 0; s < nsegs; s++) {
-        const struct SubhaloKeySeg * seg = &segs[s];
-        if(!seg->inplace || seg->decider != ThisTask) continue;
-        k = seg->ipindex;
-        const int newborn = SUBHALO_IS_PROVISIONAL(winner[k]);
-        const struct SubTrack * old = NULL;
-        if(!newborn) {
-            old = subhalo_find_member(ctx, winner[k]);
-            if(!old)
-                old = &needrec[j++];
-        }
-        if((int64_t) gs[k].count != seg->Length)
-            endrun(5, "In-place key %ld: %ld particles counted, length %ld.\n", seg->g, (int64_t) gs[k].count, seg->Length);
-        /* the record counts exactly the particles tagged above: FOF and field (J3) */
-        struct KeySums all = gs[k];
-        double * a = (double *) &all;
-        const double * b = (const double *) &fs[k];
-        size_t q;
-        for(q = 0; q < KEYSUMS_NDOUBLE; q++)
-            a[q] += b[q];
-        double cen[3];
-        for(d = 0; d < 3; d++)
-            cen[d] = seg->ref[d] + (all.mass > 0 ? all.mdx[d] / all.mass : 0);
-        struct SubhaloResult * res = &ctx->Res[ctx->ResStart[s]];
-        /* the most-bound particle of the Phase 1 rule: the first tracer-type particle in rank
-         * order (BindRank 0.. are on this, the lowest holding rank), else the rank-0 particle */
-        int64_t mb = seg->start;
-        for(i = seg->start; i < seg->start + seg->n; i++)
-            if(part_live(&P[i]) && is_tracer(i, ctx->TracerTypes)) {
-                mb = i;
-                break;
-            }
-        fill_winner_record(&res->rec, old, winner[k], seg->g, &all, cen, mb, 1, ctx);
-        res->MaxMergerMbound = gmsink[k];
-        res->newborn = newborn;
-        res->valid = 1;
-        res->history = 1;
-        res->ndesc = 0;
-        res->ipk = k;
-    }
-
-    myfree(needrec);
-    myfree(needids);
-    myfree(winner);
-    myfree(gmsink);
-    myfree(msink);
-    myfree(gbest);
-    myfree(best);
-    myfree(off);
-    myfree(cnt);
-    myfree(fs);
-    myfree(gs);
-    myfree(ls);
 }

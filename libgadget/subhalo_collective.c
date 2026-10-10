@@ -1,0 +1,2931 @@
+/* Oversized candidates unbound in place with the global tree (design 7.8, Phase 2b plan
+ * halofinder_phase2b_plan.md step 9). See subhalo_collective.h for the algorithm and the walk
+ * contract.
+ *
+ * Memory (per rank). Per-call scratch on the top of the main stack for every local particle:
+ * the source candidate (int32), the in-place claim (int32), flags (uint8), the energy of the
+ * last evaluation and the energy in the claimant's list (two doubles): 25 bytes; per candidate
+ * a CandState and the per-round vectors (SUBHALO_INPLACE_KEY_BYTES is charged per in-place key
+ * by the plan). Per iteration on the bottom: the query and tree lists (8 bytes per bound
+ * particle of the round), the tree (force_tree_active_moments: TreeAllocFactor x NumPart nodes,
+ * freed after the walk) and the treewalk's export buffers. The ordered sets of a round (mpsort)
+ * hold 40 to 80 bytes per bound or unbound particle of the round. The serial arenas have been
+ * freed before the first round (subhalo_run_serial_keys).
+ *
+ * Deviations from the plan (halofinder_phase2b_plan.md), each a simplification at the edges:
+ *  - the scratch is 25 bytes per particle, not 13: the walk label is derived from the source
+ *    candidate (label = candidate - RoundStart[round]), and the claim and its list energy are
+ *    kept for the final tag pass;
+ *  - a claim of a candidate (or serial member) that sinks later is void; the particle becomes
+ *    claimable by the sink and the candidates after it, not by intermediate candidates already
+ *    processed;
+ *  - the most-bound tracer of an in-place survivor that sinks in a later round is that of its
+ *    final pass (the serial key takes the loop order at the sinking), and a serial survivor that
+ *    sinks into an in-place candidate keeps the MostBound* of its serial record;
+ *  - a serial tail whose claimant sinks into an in-place candidate while its serial binder
+ *    survives is given to the binder, ranked after the binder's exclusive prefix;
+ *  - the final-tree check of a claim (J2) is applied when the binding owner is an in-place
+ *    candidate (serial claims bound serially were checked in their key);
+ *  - a rank with (almost) no particles gets a temporarily raised NumPart for the tree build
+ *    (forcetree.c sizes its node block by NumPart). */
+
+#include <mpi.h>
+#include <math.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <omp.h>
+#include <gsl/gsl_eigen.h>
+
+#include "utils/endrun.h"
+#include "utils/mymalloc.h"
+#include "utils/system.h"
+#include "utils/mpsort.h"
+#include "partmanager.h"
+#include "slotsmanager.h"
+#include "forcetree.h"
+#include "treewalk.h"
+/* gravshort.h defines static treewalk callbacks this file does not use */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#include "gravshort.h"
+#pragma GCC diagnostic pop
+#include "gravity.h"
+#include "walltime.h"
+#include "subhalo_unbind.h"
+#include "subhalo_collective.h"
+
+/* per-particle flags */
+#define CF_BOUND   1     /* bound by its source candidate (Cand) */
+#define CF_RES     2     /* one of the reserved most-bound tracers of Cand */
+#define CF_SCLAIM  4     /* a serial claim: the tag of a serial sub-tree member (a tail, or a root's
+                          * remainder inside its relaxed source), valid while that member is alive */
+#define CF_SBOUND  8     /* bound by a serial sub-tree member (BoundTrackId), excluded from the sources */
+#define CF_UNIV    16    /* a particle of an oversized key: the final tag pass writes it */
+#define CF_RELEASE 32    /* a stale tag of an orphan in the field: untagged by the final pass */
+
+/* Shape fit as subhalo_props.c */
+#define SHAPE_MINPART 20
+#define SHAPE_ITERATIONS 10
+#define KLYPIN_RMAX_TO_RS 2.1626
+#define KLYPIN_RS_CONSTANT 0.216216
+
+static struct SubhaloCollectiveStats CollStats;
+
+const struct SubhaloCollectiveStats *
+subhalo_collective_last_stats(void)
+{
+    return &CollStats;
+}
+
+/* The state of a candidate during the call, identical on every rank. */
+struct CandState {
+    int state;               /* SUBHALO_ST_* */
+    int iterating;           /* in the current unbinding loop */
+    int ran;                 /* unbound by the current call of unbind_loop */
+    int capped;              /* that unbinding stopped at the iteration cap */
+    int flags;               /* SUBHALO_FLAG_ITERCAP */
+    int iterations;          /* of the last unbinding */
+    int absorbed;            /* a survivor sank into it this round */
+    int has_core;
+    int has_mb;
+    int pad;
+    int64_t N, Nbound, Nlast, Ntracer;
+    double Mbound, ConvRatio;
+    double Ref0[3];          /* the reference of the nearest-image sums */
+    double RefPos[3], RefVel[3];
+    double CorePos[3], CoreVel[3], SigmaX, SigmaV;   /* the sinking core (loop order) */
+    MyIDType mbID;           /* most-bound tracer at the sinking (alive) or the previous one (died) */
+    double mbPos[3], mbVel[3];
+    int64_t keep;            /* relaxed source: max(Nbound, min(N, R Nbound)) */
+    int64_t SinkTrackId;
+    /* the current record quantities the hierarchy needs */
+    float Mbound_rec, Vmax_rec;
+    MyIDType MostBoundID_rec;
+};
+
+struct Coll {
+    struct SubhaloPlan * plan;
+    struct SubhaloCallCtx * ctx;
+    struct SubTrackTable * tab;
+    DomainDecomp * ddecomp;
+    MPI_Comm Comm;
+    int NTask, ThisTask;
+    const struct SubhaloUnbindParams * up;
+    const struct SubhaloParams * sp;
+    int64_t NumPart;
+    int32_t * Cand;
+    int32_t * Claim;
+    uint8_t * Flag;
+    double * En;
+    double * ClaimE;
+    struct CandState * cs;
+    int64_t c0, c1;          /* the current round */
+    int nwalks;
+    struct SubhaloCallStats st;
+};
+
+static inline int
+part_live(const struct particle_data * p)
+{
+    return !p->IsGarbage && !p->Swallowed;
+}
+
+static inline int
+is_tracer(int64_t i, int TracerTypes)
+{
+    return (TracerTypes >> P[i].Type) & 1;
+}
+
+static inline double
+wrap_box(double x, double BoxSize)
+{
+    while(x >= BoxSize) x -= BoxSize;
+    while(x < 0) x += BoxSize;
+    return x;
+}
+
+static inline uint64_t
+double_key(double x)
+{
+    uint64_t b;
+    memcpy(&b, &x, sizeof(b));
+    return (b & 0x8000000000000000ULL) ? ~b : (b | 0x8000000000000000ULL);
+}
+
+static const struct SubhaloMember *
+member_of(const struct Coll * C, int64_t TrackId)
+{
+    if(TrackId == SUBHALO_NOTRACK)
+        return NULL;
+    return subhalo_plan_member(C->plan, TrackId);
+}
+
+/* HBT CompareMass (subhalo_tracking.cpp:112-139), as mass_before in subhalo_track.c. */
+static int
+mass_before_v(float Ma, float Va, MyIDType Ia, int64_t Ta, float Mb, float Vb, MyIDType Ib, int64_t Tb)
+{
+    if(Ma != Mb) return Ma > Mb;
+    if(Va != Vb) return Va > Vb;
+    if(Ia != Ib) return Ia > Ib;
+    return Ta > Tb;
+}
+
+static double CollImportBufferBoost = 2;
+
+void
+subhalo_collective_set_import_buffer_boost(double boost)
+{
+    CollImportBufferBoost = boost;
+}
+
+size_t
+subhalo_collective_walk_bytes(void)
+{
+    /* query: TreeWalkQueryBase + label + index; result: TreeWalkResultBase + one double */
+    const size_t q = sizeof(TreeWalkQueryBase) + 8, r = sizeof(TreeWalkResultBase) + 8;
+    const size_t bpb = sizeof(struct data_index) + q + r + (size_t) ceil(CollImportBufferBoost * (q + r));
+    const int64_t nthr = omp_get_max_threads();
+    const int64_t nbuf = 4096 * 10 + (4096 + 1 > 100 * nthr ? 4096 + 1 : 100 * nthr);
+    return (size_t) nbuf * bpb;
+}
+
+/* ------------------------------------------------------------------ the potential-only walk */
+
+typedef struct {
+    TreeWalkQueryBase base;
+    int32_t Label;           /* dense round label of the query's candidate */
+    int32_t Index;           /* the query particle on its home rank */
+} TreeWalkQueryColl;
+
+typedef struct {
+    TreeWalkResultBase base;
+    double Phi;              /* sum_j m_j W(r_ij, h) */
+} TreeWalkResultColl;
+
+struct CollWalkPriv {
+    const int32_t * Cand;
+    double * Sum;
+    int64_t c0;
+    double theta2, h;
+};
+#define COLL_PRIV(tw) ((struct CollWalkPriv *) ((tw)->priv))
+
+static inline int
+node_label(const struct NODE * n)
+{
+    return (int) n->mom.hmax;
+}
+
+static inline int
+label_merge(int a, int b)
+{
+    if(a == -2) return b;
+    if(b == -2) return a;
+    return a == b ? a : -1;
+}
+
+/* Post-order labels of the local nodes below no (particle and node children; a pseudo node keeps
+ * what the top-leaf exchange gave it). */
+static int
+label_local(const ForceTree * tree, int no, const int32_t * Cand, int64_t c0)
+{
+    struct NODE * n = &tree->Nodes[no];
+    int lab = -2, j;
+    if(n->f.ChildType == PARTICLE_NODE_TYPE) {
+        for(j = 0; j < n->s.noccupied && j < NMAXCHILD; j++)
+            lab = label_merge(lab, (int) (Cand[n->s.suns[j]] - c0));
+    }
+    else if(n->f.ChildType == NODE_NODE_TYPE) {
+        for(j = 0; j < NMAXCHILD; j++) {
+            const int c = n->s.suns[j];
+            if(c < 0)
+                continue;
+            if(!node_is_node(c, tree))
+                endrun(5, "Subhalo in-place walk: node %d has a child %d that is not a node.\n", no, c);
+            lab = label_merge(lab, label_local(tree, c, Cand, c0));
+        }
+    }
+    else
+        return node_label(n);
+    n->mom.hmax = lab;
+    return lab;
+}
+
+/* The internal top-level nodes from their eight children (top leaves already labelled). */
+static int
+label_top(const ForceTree * tree, int no)
+{
+    struct NODE * n = &tree->Nodes[no];
+    if(!n->f.InternalTopLevel)
+        return node_label(n);
+    int lab = -2, j;
+    for(j = 0; j < 8; j++)
+        lab = label_merge(lab, label_top(tree, n->s.suns[j]));
+    n->mom.hmax = lab;
+    return lab;
+}
+
+/* Node labels of design 7.8: local post-order pass from every local top leaf, the top-leaf labels
+ * exchanged with one MPI_Allgatherv, then propagated up the top-level tree (pseudo nodes
+ * included). MyFloat holds the dense round labels exactly (< 2^24 candidates per round). */
+static void
+label_tree(const ForceTree * tree, const DomainDecomp * ddecomp, const int32_t * Cand, int64_t c0)
+{
+    int ThisTask, NTask, i;
+    MPI_Comm_rank(MPI_COMM_WORLD, &ThisTask);
+    MPI_Comm_size(MPI_COMM_WORLD, &NTask);
+    int * lab = (int *) mymalloc("SubCollTopLab", sizeof(int) * (ddecomp->NTopLeaves + 1));
+    for(i = ddecomp->Tasks[ThisTask].StartLeaf; i < ddecomp->Tasks[ThisTask].EndLeaf; i++)
+        lab[i] = label_local(tree, ddecomp->TopLeaves[i].treenode, Cand, c0);
+    int * counts = ta_malloc("SubCollLabCnt", int, NTask);
+    int * displ = ta_malloc("SubCollLabDispl", int, NTask);
+    int r;
+    for(r = 0; r < NTask; r++) {
+        displ[r] = ddecomp->Tasks[r].StartLeaf;
+        counts[r] = ddecomp->Tasks[r].EndLeaf - ddecomp->Tasks[r].StartLeaf;
+    }
+    MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, lab, counts, displ, MPI_INT, MPI_COMM_WORLD);
+    ta_free(displ);
+    ta_free(counts);
+    for(i = 0; i < ddecomp->NTopLeaves; i++)
+        tree->Nodes[ddecomp->TopLeaves[i].treenode].mom.hmax = lab[i];
+    label_top(tree, tree->firstnode);
+    myfree(lab);
+}
+
+static void
+coll_fill(int i, TreeWalkQueryColl * I, TreeWalk * tw)
+{
+    const struct CollWalkPriv * pv = COLL_PRIV(tw);
+    I->Label = (int32_t) (pv->Cand[i] - pv->c0);
+    I->Index = i;
+}
+
+static void
+coll_reduce(int i, TreeWalkResultColl * O, enum TreeWalkReduceMode mode, TreeWalk * tw)
+{
+    struct CollWalkPriv * pv = COLL_PRIV(tw);
+    TREEWALK_REDUCE(pv->Sum[i], O->Phi);
+}
+
+/* The potential-only visit (the structure of force_treeev_shortrange, gravshort-tree.c). */
+static int
+coll_visit(TreeWalkQueryColl * I, TreeWalkResultColl * O, LocalTreeWalk * lv)
+{
+    const ForceTree * tree = lv->tw->tree;
+    const struct CollWalkPriv * pv = COLL_PRIV(lv->tw);
+    const double BoxSize = tree->BoxSize;
+    const double theta2 = pv->theta2, h = pv->h;
+    const int label = I->Label;
+    /* the query meets itself only on its home rank, in the primary walk */
+    const int self = lv->mode == TREEWALK_PRIMARY ? I->Index : -1;
+    const double * inpos = I->base.Pos;
+    double sum = 0;
+    int64_t ninter = 0;
+    int listindex;
+    for(listindex = 0; listindex < NODELISTLENGTH; listindex++) {
+        int no = I->base.NodeList[listindex];
+        const int startno = no;
+        if(no < 0)
+            break;
+        while(no >= 0) {
+            const struct NODE * nop = &tree->Nodes[no];
+            if(lv->mode == TREEWALK_GHOSTS && nop->f.TopLevel && no != startno)
+                break;
+            const int nl = node_label(nop);
+            /* empty, or every particle below belongs to another candidate */
+            if(nl == -2 || (nl >= 0 && nl != label)) {
+                no = nop->sibling;
+                continue;
+            }
+            double dx[3];
+            int d;
+            for(d = 0; d < 3; d++)
+                dx[d] = NEAREST(nop->mom.cofm[d] - inpos[d], BoxSize);
+            const double r2 = dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2];
+            /* geometric opening; a mixed node is always opened */
+            const int open = nl == -1 || (double) nop->len * (double) nop->len > r2 * theta2;
+            if(!open) {
+                no = nop->sibling;
+                if(lv->mode != TREEWALK_TOPTREE) {
+                    sum += nop->mom.mass * grav_spline_potential(sqrt(r2), h);
+                    ninter++;
+                }
+                continue;
+            }
+            if(lv->mode == TREEWALK_TOPTREE) {
+                if(nop->f.ChildType == PSEUDO_NODE_TYPE) {
+                    if(-1 == treewalk_export_particle(lv, nop->s.suns[0]))
+                        return -1;
+                    no = nop->sibling;
+                    continue;
+                }
+                /* a local top leaf is walked by the primary walk */
+                if(nop->f.TopLevel && !nop->f.InternalTopLevel) {
+                    no = nop->sibling;
+                    continue;
+                }
+                no = nop->s.suns[0];
+            }
+            else {
+                if(nop->f.ChildType == PARTICLE_NODE_TYPE) {
+                    int i;
+                    for(i = 0; i < nop->s.noccupied; i++) {
+                        const int pp = nop->s.suns[i];
+                        if(pp == self || pv->Cand[pp] - pv->c0 != label)
+                            continue;
+                        double r2p = 0;
+                        for(d = 0; d < 3; d++) {
+                            const double x = NEAREST(P[pp].Pos[d] - inpos[d], BoxSize);
+                            r2p += x * x;
+                        }
+                        sum += P[pp].Mass * grav_spline_potential(sqrt(r2p), h);
+                        ninter++;
+                    }
+                    no = nop->sibling;
+                }
+                else if(nop->f.ChildType == PSEUDO_NODE_TYPE)
+                    no = nop->sibling;
+                else
+                    no = nop->s.suns[0];
+            }
+        }
+    }
+    O->Phi = sum;
+    treewalk_add_counters(lv, ninter);
+    return 1;
+}
+
+/* One global tree over the bound potential-type particles of the iterating candidates of the
+ * round and one walk for all their bound particles: Sum[i] = sum_j m_j W. Collective. */
+static void
+coll_walk(struct Coll * C, double * Sum)
+{
+    const int64_t NumPart = PartManager->NumPart;
+    int64_t i, nq = 0, nt = 0;
+    const int PotentialTypes = C->up->PotentialTypes;
+    for(i = 0; i < NumPart; i++) {
+        const int32_t c = C->Cand[i];
+        if(c < C->c0 || c >= C->c1 || !(C->Flag[i] & CF_BOUND) || !C->cs[c].iterating || !part_live(&P[i]))
+            continue;
+        nq++;
+        if((PotentialTypes >> P[i].Type) & 1)
+            nt++;
+    }
+    int * ql = (int *) mymalloc("SubCollQueries", sizeof(int) * (nq + 1));
+    int * tl = (int *) mymalloc("SubCollTreeList", sizeof(int) * (nt + 1));
+    nq = nt = 0;
+    for(i = 0; i < NumPart; i++) {
+        const int32_t c = C->Cand[i];
+        if(c < C->c0 || c >= C->c1 || !(C->Flag[i] & CF_BOUND) || !C->cs[c].iterating || !part_live(&P[i]))
+            continue;
+        ql[nq++] = (int) i;
+        if((PotentialTypes >> P[i].Type) & 1)
+            tl[nt++] = (int) i;
+        Sum[i] = 0;
+    }
+    ActiveParticles act;
+    memset(&act, 0, sizeof(act));
+    act.ActiveParticle = tl;
+    act.NumActiveParticle = nt;
+    act.MaxActiveParticle = nt;
+    act.Particles = PartManager->Base;
+    ForceTree tree;
+    memset(&tree, 0, sizeof(tree));
+    /* force_tree_build sizes its node block by NumPart: a rank with (almost) no particles could
+     * not hold the top-level grid with the per-thread node caches, so the count is raised for the
+     * build only (the tree inserts the listed particles alone; nothing above NumPart is read) */
+    const int64_t NumPartSave = PartManager->NumPart;
+    {
+        const int nthr = omp_get_max_threads();
+        const int64_t nleaf = C->ddecomp->Tasks[C->ThisTask].EndLeaf - C->ddecomp->Tasks[C->ThisTask].StartLeaf;
+        int64_t need = 2048 + 512 * (int64_t) nthr + 4 * nleaf * nthr;
+        if(need > PartManager->MaxPart)
+            need = PartManager->MaxPart;
+        if(PartManager->NumPart < need)
+            PartManager->NumPart = need;
+    }
+    force_tree_active_moments(&tree, C->ddecomp, &act, 0, 0, NULL);
+    PartManager->NumPart = NumPartSave;
+    label_tree(&tree, C->ddecomp, C->Cand, C->c0);
+
+    struct CollWalkPriv pv;
+    pv.Cand = C->Cand;
+    pv.Sum = Sum;
+    pv.c0 = C->c0;
+    pv.theta2 = C->up->OpenAngle * C->up->OpenAngle;
+    if(pv.theta2 > 0.33)
+        pv.theta2 = 0.33;
+    pv.h = C->up->h;
+    TreeWalk tw[1];
+    memset(tw, 0, sizeof(tw));
+    tw->ev_label = "SUBHALO_INPLACE";
+    tw->type = TREEWALK_ACTIVE;
+    tw->visit = (TreeWalkVisitFunction) coll_visit;
+    tw->NoNgblist = 1;
+    tw->haswork = NULL;
+    tw->fill = (TreeWalkFillQueryFunction) coll_fill;
+    tw->reduce = (TreeWalkReduceResultFunction) coll_reduce;
+    tw->query_type_elsize = sizeof(TreeWalkQueryColl);
+    tw->result_type_elsize = sizeof(TreeWalkResultColl);
+    tw->priv = &pv;
+    tw->tree = &tree;
+    treewalk_run(tw, ql, nq);
+    force_tree_free(&tree);
+    myfree(tl);
+    myfree(ql);
+    C->nwalks++;
+}
+
+/* ------------------------------------------------------------------ the unbinding loop */
+
+static inline int
+in_round(const struct Coll * C, int32_t c)
+{
+    return c >= C->c0 && c < C->c1;
+}
+
+/* E_i in the candidate's current frame from the walk sum (design 7.10, subhalo_unbind.h). */
+static inline double
+coll_energy(const struct Coll * C, int64_t i, double sum, const struct CandState * s)
+{
+    const struct SubhaloUnbindParams * up = C->up;
+    const double a = up->atime, Ha = up->Hubble * a;
+    double K = 0;
+    int d;
+    for(d = 0; d < 3; d++) {
+        const double dx = NEAREST(P[i].Pos[d] - s->RefPos[d], up->BoxSize);
+        const double dv = (P[i].Vel[d] - s->RefVel[d]) / a + Ha * dx;
+        K += dv * dv;
+    }
+    double e = 0.5 * K - up->G / a * sum;
+    if(up->WithThermal)
+        e += subhalo_thermal_energy(i, a);
+    return e;
+}
+
+#define NSUM 9
+/* Per candidate of the round (bound particles, or the whole source with all = 1): count, mass,
+ * sum m dx about Ref0, sum m Vel, tracers. Collective. */
+static void
+round_sums(const struct Coll * C, int all, double * out)
+{
+    const int64_t nc = C->c1 - C->c0;
+    double * loc = (double *) mymalloc("SubCollSums", sizeof(double) * NSUM * (nc + 1));
+    memset(loc, 0, sizeof(double) * NSUM * (nc + 1));
+    int64_t i;
+    int d;
+    for(i = 0; i < C->NumPart; i++) {
+        const int32_t c = C->Cand[i];
+        if(!in_round(C, c) || !part_live(&P[i]) || (!all && !(C->Flag[i] & CF_BOUND)))
+            continue;
+        double * s = loc + NSUM * (c - C->c0);
+        const double m = P[i].Mass;
+        s[0] += 1;
+        s[1] += m;
+        for(d = 0; d < 3; d++) {
+            s[2 + d] += m * NEAREST(P[i].Pos[d] - C->cs[c].Ref0[d], C->up->BoxSize);
+            s[5 + d] += m * P[i].Vel[d];
+        }
+        if(is_tracer(i, C->up->TracerTypes))
+            s[8] += 1;
+    }
+    MPI_Allreduce(loc, out, NSUM * nc, MPI_DOUBLE, MPI_SUM, C->Comm);
+    myfree(loc);
+}
+
+/* The HBT loop (subhalo_unbind without subsampling) for the iterating candidates of the round,
+ * every source particle of an iterating candidate starting bound. A dead candidate's particles
+ * are left unbound. Collective. */
+static void
+unbind_loop(struct Coll * C)
+{
+    const struct SubhaloUnbindParams * up = C->up;
+    const int64_t nc = C->c1 - C->c0;
+    int64_t i, c;
+    int d;
+    double * S = (double *) mymalloc("SubCollLoopSums", sizeof(double) * NSUM * (nc + 1));
+    /* every source particle bound; the source counts (subhalo_unbind's early return) */
+    for(i = 0; i < C->NumPart; i++)
+        if(in_round(C, C->Cand[i]) && C->cs[C->Cand[i]].iterating && part_live(&P[i]))
+            C->Flag[i] |= CF_BOUND;
+    round_sums(C, 0, S);
+    int any = 0;
+    for(c = C->c0; c < C->c1; c++)
+        C->cs[c].ran = 0;
+    for(c = C->c0; c < C->c1; c++) {
+        struct CandState * s = &C->cs[c];
+        if(!s->iterating)
+            continue;
+        const double * v = S + NSUM * (c - C->c0);
+        s->N = s->Nbound = (int64_t) v[0];
+        s->iterations = 0;
+        s->ConvRatio = 0;
+        s->ran = 1;
+        s->capped = 0;
+        C->st.NCandidates++;
+        if(s->N < up->MinNumPart || s->N <= 0 || v[8] < up->MinNumTracerPart) {
+            s->iterating = 0;
+            s->Nbound = 0;
+            s->state = -1;           /* dead, resolved below */
+            continue;
+        }
+        any = 1;
+    }
+    while(MPIU_Any(any, C->Comm)) {
+        for(c = C->c0; c < C->c1; c++)
+            if(C->cs[c].iterating) {
+                C->cs[c].Nlast = C->cs[c].Nbound;
+                C->cs[c].iterations++;
+            }
+        coll_walk(C, C->En);
+        /* energies of the queried particles; the bound ones stay bound */
+        for(i = 0; i < C->NumPart; i++) {
+            const int32_t cc = C->Cand[i];
+            if(!in_round(C, cc) || !C->cs[cc].iterating || !(C->Flag[i] & CF_BOUND) || !part_live(&P[i]))
+                continue;
+            C->En[i] = coll_energy(C, i, C->En[i], &C->cs[cc]);
+            if(!(C->En[i] < 0))
+                C->Flag[i] &= ~CF_BOUND;
+        }
+        round_sums(C, 0, S);
+        any = 0;
+        for(c = C->c0; c < C->c1; c++) {
+            struct CandState * s = &C->cs[c];
+            if(!s->iterating)
+                continue;
+            const double * v = S + NSUM * (c - C->c0);
+            s->Nbound = (int64_t) v[0];
+            s->ConvRatio = s->Nlast > 0 ? (double) s->Nbound / (double) s->Nlast : 0;
+            if(s->Nbound < up->MinNumPart || v[8] < up->MinNumTracerPart) {
+                s->iterating = 0;
+                s->state = -1;
+                s->Nbound = 0;
+                continue;
+            }
+            /* frame of the bound set */
+            s->Mbound = v[1];
+            for(d = 0; d < 3; d++) {
+                s->RefPos[d] = wrap_box(s->Ref0[d] + v[2 + d] / v[1], up->BoxSize);
+                s->RefVel[d] = v[5 + d] / v[1];
+            }
+            s->Ntracer = (int64_t) v[8];
+            if((double) s->Nbound >= (double) s->Nlast * up->BoundMassPrecision) {
+                s->iterating = 0;
+                continue;
+            }
+            if(up->MaxIter > 0 && s->iterations >= up->MaxIter) {
+                /* the flag of an earlier unbinding of the round is kept (ORed, as unbind_counted) */
+                s->flags |= SUBHALO_FLAG_ITERCAP;
+                s->capped = 1;
+                s->iterating = 0;
+                continue;
+            }
+            any = 1;
+        }
+    }
+    /* the deaths: the particles are all unbound */
+    for(i = 0; i < C->NumPart; i++) {
+        const int32_t cc = C->Cand[i];
+        if(in_round(C, cc) && C->cs[cc].state == -1)
+            C->Flag[i] &= ~(CF_BOUND | CF_RES);
+    }
+    for(c = C->c0; c < C->c1; c++) {
+        struct CandState * s = &C->cs[c];
+        if(s->state == -1) {
+            const struct SubhaloMember * m = &C->plan->Members[C->plan->Cands[c].member];
+            s->state = m->kind == SUBHALO_MEM_RESOLVED ? SUBHALO_ST_DIED : SUBHALO_ST_FAILED;
+            s->Nbound = 0;
+            s->Mbound = 0;
+        }
+        if(s->ran && s->capped) {
+            C->st.NItercap++;
+            if(C->st.WorstTrackId == -1 || s->ConvRatio < C->st.WorstConvRatio) {
+                C->st.WorstConvRatio = s->ConvRatio;
+                C->st.WorstTrackId = C->plan->Cands[c].TrackId;
+            }
+        }
+    }
+    myfree(S);
+}
+
+/* ------------------------------------------------------------------ cores (per-owner selection) */
+
+struct CoreRec {
+    int64_t cand;
+    double E;
+    MyIDType ID;
+    double Pos[3], Vel[3], Mass;
+    int32_t tracer, rank;
+    int64_t index;
+    int32_t owner, pad;
+};
+
+static int
+cmp_corerec_owner(const void * a, const void * b)
+{
+    const struct CoreRec * x = (const struct CoreRec *) a, * y = (const struct CoreRec *) b;
+    if(x->owner != y->owner) return (x->owner > y->owner) - (x->owner < y->owner);
+    if(x->cand != y->cand) return (x->cand > y->cand) - (x->cand < y->cand);
+    if(x->E != y->E) return (x->E > y->E) - (x->E < y->E);
+    return (x->ID > y->ID) - (x->ID < y->ID);
+}
+
+/* What the owner tells every rank about a candidate's bound set in energy order. */
+#define CORE_ND 15
+struct CoreOut {
+    double * d;              /* [nc][CORE_ND]: CorePos 3, CoreVel 3, SigmaX, SigmaV, mbPos 3, mbVel 3, has */
+    MyIDType * mbID;         /* [nc] */
+    int64_t * resv;          /* [nc][2 K]: (rank, index) of the reserved tracers, -1 */
+};
+
+/* The core of the SubhaloCoreSize most-bound tracers with non-tracer fill (subhalo_core), the
+ * most-bound tracer (else the most bound particle) and the MinNumTracerPart most-bound tracers,
+ * for every alive candidate of the round, over its bound particles in (En, ID) order: every rank
+ * sends its first K tracers and K non-tracers per candidate to the owner, which merges them;
+ * the results are reduced to every rank. Collective. */
+static void
+round_cores(const struct Coll * C, struct CoreOut * out)
+{
+    const int64_t nc = C->c1 - C->c0;
+    const int CoreSize = C->sp->SubhaloCoreSize > 0 ? C->sp->SubhaloCoreSize : 1;
+    const int NR = C->up->MinNumTracerPart;
+    const int K = CoreSize > NR ? CoreSize : NR;
+    const int TracerTypes = C->up->TracerTypes;
+    const double BoxSize = C->up->BoxSize;
+    int64_t i, n = 0;
+    out->d = (double *) mymalloc("SubCollCoreOutD", sizeof(double) * CORE_ND * (nc + 1));
+    out->mbID = (MyIDType *) mymalloc("SubCollCoreOutId", sizeof(MyIDType) * (nc + 1));
+    out->resv = (int64_t *) mymalloc("SubCollCoreOutRes", sizeof(int64_t) * 2 * NR * (nc + 1));
+    for(i = 0; i < C->NumPart; i++)
+        if(in_round(C, C->Cand[i]) && (C->Flag[i] & CF_BOUND) && C->cs[C->Cand[i]].state == SUBHALO_ST_ALIVE && part_live(&P[i]))
+            n++;
+    struct CoreRec * r = (struct CoreRec *) mymalloc("SubCollCoreRec", sizeof(struct CoreRec) * (n + 1));
+    n = 0;
+    for(i = 0; i < C->NumPart; i++) {
+        const int32_t c = C->Cand[i];
+        if(!(in_round(C, c) && (C->Flag[i] & CF_BOUND) && C->cs[c].state == SUBHALO_ST_ALIVE && part_live(&P[i])))
+            continue;
+        struct CoreRec * e = &r[n++];
+        memset(e, 0, sizeof(*e));
+        e->cand = c;
+        e->E = C->En[i];
+        e->ID = P[i].ID;
+        int d;
+        for(d = 0; d < 3; d++) {
+            e->Pos[d] = P[i].Pos[d];
+            e->Vel[d] = P[i].Vel[d];
+        }
+        e->Mass = P[i].Mass;
+        e->tracer = is_tracer(i, TracerTypes);
+        e->rank = C->ThisTask;
+        e->index = i;
+        e->owner = C->plan->Cands[c].owner;
+    }
+    qsort(r, n, sizeof(struct CoreRec), cmp_corerec_owner);
+    /* keep the first K of each kind per candidate */
+    int64_t m = 0, nt = 0, nn = 0;
+    for(i = 0; i < n; i++) {
+        if(i == 0 || r[i].cand != r[i-1].cand)
+            nt = nn = 0;
+        if(r[i].tracer ? nt++ < K : nn++ < K)
+            r[m++] = r[i];
+    }
+    int64_t * sendcounts = ta_malloc("SubCollCoreCnt", int64_t, C->NTask);
+    memset(sendcounts, 0, sizeof(int64_t) * C->NTask);
+    for(i = 0; i < m; i++)
+        sendcounts[r[i].owner]++;
+    struct CoreRec * in = NULL;
+    const int64_t nin = subhalo_alltoallv(r, sendcounts, sizeof(struct CoreRec), (void **) &in, 0, NULL, C->Comm);
+    ta_free(sendcounts);
+    qsort(in, nin, sizeof(struct CoreRec), cmp_corerec_owner);
+    double * d = (double *) mymalloc("SubCollCoreD", sizeof(double) * CORE_ND * (nc + 1));
+    MyIDType * id = (MyIDType *) mymalloc("SubCollCoreId", sizeof(MyIDType) * (nc + 1));
+    int64_t * rv = (int64_t *) mymalloc("SubCollCoreRes", sizeof(int64_t) * 2 * NR * (nc + 1));
+    memset(d, 0, sizeof(double) * CORE_ND * (nc + 1));
+    memset(id, 0, sizeof(MyIDType) * (nc + 1));
+    for(i = 0; i < 2 * NR * nc; i++)
+        rv[i] = -1;
+    int64_t a = 0;
+    while(a < nin) {
+        int64_t b = a;
+        while(b < nin && in[b].cand == in[a].cand)
+            b++;
+        const int64_t c = in[a].cand - C->c0;
+        double * o = d + CORE_ND * c;
+        /* subhalo_core: the origin is the most bound particle, tracers first, then fill */
+        int64_t num = 0, j;
+        int pass, k;
+        double msum = 0, pos[3] = {0, 0, 0}, pos2[3] = {0, 0, 0}, vel[3] = {0, 0, 0}, vel2[3] = {0, 0, 0};
+        for(pass = 0; pass < 2 && num < CoreSize; pass++)
+            for(j = a; j < b && num < CoreSize; j++) {
+                if((pass == 0) != (in[j].tracer != 0))
+                    continue;
+                num++;
+                const double mm = in[j].Mass;
+                msum += mm;
+                for(k = 0; k < 3; k++) {
+                    const double dx = NEAREST(in[j].Pos[k] - in[a].Pos[k], BoxSize);
+                    pos[k] += mm * dx;
+                    pos2[k] += mm * dx * dx;
+                    vel[k] += mm * in[j].Vel[k];
+                    vel2[k] += mm * in[j].Vel[k] * in[j].Vel[k];
+                }
+            }
+        double sx2 = 0, sv2 = 0;
+        for(k = 0; k < 3; k++) {
+            pos[k] /= msum;
+            pos2[k] /= msum;
+            vel[k] /= msum;
+            vel2[k] /= msum;
+            o[k] = wrap_box(in[a].Pos[k] + pos[k], BoxSize);
+            o[3 + k] = vel[k];
+            const double vx = pos2[k] - pos[k] * pos[k], vv = vel2[k] - vel[k] * vel[k];
+            sx2 += vx > 0 ? vx : 0;
+            sv2 += vv > 0 ? vv : 0;
+        }
+        o[6] = sqrt(sx2);
+        o[7] = sqrt(sv2);
+        int64_t mb = a, nr = 0;
+        for(j = a; j < b; j++)
+            if(in[j].tracer) {
+                mb = j;
+                break;
+            }
+        for(k = 0; k < 3; k++) {
+            o[8 + k] = in[mb].Pos[k];
+            o[11 + k] = in[mb].Vel[k];
+        }
+        o[14] = 1;
+        id[c] = in[mb].ID;
+        for(j = a; j < b && nr < NR; j++)
+            if(in[j].tracer) {
+                rv[2 * (NR * c + nr)] = in[j].rank;
+                rv[2 * (NR * c + nr) + 1] = in[j].index;
+                nr++;
+            }
+        a = b;
+    }
+    if(nc > 0) {
+        MPI_Allreduce(d, out->d, CORE_ND * nc, MPI_DOUBLE, MPI_SUM, C->Comm);
+        MPI_Allreduce(id, out->mbID, nc, MPI_UINT64_T, MPI_MAX, C->Comm);
+        MPI_Allreduce(rv, out->resv, 2 * NR * nc, MPI_INT64, MPI_MAX, C->Comm);
+    }
+    myfree(rv);
+    myfree(id);
+    myfree(d);
+    myfree(in);
+    myfree(r);
+}
+
+static void
+free_cores(struct CoreOut * o)
+{
+    myfree(o->resv);
+    myfree(o->mbID);
+    myfree(o->d);
+}
+
+/* The previous most-bound tracer of the candidates of the round that died (the first own-tag
+ * tracer in BindRank order, ties by ID; process_serial_key): every rank's best by (BindRank, ID),
+ * reduced. Collective. */
+static void
+dead_mb(struct Coll * C)
+{
+    const int64_t nc = C->c1 - C->c0;
+    int64_t i, c;
+    int d;
+    int64_t * br = (int64_t *) mymalloc("SubCollMbBr", sizeof(int64_t) * 2 * (nc + 1));
+    MyIDType * ids = (MyIDType *) mymalloc("SubCollMbId", sizeof(MyIDType) * 2 * (nc + 1));
+    double * pv = (double *) mymalloc("SubCollMbPv", sizeof(double) * 12 * (nc + 1));
+    for(c = 0; c < nc; c++) {
+        br[c] = INT64_MAX;
+        ids[c] = (MyIDType) -1;
+    }
+    for(i = 0; i < C->NumPart; i++) {
+        const int32_t cc = C->Cand[i];
+        if(!in_round(C, cc) || C->cs[cc].state != SUBHALO_ST_DIED || !part_live(&P[i]) || !is_tracer(i, C->up->TracerTypes)
+           || P[i].TrackId != C->plan->Cands[cc].TrackId)
+            continue;
+        if(P[i].BindRank < br[cc - C->c0])
+            br[cc - C->c0] = P[i].BindRank;
+    }
+    if(nc > 0)
+        MPI_Allreduce(br, br + nc, nc, MPI_INT64, MPI_MIN, C->Comm);
+    for(i = 0; i < C->NumPart; i++) {
+        const int32_t cc = C->Cand[i];
+        if(!in_round(C, cc) || C->cs[cc].state != SUBHALO_ST_DIED || !part_live(&P[i]) || !is_tracer(i, C->up->TracerTypes)
+           || P[i].TrackId != C->plan->Cands[cc].TrackId || P[i].BindRank != br[nc + cc - C->c0])
+            continue;
+        if(P[i].ID < ids[cc - C->c0])
+            ids[cc - C->c0] = P[i].ID;
+    }
+    if(nc > 0)
+        MPI_Allreduce(ids, ids + nc, nc, MPI_UINT64_T, MPI_MIN, C->Comm);
+    memset(pv, 0, sizeof(double) * 12 * (nc + 1));
+    for(i = 0; i < C->NumPart; i++) {
+        const int32_t cc = C->Cand[i];
+        if(!in_round(C, cc) || C->cs[cc].state != SUBHALO_ST_DIED || P[i].ID != ids[nc + cc - C->c0] || !part_live(&P[i])
+           || P[i].TrackId != C->plan->Cands[cc].TrackId)
+            continue;
+        for(d = 0; d < 3; d++) {
+            pv[6 * (cc - C->c0) + d] = P[i].Pos[d];
+            pv[6 * (cc - C->c0) + 3 + d] = P[i].Vel[d];
+        }
+    }
+    if(nc > 0)
+        MPI_Allreduce(pv, pv + 6 * nc, 6 * nc, MPI_DOUBLE, MPI_SUM, C->Comm);
+    for(c = 0; c < nc; c++) {
+        struct CandState * s = &C->cs[C->c0 + c];
+        if(s->state != SUBHALO_ST_DIED)
+            continue;
+        s->has_mb = br[nc + c] < INT64_MAX;
+        s->has_core = s->has_mb;
+        if(!s->has_mb)
+            continue;
+        s->mbID = ids[nc + c];
+        for(d = 0; d < 3; d++) {
+            s->mbPos[d] = s->CorePos[d] = pv[6 * nc + 6 * c + d];
+            s->mbVel[d] = s->CoreVel[d] = pv[6 * nc + 6 * c + 3 + d];
+        }
+        s->SigmaX = s->SigmaV = 0;
+    }
+    myfree(pv);
+    myfree(ids);
+    myfree(br);
+}
+
+/* ------------------------------------------------------------------ properties: the distributed ordered set */
+
+/* Per-candidate results of a round, on every rank (the owner writes the record from them). */
+#define HS_N 0
+#define HS_NTR 1
+#define HS_NT 2
+#define HS_MT 8
+#define HS_M 14
+#define HS_K 15
+#define HS_U 16
+#define HS_J 17
+#define HS_I 20
+#define HS_SFR 26
+#define HS_HE 27
+#define HS_BHM 28
+#define HS_MDOT 29
+#define HS_GZ 30
+#define HS_SZ 31
+#define HS_GZE 32
+#define HS_SZE (32 + NMETALS)
+#define NHS (32 + 2 * NMETALS)
+
+struct RoundProps {
+    double * hs;             /* [nc][NHS] holder-side sums */
+    double * bhm;            /* [nc] most massive BH subgrid mass, -1 */
+    MyIDType * bhid;         /* [nc] its ID, (MyIDType) -1 */
+    /* the radial profile */
+    double * Mso;            /* [nc][NSO] */
+    int64_t * kc;            /* [nc][NSO] crossing positions, -1 */
+    double * prof;           /* [nc][8]: hbt best M/r, Rmax, vir best M/r, RmaxVir, rhalf, Renclose, (unused) x2 */
+    double * jv;             /* [nc][9]: JVir sums 3, x sums 3, v sums 3 */
+    float * shape;           /* [nc][2][5]: BtoA, CtoA, AxisA[3] (vir, 500c), -1 */
+};
+
+struct RadRec {
+    uint64_t key[3];         /* radix: ID, r, label (most significant last) */
+    double r, m;
+    double dx[3];            /* NEAREST(x - core) */
+    double vel[3];
+};
+
+static void
+radrec_radix(const void * a, void * radix, void * arg)
+{
+    memcpy(radix, ((const struct RadRec *) a)->key, 24);
+}
+
+static void
+coll_eigen3(double mat[9], double eval[3], double evec[9], gsl_eigen_symmv_workspace * ws)
+{
+    gsl_matrix_view m = gsl_matrix_view_array(mat, 3, 3);
+    gsl_vector_view ev = gsl_vector_view_array(eval, 3);
+    gsl_matrix_view em = gsl_matrix_view_array(evec, 3, 3);
+    gsl_eigen_symmv(&m.matrix, &ev.vector, &em.matrix, ws);
+    gsl_eigen_symmv_sort(&ev.vector, &em.matrix, GSL_EIGEN_SORT_VAL_DESC);
+}
+
+/* The Allgood fit of subhalo_props.c (allgood_shape) for every candidate with an aperture,
+ * the tensor sums reduced over the ranks each iteration. np[c]: particles of the aperture (the
+ * global positions 0 .. np - 1), R[c] its radius; out: BtoA, CtoA, AxisA per candidate. */
+static void
+shapes_distributed(const struct Coll * C, const struct RadRec * rr, int64_t nr, const int64_t * pos, int64_t nc,
+                   const int64_t * np, const double * R, double rfloor, float * out, int stride)
+{
+    int64_t c, k;
+    int d, e, it;
+    double * orth = (double *) mymalloc("SubCollShOrth", sizeof(double) * 9 * (nc + 1));
+    double * ax2 = (double *) mymalloc("SubCollShAx", sizeof(double) * 3 * (nc + 1));
+    double * prev = (double *) mymalloc("SubCollShPrev", sizeof(double) * 2 * (nc + 1));
+    int * active = (int *) mymalloc("SubCollShAct", sizeof(int) * (nc + 1));
+    double * T = (double *) mymalloc("SubCollShT", sizeof(double) * 8 * (nc + 1));
+    double * TG = (double *) mymalloc("SubCollShTG", sizeof(double) * 8 * (nc + 1));
+    gsl_eigen_symmv_workspace * ws = gsl_eigen_symmv_alloc(3);
+    if(!ws)
+        endrun(1, "Subhalo properties: gsl_eigen_symmv_alloc failed\n");
+    int nact = 0;
+    for(c = 0; c < nc; c++) {
+        active[c] = np[c] >= SHAPE_MINPART && R[c] > 0;
+        nact += active[c];
+        for(d = 0; d < 9; d++)
+            orth[9 * c + d] = (d % 4 == 0) ? 1 : 0;
+        for(d = 0; d < 3; d++)
+            ax2[3 * c + d] = R[c] * R[c];
+        prev[2 * c] = prev[2 * c + 1] = 0;
+    }
+    for(it = 0; it < SHAPE_ITERATIONS && nact > 0; it++) {
+        memset(T, 0, sizeof(double) * 8 * (nc + 1));
+        for(k = 0; k < nr; k++) {
+            c = (int64_t) rr[k].key[2];
+            if(!active[c] || pos[k] >= np[c])
+                continue;
+            const double minq2 = (rfloor / R[c]) * (rfloor / R[c]);
+            double q2 = 0;
+            for(e = 0; e < 3; e++) {
+                const double * o = orth + 9 * c + 3 * e;
+                const double pe = o[0] * rr[k].dx[0] + o[1] * rr[k].dx[1] + o[2] * rr[k].dx[2];
+                q2 += pe * pe / ax2[3 * c + e];
+            }
+            if(q2 < minq2)
+                q2 = minq2;
+            if(!(q2 <= 1))
+                continue;
+            const double w = rr[k].m / q2;
+            double * t = T + 8 * c;
+            t[6] += 1;
+            t[7] += w;
+            int q = 0;
+            for(d = 0; d < 3; d++)
+                for(e = 0; e <= d; e++)
+                    t[q++] += w * rr[k].dx[d] * rr[k].dx[e];
+        }
+        MPI_Allreduce(T, TG, 8 * nc, MPI_DOUBLE, MPI_SUM, C->Comm);
+        nact = 0;
+        for(c = 0; c < nc; c++) {
+            if(!active[c])
+                continue;
+            const double * t = TG + 8 * c;
+            if(t[6] < SHAPE_MINPART || !(t[7] > 0)) {
+                active[c] = 0;
+                continue;
+            }
+            double M[9], eval[3], evec[9];
+            int q = 0;
+            for(d = 0; d < 3; d++)
+                for(e = 0; e <= d; e++) {
+                    M[3 * d + e] = t[q++] / t[7];
+                    M[3 * e + d] = M[3 * d + e];
+                }
+            coll_eigen3(M, eval, evec, ws);
+            if(!(eval[0] > 0 && eval[1] > 0 && eval[2] > 0)) {
+                active[c] = 0;
+                continue;
+            }
+            const double ba = sqrt(eval[1] / eval[0]), ca = sqrt(eval[2] / eval[0]);
+            double A[3] = {evec[0], evec[3], evec[6]};
+            int big = 0;
+            for(d = 1; d < 3; d++)
+                if(fabs(A[d]) > fabs(A[big]))
+                    big = d;
+            const double sgn = A[big] < 0 ? -1 : 1;
+            float * o = out + stride * c;
+            o[0] = (float) ba;
+            o[1] = (float) ca;
+            for(d = 0; d < 3; d++)
+                o[2 + d] = (float) (sgn * A[d]);
+            if(fabs(ba - prev[2 * c]) < 0.01 * prev[2 * c] && fabs(ca - prev[2 * c + 1]) < 0.01 * prev[2 * c + 1]) {
+                active[c] = 0;
+                continue;
+            }
+            prev[2 * c] = ba;
+            prev[2 * c + 1] = ca;
+            for(e = 0; e < 3; e++) {
+                for(d = 0; d < 3; d++)
+                    orth[9 * c + 3 * e + d] = evec[3 * d + e];
+                ax2[3 * c + e] = R[c] * R[c] * eval[e] / eval[0];
+            }
+            nact++;
+        }
+    }
+    gsl_eigen_symmv_free(ws);
+    myfree(TG);
+    myfree(T);
+    myfree(active);
+    myfree(prev);
+    myfree(ax2);
+    myfree(orth);
+}
+
+/* The properties of the alive candidates of the round (subhalo_props_hbt, subhalo_props_rockstar
+ * and subhalo_props_baryons with the same formulas), from the final-pass energies, the final
+ * frames and the final cores. Collective; rp is allocated here (bottom) and freed by the caller
+ * with free_round_props. */
+static void
+round_props(const struct Coll * C, const struct CoreOut * core, struct RoundProps * rp)
+{
+    const int64_t nc = C->c1 - C->c0;
+    const struct SubhaloUnbindParams * up = C->up;
+    const double a = up->atime, BoxSize = up->BoxSize;
+    const double rfloor = up->h / 2.8;
+    const double * rho = C->ctx->rho;
+    int64_t i, c, k;
+    int d, s;
+
+    rp->hs = (double *) mymalloc("SubCollHs", sizeof(double) * NHS * (nc + 1));
+    rp->bhm = (double *) mymalloc("SubCollBhm", sizeof(double) * (nc + 1));
+    rp->bhid = (MyIDType *) mymalloc("SubCollBhid", sizeof(MyIDType) * (nc + 1));
+    rp->Mso = (double *) mymalloc("SubCollMso", sizeof(double) * SUBHALO_NSO * (nc + 1));
+    rp->kc = (int64_t *) mymalloc("SubCollKc", sizeof(int64_t) * SUBHALO_NSO * (nc + 1));
+    rp->prof = (double *) mymalloc("SubCollProf", sizeof(double) * 8 * (nc + 1));
+    rp->jv = (double *) mymalloc("SubCollJv", sizeof(double) * 9 * (nc + 1));
+    rp->shape = (float *) mymalloc("SubCollShape", sizeof(float) * 10 * (nc + 1));
+    for(k = 0; k < 10 * nc; k++)
+        rp->shape[k] = -1;
+
+    /* ---- holder-side sums: counts, masses, energies, J, inertia, baryons ---- */
+    double * hs = (double *) mymalloc("SubCollHsLoc", sizeof(double) * NHS * (nc + 1));
+    double * bm = (double *) mymalloc("SubCollBhmLoc", sizeof(double) * (nc + 1));
+    MyIDType * bid = (MyIDType *) mymalloc("SubCollBhidLoc", sizeof(MyIDType) * (nc + 1));
+    memset(hs, 0, sizeof(double) * NHS * (nc + 1));
+    for(c = 0; c < nc; c++) {
+        bm[c] = -1;
+        bid[c] = (MyIDType) -1;
+    }
+    int64_t nb = 0;
+    for(i = 0; i < C->NumPart; i++) {
+        const int32_t cc = C->Cand[i];
+        if(!in_round(C, cc) || !(C->Flag[i] & CF_BOUND) || C->cs[cc].state != SUBHALO_ST_ALIVE || !part_live(&P[i]))
+            continue;
+        nb++;
+        const struct CandState * cs = &C->cs[cc];
+        const double * cp = core->d + CORE_ND * (cc - C->c0);
+        double * h = hs + NHS * (cc - C->c0);
+        const double m = P[i].Mass;
+        const int type = P[i].Type;
+        h[HS_N] += 1;
+        if(is_tracer(i, up->TracerTypes))
+            h[HS_NTR] += 1;
+        h[HS_NT + type] += 1;
+        h[HS_MT + type] += m;
+        h[HS_M] += m;
+        double k2 = 0, dxc[3], dvc[3];
+        for(d = 0; d < 3; d++) {
+            const double dx = NEAREST(P[i].Pos[d] - cs->RefPos[d], BoxSize);
+            const double dv = (P[i].Vel[d] - cs->RefVel[d]) / a + up->Hubble * a * dx;
+            k2 += dv * dv;
+            dxc[d] = NEAREST(P[i].Pos[d] - cp[d], BoxSize);
+            dvc[d] = P[i].Vel[d] - cs->RefVel[d];
+        }
+        double phi = C->En[i] - 0.5 * k2;
+        if(up->WithThermal)
+            phi -= subhalo_thermal_energy(i, a);
+        h[HS_K] += m * 0.5 * k2;
+        h[HS_U] += m * phi;
+        h[HS_J + 0] += m * (dxc[1] * dvc[2] - dxc[2] * dvc[1]);
+        h[HS_J + 1] += m * (dxc[2] * dvc[0] - dxc[0] * dvc[2]);
+        h[HS_J + 2] += m * (dxc[0] * dvc[1] - dxc[1] * dvc[0]);
+        h[HS_I + 0] += m * dxc[0] * dxc[0];
+        h[HS_I + 1] += m * dxc[1] * dxc[1];
+        h[HS_I + 2] += m * dxc[2] * dxc[2];
+        h[HS_I + 3] += m * dxc[0] * dxc[1];
+        h[HS_I + 4] += m * dxc[0] * dxc[2];
+        h[HS_I + 5] += m * dxc[1] * dxc[2];
+        if(type == 0) {
+            h[HS_HE] += m * P[i].HeIIIionized;
+            h[HS_SFR] += SPHP(i).Sfr;
+            h[HS_GZ] += SPHP(i).Metallicity * m;
+            for(d = 0; d < NMETALS; d++)
+                h[HS_GZE + d] += SPHP(i).Metals[d] * m;
+        }
+        else if(type == 4) {
+            h[HS_SZ] += STARP(i).Metallicity * m;
+            for(d = 0; d < NMETALS; d++)
+                h[HS_SZE + d] += STARP(i).Metals[d] * m;
+        }
+        else if(type == 5) {
+            const double bmass = BHP(i).Mass;
+            h[HS_BHM] += bmass;
+            h[HS_MDOT] += BHP(i).Mdot;
+            const int64_t q = cc - C->c0;
+            if(bmass > bm[q] || (bmass == bm[q] && P[i].ID < bid[q])) {
+                bm[q] = bmass;
+                bid[q] = P[i].ID;
+            }
+        }
+    }
+    if(nc > 0) {
+        MPI_Allreduce(hs, rp->hs, NHS * nc, MPI_DOUBLE, MPI_SUM, C->Comm);
+        MPI_Allreduce(bm, rp->bhm, nc, MPI_DOUBLE, MPI_MAX, C->Comm);
+        for(c = 0; c < nc; c++)
+            if(bm[c] != rp->bhm[c])
+                bid[c] = (MyIDType) -1;
+        MPI_Allreduce(bid, rp->bhid, nc, MPI_UINT64_T, MPI_MIN, C->Comm);
+    }
+    myfree(bid);
+    myfree(bm);
+    myfree(hs);
+
+    /* ---- the radial ordered set about the cores: (label, r, ID), M(<= r) by a vector Exscan ---- */
+    int64_t ntot = 0;
+    MPI_Allreduce(&nb, &ntot, 1, MPI_INT64, MPI_SUM, C->Comm);
+    for(c = 0; c < nc; c++) {
+        for(s = 0; s < SUBHALO_NSO; s++) {
+            rp->kc[SUBHALO_NSO * c + s] = -1;
+            rp->Mso[SUBHALO_NSO * c + s] = 0;
+        }
+        for(d = 0; d < 8; d++)
+            rp->prof[8 * c + d] = -1;
+        for(d = 0; d < 9; d++)
+            rp->jv[9 * c + d] = 0;
+    }
+    if(ntot == 0)
+        return;
+    struct RadRec * rr = (struct RadRec *) mymalloc("SubCollRad", sizeof(struct RadRec) * (nb + 1));
+    nb = 0;
+    for(i = 0; i < C->NumPart; i++) {
+        const int32_t cc = C->Cand[i];
+        if(!in_round(C, cc) || !(C->Flag[i] & CF_BOUND) || C->cs[cc].state != SUBHALO_ST_ALIVE || !part_live(&P[i]))
+            continue;
+        const double * cp = core->d + CORE_ND * (cc - C->c0);
+        struct RadRec * e = &rr[nb++];
+        double r2 = 0;
+        for(d = 0; d < 3; d++) {
+            e->dx[d] = NEAREST(P[i].Pos[d] - cp[d], BoxSize);
+            e->vel[d] = P[i].Vel[d];
+            r2 += e->dx[d] * e->dx[d];
+        }
+        const double r = sqrt(r2);
+        e->r = r > rfloor ? r : rfloor;
+        e->m = P[i].Mass;
+        e->key[0] = P[i].ID;
+        e->key[1] = double_key(e->r);
+        e->key[2] = (uint64_t) (cc - C->c0);
+    }
+    mpsort_mpi(rr, nb, sizeof(struct RadRec), radrec_radix, 24, NULL, C->Comm);
+    /* positions and cumulative masses: local prefix per label + vector Exscan */
+    int64_t * cnt = (int64_t *) mymalloc("SubCollRadCnt", sizeof(int64_t) * 2 * (nc + 1));
+    double * msum = (double *) mymalloc("SubCollRadM", sizeof(double) * 2 * (nc + 1));
+    memset(cnt, 0, sizeof(int64_t) * 2 * (nc + 1));
+    memset(msum, 0, sizeof(double) * 2 * (nc + 1));
+    for(k = 0; k < nb; k++) {
+        cnt[rr[k].key[2]]++;
+        msum[rr[k].key[2]] += rr[k].m;
+    }
+    MPI_Exscan(cnt, cnt + nc, nc, MPI_INT64, MPI_SUM, C->Comm);
+    MPI_Exscan(msum, msum + nc, nc, MPI_DOUBLE, MPI_SUM, C->Comm);
+    if(C->ThisTask == 0)
+        for(c = 0; c < nc; c++) {
+            cnt[nc + c] = 0;
+            msum[nc + c] = 0;
+        }
+    int64_t * pos = (int64_t *) mymalloc("SubCollRadPos", sizeof(int64_t) * (nb + 1));
+    /* local candidates of each per-label quantity (the global one is reduced below) */
+    const int NL = 8 + 2 * SUBHALO_NSO;
+    double * L = (double *) mymalloc("SubCollRadL", sizeof(double) * NL * (nc + 1));
+    double * G = (double *) mymalloc("SubCollRadG", sizeof(double) * NL * (nc + 1));
+    /* L: 0 hbt best, 1 vir best, 2 rhalf position (min), 3 Renclose (max r), 4.. kc[s] (max), (4 + NSO).. unused */
+    for(c = 0; c < nc; c++) {
+        double * l = L + NL * c;
+        l[0] = -1;
+        l[1] = 0;
+        l[2] = 1e300;
+        l[3] = -1;
+        for(s = 0; s < SUBHALO_NSO; s++)
+            l[4 + s] = -1;
+    }
+    double * Mc = (double *) mymalloc("SubCollRadMc", sizeof(double) * (nb + 1));
+    {
+        int64_t lab = -1, j = 0;
+        double M = 0;
+        for(k = 0; k < nb; k++) {
+            c = (int64_t) rr[k].key[2];
+            if(c != lab) {
+                lab = c;
+                j = 0;
+                M = msum[nc + c];
+            }
+            pos[k] = cnt[nc + c] + j++;
+            M += rr[k].m;
+            Mc[k] = M;
+            const double r = rr[k].r;
+            const double Mtot = rp->hs[NHS * c + HS_M];
+            const double dens = M / (4.0 / 3.0 * M_PI * r * r * r);
+            double * l = L + NL * c;
+            for(s = 0; s < SUBHALO_NSO; s++)
+                if(dens > rho[s])
+                    l[4 + s] = (double) pos[k];
+            if(M / r > l[0])
+                l[0] = M / r;
+            if(dens > rho[0] && M / r > l[1])
+                l[1] = M / r;
+            if(M >= 0.5 * Mtot && (double) pos[k] < l[2])
+                l[2] = (double) pos[k];
+            if(r > l[3])
+                l[3] = r;
+        }
+    }
+    /* maxima of the values and the crossing positions, the minimum of the half-mass position */
+    double * MX = (double *) mymalloc("SubCollRadMx", sizeof(double) * NL * (nc + 1));
+    for(c = 0; c < nc; c++) {
+        double * l = L + NL * c, * g = G + NL * c;
+        g[0] = l[0];
+        g[1] = l[1];
+        g[2] = -l[2];
+        g[3] = l[3];
+        for(s = 0; s < SUBHALO_NSO; s++)
+            g[4 + s] = l[4 + s];
+    }
+    MPI_Allreduce(G, MX, NL * nc, MPI_DOUBLE, MPI_MAX, C->Comm);
+    /* second scan: the position attaining each maximum first, the masses at the crossings, the radii */
+    for(c = 0; c < nc; c++) {
+        double * g = G + NL * c;
+        for(d = 0; d < NL; d++)
+            g[d] = 0;
+        g[0] = g[1] = 1e300;        /* positions of the first maximum: min */
+    }
+    for(k = 0; k < nb; k++) {
+        c = (int64_t) rr[k].key[2];
+        const double * mx = MX + NL * c;
+        double * g = G + NL * c;
+        const double r = rr[k].r, M = Mc[k];
+        const double dens = M / (4.0 / 3.0 * M_PI * r * r * r);
+        if(M / r == mx[0] && (double) pos[k] < g[0])
+            g[0] = (double) pos[k];
+        if(mx[1] > 0 && dens > rho[0] && M / r == mx[1] && (double) pos[k] < g[1])
+            g[1] = (double) pos[k];
+    }
+    double * G2 = (double *) mymalloc("SubCollRadG2", sizeof(double) * NL * (nc + 1));
+    for(c = 0; c < nc; c++) {
+        G[NL * c] = -G[NL * c];
+        G[NL * c + 1] = -G[NL * c + 1];
+    }
+    MPI_Allreduce(G, G2, NL * nc, MPI_DOUBLE, MPI_MAX, C->Comm);
+    for(c = 0; c < nc; c++) {
+        double * g = G + NL * c;
+        for(d = 0; d < NL; d++)
+            g[d] = 0;
+    }
+    /* sums of the values at the chosen positions (one particle each) */
+    for(k = 0; k < nb; k++) {
+        c = (int64_t) rr[k].key[2];
+        const double * mx = MX + NL * c, * p2 = G2 + NL * c;
+        double * g = G + NL * c;
+        const double pk = (double) pos[k];
+        if(pk == -p2[0]) g[0] += rr[k].r;                 /* Rmax */
+        if(pk == -p2[1]) g[1] += rr[k].r;                 /* RmaxVir */
+        if(pk == -mx[2]) g[2] += rr[k].r;                 /* Rhalf */
+        for(s = 0; s < SUBHALO_NSO; s++)
+            if(mx[4 + s] >= 0 && pk == mx[4 + s])
+                g[4 + s] += Mc[k];                         /* Mso */
+    }
+    MPI_Allreduce(G, G2, NL * nc, MPI_DOUBLE, MPI_SUM, C->Comm);
+    for(c = 0; c < nc; c++) {
+        const double * mx = MX + NL * c, * g = G2 + NL * c;
+        double * pr = rp->prof + 8 * c;
+        pr[0] = mx[0];                  /* best M/r (HBT, all bound) */
+        pr[1] = g[0];                   /* Rmax */
+        pr[2] = mx[1];                  /* best M/r inside the virial threshold, 0 if none */
+        pr[3] = mx[1] > 0 ? g[1] : -1;  /* RmaxVir */
+        pr[4] = g[2];                   /* Rhalf */
+        pr[5] = mx[3];                  /* Renclose */
+        for(s = 0; s < SUBHALO_NSO; s++) {
+            rp->kc[SUBHALO_NSO * c + s] = (int64_t) mx[4 + s];
+            rp->Mso[SUBHALO_NSO * c + s] = mx[4 + s] >= 0 ? g[4 + s] : 0;
+        }
+    }
+    myfree(G2);
+    myfree(MX);
+    /* inside the virial aperture (crossing particle included): JVir in the CoreVel frame, the mean
+     * offsets (properties.c:417-458) */
+    {
+        double * jl = (double *) mymalloc("SubCollJvLoc", sizeof(double) * 9 * (nc + 1));
+        memset(jl, 0, sizeof(double) * 9 * (nc + 1));
+        for(k = 0; k < nb; k++) {
+            c = (int64_t) rr[k].key[2];
+            if(pos[k] > rp->kc[SUBHALO_NSO * c])
+                continue;
+            const double * cp = core->d + CORE_ND * c;
+            double dvk[3];
+            for(d = 0; d < 3; d++)
+                dvk[d] = rr[k].vel[d] - cp[3 + d];
+            const double m = rr[k].m;
+            double * j = jl + 9 * c;
+            j[0] += m * (rr[k].dx[1] * dvk[2] - rr[k].dx[2] * dvk[1]);
+            j[1] += m * (rr[k].dx[2] * dvk[0] - rr[k].dx[0] * dvk[2]);
+            j[2] += m * (rr[k].dx[0] * dvk[1] - rr[k].dx[1] * dvk[0]);
+            for(d = 0; d < 3; d++) {
+                j[3 + d] += m * rr[k].dx[d];
+                j[6 + d] += m * dvk[d];
+            }
+        }
+        MPI_Allreduce(jl, rp->jv, 9 * nc, MPI_DOUBLE, MPI_SUM, C->Comm);
+        myfree(jl);
+    }
+    /* shapes at Rvir and R500c over the particles up to each crossing */
+    {
+        int64_t * np = (int64_t *) mymalloc("SubCollShNp", sizeof(int64_t) * (nc + 1));
+        double * R = (double *) mymalloc("SubCollShR", sizeof(double) * (nc + 1));
+        int ap;
+        for(ap = 0; ap < 2; ap++) {
+            const int sdef = ap == 0 ? 0 : 3;
+            for(c = 0; c < nc; c++) {
+                const int64_t kcs = rp->kc[SUBHALO_NSO * c + sdef];
+                np[c] = kcs >= 0 ? kcs + 1 : 0;
+                R[c] = kcs >= 0 ? cbrt(3 * rp->Mso[SUBHALO_NSO * c + sdef] / (4 * M_PI * rho[sdef])) : -1;
+            }
+            shapes_distributed(C, rr, nb, pos, nc, np, R, rfloor, rp->shape + 5 * ap, 10);
+        }
+        myfree(R);
+        myfree(np);
+    }
+    myfree(Mc);
+    myfree(G);
+    myfree(L);
+    myfree(pos);
+    myfree(msum);
+    myfree(cnt);
+    myfree(rr);
+}
+
+static void
+free_round_props(struct RoundProps * rp)
+{
+    myfree(rp->shape);
+    myfree(rp->jv);
+    myfree(rp->prof);
+    myfree(rp->kc);
+    myfree(rp->Mso);
+    myfree(rp->bhid);
+    myfree(rp->bhm);
+    myfree(rp->hs);
+}
+
+/* ------------------------------------------------------------------ sinking */
+
+static int64_t
+member_lookup_c(const struct Coll * C, int64_t TrackId)
+{
+    const struct SubhaloMember * m = member_of(C, TrackId);
+    return m ? m - C->plan->Members : -1;
+}
+
+/* 1 if member a is a proper ancestor of member j in the processing tree. */
+static int
+member_ancestor(const struct SubhaloMember * M, int64_t j, int64_t a, int64_t nmem)
+{
+    int64_t u = M[j].Parent, steps = 0;
+    while(u >= 0 && steps++ <= nmem) {
+        if(u == a)
+            return 1;
+        u = M[u].Parent;
+    }
+    return 0;
+}
+
+/* HBT MergeRecursively for every alive candidate X of the round against its whole processing
+ * subtree (serial members and in-place candidates of earlier rounds): the resolved descendants
+ * alive or dead this call with a core whose core falls in X's (subhalo_sink_test) sink into X;
+ * a sunk survivor's bound set joins X's source (serial: BoundTrackId == S, a local test;
+ * in place: its bound particles). Returns the number of candidates that absorbed a survivor
+ * (identical on every rank). */
+static int64_t
+round_sinking(struct Coll * C)
+{
+    if(!C->sp->SubhaloMergeTrapped)
+        return 0;
+    struct SubhaloMember * M = C->plan->Members;
+    const int64_t nmem = C->plan->NMembers;
+    const struct SubhaloInplaceCand * Cd = C->plan->Cands;
+    int64_t c, j, nabs = 0, nsink = 0;
+    /* members that sank alive into a candidate of this round */
+    char * sank = (char *) mymalloc("SubCollSank", nmem + 1);
+    memset(sank, 0, nmem + 1);
+    for(c = C->c0; c < C->c1; c++) {
+        struct CandState * x = &C->cs[c];
+        if(x->state != SUBHALO_ST_ALIVE || !x->has_core)
+            continue;
+        const int64_t xm = Cd[c].member;
+        for(j = 0; j < nmem; j++) {
+            if(j == xm || M[j].g != M[xm].g || M[j].kind != SUBHALO_MEM_RESOLVED || !member_ancestor(M, j, xm, nmem))
+                continue;
+            int st;
+            const double * pos, * vel;
+            double sx, sv;
+            if(M[j].cand >= 0) {
+                const struct CandState * y = &C->cs[M[j].cand];
+                st = y->state;
+                if(!y->has_core) continue;
+                pos = y->CorePos;
+                vel = y->CoreVel;
+                sx = y->SigmaX;
+                sv = y->SigmaV;
+            }
+            else {
+                st = M[j].state;
+                if(!M[j].has_core) continue;
+                pos = M[j].CorePos;
+                vel = M[j].CoreVel;
+                sx = M[j].SigmaX;
+                sv = M[j].SigmaV;
+            }
+            if(st != SUBHALO_ST_ALIVE && st != SUBHALO_ST_DIED)
+                continue;
+            if(!subhalo_sink_test(pos, vel, x->CorePos, x->CoreVel, x->SigmaX, x->SigmaV, sx, sv, C->sp->SubhaloSinkSymmetric, C->up->BoxSize))
+                continue;
+            nsink++;
+            if(M[j].cand >= 0) {
+                C->cs[M[j].cand].state = SUBHALO_ST_SUNK;
+                C->cs[M[j].cand].SinkTrackId = Cd[c].TrackId;
+            }
+            M[j].state = SUBHALO_ST_SUNK;
+            M[j].SinkTrackId = Cd[c].TrackId;
+            /* a survivor's bound set joins x */
+            if(st == SUBHALO_ST_ALIVE) {
+                sank[j] = 1;
+                if(!x->absorbed) {
+                    x->absorbed = 1;
+                    nabs++;
+                }
+            }
+        }
+    }
+    CollStats.NSunk += nsink;
+    if(nabs == 0) {
+        myfree(sank);
+        return 0;
+    }
+    /* the bound sets move: serial ones by their BoundTrackId, in-place ones by their candidate */
+    int64_t i;
+    for(i = 0; i < C->NumPart; i++) {
+        if(!part_live(&P[i]))
+            continue;
+        if(C->Flag[i] & CF_SBOUND) {
+            const int64_t b = member_lookup_c(C, P[i].BoundTrackId);
+            if(b >= 0 && sank[b] && M[b].cand < 0) {
+                C->Cand[i] = M[member_lookup_c(C, M[b].SinkTrackId)].cand;
+                C->Flag[i] &= ~CF_SBOUND;
+            }
+        }
+        else if(C->Cand[i] >= 0 && (C->Flag[i] & CF_BOUND)) {
+            const int64_t y = Cd[C->Cand[i]].member;
+            if(sank[y]) {
+                C->Cand[i] = M[member_lookup_c(C, M[y].SinkTrackId)].cand;
+                C->Flag[i] &= ~(CF_BOUND | CF_RES);
+            }
+        }
+    }
+    myfree(sank);
+    return nabs;
+}
+
+/* ------------------------------------------------------------------ claims and the commit of a round */
+
+#define CF_WITHIN 64     /* round scratch: inside its candidate's relaxed source */
+#define CF_ADDED 128     /* final pass: given to its serial binder (its serial claimant sank) */
+
+struct UPosRec {
+    uint64_t key[3];         /* radix: ID, E, label */
+    int32_t rank, pad;
+    int64_t index;
+};
+
+static void
+uposrec_radix(const void * a, void * radix, void * arg)
+{
+    memcpy(radix, ((const struct UPosRec *) a)->key, 24);
+}
+
+/* The unbound particles of every alive candidate of the round that lie inside its relaxed
+ * source (list positions Nbound .. keep - 1 in the energy order of their removal, ties by ID):
+ * a global sort on (label, E, ID), the positions by a vector Exscan, the answers back to the
+ * holders (CF_WITHIN). Collective. */
+static void
+round_within(struct Coll * C)
+{
+    const int64_t nc = C->c1 - C->c0;
+    int64_t i, n = 0, ntot = 0, k, c;
+    for(i = 0; i < C->NumPart; i++) {
+        const int32_t cc = C->Cand[i];
+        if(in_round(C, cc) && C->cs[cc].state == SUBHALO_ST_ALIVE && !(C->Flag[i] & CF_BOUND) && part_live(&P[i])
+           && C->cs[cc].keep > C->cs[cc].Nbound)
+            n++;
+    }
+    MPI_Allreduce(&n, &ntot, 1, MPI_INT64, MPI_SUM, C->Comm);
+    if(ntot == 0)
+        return;
+    struct UPosRec * u = (struct UPosRec *) mymalloc("SubCollUPos", sizeof(struct UPosRec) * (n + 1));
+    n = 0;
+    for(i = 0; i < C->NumPart; i++) {
+        const int32_t cc = C->Cand[i];
+        if(!(in_round(C, cc) && C->cs[cc].state == SUBHALO_ST_ALIVE && !(C->Flag[i] & CF_BOUND) && part_live(&P[i])
+             && C->cs[cc].keep > C->cs[cc].Nbound))
+            continue;
+        u[n].key[0] = P[i].ID;
+        u[n].key[1] = double_key(C->En[i]);
+        u[n].key[2] = (uint64_t) (cc - C->c0);
+        u[n].rank = C->ThisTask;
+        u[n].pad = 0;
+        u[n].index = i;
+        n++;
+    }
+    mpsort_mpi(u, n, sizeof(struct UPosRec), uposrec_radix, 24, NULL, C->Comm);
+    int64_t * cnt = (int64_t *) mymalloc("SubCollUPosCnt", sizeof(int64_t) * 2 * (nc + 1));
+    memset(cnt, 0, sizeof(int64_t) * 2 * (nc + 1));
+    for(k = 0; k < n; k++)
+        cnt[u[k].key[2]]++;
+    MPI_Exscan(cnt, cnt + nc, nc, MPI_INT64, MPI_SUM, C->Comm);
+    if(C->ThisTask == 0)
+        for(c = 0; c < nc; c++)
+            cnt[nc + c] = 0;
+    /* the answers grouped by holder */
+    int64_t * sendcounts = ta_malloc("SubCollUPosSend", int64_t, C->NTask);
+    memset(sendcounts, 0, sizeof(int64_t) * C->NTask);
+    int64_t lab = -1, j = 0, nw = 0;
+    for(k = 0; k < n; k++) {
+        c = (int64_t) u[k].key[2];
+        if(c != lab) {
+            lab = c;
+            j = 0;
+        }
+        const struct CandState * s = &C->cs[C->c0 + c];
+        const int64_t p = cnt[nc + c] + j++;
+        u[k].pad = p < s->keep - s->Nbound;
+        if(u[k].pad) {
+            sendcounts[u[k].rank]++;
+            nw++;
+        }
+    }
+    int64_t * off = ta_malloc("SubCollUPosOff", int64_t, C->NTask);
+    int r;
+    off[0] = 0;
+    for(r = 1; r < C->NTask; r++)
+        off[r] = off[r - 1] + sendcounts[r - 1];
+    int64_t * idx = (int64_t *) mymalloc("SubCollUPosIdx", sizeof(int64_t) * (nw + 1));
+    for(k = 0; k < n; k++)
+        if(u[k].pad)
+            idx[off[u[k].rank]++] = u[k].index;
+    int64_t * in = NULL;
+    const int64_t nin = subhalo_alltoallv(idx, sendcounts, sizeof(int64_t), (void **) &in, 0, NULL, C->Comm);
+    for(k = 0; k < nin; k++)
+        C->Flag[in[k]] |= CF_WITHIN;
+    myfree(in);
+    myfree(idx);
+    ta_free(off);
+    ta_free(sendcounts);
+    myfree(cnt);
+    myfree(u);
+}
+
+/* No valid deeper claim: neither a serial claim of an alive member nor the claim of an alive
+ * in-place candidate (a claim of a candidate or member that has sunk since is void). */
+static inline int
+claimable(const struct Coll * C, int64_t i)
+{
+    if(C->Flag[i] & CF_SCLAIM) {
+        const struct SubhaloMember * m = member_of(C, P[i].TrackId);
+        if(m && m->state == SUBHALO_ST_ALIVE)
+            return 0;
+    }
+    if(C->Claim[i] >= 0 && C->cs[C->Claim[i]].state == SUBHALO_ST_ALIVE)
+        return 0;
+    return 1;
+}
+
+/* The end of a round: the reserved tracers, the claims of the relaxed sources, and the
+ * remainders passed to the parent candidates (HBT's append of the child's unbound particles). */
+static void
+round_commit(struct Coll * C, const struct CoreOut * fin)
+{
+    const int64_t nc = C->c1 - C->c0;
+    const int NR = C->up->MinNumTracerPart;
+    int64_t i, c;
+    int q;
+    for(c = 0; c < nc; c++) {
+        if(C->cs[C->c0 + c].state != SUBHALO_ST_ALIVE)
+            continue;
+        for(q = 0; q < NR; q++) {
+            const int64_t rk = fin->resv[2 * (NR * c + q)], ix = fin->resv[2 * (NR * c + q) + 1];
+            if(rk == C->ThisTask && ix >= 0 && ix < C->NumPart)
+                C->Flag[ix] |= CF_RES;
+        }
+    }
+    for(i = 0; i < C->NumPart; i++) {
+        const int32_t cc = C->Cand[i];
+        if(!in_round(C, cc))
+            continue;
+        const struct CandState * s = &C->cs[cc];
+        if(s->state == SUBHALO_ST_ALIVE) {
+            if(((C->Flag[i] & CF_BOUND) || (C->Flag[i] & CF_WITHIN)) && claimable(C, i)) {
+                C->Claim[i] = cc;
+                C->ClaimE[i] = C->En[i];
+            }
+            if(!(C->Flag[i] & CF_BOUND)) {
+                C->Cand[i] = C->plan->Cands[cc].parent;
+                C->Flag[i] &= ~CF_RES;
+            }
+        }
+        else {
+            C->Cand[i] = C->plan->Cands[cc].parent;
+            C->Flag[i] &= ~(CF_BOUND | CF_RES);
+        }
+        C->Flag[i] &= ~CF_WITHIN;
+    }
+}
+
+/* ------------------------------------------------------------------ records */
+
+/* Vmax as the serial key stores it: sqrt(G M/r / a) in Vel units, then the unit factor. */
+static inline float
+rec_vmax(double best, const struct SubhaloUnbindParams * up)
+{
+    float v = (float) sqrt(up->G * best / up->atime);
+    v *= subhalo_vel_to_kms(1.0);
+    return v;
+}
+
+/* The record of an alive candidate of the current round (owner only), with the formulas of
+ * subhalo_props_hbt, subhalo_props_rockstar and subhalo_props_baryons and the unit conversions
+ * of process_serial_key; the hierarchy columns and the exclusive/tail counts come later. */
+static void
+fill_alive_record(const struct Coll * C, int64_t c, const struct CoreOut * fin, const struct RoundProps * rp,
+                  struct SubTrack * rec, const struct SubTrack * old)
+{
+    const struct SubhaloUnbindParams * up = C->up;
+    const struct SubhaloCallCtx * ctx = C->ctx;
+    const struct CandState * s = &C->cs[c];
+    const struct SubhaloInplaceCand * cd = &C->plan->Cands[c];
+    const struct SubhaloMember * m = &C->plan->Members[cd->member];
+    const int64_t q = c - C->c0;
+    const double a = up->atime, G = up->G, BoxSize = up->BoxSize;
+    const double vu = subhalo_vel_to_kms(1.0), vkms = subhalo_vel_to_kms(a);
+    const double * rho = ctx->rho;
+    double ULen, UMass, UVel;
+    subhalo_get_units(&ULen, &UMass, &UVel);
+    const double lenfac = ULen / 3.085678e21;
+    const double * h = rp->hs + NHS * q;
+    const double * cp = fin->d + CORE_ND * q;
+    const double * pr = rp->prof + 8 * q;
+    const double * Mso = rp->Mso + SUBHALO_NSO * q;
+    const int64_t * kc = rp->kc + SUBHALO_NSO * q;
+    int d, t;
+
+    subhalo_track_carry(rec, old, cd->TrackId, ctx->SnapNum);
+    /* HBT (subhalo_props_hbt) */
+    rec->Nbound = (int32_t) h[HS_N];
+    rec->NboundTracer = (int32_t) h[HS_NTR];
+    rec->Mbound = (float) h[HS_M];
+    for(t = 0; t < 6; t++) {
+        rec->NboundType[t] = (int32_t) h[HS_NT + t];
+        rec->MboundType[t] = (float) h[HS_MT + t];
+    }
+    rec->Flags |= s->flags | SUBHALO_FLAG_INPLACE;
+    for(d = 0; d < 3; d++) {
+        rec->CorePos[d] = wrap_box(cp[d] - ctx->Offset[d], BoxSize);
+        rec->CoreVel[d] = (float) (cp[3 + d] / a);
+        rec->CoMPos[d] = wrap_box(s->RefPos[d] - ctx->Offset[d], BoxSize);
+        rec->CoMVel[d] = (float) (s->RefVel[d] / a);
+        rec->MostBoundPos[d] = wrap_box(cp[8 + d] - ctx->Offset[d], BoxSize);
+        rec->MostBoundVel[d] = (float) (cp[11 + d] / a);
+    }
+    rec->CoreSigmaX = (float) cp[6];
+    rec->CoreSigmaV = (float) (cp[7] / a);
+    rec->MostBoundID = fin->mbID[q];
+    rec->Vmax = (float) sqrt(G * pr[0] / a);
+    rec->Rmax = (float) pr[1];
+    {
+        const double K = h[HS_K], U = h[HS_U], M = h[HS_M];
+        rec->Ekin = (float) (K / M);
+        rec->Epot = (float) (0.5 * U / M);
+        rec->KinToPot = rec->Epot != 0 ? (float) (K / M / fabs(0.5 * U / M)) : -1;
+    }
+    for(d = 0; d < 3; d++) {
+        rec->CoreVel[d] *= vu;
+        rec->MostBoundVel[d] *= vu;
+        rec->CoMVel[d] *= vu;
+    }
+    rec->CoreSigmaV *= vu;
+    rec->Vmax *= vu;
+    rec->Ekin *= vu * vu;
+    rec->Epot *= vu * vu;
+
+    /* Rockstar (subhalo_props_rockstar) */
+    int sd;
+    for(sd = 0; sd < SUBHALO_NSO; sd++)
+        rec->MBoundSO[sd] = rec->RBoundSO[sd] = -1;
+    rec->VmaxVir = rec->RmaxVir = rec->Rhalf = rec->Renclose = -1;
+    for(d = 0; d < 3; d++) {
+        rec->J[d] = rec->JVir[d] = -1;
+        rec->AxisA[d] = rec->AxisA500[d] = -1;
+    }
+    rec->SpinPeebles = rec->SpinBullock = rec->Xoff = rec->Voff = rec->RsKlypin = -1;
+    rec->BtoA = rec->CtoA = rec->BtoA500 = rec->CtoA500 = -1;
+    for(d = 0; d < 6; d++)
+        rec->InertiaTensor[d] = -1;
+    const double Mtot = h[HS_M];
+    for(sd = 0; sd < SUBHALO_NSO; sd++)
+        if(kc[sd] >= 0) {
+            rec->MBoundSO[sd] = (float) Mso[sd];
+            rec->RBoundSO[sd] = (float) cbrt(3 * Mso[sd] / (4 * M_PI * rho[sd]));
+        }
+    rec->Rhalf = (float) pr[4];
+    rec->Renclose = (float) pr[5];
+    const double Mvir = Mso[0];
+    const double Rvir = kc[0] >= 0 ? cbrt(3 * Mvir / (4 * M_PI * rho[0])) : -1;
+    const double best = pr[2], rbest = pr[3];
+    if(kc[0] >= 0 && best > 0) {
+        rec->VmaxVir = (float) (sqrt(G * best / a) * vu);
+        rec->RmaxVir = (float) rbest;
+    }
+    double J[3], jmag = 0;
+    for(d = 0; d < 3; d++) {
+        J[d] = h[HS_J + d] / Mtot;
+        jmag += J[d] * J[d];
+        rec->J[d] = (float) (J[d] * vu * lenfac);
+    }
+    jmag = sqrt(jmag);
+    for(d = 0; d < 6; d++)
+        rec->InertiaTensor[d] = (float) (h[HS_I + d] / Mtot);
+    {
+        const double eps = (h[HS_K] + 0.5 * h[HS_U]) / Mtot;
+        if(Mtot > 0)
+            rec->SpinPeebles = (float) (jmag * sqrt(fabs(eps)) / (G * Mtot));
+    }
+    if(kc[0] >= 0 && Mvir > 0) {
+        const double * jv = rp->jv + 9 * q;
+        double jj = 0, xo = 0, vo = 0, Jv[3];
+        for(d = 0; d < 3; d++) {
+            Jv[d] = jv[d] / Mvir;
+            jj += Jv[d] * Jv[d];
+            rec->JVir[d] = (float) (Jv[d] * vu * lenfac);
+            xo += (jv[3 + d] / Mvir) * (jv[3 + d] / Mvir);
+            vo += (jv[6 + d] / Mvir) * (jv[6 + d] / Mvir);
+        }
+        rec->SpinBullock = (float) (sqrt(jj) / sqrt(2 * G * Mvir * a * Rvir));
+        rec->Xoff = (float) sqrt(xo);
+        rec->Voff = (float) (sqrt(vo) * vkms);
+        if(best > 0) {
+            const double f = Rvir * best / (Mvir * KLYPIN_RS_CONSTANT);
+            double rs = rbest / KLYPIN_RMAX_TO_RS;
+            if(f >= 4.625) {
+                const double conc = subhalo_klypin_f_to_c(f);
+                if(conc > 0)
+                    rs = Rvir / conc;
+            }
+            rec->RsKlypin = (float) rs;
+        }
+    }
+    const float * sh = rp->shape + 10 * q;
+    rec->BtoA = sh[0];
+    rec->CtoA = sh[1];
+    rec->BtoA500 = sh[5];
+    rec->CtoA500 = sh[6];
+    for(d = 0; d < 3; d++) {
+        rec->AxisA[d] = sh[2 + d];
+        rec->AxisA500[d] = sh[7 + d];
+    }
+
+    /* baryons (subhalo_props_baryons) */
+    rec->StarFormationRate = (float) h[HS_SFR];
+    rec->MassHeIonized = (float) h[HS_HE];
+    rec->BlackholeMass = (float) h[HS_BHM];
+    rec->BlackholeAccretionRate = (float) h[HS_MDOT];
+    rec->MostMassiveBHID = rp->bhid[q];
+    rec->GasMetalMass = rec->StellarMetalMass = -1;
+    for(t = 0; t < NMETALS; t++)
+        rec->GasMetalElemMass[t] = rec->StellarMetalElemMass[t] = -1;
+    if(ctx->MetalReturnOn) {
+        rec->GasMetalMass = (float) h[HS_GZ];
+        rec->StellarMetalMass = (float) h[HS_SZ];
+        for(t = 0; t < NMETALS; t++) {
+            rec->GasMetalElemMass[t] = (float) h[HS_GZE + t];
+            rec->StellarMetalElemMass[t] = (float) h[HS_SZE + t];
+        }
+    }
+    /* a resurrected orphan: the orphan tracer state is not a Subhalo column */
+    if(m->kind == SUBHALO_MEM_ORPHAN) {
+        rec->SnapTracerLost = -1;
+        for(d = 0; d < 3; d++) {
+            rec->TracerPos[d] = -1;
+            rec->TracerVel[d] = -1;
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ the hierarchy of the oversized keys */
+
+struct HierCtx {
+    const struct SubhaloMember * M;
+    const float * Mb, * Vm;
+    const MyIDType * Id;
+};
+static const struct HierCtx * HierSort;
+
+static int
+cmp_hier_mass(const void * a, const void * b)
+{
+    const int64_t x = *(const int64_t *) a, y = *(const int64_t *) b;
+    const struct HierCtx * h = HierSort;
+    if(mass_before_v(h->Mb[x], h->Vm[x], h->Id[x], h->M[x].TrackId, h->Mb[y], h->Vm[y], h->Id[y], h->M[y].TrackId))
+        return -1;
+    if(mass_before_v(h->Mb[y], h->Vm[y], h->Id[y], h->M[y].TrackId, h->Mb[x], h->Vm[x], h->Id[x], h->M[x].TrackId))
+        return 1;
+    return 0;
+}
+
+static int
+cmp_member_idx_g(const void * a, const void * b)
+{
+    const int64_t x = *(const int64_t *) a, y = *(const int64_t *) b;
+    const struct SubhaloMember * M = HierSort->M;
+    if(M[x].g != M[y].g) return (M[x].g > M[y].g) - (M[x].g < M[y].g);
+    return (M[x].TrackId > M[y].TrackId) - (M[x].TrackId < M[y].TrackId);
+}
+
+/* UpdateTracks of process_serial_key for every oversized key over all its members: survivors
+ * ranked by mass (CompareMass), the most massive promoted to the central with every other top
+ * survivor nested under it, the nearest surviving ancestor as the parent; members that died or
+ * sank this call get the nearest surviving ancestor (else the central). maxmerge[gidx]: the
+ * largest previous Mbound of the tracks that sank into the central or arrived as its
+ * satellites. Identical on every rank. */
+static void
+coll_hierarchy(struct Coll * C, double * maxmerge)
+{
+    struct SubhaloMember * M = C->plan->Members;
+    const int64_t nmem = C->plan->NMembers;
+    int64_t i, c, j;
+    float * Mb = (float *) mymalloc("SubCollHierMb", sizeof(float) * (nmem + 1));
+    float * Vm = (float *) mymalloc("SubCollHierVm", sizeof(float) * (nmem + 1));
+    MyIDType * Id = (MyIDType *) mymalloc("SubCollHierId", sizeof(MyIDType) * (nmem + 1));
+    int64_t * ord = (int64_t *) mymalloc("SubCollHierOrd", sizeof(int64_t) * (nmem + 1));
+    int64_t * sv = (int64_t *) mymalloc("SubCollHierSv", sizeof(int64_t) * (nmem + 1));
+    for(i = 0; i < nmem; i++) {
+        Mb[i] = M[i].Mbound;
+        Vm[i] = M[i].Vmax;
+        Id[i] = M[i].MostBoundID;
+    }
+    /* the in-place candidates' states and current values */
+    for(c = 0; c < C->plan->NCands; c++) {
+        const int64_t m = C->plan->Cands[c].member;
+        M[m].state = C->cs[c].state;
+        M[m].SinkTrackId = C->cs[c].SinkTrackId;
+        Mb[m] = M[m].Mbound = C->cs[c].Mbound_rec;
+        Vm[m] = M[m].Vmax = C->cs[c].Vmax_rec;
+        Id[m] = M[m].MostBoundID = C->cs[c].MostBoundID_rec;
+    }
+    struct HierCtx hc = {M, Mb, Vm, Id};
+    HierSort = &hc;
+    for(i = 0; i < nmem; i++)
+        ord[i] = i;
+    qsort(ord, nmem, sizeof(int64_t), cmp_member_idx_g);
+    for(i = 0; i < C->plan->NInplace; i++)
+        maxmerge[i] = 0;
+    i = 0;
+    while(i < nmem) {
+        int64_t e = i;
+        while(e < nmem && M[ord[e]].g == M[ord[i]].g)
+            e++;
+        const int64_t gidx = subhalo_plan_inplace_index(C->plan, M[ord[i]].g);
+        int64_t ns = 0;
+        for(j = i; j < e; j++) {
+            const int64_t v = ord[j];
+            M[v].frank = M[v].fdepth = -1;
+            M[v].FinalParent = M[v].Central = SUBHALO_NOTRACK;
+            if(M[v].state == SUBHALO_ST_ALIVE)
+                sv[ns++] = v;
+        }
+        qsort(sv, ns, sizeof(int64_t), cmp_hier_mass);
+        int64_t X = ns > 0 ? sv[0] : -1;
+        for(j = 0; j < ns; j++)
+            M[sv[j]].frank = (int32_t) j;
+        /* the nearest surviving ancestor; top survivors under the promoted central */
+        for(j = i; j < e; j++) {
+            const int64_t v = ord[j];
+            int64_t u = M[v].Parent, steps = 0;
+            while(u >= 0 && M[u].state != SUBHALO_ST_ALIVE && steps++ <= nmem)
+                u = M[u].Parent;
+            if(v == X)
+                M[v].FinalParent = SUBHALO_NOTRACK;
+            else if(u >= 0 && M[u].state == SUBHALO_ST_ALIVE)
+                M[v].FinalParent = M[u].TrackId;
+            else
+                M[v].FinalParent = X >= 0 ? M[X].TrackId : SUBHALO_NOTRACK;
+            M[v].Central = X >= 0 ? M[X].TrackId : SUBHALO_NOTRACK;
+        }
+        for(j = 0; j < ns; j++) {
+            const int64_t v = sv[j];
+            int64_t u = v, dd = 0;
+            while(M[u].FinalParent != SUBHALO_NOTRACK && dd <= ns) {
+                u = member_lookup_c(C, M[u].FinalParent);
+                dd++;
+            }
+            M[v].fdepth = (int32_t) dd;
+        }
+        /* the central's merger columns */
+        if(X >= 0 && gidx >= 0) {
+            double mm = 0;
+            for(j = i; j < e; j++) {
+                const int64_t v = ord[j];
+                if(v == X || M[v].kind != SUBHALO_MEM_RESOLVED)
+                    continue;
+                if(M[v].state == SUBHALO_ST_ALIVE && (M[v].PrevRank <= 0 || M[v].PrevCentral != M[X].TrackId) && M[v].MboundPrev > mm)
+                    mm = M[v].MboundPrev;
+                if(M[v].state == SUBHALO_ST_SUNK && M[v].SinkTrackId == M[X].TrackId && M[v].MboundPrev > mm)
+                    mm = M[v].MboundPrev;
+            }
+            maxmerge[gidx] = mm;
+        }
+        i = e;
+    }
+    HierSort = NULL;
+    myfree(sv);
+    myfree(ord);
+    myfree(Id);
+    myfree(Vm);
+    myfree(Mb);
+}
+
+/* 1 if A is T or one of T's ancestors in the final hierarchy. */
+static int
+final_ancestor_c(const struct Coll * C, int64_t T, int64_t A)
+{
+    int steps = 0;
+    while(T != SUBHALO_NOTRACK && steps++ <= C->plan->NMembers + 1) {
+        if(T == A)
+            return 1;
+        const struct SubhaloMember * m = member_of(C, T);
+        if(!m)
+            return 0;
+        T = m->FinalParent;
+    }
+    return 0;
+}
+
+/* record_mb of process_serial_key from a stored most-bound particle. */
+static void
+rec_mb(struct SubTrack * rec, MyIDType id, const double pos[3], const double vel[3], const struct SubhaloCallCtx * ctx)
+{
+    const double vfac = subhalo_vel_to_kms(ctx->atime);
+    int d;
+    rec->MostBoundID = id;
+    for(d = 0; d < 3; d++) {
+        rec->MostBoundPos[d] = wrap_box(pos[d] - ctx->Offset[d], ctx->BoxSize);
+        rec->MostBoundVel[d] = vel[d] * vfac;
+    }
+}
+
+/* The hierarchy columns of the in-place records (owner) and of the serial sub-tree results,
+ * a serial survivor that sank into an in-place candidate turned into an orphan. */
+static void
+coll_records(struct Coll * C, const double * maxmerge, const int64_t * slotof, const struct SubTrack * oldrec)
+{
+    struct SubhaloCallCtx * ctx = C->ctx;
+    const int64_t TotNgroups = C->plan->TotNgroups;
+    int64_t c, i;
+    for(c = 0; c < C->plan->NCands; c++) {
+        if(slotof[c] < 0)
+            continue;
+        struct SubhaloResult * rs = &ctx->Res[slotof[c]];
+        struct SubTrack * rec = &rs->rec;
+        const struct SubhaloInplaceCand * cd = &C->plan->Cands[c];
+        const struct SubhaloMember * m = &C->plan->Members[cd->member];
+        const struct CandState * s = &C->cs[c];
+        const struct SubTrack * old = m->kind == SUBHALO_MEM_NEWBORN ? NULL : &oldrec[slotof[c] - ctx->IpResStart];
+        const int64_t host = cd->g <= TotNgroups ? cd->g : -1;
+        rs->ndesc = 0;
+        rs->MaxMergerMbound = 0;
+        rs->ipk = -1;
+        rs->subkey = -1;
+        rs->state = s->state;
+        if(s->state == SUBHALO_ST_ALIVE) {
+            rs->valid = 1;
+            rs->history = 1;
+            rs->newborn = m->kind == SUBHALO_MEM_NEWBORN;
+            rec->HostGroup = host;
+            rec->Host = host;
+            rec->Rank = m->frank;
+            rec->Depth = m->fdepth;
+            rec->NestedParentTrackId = m->FinalParent;
+            rec->CentralTrackId = m->Central;
+            rec->SinkTrackId = -1;
+            rec->DescendantTrackId = cd->TrackId;
+            rec->SnapDeath = rec->SnapSink = -1;
+            rec->Alive = 1;
+            if(m->frank == 0) {
+                rs->MaxMergerMbound = maxmerge[cd->gidx];
+                rs->ipk = cd->gidx;
+            }
+            continue;
+        }
+        rs->history = 0;
+        rs->newborn = 0;
+        if(m->kind == SUBHALO_MEM_NEWBORN) {
+            rs->valid = 0;
+            continue;
+        }
+        rs->valid = 1;
+        *rec = *old;
+        rec->HostGroup = host;
+        rec->CentralTrackId = m->Central;
+        if(m->kind != SUBHALO_MEM_RESOLVED)
+            continue;   /* an orphan central that was not resurrected keeps its record */
+        if(host >= 0 && m->Central != SUBHALO_NOTRACK && m->Central != cd->TrackId && rec->SnapLastIsolation < 0)
+            rec->SnapLastIsolation = ctx->SnapNum - 1;
+        if(s->has_mb)
+            rec_mb(rec, s->mbID, s->mbPos, s->mbVel, ctx);
+        subhalo_track_make_orphan(rec, s->state == SUBHALO_ST_SUNK ? s->SinkTrackId : SUBHALO_NOTRACK, ctx->SnapNum);
+        rec->NestedParentTrackId = m->FinalParent;
+        int t;
+        for(t = 0; t < old->NTracers && t < SUBHALO_MAXTRACERS; t++)
+            rs->DescOwner[t] = SUBHALO_DESC_PENDING;
+        rs->ndesc = t;
+    }
+    /* the serial sub-tree results */
+    for(i = 0; i < ctx->IpResStart; i++) {
+        struct SubhaloResult * rs = &ctx->Res[i];
+        if(rs->subkey < 0 || !rs->valid)
+            continue;
+        struct SubTrack * rec = &rs->rec;
+        const struct SubhaloMember * m = member_of(C, rec->TrackId);
+        if(!m)
+            endrun(5, "Subhalo in place: sub-tree result %ld is not a member.\n", rec->TrackId);
+        if(rs->state == SUBHALO_ST_ALIVE && m->state == SUBHALO_ST_ALIVE) {
+            rec->Rank = m->frank;
+            rec->Depth = m->fdepth;
+            rec->NestedParentTrackId = m->FinalParent;
+            rec->CentralTrackId = m->Central;
+            if(m->frank == 0) {
+                const int64_t gidx = subhalo_plan_inplace_index(C->plan, m->g);
+                rs->MaxMergerMbound = maxmerge[gidx];
+                rs->ipk = gidx;
+            }
+            continue;
+        }
+        if(rs->state == SUBHALO_ST_ALIVE) {
+            /* sank into an in-place candidate: an orphan with the most-bound tracer of its set */
+            const struct SubTrack * old = subhalo_find_member(ctx, rec->TrackId);
+            if(!old)
+                endrun(5, "Subhalo in place: no previous record of sub-tree member %ld.\n", rec->TrackId);
+            const MyIDType mbid = rec->MostBoundID;
+            double mpos[3], mvel[3];
+            int d;
+            for(d = 0; d < 3; d++) {
+                mpos[d] = rec->MostBoundPos[d];
+                mvel[d] = rec->MostBoundVel[d];
+            }
+            *rec = *old;
+            rec->MostBoundID = mbid;
+            for(d = 0; d < 3; d++) {
+                rec->MostBoundPos[d] = mpos[d];
+                rec->MostBoundVel[d] = mvel[d];
+            }
+            subhalo_track_make_orphan(rec, m->SinkTrackId, ctx->SnapNum);
+            rs->history = 0;
+            rs->state = SUBHALO_ST_SUNK;
+            int t;
+            for(t = 0; t < old->NTracers && t < SUBHALO_MAXTRACERS; t++)
+                rs->DescOwner[t] = SUBHALO_DESC_PENDING;
+            rs->ndesc = t;
+            rs->MaxMergerMbound = 0;
+        }
+        /* a member that died in its key and then sank into an in-place candidate (its core is
+         * the previous most-bound tracer, merge_subtree) */
+        if(rs->state == SUBHALO_ST_DIED && m->state == SUBHALO_ST_SUNK) {
+            rec->SinkTrackId = m->SinkTrackId;
+            rec->SnapSink = ctx->SnapNum;
+            rec->DescendantTrackId = m->SinkTrackId;
+            rs->state = SUBHALO_ST_SUNK;
+        }
+        rec->HostGroup = m->g;
+        rec->NestedParentTrackId = m->FinalParent;
+        rec->CentralTrackId = m->Central;
+        if(m->Central != SUBHALO_NOTRACK && m->Central != rec->TrackId && rec->SnapLastIsolation < 0)
+            rec->SnapLastIsolation = ctx->SnapNum - 1;
+    }
+}
+
+/* ------------------------------------------------------------------ the final tag pass */
+
+struct TagRec {
+    uint64_t key[3];         /* radix: ID, E, (candidate << 1) | not bound by it */
+    int32_t rank, type;
+    int64_t index;
+};
+
+static void
+tagrec_radix(const void * a, void * radix, void * arg)
+{
+    memcpy(radix, ((const struct TagRec *) a)->key, 24);
+}
+
+struct Removed {
+    int64_t TrackId;
+    int32_t BindRank, Type;
+    int32_t excl, pad;
+};
+
+static int
+cmp_removed(const void * a, const void * b)
+{
+    const struct Removed * x = (const struct Removed *) a, * y = (const struct Removed *) b;
+    if(x->TrackId != y->TrackId) return (x->TrackId > y->TrackId) - (x->TrackId < y->TrackId);
+    return (x->BindRank > y->BindRank) - (x->BindRank < y->BindRank);
+}
+
+/* The tags of every particle of an oversized key (design 7.2 step 9, D10): a reserved tracer to
+ * its candidate; else a valid serial claim (an alive member's tail or a root's relaxed
+ * remainder) keeps its tag; else the in-place claim of the deepest alive candidate whose
+ * relaxed source holds it; a claim whose binding owner is not the claimant or one of its
+ * ancestors in the final tree goes to the binding owner (J2); BoundTrackId the candidate (or
+ * serial member) that bound it; dense own-tag ranks of the in-place candidates in their list
+ * order (bound by final-pass energy, then the relaxed tail by the energy of its removal); the
+ * serial ranks closed over the particles the in-place candidates took; the exclusive and tail
+ * counts of the in-place records and the corrections of the serial ones. Collective. */
+static void
+coll_final_tags(struct Coll * C, const int64_t * slotof)
+{
+    struct SubhaloCallCtx * ctx = C->ctx;
+    const struct SubhaloInplaceCand * Cd = C->plan->Cands;
+    const int64_t ncand = C->plan->NCands;
+    int64_t i, k, c;
+    int t;
+    int64_t nt = 0, nrm = 0, nwritten = 0, nrel = 0, nj2 = 0;
+    for(i = 0; i < C->NumPart; i++)
+        if(C->Flag[i] & CF_UNIV)
+            nt++;
+    struct TagRec * tr = (struct TagRec *) mymalloc("SubCollTagRec", sizeof(struct TagRec) * (nt + 1));
+    struct Removed * rm = (struct Removed *) mymalloc("SubCollRemoved", sizeof(struct Removed) * (nt + 1));
+    MyIDType * ad_id = (MyIDType *) mymalloc("SubCollAddedId", sizeof(MyIDType) * (nt + 1));
+    /* per candidate and type: exclusive and tail own-tag counts */
+    int64_t * cnt = (int64_t *) mymalloc("SubCollTagCnt", sizeof(int64_t) * 12 * (ncand + 1));
+    memset(cnt, 0, sizeof(int64_t) * 12 * (ncand + 1));
+    nt = 0;
+    for(i = 0; i < C->NumPart; i++) {
+        const uint8_t f = C->Flag[i];
+        if(f & CF_RELEASE) {
+            P[i].TrackId = -1;
+            P[i].BindRank = -1;
+            P[i].BoundTrackId = -1;
+            nrel++;
+            continue;
+        }
+        if(!(f & CF_UNIV))
+            continue;
+        nwritten++;
+        const int64_t T0 = P[i].TrackId, B0 = P[i].BoundTrackId;
+        const int32_t cc = C->Cand[i];
+        int64_t bT = SUBHALO_NOTRACK, bc = -1;
+        if(f & CF_SBOUND)
+            bT = B0;
+        else if(cc >= 0 && (f & CF_BOUND) && C->cs[cc].state == SUBHALO_ST_ALIVE) {
+            bT = Cd[cc].TrackId;
+            bc = cc;
+        }
+        int64_t tag = SUBHALO_NOTRACK, tc = -1;
+        int bound = 0;
+        double E = 0;
+        const struct SubhaloMember * m0 = member_of(C, T0);
+        const int sclaim = (f & CF_SCLAIM) && m0 && m0->state == SUBHALO_ST_ALIVE && m0->cand < 0;
+        if((f & CF_RES) && bc >= 0) {
+            tag = bT;
+            tc = bc;
+            bound = 1;
+            E = C->En[i];
+        }
+        else if(sclaim) {
+            tag = T0;
+            if(bc >= 0 && !final_ancestor_c(C, T0, bT)) {
+                tag = bT;
+                tc = bc;
+                bound = 1;
+                E = C->En[i];
+                nj2++;
+            }
+        }
+        else if(C->Claim[i] >= 0 && C->cs[C->Claim[i]].state == SUBHALO_ST_ALIVE) {
+            tc = C->Claim[i];
+            tag = Cd[tc].TrackId;
+            bound = bc == tc;
+            E = bound ? C->En[i] : C->ClaimE[i];
+            if(bc >= 0 && bc != tc && !final_ancestor_c(C, tag, bT)) {
+                tag = bT;
+                tc = bc;
+                bound = 1;
+                E = C->En[i];
+                nj2++;
+            }
+        }
+        else if(bc >= 0) {
+            tag = bT;
+            tc = bc;
+            bound = 1;
+            E = C->En[i];
+        }
+        else if(f & CF_SBOUND) {
+            /* a serial tail whose claimant sank into an in-place candidate while its serial
+             * binder survives: the binder's own (inserted after its exclusive prefix below) */
+            tag = bT;
+            C->Flag[i] |= CF_ADDED;
+            rm[nrm].TrackId = bT;
+            rm[nrm].BindRank = -1;
+            rm[nrm].Type = P[i].Type;
+            rm[nrm].excl = 2;
+            rm[nrm].pad = 0;
+            ad_id[nrm] = P[i].ID;
+            nrm++;
+        }
+        /* a serial own-tag particle taken over by an in-place candidate */
+        if((f & CF_SCLAIM) && m0 && m0->cand < 0 && m0->state == SUBHALO_ST_ALIVE && tag != T0) {
+            rm[nrm].TrackId = T0;
+            rm[nrm].BindRank = P[i].BindRank;
+            rm[nrm].Type = P[i].Type;
+            rm[nrm].excl = B0 == T0;
+            rm[nrm].pad = 0;
+            ad_id[nrm] = P[i].ID;
+            nrm++;
+        }
+        P[i].TrackId = tag;
+        P[i].BoundTrackId = bT;
+        if(tag == SUBHALO_NOTRACK) {
+            P[i].BindRank = -1;
+            P[i].BoundTrackId = -1;
+            continue;
+        }
+        if(tc < 0)
+            continue;           /* a serial tag keeps its rank (closed below) */
+        struct TagRec * e = &tr[nt++];
+        e->key[0] = P[i].ID;
+        e->key[1] = double_key(E);
+        e->key[2] = ((uint64_t) tc << 1) | (uint64_t) (bound ? 0 : 1);
+        e->rank = C->ThisTask;
+        e->type = P[i].Type;
+        e->index = i;
+        cnt[12 * tc + (bound ? 0 : 6) + P[i].Type]++;
+    }
+    /* ---- the serial ranks and counts: the particles the in-place candidates took (excl 0/1) are
+     *      removed from their serial track's dense ranks, the tails given to their serial binder
+     *      (excl 2, ordered by ID) inserted after its exclusive prefix ---- */
+    {
+        int64_t tot = 0, nrem = 0;
+        MPI_Allreduce(&nrm, &tot, 1, MPI_INT64, MPI_SUM, C->Comm);
+        for(k = 0; k < nrm; k++)
+            if(rm[k].excl != 2)
+                nrem++;
+        MPI_Allreduce(MPI_IN_PLACE, &nrem, 1, MPI_INT64, MPI_SUM, C->Comm);
+        CollStats.NStolen = nrem;
+        if(tot > 0) {
+            /* the added entries carry their particle's ID in place of the rank, for the order */
+            for(k = 0; k < nrm; k++)
+                if(rm[k].excl == 2)
+                    rm[k].BindRank = -1;
+            int * counts = ta_malloc("SubCollRmCnt", int, C->NTask);
+            int * displ = ta_malloc("SubCollRmDispl", int, C->NTask);
+            int nb = (int) (nrm * sizeof(struct Removed));
+            MPI_Allgather(&nb, 1, MPI_INT, counts, 1, MPI_INT, C->Comm);
+            int64_t s = 0;
+            int r;
+            for(r = 0; r < C->NTask; r++) {
+                displ[r] = (int) s;
+                s += counts[r];
+            }
+            struct Removed * all = (struct Removed *) mymalloc("SubCollRmAll", sizeof(struct Removed) * (tot + 1));
+            MPI_Allgatherv(rm, nb, MPI_BYTE, all, counts, displ, MPI_BYTE, C->Comm);
+            for(r = 0; r < C->NTask; r++) {
+                displ[r] = (int) (displ[r] / sizeof(struct Removed) * sizeof(MyIDType));
+                counts[r] = (int) (counts[r] / sizeof(struct Removed) * sizeof(MyIDType));
+            }
+            MyIDType * allid = (MyIDType *) mymalloc("SubCollRmIds", sizeof(MyIDType) * (tot + 1));
+            MPI_Allgatherv(ad_id, (int) (nrm * sizeof(MyIDType)), MPI_BYTE, allid, counts, displ, MPI_BYTE, C->Comm);
+            ta_free(displ);
+            ta_free(counts);
+            /* the added ones: their order j among their binder's (by ID), kept in the local
+             * entries as BindRank -(2 + j) */
+            for(k = 0; k < nrm; k++)
+                if(rm[k].excl == 2) {
+                    int64_t j = 0, q;
+                    for(q = 0; q < tot; q++)
+                        if(all[q].excl == 2 && all[q].TrackId == rm[k].TrackId && allid[q] < ad_id[k])
+                            j++;
+                    rm[k].BindRank = (int32_t) (-2 - j);
+                }
+            myfree(allid);
+            qsort(all, tot, sizeof(struct Removed), cmp_removed);
+            for(i = 0; i < C->NumPart; i++) {
+                if(!(C->Flag[i] & CF_UNIV) || P[i].TrackId < 0)
+                    continue;
+                const struct SubhaloMember * m = member_of(C, P[i].TrackId);
+                if(!m || m->cand >= 0)
+                    continue;
+                const int64_t T = P[i].TrackId;
+                int64_t nremb = 0, nremx = 0, nadd = 0;
+                /* the entries of T: a contiguous run of the sorted list */
+                int64_t lo = 0, hi = tot;
+                while(lo < hi) {
+                    const int64_t mid = (lo + hi) / 2;
+                    if(all[mid].TrackId < T) lo = mid + 1;
+                    else hi = mid;
+                }
+                for(k = lo; k < tot && all[k].TrackId == T; k++) {
+                    if(all[k].excl == 2) nadd++;
+                    else {
+                        if(all[k].excl == 1) nremx++;
+                        if(!(C->Flag[i] & CF_ADDED) && all[k].BindRank < P[i].BindRank) nremb++;
+                    }
+                }
+                const int64_t nbex = m->NboundExclusive - nremx;
+                if(C->Flag[i] & CF_ADDED) {
+                    int64_t j = -1;
+                    for(k = 0; k < nrm; k++)
+                        if(rm[k].excl == 2 && ad_id[k] == P[i].ID)
+                            j = -2 - rm[k].BindRank;
+                    if(j < 0)
+                        endrun(5, "Subhalo in place: an added tail particle %lu lost its entry.\n", (unsigned long) P[i].ID);
+                    P[i].BindRank = (int32_t) (nbex + j);
+                    C->Flag[i] &= ~CF_ADDED;
+                    continue;
+                }
+                int64_t rr = P[i].BindRank - nremb;
+                if(rr >= nbex)
+                    rr += nadd;
+                P[i].BindRank = (int32_t) rr;
+            }
+            for(i = 0; i < ctx->IpResStart; i++) {
+                struct SubhaloResult * rs = &ctx->Res[i];
+                if(rs->subkey < 0 || !rs->valid || rs->rec.Nbound <= 0)
+                    continue;
+                int64_t lo = 0, hi = tot;
+                while(lo < hi) {
+                    const int64_t mid = (lo + hi) / 2;
+                    if(all[mid].TrackId < rs->rec.TrackId) lo = mid + 1;
+                    else hi = mid;
+                }
+                for(k = lo; k < tot && all[k].TrackId == rs->rec.TrackId; k++) {
+                    if(all[k].excl == 1) {
+                        rs->rec.NboundExclusive--;
+                        rs->rec.NboundExclusiveType[all[k].Type]--;
+                    }
+                    else if(all[k].excl == 0)
+                        rs->rec.NtailType[all[k].Type]--;
+                    else {
+                        rs->rec.NboundExclusive++;
+                        rs->rec.NboundExclusiveType[all[k].Type]++;
+                    }
+                }
+            }
+            myfree(all);
+        }
+    }
+    /* ---- the in-place own-tag ranks: (candidate, bound first, E, ID) ---- */
+    {
+        int64_t tot = 0;
+        MPI_Allreduce(&nt, &tot, 1, MPI_INT64, MPI_SUM, C->Comm);
+        if(tot > 0) {
+            mpsort_mpi(tr, nt, sizeof(struct TagRec), tagrec_radix, 24, NULL, C->Comm);
+            int64_t * off = (int64_t *) mymalloc("SubCollTagOff", sizeof(int64_t) * 2 * (ncand + 1));
+            memset(off, 0, sizeof(int64_t) * 2 * (ncand + 1));
+            for(k = 0; k < nt; k++)
+                off[tr[k].key[2] >> 1]++;
+            MPI_Exscan(off, off + ncand, ncand, MPI_INT64, MPI_SUM, C->Comm);
+            if(C->ThisTask == 0)
+                for(c = 0; c < ncand; c++)
+                    off[ncand + c] = 0;
+            int64_t * sendcounts = ta_malloc("SubCollTagSend", int64_t, C->NTask);
+            memset(sendcounts, 0, sizeof(int64_t) * C->NTask);
+            for(k = 0; k < nt; k++)
+                sendcounts[tr[k].rank]++;
+            int64_t * o = ta_malloc("SubCollTagO", int64_t, C->NTask);
+            int r;
+            o[0] = 0;
+            for(r = 1; r < C->NTask; r++)
+                o[r] = o[r - 1] + sendcounts[r - 1];
+            int64_t * ans = (int64_t *) mymalloc("SubCollTagAns", sizeof(int64_t) * 2 * (nt + 1));
+            int64_t lab = -1, j = 0;
+            for(k = 0; k < nt; k++) {
+                const int64_t cc = (int64_t) (tr[k].key[2] >> 1);
+                if(cc != lab) {
+                    lab = cc;
+                    j = 0;
+                }
+                const int64_t rank = off[ncand + cc] + j++;
+                if(rank > INT32_MAX)
+                    endrun(1, "Subhalo in place: BindRank of candidate %ld beyond the int32 range.\n", Cd[cc].TrackId);
+                int64_t * a = ans + 2 * o[tr[k].rank]++;
+                a[0] = tr[k].index;
+                a[1] = rank;
+            }
+            int64_t * in = NULL;
+            const int64_t nin = subhalo_alltoallv(ans, sendcounts, 2 * sizeof(int64_t), (void **) &in, 0, NULL, C->Comm);
+            for(k = 0; k < nin; k++)
+                P[in[2 * k]].BindRank = (int32_t) in[2 * k + 1];
+            myfree(in);
+            myfree(ans);
+            ta_free(o);
+            ta_free(sendcounts);
+            myfree(off);
+        }
+    }
+    /* ---- the exclusive and tail counts of the in-place records ---- */
+    {
+        int64_t * g = (int64_t *) mymalloc("SubCollTagCntG", sizeof(int64_t) * 12 * (ncand + 1));
+        MPI_Allreduce(cnt, g, 12 * ncand, MPI_INT64, MPI_SUM, C->Comm);
+        for(c = 0; c < ncand; c++) {
+            if(slotof[c] < 0 || C->cs[c].state != SUBHALO_ST_ALIVE)
+                continue;
+            struct SubTrack * rec = &ctx->Res[slotof[c]].rec;
+            int64_t nex = 0;
+            for(t = 0; t < 6; t++) {
+                rec->NboundExclusiveType[t] = (int32_t) g[12 * c + t];
+                rec->NtailType[t] = (int32_t) g[12 * c + 6 + t];
+                nex += g[12 * c + t];
+            }
+            rec->NboundExclusive = (int32_t) nex;
+        }
+        myfree(g);
+    }
+    myfree(cnt);
+    myfree(ad_id);
+    myfree(rm);
+    myfree(tr);
+    int64_t loc[3] = {nwritten, nrel, nj2}, tot3[3];
+    MPI_Allreduce(loc, tot3, 3, MPI_INT64, MPI_SUM, C->Comm);
+    ctx->Stats.NFallbackField += nwritten;
+    ctx->Stats.NFallbackReleased += nrel;
+    CollStats.NJ2 = tot3[2];
+}
+
+/* ------------------------------------------------------------------ setup */
+
+/* The serial sub-tree results into the member table (every rank): state, counts, Keep, the
+ * current record values, the sinking core and an in-key sink. Collective. */
+struct SerialInfo {
+    int64_t TrackId;
+    int64_t SinkTo;
+    int32_t state, Nbound, NboundExclusive, Keep;
+    int32_t has_core, pad;
+    float Mbound, Vmax;
+    MyIDType MostBoundID;
+    double CorePos[3], CoreVel[3], SigmaX, SigmaV;
+};
+
+/* What every rank holds per in-place key and candidate (the plan's entries, the candidate state,
+ * the per-round vectors of the cores, sums, profile and shapes, the hierarchy) and per member of
+ * an oversized key (the member table, the gathered serial result, the hierarchy arrays): the
+ * budget of the plan (subhalo_plan_default_cfg) charges these constants. */
+_Static_assert(sizeof(struct SubhaloInplaceKey) + sizeof(struct SubhaloInplaceCand) + sizeof(struct CandState)
+               + 8 * (NHS + 2 + CORE_ND + 1 + 2 * SUBHALO_MAXTRACERS + 2 * SUBHALO_NSO + 8 + 9 + 2 * NSUM + 12 + 4) + 4 * 10
+               <= SUBHALO_INPLACE_KEY_BYTES, "SUBHALO_INPLACE_KEY_BYTES does not cover the per-candidate vectors");
+_Static_assert(sizeof(struct SubhaloMember) + sizeof(struct SerialInfo) + 32 <= SUBHALO_INPLACE_MEMBER_BYTES,
+               "SUBHALO_INPLACE_MEMBER_BYTES does not cover the member table");
+
+static void
+gather_serial(struct Coll * C)
+{
+    struct SubhaloCallCtx * ctx = C->ctx;
+    int64_t i, n = 0;
+    for(i = 0; i < ctx->IpResStart; i++)
+        if(ctx->Res[i].subkey >= 0 && ctx->Res[i].valid)
+            n++;
+    int64_t tot = 0;
+    MPI_Allreduce(&n, &tot, 1, MPI_INT64, MPI_SUM, C->Comm);
+    subhalo_check_mpi_count(tot * (int64_t) sizeof(struct SerialInfo), "the serial sub-tree results (bytes)", C->Comm);
+    struct SerialInfo * all = (struct SerialInfo *) mymalloc("SubCollSerAll", sizeof(struct SerialInfo) * (tot + 1));
+    struct SerialInfo * loc = (struct SerialInfo *) mymalloc("SubCollSerLoc", sizeof(struct SerialInfo) * (n + 1));
+    n = 0;
+    for(i = 0; i < ctx->IpResStart; i++) {
+        const struct SubhaloResult * rs = &ctx->Res[i];
+        if(rs->subkey < 0 || !rs->valid)
+            continue;
+        struct SerialInfo * e = &loc[n++];
+        memset(e, 0, sizeof(*e));
+        e->TrackId = rs->rec.TrackId;
+        e->SinkTo = rs->SinkTo;
+        e->state = rs->state;
+        e->Nbound = rs->rec.Nbound;
+        e->NboundExclusive = rs->rec.NboundExclusive;
+        e->Keep = rs->Keep;
+        e->has_core = rs->has_core;
+        e->Mbound = rs->rec.Mbound;
+        e->Vmax = rs->rec.Vmax;
+        e->MostBoundID = rs->rec.MostBoundID;
+        int d;
+        for(d = 0; d < 3; d++) {
+            e->CorePos[d] = rs->CorePos[d];
+            e->CoreVel[d] = rs->CoreVel[d];
+        }
+        e->SigmaX = rs->SigmaX;
+        e->SigmaV = rs->SigmaV;
+    }
+    int * counts = ta_malloc("SubCollSerCnt", int, C->NTask);
+    int * displ = ta_malloc("SubCollSerDispl", int, C->NTask);
+    int nb = (int) (n * sizeof(struct SerialInfo));
+    MPI_Allgather(&nb, 1, MPI_INT, counts, 1, MPI_INT, C->Comm);
+    int64_t s = 0;
+    int r;
+    for(r = 0; r < C->NTask; r++) {
+        displ[r] = (int) s;
+        s += counts[r];
+    }
+    MPI_Allgatherv(loc, nb, MPI_BYTE, all, counts, displ, MPI_BYTE, C->Comm);
+    ta_free(displ);
+    ta_free(counts);
+    myfree(loc);
+    for(i = 0; i < tot; i++) {
+        const int64_t j = member_lookup_c(C, all[i].TrackId);
+        if(j < 0)
+            endrun(5, "Subhalo in place: serial result %ld is not a member of an oversized key.\n", all[i].TrackId);
+        struct SubhaloMember * m = &C->plan->Members[j];
+        m->state = all[i].state;
+        m->SinkTrackId = all[i].state == SUBHALO_ST_SUNK ? all[i].SinkTo : SUBHALO_NOTRACK;
+        m->Nbound = all[i].state == SUBHALO_ST_ALIVE ? all[i].Nbound : 0;
+        m->NboundExclusive = all[i].NboundExclusive;
+        m->Keep = all[i].Keep;
+        m->has_core = all[i].has_core;
+        m->Mbound = all[i].Mbound;
+        m->Vmax = all[i].Vmax;
+        m->MostBoundID = all[i].MostBoundID;
+        int d;
+        for(d = 0; d < 3; d++) {
+            m->CorePos[d] = all[i].CorePos[d];
+            m->CoreVel[d] = all[i].CoreVel[d];
+        }
+        m->SigmaX = all[i].SigmaX;
+        m->SigmaV = all[i].SigmaV;
+    }
+    myfree(all);
+}
+
+/* Every particle of an oversized key to the source of one candidate (design 7.8 candidate set):
+ * the own tag of an in-place candidate; a serial sub-tree member's provisional remainder
+ * (BoundTrackId -1) to the candidate above its root, with a serial claim if it is a tail of an
+ * alive member or inside an alive root's relaxed source; a particle bound by a serial member is
+ * excluded (and keeps its tag); an untagged or foreign-tagged group particle to the central; a
+ * field particle with a stale orphan tag is released. */
+static void
+init_sources(struct Coll * C)
+{
+    const struct SubhaloPlan * plan = C->plan;
+    int64_t i;
+    int64_t nuniv = 0;
+    for(i = 0; i < C->NumPart; i++) {
+        C->Cand[i] = -1;
+        C->Claim[i] = -1;
+        C->Flag[i] = 0;
+        C->En[i] = 0;
+        C->ClaimE[i] = 0;
+        const struct particle_data * p = &P[i];
+        if(!part_live(p))
+            continue;
+        int64_t u = -1;
+        const struct SubhaloMember * m = p->TrackId >= 0 ? member_of(C, p->TrackId) : NULL;
+        if(p->GrNr >= 1 && subhalo_plan_inplace_index(plan, p->GrNr) >= 0)
+            u = p->GrNr;
+        else if(p->GrNr < 0 && m)
+            u = m->g;
+        if(u < 0)
+            continue;
+        if(m && m->g != u)
+            m = NULL;
+        C->Flag[i] = CF_UNIV;
+        nuniv++;
+        if(m && m->cand >= 0 && (m->kind != SUBHALO_MEM_ORPHAN || p->GrNr == u))
+            C->Cand[i] = m->cand;
+        else if(m && m->cand < 0 && m->SubKey >= 0) {
+            const struct SubhaloSubKey * sk = &plan->SubKeys[m->SubKey - plan->SubKeyBase];
+            const struct SubhaloMember * R = &plan->Members[sk->root];
+            if(R->Parent < 0 || plan->Members[R->Parent].cand < 0)
+                endrun(5, "Subhalo in place: the root %ld of sub-tree key %ld has no in-place parent.\n", R->TrackId, m->SubKey);
+            if(p->BoundTrackId >= 0)
+                C->Flag[i] |= CF_SBOUND | CF_SCLAIM;
+            else {
+                C->Cand[i] = plan->Members[R->Parent].cand;
+                if(m->state == SUBHALO_ST_ALIVE && (!m->root || p->BindRank < m->NboundExclusive + m->Keep))
+                    C->Flag[i] |= CF_SCLAIM;
+            }
+        }
+        else if(p->GrNr == u) {
+            const int64_t k = subhalo_plan_inplace_index(plan, u);
+            C->Cand[i] = plan->Inplace[k].central;
+        }
+        else {
+            /* a field particle tagged by an orphan member: a stale tag */
+            C->Flag[i] = CF_RELEASE;
+            nuniv--;
+        }
+    }
+    (void) nuniv;
+}
+
+/* ------------------------------------------------------------------ the rounds */
+
+/* The sinking core and the most-bound tracer (loop order) of the alive candidates of the round. */
+static void
+set_loop_cores(struct Coll * C)
+{
+    struct CoreOut lc;
+    round_cores(C, &lc);
+    int64_t c;
+    int d;
+    for(c = C->c0; c < C->c1; c++) {
+        struct CandState * s = &C->cs[c];
+        if(s->state != SUBHALO_ST_ALIVE)
+            continue;
+        const double * o = lc.d + CORE_ND * (c - C->c0);
+        s->has_core = o[14] > 0;
+        for(d = 0; d < 3; d++) {
+            s->CorePos[d] = o[d];
+            s->CoreVel[d] = o[3 + d];
+            s->mbPos[d] = o[8 + d];
+            s->mbVel[d] = o[11 + d];
+        }
+        s->SigmaX = o[6];
+        s->SigmaV = o[7];
+        s->mbID = lc.mbID[c - C->c0];
+        s->has_mb = s->has_core;
+    }
+    free_cores(&lc);
+    dead_mb(C);
+}
+
+static void
+run_round(struct Coll * C, int r, const int64_t * slotof, const struct SubTrack * oldrec)
+{
+    const struct SubhaloPlan * plan = C->plan;
+    const struct SubhaloUnbindParams * up = C->up;
+    C->c0 = plan->RoundStart[r];
+    C->c1 = plan->RoundStart[r + 1];
+    const double t0 = MPI_Wtime();
+    const int w0 = C->nwalks;
+    int64_t c, i;
+    int d;
+    for(c = C->c0; c < C->c1; c++) {
+        struct CandState * s = &C->cs[c];
+        const struct SubhaloInplaceCand * cd = &plan->Cands[c];
+        s->state = SUBHALO_ST_ALIVE;
+        s->iterating = 1;
+        s->absorbed = 0;
+        s->flags = 0;
+        for(d = 0; d < 3; d++) {
+            s->Ref0[d] = s->RefPos[d] = cd->RefPos[d];
+            s->RefVel[d] = cd->RefVel[d];
+        }
+    }
+    /* e: the loop */
+    unbind_loop(C);
+    /* g: sinking of the descendants on the loop-order cores, then the absorbing candidates
+     * unbound again from their whole source (process_serial_key) */
+    set_loop_cores(C);
+    if(round_sinking(C) > 0) {
+        for(c = C->c0; c < C->c1; c++) {
+            struct CandState * s = &C->cs[c];
+            s->iterating = s->absorbed && s->state == SUBHALO_ST_ALIVE;
+        }
+        unbind_loop(C);
+        set_loop_cores(C);
+    }
+    /* f: the final pass on the converged sets with the final frames */
+    int64_t npos = 0;
+    for(c = C->c0; c < C->c1; c++)
+        C->cs[c].iterating = C->cs[c].state == SUBHALO_ST_ALIVE;
+    coll_walk(C, C->En);
+    for(i = 0; i < C->NumPart; i++) {
+        const int32_t cc = C->Cand[i];
+        if(!in_round(C, cc) || !C->cs[cc].iterating || !(C->Flag[i] & CF_BOUND) || !part_live(&P[i]))
+            continue;
+        C->En[i] = coll_energy(C, i, C->En[i], &C->cs[cc]);
+        if(C->En[i] >= 0)
+            npos++;
+    }
+    C->ctx->Stats.NFinalPositive += npos;
+    for(c = C->c0; c < C->c1; c++) {
+        struct CandState * s = &C->cs[c];
+        s->iterating = 0;
+        if(s->state != SUBHALO_ST_ALIVE)
+            continue;
+        C->st.NFinalBound += s->Nbound;
+        int64_t keep = (int64_t) (s->Nbound * C->sp->SubhaloSourceRelaxFactor);
+        if(keep < s->Nbound) keep = s->Nbound;
+        if(keep > s->N) keep = s->N;
+        s->keep = keep;
+    }
+    /* h: the final cores, the most-bound tracers, the reserved tracers; i: the properties */
+    struct CoreOut fin;
+    round_cores(C, &fin);
+    struct RoundProps rp;
+    round_props(C, &fin, &rp);
+    const double G = up->G;
+    for(c = C->c0; c < C->c1; c++) {
+        struct CandState * s = &C->cs[c];
+        if(s->state != SUBHALO_ST_ALIVE)
+            continue;
+        const int64_t q = c - C->c0;
+        const double * o = fin.d + CORE_ND * q;
+        s->mbID = fin.mbID[q];
+        for(d = 0; d < 3; d++) {
+            s->mbPos[d] = o[8 + d];
+            s->mbVel[d] = o[11 + d];
+        }
+        s->has_mb = 1;
+        s->Mbound_rec = (float) rp.hs[NHS * q + HS_M];
+        s->Vmax_rec = rec_vmax(rp.prof[8 * q], up);
+        s->MostBoundID_rec = fin.mbID[q];
+        if(slotof[c] >= 0) {
+            const struct SubhaloMember * m = &plan->Members[plan->Cands[c].member];
+            const struct SubTrack * old = m->kind == SUBHALO_MEM_NEWBORN ? NULL : &oldrec[slotof[c] - C->ctx->IpResStart];
+            fill_alive_record(C, c, &fin, &rp, &C->ctx->Res[slotof[c]].rec, old);
+        }
+    }
+    (void) G;
+    free_round_props(&rp);
+    /* the relaxed sources (claims) and the remainders to the parents */
+    round_within(C);
+    round_commit(C, &fin);
+    free_cores(&fin);
+    int64_t nalive = 0, ndied = 0;
+    for(c = C->c0; c < C->c1; c++) {
+        if(C->cs[c].state == SUBHALO_ST_ALIVE) nalive++;
+        else if(C->cs[c].state == SUBHALO_ST_DIED || C->cs[c].state == SUBHALO_ST_FAILED) ndied++;
+    }
+    CollStats.NAlive += nalive;
+    CollStats.NDied += ndied;
+    const double dt = MPI_Wtime() - t0;
+    if(r < 16) {
+        CollStats.NCandsRound[r] = C->c1 - C->c0;
+        CollStats.Iterations[r] = C->nwalks - w0;
+        CollStats.Seconds[r] = dt;
+    }
+    message(0, "Subhalo in place: round %d of %d: %ld candidates (%ld alive, %ld died), %d tree builds and walks, %g s; free %g MB.\n",
+            r, plan->NRounds, C->c1 - C->c0, nalive, ndied, C->nwalks - w0, dt, mymalloc_freebytes() / (1024. * 1024.));
+}
+
+void
+subhalo_collective_run(struct SubhaloPlan * plan, struct SubhaloCallCtx * ctx, DomainDecomp * ddecomp,
+                       struct SubTrackTable * tab, MPI_Comm Comm)
+{
+    memset(&CollStats, 0, sizeof(CollStats));
+    if(plan->NCands == 0)
+        return;
+    struct Coll C;
+    memset(&C, 0, sizeof(C));
+    C.plan = plan;
+    C.ctx = ctx;
+    C.tab = tab;
+    C.ddecomp = ddecomp;
+    C.Comm = Comm;
+    MPI_Comm_size(Comm, &C.NTask);
+    MPI_Comm_rank(Comm, &C.ThisTask);
+    C.up = ctx->up;
+    C.sp = subhalo_get_params();
+    C.NumPart = PartManager->NumPart;
+    C.st.WorstConvRatio = 1;
+    C.st.WorstTrackId = -1;
+    const int64_t ncand = plan->NCands;
+    int64_t c, j;
+    const double t0 = MPI_Wtime();
+    CollStats.NRounds = plan->NRounds;
+    CollStats.NCands = ncand;
+
+    /* 1. the serial sub-tree results */
+    gather_serial(&C);
+
+    /* the owner slots and the previous records of the owned candidates (top) */
+    int64_t * slotof = (int64_t *) mymalloc2("SubCollSlotOf", sizeof(int64_t) * (ncand + 1));
+    j = 0;
+    for(c = 0; c < ncand; c++)
+        slotof[c] = plan->Cands[c].owner == C.ThisTask ? ctx->IpResStart + j++ : -1;
+    if(j != ctx->NIpRes)
+        endrun(5, "Subhalo in place: %ld owned candidates for %ld result slots.\n", j, ctx->NIpRes);
+    struct SubTrack * oldrec = (struct SubTrack *) mymalloc2("SubCollOldRec", sizeof(struct SubTrack) * (j + 1));
+    {
+        int64_t * ids = (int64_t *) mymalloc("SubCollOldIds", sizeof(int64_t) * (j + 1));
+        int64_t * pos = (int64_t *) mymalloc("SubCollOldPos", sizeof(int64_t) * (j + 1));
+        int64_t n = 0;
+        for(c = 0; c < ncand; c++) {
+            if(slotof[c] < 0)
+                continue;
+            subhalo_track_clear(&oldrec[slotof[c] - ctx->IpResStart], plan->Cands[c].TrackId);
+            if(!SUBHALO_IS_PROVISIONAL(plan->Cands[c].TrackId)) {
+                ids[n] = plan->Cands[c].TrackId;
+                pos[n] = slotof[c] - ctx->IpResStart;
+                n++;
+            }
+        }
+        struct SubTrack * got = (struct SubTrack *) mymalloc("SubCollOldGot", sizeof(struct SubTrack) * (n + 1));
+        subhalo_table_fetch(tab, ids, n, got, Comm);
+        for(c = 0; c < n; c++)
+            oldrec[pos[c]] = got[c];
+        myfree(got);
+        myfree(pos);
+        myfree(ids);
+        for(c = 0; c < ctx->NIpRes; c++) {
+            memset(&ctx->Res[ctx->IpResStart + c], 0, sizeof(struct SubhaloResult));
+            ctx->Res[ctx->IpResStart + c].ipk = -1;
+            ctx->Res[ctx->IpResStart + c].subkey = -1;
+        }
+    }
+
+    /* the per-call scratch (top) */
+    C.cs = (struct CandState *) mymalloc2("SubCollCands", sizeof(struct CandState) * (ncand + 1));
+    memset(C.cs, 0, sizeof(struct CandState) * (ncand + 1));
+    for(c = 0; c < ncand; c++) {
+        C.cs[c].state = SUBHALO_ST_NONE;
+        C.cs[c].SinkTrackId = SUBHALO_NOTRACK;
+    }
+    C.Cand = (int32_t *) mymalloc2("SubCollCand", sizeof(int32_t) * (C.NumPart + 1));
+    C.Claim = (int32_t *) mymalloc2("SubCollClaim", sizeof(int32_t) * (C.NumPart + 1));
+    C.Flag = (uint8_t *) mymalloc2("SubCollFlag", C.NumPart + 1);
+    C.En = (double *) mymalloc2("SubCollEn", sizeof(double) * (C.NumPart + 1));
+    C.ClaimE = (double *) mymalloc2("SubCollClaimE", sizeof(double) * (C.NumPart + 1));
+
+    /* 2. the sources */
+    init_sources(&C);
+    walltime_measure("/Subhalo/InPlace/Setup");
+
+    /* 3. the rounds, deepest first */
+    int r;
+    for(r = 0; r < plan->NRounds; r++)
+        run_round(&C, r, slotof, oldrec);
+    walltime_measure("/Subhalo/InPlace/Rounds");
+
+    /* 4. the hierarchy, the records */
+    double * maxmerge = (double *) mymalloc("SubCollMaxMerge", sizeof(double) * (plan->NInplace + 1));
+    coll_hierarchy(&C, maxmerge);
+    coll_records(&C, maxmerge, slotof, oldrec);
+    myfree(maxmerge);
+
+    /* 5. the final tags */
+    coll_final_tags(&C, slotof);
+    walltime_measure("/Subhalo/InPlace/Tags");
+
+    myfree(C.ClaimE);
+    myfree(C.En);
+    myfree(C.Flag);
+    myfree(C.Claim);
+    myfree(C.Cand);
+    myfree(C.cs);
+    myfree(oldrec);
+    myfree(slotof);
+
+    /* the candidate-level diagnostics are identical on every rank: counted once */
+    if(C.ThisTask == 0) {
+        ctx->Stats.NCandidates += C.st.NCandidates;
+        ctx->Stats.NItercap += C.st.NItercap;
+        ctx->Stats.NFinalBound += C.st.NFinalBound;
+        if(C.st.NItercap > 0 && (ctx->Stats.WorstTrackId == -1 || C.st.WorstConvRatio < ctx->Stats.WorstConvRatio)) {
+            ctx->Stats.WorstConvRatio = C.st.WorstConvRatio;
+            ctx->Stats.WorstTrackId = C.st.WorstTrackId;
+        }
+    }
+    int64_t iters = 0;
+    for(r = 0; r < plan->NRounds && r < 16; r++)
+        iters += CollStats.Iterations[r];
+    message(0, "Subhalo in place: %ld candidates in %d round(s), %ld tree builds and walks, %ld alive, %ld died, %ld descendants sunk; "
+               "%ld serial own-tag particles taken by in-place candidates, %ld claims given to the binding owner (J2); %g s.\n",
+            ncand, plan->NRounds, iters, CollStats.NAlive, CollStats.NDied, CollStats.NSunk, CollStats.NStolen, CollStats.NJ2, MPI_Wtime() - t0);
+}

@@ -27,7 +27,7 @@ TESTED = hci \
 	subhalo_unbind \
 	subhalo_props
 
-MPI_TESTED = exchange fof subhalo subhalo_so
+MPI_TESTED = exchange fof subhalo subhalo_so subhalo_collective
 
 TESTBIN :=$(UTILS_TESTED:%=.objs/utils/test_%) $(UTILS_MPI_TESTED:%=.objs/utils/test_%) $(TESTED:%=.objs/test_%) $(MPI_TESTED:%=.objs/test_%)
 MPISUITE = $(MPI_TESTED:%=test_%) $(UTILS_MPI_TESTED:%=utils/test_%)
@@ -50,7 +50,7 @@ GADGET_OBJS =  \
 	 fof.o fofpetaio.o petaio.o \
 	 subhalo.o subhalo_gather.o subhalo_track.o subhalo_io.o \
 	 subhalo_unbind.o subhalo_props.o \
-	 subhalo_so.o \
+	 subhalo_so.o subhalo_collective.o \
 	 domain.o exchange.o slotsmanager.o partmanager.o \
 	 blackhole.o bhinfo.o bhdynfric.o \
 	 timebinmgr.o \
@@ -136,6 +136,9 @@ all: libgadget.a libgadget-utils.a
 	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
 
 .objs/test_subhalo_so: tests/test_subhalo_so.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
+	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
+
+.objs/test_subhalo_collective: tests/test_subhalo_collective.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
 	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
 
 .objs/test_forcetree: tests/test_forcetree.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
