@@ -656,35 +656,66 @@ key_dims(const struct SubhaloPlanCfg * cfg, const struct SubhaloDirKey * k, doub
         dims[7] += cfg->SubKeyPartBytes * (double) k->Length;
 }
 
-/* Greedy longest-first on rank 0 for the head keys (already in GrNr = decreasing length order):
- * the rank with the most free particle budget among those where the key fits in every dimension. */
+struct HeadOrder {
+    double cost;
+    int64_t g;
+    int64_t i;
+};
+
+static int
+cmp_headorder(const void * a, const void * b)
+{
+    const struct HeadOrder * x = (const struct HeadOrder *) a, * y = (const struct HeadOrder *) b;
+    /* decreasing cost, ties by g */
+    if(x->cost != y->cost)
+        return (x->cost < y->cost) - (x->cost > y->cost);
+    return (x->g > y->g) - (x->g < y->g);
+}
+
+/* Cost-aware greedy on rank 0 for the head keys (hk in g order; Phase 5c): the keys by decreasing
+ * subhalo_key_cost (ties by g), each to the rank with the least assigned cost among those where it
+ * fits in every dimension (ties: the most free particle budget, then the lowest rank). hr is in
+ * the order of hk; asg (PLAN_NDIM per rank) and hcost (per rank) accumulate the assignment. */
 static void
-pack_head(const struct HeadKey * hk, int64_t nh, const struct RankBudget * rb, int NTask, double * asg, struct HeadResult * hr)
+pack_head(const struct HeadKey * hk, int64_t nh, const struct RankBudget * rb, int NTask, double * asg, double * hcost,
+          struct HeadResult * hr)
 {
     int64_t k;
     int r, d;
+    struct HeadOrder * ord = (struct HeadOrder *) mymalloc("SubHeadOrder", sizeof(struct HeadOrder) * (nh + 1));
     for(k = 0; k < nh; k++) {
+        ord[k].cost = subhalo_key_cost((int64_t) hk[k].dims[0]);
+        ord[k].g = hk[k].g;
+        ord[k].i = k;
+    }
+    qsort(ord, nh, sizeof(struct HeadOrder), cmp_headorder);
+    for(k = 0; k < nh; k++) {
+        const int64_t i = ord[k].i;
         int best = -1;
-        double bestfree = -1;
+        double bestcost = 0, bestfree = 0;
         for(r = 0; r < NTask; r++) {
             int fits = 1;
             for(d = 0; d < PLAN_NDIM; d++)
-                if(hk[k].dims[d] > rb[r].cap[d] - asg[PLAN_NDIM * r + d])
+                if(hk[i].dims[d] > rb[r].cap[d] - asg[PLAN_NDIM * r + d])
                     fits = 0;
             if(!fits)
                 continue;
             const double freer = rb[r].cap[0] - asg[PLAN_NDIM * r];
-            if(freer > bestfree) {
+            if(best < 0 || hcost[r] < bestcost || (hcost[r] == bestcost && freer > bestfree)) {
+                bestcost = hcost[r];
                 bestfree = freer;
                 best = r;
             }
         }
-        hr[k].g = hk[k].g;
-        hr[k].target = best;
-        if(best >= 0)
+        hr[i].g = hk[i].g;
+        hr[i].target = best;
+        if(best >= 0) {
             for(d = 0; d < PLAN_NDIM; d++)
-                asg[PLAN_NDIM * best + d] += hk[k].dims[d];
+                asg[PLAN_NDIM * best + d] += hk[i].dims[d];
+            hcost[best] += ord[k].cost;
+        }
     }
+    myfree(ord);
 }
 
 /* Oversized census of every rank and the global number of in-place keys; nnew[0]: of those the
@@ -867,6 +898,8 @@ subhalo_plan_pack(struct SubhaloDirKey * dk, int64_t ndir, const struct SubhaloD
     double * loadloc = (double *) mymalloc("SubLoadLoc", sizeof(double) * PLAN_NDIM * NTask);
     double * excess = (double *) mymalloc("SubExcess", sizeof(double) * PLAN_NDIM * NTask);
     double * CE = (double *) mymalloc("SubCumCap", sizeof(double) * NTask);
+    double * hcost = (double *) mymalloc("SubHeadCost", sizeof(double) * NTask);
+    double * Er = (double *) mymalloc("SubTailCap", sizeof(double) * NTask);
     const int64_t HeadCap = (int64_t) SUBHALO_HEAD_PER_TASK * NTask < SUBHALO_HEAD_MAX ? (int64_t) SUBHALO_HEAD_PER_TASK * NTask : SUBHALO_HEAD_MAX;
     const int64_t H = TotNgroups < HeadCap ? TotNgroups : HeadCap;
     double dims[PLAN_NDIM];
@@ -944,10 +977,12 @@ subhalo_plan_pack(struct SubhaloDirKey * dk, int64_t ndir, const struct SubhaloD
         MPI_Gatherv(hloc, hbytes, MPI_BYTE, hall, hcounts, hdispl, MPI_BYTE, 0, Comm);
         struct HeadResult * hr = (struct HeadResult *) mymalloc("SubHeadRes", sizeof(struct HeadResult) * (nh + 1));
         memset(asg, 0, sizeof(double) * PLAN_NDIM * NTask);
+        memset(hcost, 0, sizeof(double) * NTask);
         if(ThisTask == 0)
-            pack_head(hall, nh, rb, NTask, asg, hr);
+            pack_head(hall, nh, rb, NTask, asg, hcost, hr);
         MPI_Bcast(hr, sizeof(struct HeadResult) * nh, MPI_BYTE, 0, Comm);
         MPI_Bcast(asg, PLAN_NDIM * NTask, MPI_DOUBLE, 0, Comm);
+        MPI_Bcast(hcost, NTask, MPI_DOUBLE, 0, Comm);
         int64_t j = 0;
         for(k = 0; k < ndir; k++) {
             if(dk[k].oversized || dk[k].g > H) continue;
@@ -965,9 +1000,10 @@ subhalo_plan_pack(struct SubhaloDirKey * dk, int64_t ndir, const struct SubhaloD
 
         /* tail: the remaining budgets E_r, with the tail's type and byte mix taken as uniform
          * (the census below checks the real loads) */
-        double tl[PLAN_NDIM], tmax[PLAN_NDIM];
+        double tl[PLAN_NDIM + 1], tmax[PLAN_NDIM];
         for(d = 0; d < PLAN_NDIM; d++)
             tl[d] = tmax[d] = 0;
+        tl[PLAN_NDIM] = 0;      /* the tail's summed cost */
         for(k = 0; k < ndir; k++) {
             if(dk[k].oversized || dk[k].g <= H) continue;
             key_dims(cfg, &dk[k], dims);
@@ -975,11 +1011,13 @@ subhalo_plan_pack(struct SubhaloDirKey * dk, int64_t ndir, const struct SubhaloD
                 tl[d] += dims[d];
                 if(dims[d] > tmax[d]) tmax[d] = dims[d];
             }
+            tl[PLAN_NDIM] += subhalo_key_cost(dk[k].Length);
         }
-        double TailN[PLAN_NDIM], TailMax[PLAN_NDIM];
-        MPI_Allreduce(tl, TailN, PLAN_NDIM, MPI_DOUBLE, MPI_SUM, Comm);
+        double TailN[PLAN_NDIM + 1], TailMax[PLAN_NDIM];
+        MPI_Allreduce(tl, TailN, PLAN_NDIM + 1, MPI_DOUBLE, MPI_SUM, Comm);
         MPI_Allreduce(tmax, TailMax, PLAN_NDIM, MPI_DOUBLE, MPI_MAX, Comm);
-        double cum = 0;
+        const double TailC = TailN[PLAN_NDIM];
+        double Etot = 0;
         for(r = 0; r < NTask; r++) {
             double E = 0;
             if(TailN[0] > 0) {
@@ -991,7 +1029,42 @@ subhalo_plan_pack(struct SubhaloDirKey * dk, int64_t ndir, const struct SubhaloD
                 }
             }
             if(E < 0) E = 0;
-            cum += E;
+            Er[r] = E;
+            Etot += E;
+        }
+        /* Phase 5c: the tail's weights W_r, water-filled against the head costs: with c = TailC /
+         * TailN the tail's mean cost per particle, W_r = clamp((L - hcost_r) / c, 0, E_r) with the
+         * level L such that sum W = TailN. When the tail does not fit the capacity (TailN >= sum E)
+         * every W_r = E_r, the plan of the capacities alone. The weights only choose the ranks; the
+         * placement test below and the census still use the capacities. */
+        if(TailN[0] > 0 && TailN[0] < Etot && TailC > 0) {
+            const double c = TailC / TailN[0];
+            double lo = hcost[0], hi = hcost[0] + Er[0] * c;
+            for(r = 1; r < NTask; r++) {
+                if(hcost[r] < lo) lo = hcost[r];
+                if(hcost[r] + Er[r] * c > hi) hi = hcost[r] + Er[r] * c;
+            }
+            int it;
+            for(it = 0; it < 200 && hi > lo; it++) {
+                const double mid = 0.5 * (lo + hi);
+                if(mid <= lo || mid >= hi)
+                    break;
+                double sw = 0;
+                for(r = 0; r < NTask; r++) {
+                    double w = (mid - hcost[r]) / c;
+                    sw += w < 0 ? 0 : (w > Er[r] ? Er[r] : w);
+                }
+                if(sw < TailN[0]) lo = mid;
+                else hi = mid;
+            }
+            for(r = 0; r < NTask; r++) {
+                const double w = (hi - hcost[r]) / c;
+                Er[r] = w < 0 ? 0 : (w > Er[r] ? Er[r] : w);
+            }
+        }
+        double cum = 0;
+        for(r = 0; r < NTask; r++) {
+            cum += Er[r];
             CE[r] = cum;
         }
         /* The keys whose start (prefix of lengths in GrNr order) lies below the total capacity
@@ -1012,14 +1085,14 @@ subhalo_plan_pack(struct SubhaloDirKey * dk, int64_t ndir, const struct SubhaloD
         MPI_Exscan(&ntl, &jt, 1, MPI_INT64, MPI_SUM, Comm);
         if(ThisTask == 0)
             jt = 0;
-        const double CEtot = CE[NTask - 1];
+        const double CEtot = Etot, CWtot = CE[NTask - 1];
         for(k = 0; k < ndir; k++) {
             if(dk[k].oversized || dk[k].g <= H) continue;
-            if(pfx >= CEtot)
+            if(pfx >= CEtot || CWtot <= 0)
                 dk[k].target = -1;
             else {
                 double w = ((double) jt + 0.5) * 0.6180339887498949;
-                w = (w - floor(w)) * CEtot;
+                w = (w - floor(w)) * CWtot;
                 int lo_r = 0, hi_r = NTask;
                 while(lo_r < hi_r) {
                     int mid = (lo_r + hi_r) / 2;
@@ -1101,6 +1174,8 @@ subhalo_plan_pack(struct SubhaloDirKey * dk, int64_t ndir, const struct SubhaloD
         }
     }
     (void) i; (void) t;
+    myfree(Er);
+    myfree(hcost);
     myfree(CE);
     myfree(excess);
     myfree(loadloc);
@@ -1935,6 +2010,7 @@ plan_census_pass(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubTra
         res.slotfree[t] = info->enabled ? info->maxsize - info->size : 0;
     }
     res.freebytes = (double) mymalloc_freebytes();
+    plan->PackFreeBytes = res.freebytes;
     struct SubhaloPlanCfg cfg;
     subhalo_plan_default_cfg(&cfg, TotKeys, NTask);
     /* the in-place structure this pass knows: its candidates and member tracks (audit Q1) */
@@ -1972,7 +2048,12 @@ subhalo_plan_last_summary(void)
  * bytes now less what the serial stage keeps until the collective call ends (per serial key it
  * processes the member records, result slots and per-key buffers, a sub-tree key's binder
  * ordinals; per local in-place segment its members and buffers) and the slot growth the received
- * keys can force. Collective; returns 1 on every rank if some rank cannot fit. */
+ * keys can force. Collective; returns 1 on every rank if some rank cannot fit.
+ * Phase 5c: first, for every plan, the reserve admission: the free bytes at pack time must cover
+ * the constant reserve and the per-MaxPart sort bytes of the byte budget on every rank (a rank
+ * below it has a zero byte budget, so it receives no key, but it still runs the call's own
+ * constant-size and per-particle steps); a rank short of it fails the call the same way
+ * (a->reserve_failed; a->failed and failstage stay the collective stage's). */
 static int
 plan_admit(struct SubhaloPlan * plan, const struct SubhaloDirKey * dk, int64_t ndir, const struct SubhaloDirMsg * in,
            const struct SubhaloTrackKey * fkmap, int64_t nfk, const DomainDecomp * ddecomp, MPI_Comm Comm)
@@ -1981,14 +2062,29 @@ plan_admit(struct SubhaloPlan * plan, const struct SubhaloDirKey * dk, int64_t n
     struct SubhaloCollAdmit * a = &plan->Admit;
     memset(a, 0, sizeof(*a));
     a->failrank = a->failstage = -1;
+    struct SubhaloPlanCfg cfg;
+    subhalo_plan_default_cfg(&cfg, plan->TotKeys, NTask);
+    {
+        a->reserve_need = cfg.ReserveBytes + cfg.SortBytesPerPart * (double) PartManager->MaxPart;
+        a->pack_free = plan->PackFreeBytes;
+        struct { double v; int r; } rs = {a->reserve_need - a->pack_free, ThisTask}, wrs;
+        MPI_Allreduce(&rs, &wrs, 1, MPI_DOUBLE_INT, MPI_MAXLOC, Comm);
+        double rinfo[2] = {a->reserve_need, a->pack_free};
+        MPI_Bcast(rinfo, 2, MPI_DOUBLE, wrs.r, Comm);
+        a->reserve_short = wrs.v;
+        a->reserve_rank = wrs.r;
+        a->reserve_failed = wrs.v > 0;
+        if(a->reserve_failed)
+            message(0, "Subhalo plan: rank %d is short of the plan's reserve by %g MB: it needs %g MB (the constant reserve and the "
+                       "per-particle sort bytes) and had %g MB free when the plan was packed. The call fails before the exchange.\n",
+                    wrs.r, wrs.v / 1048576., rinfo[0] / 1048576., rinfo[1] / 1048576.);
+    }
     if(plan->NCands == 0) {
         LastAdmit = *a;
-        return 0;
+        return a->reserve_failed;
     }
     a->checked = 1;
     const struct SubhaloParams * sp = subhalo_get_params();
-    struct SubhaloPlanCfg cfg;
-    subhalo_plan_default_cfg(&cfg, plan->TotKeys, NTask);
     int64_t i, k;
     int t;
     /* per rank: [0] bytes the serial stage keeps, [1..6] particles of each type received, [7] particles of sub-tree keys */
@@ -2102,7 +2198,7 @@ plan_admit(struct SubhaloPlan * plan, const struct SubhaloDirKey * dk, int64_t n
         message(0, "Subhalo plan: in-place stage admitted; tightest rank %d needs %g MB of %g MB (largest stage: %s).\n",
                 wsh.r, info[1] / 1048576., info[2] / 1048576., SubhaloCollStageName[a->failstage]);
     LastAdmit = *a;
-    return a->failed;
+    return a->failed || a->reserve_failed;
 }
 
 static int
@@ -2649,7 +2745,24 @@ subhalo_layout(int i, const void * userdata)
 int
 subhalo_plan_exchange(struct SubhaloPlan * plan, MPI_Comm Comm)
 {
+    /* the exchange volume (Phase 5c): live particles leaving, and arriving from the change of
+     * the live count */
+    int64_t i, before = 0, out = 0, after = 0;
+    #pragma omp parallel for reduction(+: before, out)
+    for(i = 0; i < PartManager->NumPart; i++) {
+        if(P[i].IsGarbage)
+            continue;
+        before++;
+        if(P[i].TopLeaf != plan->ThisTask)
+            out++;
+    }
     int failure = domain_exchange(subhalo_layout, PartManager, NULL, PartManager, SlotsManager, 10000, Comm);
+    #pragma omp parallel for reduction(+: after)
+    for(i = 0; i < PartManager->NumPart; i++)
+        if(!P[i].IsGarbage)
+            after++;
+    plan->ExchOut = out;
+    plan->ExchIn = after - (before - out);
     if(failure)
         message(1, "Subhalo exchange did not complete on this rank.\n");
     if(subhalo_get_params()->SubhaloDebugForceExchangeFailure) {
@@ -2796,6 +2909,7 @@ subhalo_restore_domain(DomainDecomp * ddecomp)
 /* ------------------------------------------------------------------ per-thread arenas (design 7.1) */
 
 struct KeyOrder {
+    double cost;
     int64_t n;
     int64_t g;
     int64_t k;
@@ -2805,43 +2919,85 @@ static int
 cmp_keyorder(const void * a, const void * b)
 {
     const struct KeyOrder * x = (const struct KeyOrder *) a, * y = (const struct KeyOrder *) b;
-    /* longest first, ties by GrNr */
-    if(x->n != y->n)
-        return (x->n < y->n) - (x->n > y->n);
+    /* most expensive first, ties by GrNr */
+    if(x->cost != y->cost)
+        return (x->cost < y->cost) - (x->cost > y->cost);
     return (x->g > y->g) - (x->g < y->g);
+}
+
+static struct SubhaloSerialStats SerialStats;
+
+const struct SubhaloSerialStats *
+subhalo_serial_last_stats(void)
+{
+    return &SerialStats;
+}
+
+void
+subhalo_serial_reset_stats(void)
+{
+    memset(&SerialStats, 0, sizeof(SerialStats));
+}
+
+static void
+serial_stats_key(double dt, int64_t n, int alone)
+{
+    struct SubhaloSerialStats * ss = &SerialStats;
+    ss->NKeys++;
+    ss->KeyTimeSum += dt;
+    if(n > ss->LargestN)
+        ss->LargestN = n;
+    if(dt > ss->KeyTimeMax) {
+        ss->KeyTimeMax = dt;
+        ss->KeyTimeMaxN = n;
+    }
+    if(alone) {
+        ss->NAlone++;
+        return;
+    }
+    const double x = (double) n * log2(n > 2 ? (double) n : 2.);
+    ss->FitN += 1;
+    ss->FitX += x;
+    ss->FitXX += x * x;
+    ss->FitY += dt;
+    ss->FitXY += x * dt;
 }
 
 double
 subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t bytes_per_part, const int64_t * extra,
                         subhalo_key_fn fn, void * userdata)
 {
-    int64_t k, ns = 0, total = 0;
+    int64_t k, ns = 0;
+    double totalcost = 0;
     int t;
     const int nthreads = omp_get_max_threads();
     for(k = 0; k < nsegs; k++)
-        if(!segs[k].inplace) {
+        if(!segs[k].inplace)
             ns++;
-            total += segs[k].n;
-        }
     struct KeyOrder * ord = (struct KeyOrder *) mymalloc("SubKeyOrder", sizeof(struct KeyOrder) * (ns + 1));
     ns = 0;
     for(k = 0; k < nsegs; k++)
         if(!segs[k].inplace) {
+            ord[ns].cost = subhalo_key_cost(segs[k].n);
             ord[ns].n = segs[k].n;
             ord[ns].g = segs[k].g;
             ord[ns].k = k;
+            totalcost += ord[ns].cost;
             ns++;
         }
+    /* the cost is increasing in n: the same order as longest first */
     qsort(ord, ns, sizeof(struct KeyOrder), cmp_keyorder);
 #define KEY_ARENA_BYTES(kk) ((size_t) bytes_per_part * (size_t) segs[kk].n + (size_t) (extra ? extra[kk] : 0) + 64)
     double peakfrac = 0;
+    SerialStats.NThreads = nthreads;
 
-    /* keys above one thread's share run alone, with every thread inside the key */
-    const int64_t share = (total + nthreads - 1) / nthreads;
+    /* keys above one thread's share of the cost run alone, with every thread inside the key */
+    const double share = totalcost / nthreads;
     int64_t nalone = 0;
-    while(nthreads > 1 && nalone < ns && ord[nalone].n > share)
+    while(nthreads > 1 && nalone < ns && ord[nalone].cost > share)
         nalone++;
     if(nalone > 0) {
+        const double ta = MPI_Wtime();
         struct SubhaloArena arena;
         arena.size = 0;
         for(k = 0; k < nalone; k++)
@@ -2851,23 +3007,30 @@ subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t
         for(k = 0; k < nalone; k++) {
             arena.used = 0;
             arena.peak = 0;
+            const double t0 = MPI_Wtime();
             fn(&segs[ord[k].k], ord[k].k, &arena, nthreads, userdata);
+            serial_stats_key(MPI_Wtime() - t0, ord[k].n, 1);
             const double f = (double) arena.peak / (double) KEY_ARENA_BYTES(ord[k].k);
             if(f > peakfrac)
                 peakfrac = f;
         }
         myfree(arena.base);
+        SerialStats.AloneWall += MPI_Wtime() - ta;
     }
 
-    /* the rest: static longest-processing-time-first assignment to threads */
-    int64_t * load = (int64_t *) mymalloc("SubThreadLoad", sizeof(int64_t) * nthreads);
+    /* the rest: static longest-processing-time-first assignment of the costs to the threads; each
+     * thread processes its keys in the order of ord (non-increasing cost) */
+    double * load = (double *) mymalloc("SubThreadLoad", sizeof(double) * nthreads);
     int64_t * maxb = (int64_t *) mymalloc("SubThreadMaxB", sizeof(int64_t) * nthreads);
     int64_t * count = (int64_t *) mymalloc("SubThreadCount", sizeof(int64_t) * nthreads);
     double * tpeak = (double *) mymalloc("SubThreadPeak", sizeof(double) * nthreads);
+    double * tbusy = (double *) mymalloc("SubThreadBusy", sizeof(double) * nthreads);
+    double * kt = (double *) mymalloc("SubKeyTime", sizeof(double) * (ns + 1));
     int * owner = (int *) mymalloc("SubKeyOwner", sizeof(int) * (ns + 1));
     for(t = 0; t < nthreads; t++) {
-        load[t] = maxb[t] = count[t] = 0;
-        tpeak[t] = 0;
+        load[t] = 0;
+        maxb[t] = count[t] = 0;
+        tpeak[t] = tbusy[t] = 0;
     }
     for(k = nalone; k < ns; k++) {
         int best = 0;
@@ -2875,7 +3038,7 @@ subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t
             if(load[t] < load[best])
                 best = t;
         owner[k] = best;
-        load[best] += ord[k].n;
+        load[best] += ord[k].cost;
         count[best]++;
         if((int64_t) KEY_ARENA_BYTES(ord[k].k) > maxb[best])
             maxb[best] = KEY_ARENA_BYTES(ord[k].k);
@@ -2887,6 +3050,7 @@ subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t
         arenas[t].peak = 0;
         arenas[t].base = (char *) mymalloc2("SubArena", arenas[t].size);
     }
+    const double tthr = MPI_Wtime();
     #pragma omp parallel num_threads(nthreads)
     {
         const int tid = omp_get_thread_num();
@@ -2899,7 +3063,10 @@ subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t
                 if(owner[kk] != tt) continue;
                 arenas[tt].used = 0;
                 arenas[tt].peak = 0;
+                const double t0 = omp_get_wtime();
                 fn(&segs[ord[kk].k], ord[kk].k, &arenas[tt], 1, userdata);
+                kt[kk] = omp_get_wtime() - t0;
+                tbusy[tt] += kt[kk];
                 /* relative to what the key itself was allowed, not the thread's larger arena */
                 const double f = (double) arenas[tt].peak / (double) KEY_ARENA_BYTES(ord[kk].k);
                 if(f > tpeak[tt])
@@ -2908,6 +3075,19 @@ subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t
         }
     }
 #undef KEY_ARENA_BYTES
+    if(ns > nalone) {
+        SerialStats.ThreadedWall += MPI_Wtime() - tthr;
+        double bmax = 0, bsum = 0;
+        for(t = 0; t < nthreads; t++) {
+            bsum += tbusy[t];
+            if(tbusy[t] > bmax)
+                bmax = tbusy[t];
+        }
+        SerialStats.ThreadMax += bmax;
+        SerialStats.ThreadSum += bsum;
+    }
+    for(k = nalone; k < ns; k++)
+        serial_stats_key(kt[k], ord[k].n, 0);
     for(t = 0; t < nthreads; t++)
         if(tpeak[t] > peakfrac)
             peakfrac = tpeak[t];
@@ -2915,6 +3095,8 @@ subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t
         myfree(arenas[t].base);
     myfree(arenas);
     myfree(owner);
+    myfree(kt);
+    myfree(tbusy);
     myfree(tpeak);
     myfree(count);
     myfree(maxb);

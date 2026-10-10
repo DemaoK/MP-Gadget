@@ -11,6 +11,7 @@
  * the last allocation on the bottom. Bottom allocations (mymalloc) are scratch that is freed
  * within the function that made it. */
 
+#include <math.h>
 #include "subhalo.h"
 
 /* Per-thread scratch per particle of a key (design 7.1), Phase 2a (audit J7):
@@ -43,6 +44,23 @@ size_t subhalo_arena_bytes_per_part(void);
 #define SUBHALO_INPLACE_KEY_BYTES 512
 #define SUBHALO_INPLACE_CAND_BYTES 4096
 #define SUBHALO_INPLACE_MEMBER_BYTES 768
+
+/* Phase 5c: the estimated processing cost of a serial key of N particles, in arbitrary units,
+ * cost(N) = SUBHALO_COST_ITER * N log2 max(N, 2) + SUBHALO_COST_KEY: the tree builds and walks of
+ * the unbinding iterations scale as N log N, the per-key constant covers the record fetch, the
+ * hierarchy and the per-key setup. Only the ratio SUBHALO_COST_KEY / SUBHALO_COST_ITER matters
+ * (the planner and subhalo_run_serial_keys compare costs with each other). The values are
+ * placeholders to calibrate on dm-128 from the fit of the measured key times that the per-call
+ * summary logs ("key time fit"). On dm-small (64^3, keys of 20 to 4058 particles, one thread per
+ * rank) the fit gave 1.1e-6 to 1.25e-6 s per N log2 N and an intercept that is not resolved
+ * (slightly negative: the times curve upward in N log N), so only the slope is calibrated there:
+ * one cost unit is about 1.2e-7 s and the placeholder per-key constant about 0.25 ms. */
+#define SUBHALO_COST_ITER 10.
+#define SUBHALO_COST_KEY 2000.
+static inline double subhalo_key_cost(int64_t N) {
+    const double n = N > 2 ? (double) N : 2.;
+    return SUBHALO_COST_ITER * (double) (N > 0 ? N : 0) * log2(n) + SUBHALO_COST_KEY;
+}
 
 /* Catalogue int32 guards (audit Q4; the schema columns are i4): a count of n particles fits if
  * 0 <= n <= INT32_MAX; a dense 0-based rank r fits only if r < INT32_MAX (the rank INT32_MAX
@@ -255,6 +273,14 @@ struct SubhaloCollAdmit {
     double avail;            /* this rank: free bytes left for the collective call */
     double worst_short;      /* largest need - avail over the ranks (> 0: failed) */
     int64_t NumPart, NUniv, NSubPart;    /* this rank's inputs: particles, particles of oversized groups, of its sub-tree keys */
+    /* Phase 5c: the reserve admission, checked for every plan (also without in-place candidates):
+     * the free bytes at pack time must cover the plan's constant reserve and the per-MaxPart sort
+     * bytes (cfg.ReserveBytes + cfg.SortBytesPerPart * MaxPart) on every rank */
+    int reserve_failed;      /* 1: some rank is short of the reserve */
+    int reserve_rank;        /* the rank with the largest shortfall */
+    double reserve_short;    /* its shortfall (bytes; <= 0 when the check passed) */
+    double reserve_need;     /* this rank: the reserve */
+    double pack_free;        /* this rank: the free bytes at pack time */
 };
 struct SubhaloPlan {
     int NTask, ThisTask;
@@ -286,6 +312,9 @@ struct SubhaloPlan {
     int64_t NOrphanIds;
     struct SubhaloPlanStats Stats;
     struct SubhaloCollAdmit Admit;          /* the admission of the collective stage (audit Q1) */
+    /* Phase 5c */
+    double PackFreeBytes;                   /* this rank: mymalloc_freebytes() at the last packing */
+    int64_t ExchOut, ExchIn;                /* this rank: live particles sent and received by subhalo_plan_exchange */
 };
 
 /* ---- the packing as a particle-free function (unit-testable with synthetic inputs) ---- */
@@ -505,13 +534,36 @@ static inline void * subhalo_arena_get(struct SubhaloArena * a, size_t bytes) {
 
 /* Callback processing serial key k with one arena; nthreads > 1 only for a key processed alone. */
 typedef void (*subhalo_key_fn)(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloArena * arena, int nthreads, void * userdata);
-/* Static longest-first schedule of the serial segments over the OpenMP threads, one arena per
- * thread (mymalloc2 in thread order, freed in reverse); keys above one thread's share are
- * processed alone first. Key k needs an arena of bytes_per_part * segs[k].n + extra[k] + 64
- * bytes (extra may be NULL). Returns the largest arena high-water mark of a key as a fraction
- * of its arena (diagnostic). */
+/* Static cost-ordered schedule of the serial segments over the OpenMP threads (Phase 5c): the
+ * keys sorted by decreasing subhalo_key_cost(n) (ties by g; the same order as by n), those whose
+ * cost exceeds the total cost / nthreads processed alone first with every thread inside the key,
+ * the rest assigned longest-processing-time first on cost to the least loaded thread and processed
+ * by each thread in that order; one arena per thread (mymalloc2 in thread order, freed in
+ * reverse). Key k needs an arena of bytes_per_part * segs[k].n + extra[k] + 64 bytes (extra may
+ * be NULL). Every fn() call is timed into the statistics below. Returns the largest arena
+ * high-water mark of a key as a fraction of its arena (diagnostic). */
 double subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t bytes_per_part, const int64_t * extra,
                                subhalo_key_fn fn, void * userdata);
+/* This rank's measured key times, summed over the subhalo_run_serial_keys calls since the last
+ * reset (the driver resets before the serial stage). */
+struct SubhaloSerialStats {
+    int64_t NKeys;            /* keys processed */
+    int64_t NAlone;           /* of which alone (every thread inside the key) */
+    int64_t LargestN;         /* particles of the largest key */
+    double KeyTimeMax;        /* the longest measured key time (s) */
+    int64_t KeyTimeMaxN;      /* its particles */
+    double AloneWall;         /* wall time of the keys processed alone (s) */
+    double ThreadedWall;      /* wall time of the threaded part (s) */
+    double ThreadMax;         /* sum over calls of the largest per-thread summed key time of the threaded part */
+    double ThreadSum;         /* sum over calls and threads of the per-thread summed key times */
+    int NThreads;             /* threads of the last call */
+    double KeyTimeSum;        /* summed key times (alone keys counted once, at their wall time) */
+    /* least-squares sums of the single-threaded key times t against x = N log2 max(N, 2) (the fit
+     * t = a x + b calibrates SUBHALO_COST_KEY / SUBHALO_COST_ITER = b / a) */
+    double FitN, FitX, FitXX, FitY, FitXY;
+};
+const struct SubhaloSerialStats * subhalo_serial_last_stats(void);
+void subhalo_serial_reset_stats(void);
 
 /* ------------------------------------------------------------------ batched ID lookup (subhalo.c) */
 
@@ -569,6 +621,14 @@ struct SubhaloResult {
     int64_t SinkTo;          /* the node it sank into in the key (TrackId), -1 */
 };
 
+/* Phase 5c: the stages of one call, timed by the driver (wall time and the main-allocator used
+ * high water of each stage); SubhaloStageName in subhalo.c. */
+enum { SUBHALO_STAGE_SETUP = 0, SUBHALO_STAGE_VOTE, SUBHALO_STAGE_FRAMES, SUBHALO_STAGE_LOOKUP, SUBHALO_STAGE_PLAN,
+       SUBHALO_STAGE_EXCHANGE, SUBHALO_STAGE_SORT, SUBHALO_STAGE_FETCH, SUBHALO_STAGE_SERIAL, SUBHALO_STAGE_RESTORE,
+       SUBHALO_STAGE_ROUNDS, SUBHALO_STAGE_NUMBER, SUBHALO_STAGE_DESCENDANTS, SUBHALO_STAGE_HISTORY, SUBHALO_STAGE_STORE,
+       SUBHALO_STAGE_UNHOSTED, SUBHALO_STAGE_ORPHANSYNC, SUBHALO_STAGE_FIELDSO, SUBHALO_NSTAGE };
+extern const char * const SubhaloStageName[SUBHALO_NSTAGE];
+
 /* Diagnostics of one call (local during the call, global totals after subhalo_find). */
 struct SubhaloCallStats {
     int64_t NCandidates;     /* candidates unbound in serial keys (each unbinding counted once) */
@@ -581,6 +641,32 @@ struct SubhaloCallStats {
     int64_t NFallbackField;  /* Phase 2b: particles of the oversized keys whose tags the final pass of the rounds wrote */
     int64_t NFallbackReleased; /* of which released (stale tags of orphans in the field) */
     double ArenaPeakFrac;    /* largest arena high-water mark of a key / its arena size */
+    /* ---- Phase 5c instrumentation (global, set by subhalo_find on every return path; on a
+     * failed call the counters above and below are zero, the wall times and memory peaks of the
+     * stages that ran are kept and Complete is 0) ---- */
+    int Complete;            /* 1: the call completed */
+    int PeakRank, PeakStage; /* where the used high water was reached (-1 if not measured) */
+    double WallTime;         /* wall time of the call, max over the ranks (s) */
+    double WallTimeMean;     /* mean over the ranks */
+    int64_t PeakBytes;       /* main-allocator used high water of the call (bytes), max over the ranks; 0 under use_malloc */
+    double StageMax[SUBHALO_NSTAGE];        /* wall time per stage (s), max over the ranks */
+    double StageMean[SUBHALO_NSTAGE];       /* mean over the ranks */
+    double StagePeakBytes[SUBHALO_NSTAGE];  /* used high water within the stage, max over the ranks */
+    double ExchOutMax, ExchOutMean;         /* particles sent by the exchange, max and mean over the ranks */
+    double ExchInMax, ExchInMean;           /* received */
+    int64_t NSerial, LargestSerial;         /* serial keys of the plan, the largest's particles */
+    int64_t NSerialKeys, NAloneKeys;        /* keys run by subhalo_run_serial_keys (sum over the ranks), of which alone */
+    double KeyTimeMax;                      /* longest measured key time (s) */
+    int64_t KeyTimeMaxN;                    /* its particles */
+    double ThreadImbalance;                 /* largest over the ranks of max / mean of the per-thread summed key times */
+    double ThreadImbalanceMean;             /* mean over the ranks (ranks with threaded keys) */
+    double RankImbalance;                   /* max / mean over the ranks of the serial key time (alone wall + slowest thread) */
+    double KeyFitA, KeyFitB;                /* t = A N log2 N + B fitted to the single-threaded key times of every rank */
+    int64_t NCands;                         /* in-place candidates */
+    int NRounds;                            /* their rounds */
+    double TreeBytes;                       /* the admission's tree-stage estimate of the rounds, max over the ranks */
+    int FieldSOPass1Walks, FieldSOPass2Walks, FieldSOBins;
+    int64_t FieldSOCentrals;
 };
 /* The statistics of the last completed subhalo_find (global; for the tests and the log). */
 const struct SubhaloCallStats * subhalo_last_call_stats(void);

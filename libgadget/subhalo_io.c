@@ -716,6 +716,11 @@ subhalo_write_header_attrs(BigBlock * bh, const struct part_manager_type * pman,
     /* the comoving thresholds (vir, 200b, 200c, 500c, 2500c) of the call the records describe */
     double SOThresholds[SUBHALO_NSO];
     subhalo_state_so_thresholds(SOThresholds);
+    /* Phase 5c: the cost of the last finder call (wall time, max over the ranks, in seconds; the
+     * main-allocator used high water, max over the ranks, in bytes; 0 under use_malloc) */
+    const struct SubhaloCallStats * cs = subhalo_last_call_stats();
+    double SubhaloWallTime = cs->WallTime;
+    uint64_t SubhaloPeakBytes = cs->PeakBytes > 0 ? (uint64_t) cs->PeakBytes : 0;
 
     if(
     (0 != big_block_set_attr(bh, "NumPartSavedTotal", NumPartSavedTotal, "u8", 6)) ||
@@ -734,6 +739,8 @@ subhalo_write_header_attrs(BigBlock * bh, const struct part_manager_type * pman,
     (0 != big_block_set_attr(bh, "UnitMass_in_g", &UnitMass_in_g, "f8", 1)) ||
     (0 != big_block_set_attr(bh, "UnitVelocity_in_cm_per_s", &UnitVelocity_in_cm_per_s, "f8", 1)) ||
     (0 != big_block_set_attr(bh, "SOThresholds", SOThresholds, "f8", SUBHALO_NSO)) ||
+    (0 != big_block_set_attr(bh, "SubhaloWallTime", &SubhaloWallTime, "f8", 1)) ||
+    (0 != big_block_set_attr(bh, "SubhaloPeakBytes", &SubhaloPeakBytes, "u8", 1)) ||
     (0 != big_block_set_attr(bh, "SubhaloParameters", params, "S1", strlen(params)))) {
         endrun(0, "Failed to write subhalo header attributes: %s\n", big_file_get_error_message());
     }

@@ -1983,6 +1983,184 @@ stats_reduce(const struct SubhaloCallStats * loc, struct SubhaloCallStats * tot,
     tot->WorstTrackId = out.r < 2. ? wt : -1;
 }
 
+/* ------------------------------------------------------------------ per-stage instrumentation (Phase 5c) */
+
+const char * const SubhaloStageName[SUBHALO_NSTAGE] = {
+    "setup", "vote", "frames", "lookup", "plan", "exchange", "sort", "fetch", "serial", "restore",
+    "rounds", "number", "descendants", "history", "store", "unhosted", "orphansync", "fieldso"};
+static const char * const SubhaloStageClock[SUBHALO_NSTAGE] = {
+    "/Subhalo/Setup", "/Subhalo/Vote", "/Subhalo/Frames", "/Subhalo/Lookup", "/Subhalo/Plan", "/Subhalo/Exchange",
+    "/Subhalo/Sort", "/Subhalo/Fetch", "/Subhalo/Serial", "/Subhalo/Restore", "/Subhalo/Rounds", "/Subhalo/Number",
+    "/Subhalo/Descendants", "/Subhalo/History", "/Subhalo/Store", "/Subhalo/Unhosted", "/Subhalo/OrphanSync",
+    "/Subhalo/FieldSO"};
+
+/* This rank's stage clock of the current call: wall time and main-allocator used high water per
+ * stage (the high water from the allocator's low-water mark of the free bytes, reset at every
+ * stage end; the collective resets it once more at its own start, inside the rounds stage). */
+static struct {
+    double tstart, tlast;
+    double time[SUBHALO_NSTAGE];
+    double peak[SUBHALO_NSTAGE];
+} SubClock;
+
+static double
+stage_used_high_water(void)
+{
+    if(A_MAIN->use_malloc)
+        return 0;
+    return (double) (A_MAIN->size - allocator_get_min_free(A_MAIN));
+}
+
+static void
+stage_begin_call(void)
+{
+    memset(&SubClock, 0, sizeof(SubClock));
+    SubClock.tstart = SubClock.tlast = MPI_Wtime();
+    allocator_reset_min_free(A_MAIN);
+}
+
+static void
+stage_end(int s)
+{
+    const double t = MPI_Wtime();
+    SubClock.time[s] += t - SubClock.tlast;
+    SubClock.tlast = t;
+    const double u = stage_used_high_water();
+    if(u > SubClock.peak[s])
+        SubClock.peak[s] = u;
+    allocator_reset_min_free(A_MAIN);
+    walltime_measure(SubhaloStageClock[s]);
+}
+
+/* Finishes every call, on every return path (collective): reduces the stage clock and the call's
+ * diagnostics into SubLastStats and logs the per-call summary block. locstats (this rank's
+ * diagnostics), plan and so may be NULL; on a failed call (complete = 0) every counter is zero
+ * and only the wall times and memory peaks of the stages that ran are kept. */
+static void
+subhalo_finish_call(int SnapNum, int complete, const struct SubhaloCallStats * locstats, const struct SubhaloPlan * plan,
+                    const struct SubhaloSOStats * so, MPI_Comm Comm)
+{
+    int NTask, ThisTask, s;
+    MPI_Comm_size(Comm, &NTask);
+    MPI_Comm_rank(Comm, &ThisTask);
+    struct SubhaloCallStats * st = &SubLastStats;
+    if(complete && locstats)
+        stats_reduce(locstats, st, Comm);
+    else
+        memset(st, 0, sizeof(*st));
+    st->Complete = complete;
+
+    /* wall time and the used high water per stage */
+    const double wall = MPI_Wtime() - SubClock.tstart;
+    double loc[2 * SUBHALO_NSTAGE + 1], mx[2 * SUBHALO_NSTAGE + 1], sum[SUBHALO_NSTAGE + 1];
+    for(s = 0; s < SUBHALO_NSTAGE; s++) {
+        loc[s] = SubClock.time[s];
+        loc[SUBHALO_NSTAGE + s] = SubClock.peak[s];
+    }
+    loc[2 * SUBHALO_NSTAGE] = wall;
+    MPI_Allreduce(loc, mx, 2 * SUBHALO_NSTAGE + 1, MPI_DOUBLE, MPI_MAX, Comm);
+    double tl[SUBHALO_NSTAGE + 1];
+    for(s = 0; s < SUBHALO_NSTAGE; s++)
+        tl[s] = SubClock.time[s];
+    tl[SUBHALO_NSTAGE] = wall;
+    MPI_Allreduce(tl, sum, SUBHALO_NSTAGE + 1, MPI_DOUBLE, MPI_SUM, Comm);
+    for(s = 0; s < SUBHALO_NSTAGE; s++) {
+        st->StageMax[s] = mx[s];
+        st->StageMean[s] = sum[s] / NTask;
+        st->StagePeakBytes[s] = mx[SUBHALO_NSTAGE + s];
+    }
+    st->WallTime = mx[2 * SUBHALO_NSTAGE];
+    st->WallTimeMean = sum[SUBHALO_NSTAGE] / NTask;
+    {
+        int ps = 0;
+        for(s = 1; s < SUBHALO_NSTAGE; s++)
+            if(SubClock.peak[s] > SubClock.peak[ps])
+                ps = s;
+        struct { double v; int r; } in = {SubClock.peak[ps], ThisTask}, out;
+        MPI_Allreduce(&in, &out, 1, MPI_DOUBLE_INT, MPI_MAXLOC, Comm);
+        MPI_Bcast(&ps, 1, MPI_INT, out.r, Comm);
+        st->PeakBytes = (int64_t) out.v;
+        st->PeakRank = out.v > 0 ? out.r : -1;
+        st->PeakStage = out.v > 0 ? ps : -1;
+    }
+
+    if(complete) {
+        /* the exchange volume */
+        if(plan) {
+            double ex[2] = {(double) plan->ExchOut, (double) plan->ExchIn}, exm[2], exs[2];
+            MPI_Allreduce(ex, exm, 2, MPI_DOUBLE, MPI_MAX, Comm);
+            MPI_Allreduce(ex, exs, 2, MPI_DOUBLE, MPI_SUM, Comm);
+            st->ExchOutMax = exm[0];
+            st->ExchInMax = exm[1];
+            st->ExchOutMean = exs[0] / NTask;
+            st->ExchInMean = exs[1] / NTask;
+            st->NSerial = plan->Stats.NSerial;
+            st->LargestSerial = plan->Stats.LargestSerial;
+            st->NCands = plan->NCands;
+            st->NRounds = plan->NRounds;
+            double tb = plan->Admit.checked ? plan->Admit.stage[SUBHALO_COLL_TREE] : 0;
+            MPI_Allreduce(&tb, &st->TreeBytes, 1, MPI_DOUBLE, MPI_MAX, Comm);
+        }
+        /* the serial keys: counts, the longest key, the thread and rank balance, the cost fit */
+        const struct SubhaloSerialStats * ss = subhalo_serial_last_stats();
+        int64_t cnt[2] = {ss->NKeys, ss->NAlone}, cntg[2];
+        MPI_Allreduce(cnt, cntg, 2, MPI_INT64, MPI_SUM, Comm);
+        st->NSerialKeys = cntg[0];
+        st->NAloneKeys = cntg[1];
+        struct { double v; int r; } kin = {ss->KeyTimeMax, ThisTask}, kout;
+        MPI_Allreduce(&kin, &kout, 1, MPI_DOUBLE_INT, MPI_MAXLOC, Comm);
+        int64_t kn = ss->KeyTimeMaxN;
+        MPI_Bcast(&kn, 1, MPI_INT64, kout.r, Comm);
+        st->KeyTimeMax = kout.v;
+        st->KeyTimeMaxN = kn;
+        const double timb = (ss->ThreadSum > 0 && ss->NThreads > 0) ? ss->ThreadMax / (ss->ThreadSum / ss->NThreads) : 0;
+        const double rload = ss->AloneWall + ss->ThreadMax;
+        double bl[8] = {timb, timb > 0 ? 1 : 0, rload, ss->FitN, ss->FitX, ss->FitXX, ss->FitY, ss->FitXY}, bs[8], bm = 0, rm = 0;
+        MPI_Allreduce(bl, bs, 8, MPI_DOUBLE, MPI_SUM, Comm);
+        MPI_Allreduce(&timb, &bm, 1, MPI_DOUBLE, MPI_MAX, Comm);
+        MPI_Allreduce(&rload, &rm, 1, MPI_DOUBLE, MPI_MAX, Comm);
+        st->ThreadImbalance = bm;
+        st->ThreadImbalanceMean = bs[1] > 0 ? bs[0] / bs[1] : 0;
+        st->RankImbalance = bs[2] > 0 ? rm / (bs[2] / NTask) : 0;
+        const double den = bs[3] * bs[5] - bs[4] * bs[4];
+        if(bs[3] >= 2 && den > 0) {
+            st->KeyFitA = (bs[3] * bs[7] - bs[4] * bs[6]) / den;
+            st->KeyFitB = (bs[6] - st->KeyFitA * bs[4]) / bs[3];
+        }
+        if(so) {
+            st->FieldSOPass1Walks = so->Npass1Walks;
+            st->FieldSOPass2Walks = so->Npass2Walks;
+            st->FieldSOBins = so->NBins;
+            st->FieldSOCentrals = so->Ncentral;
+        }
+    }
+
+    /* the summary block */
+    message(0, "Subhalo call summary, snapshot %d (%s): wall %.3f s (max over %d ranks), %.3f s (mean); main allocator used high water "
+               "%.1f MB on rank %d in stage %s.\n", SnapNum, complete ? "complete" : "FAILED", st->WallTime, NTask, st->WallTimeMean,
+            st->PeakBytes / 1048576., st->PeakRank, st->PeakStage >= 0 ? SubhaloStageName[st->PeakStage] : "-");
+    message(0, "Subhalo call summary:   %-12s | %9s | %9s | %9s\n", "stage", "max s", "mean s", "peak MB");
+    for(s = 0; s < SUBHALO_NSTAGE; s++)
+        message(0, "Subhalo call summary:   %-12s | %9.4f | %9.4f | %9.1f\n", SubhaloStageName[s], st->StageMax[s], st->StageMean[s],
+                st->StagePeakBytes[s] / 1048576.);
+    if(!complete)
+        return;
+    message(0, "Subhalo call summary: exchange: particles out %.0f max, %.1f mean; in %.0f max, %.1f mean per rank.\n",
+            st->ExchOutMax, st->ExchOutMean, st->ExchInMax, st->ExchInMean);
+    message(0, "Subhalo call summary: serial keys: %ld run (%ld alone), plan %ld serial keys, largest %ld particles; longest key %.4f s "
+               "(%ld particles); thread imbalance max/mean %.3f (worst rank), %.3f (mean over ranks); rank imbalance max/mean %.3f.\n",
+            st->NSerialKeys, st->NAloneKeys, st->NSerial, st->LargestSerial, st->KeyTimeMax, st->KeyTimeMaxN, st->ThreadImbalance,
+            st->ThreadImbalanceMean, st->RankImbalance);
+    message(0, "Subhalo call summary: key time fit t = %g s x N log2 N + %g s (B/A = %g particle-log units; the cost model uses "
+               "SUBHALO_COST_KEY / SUBHALO_COST_ITER = %g).\n", st->KeyFitA, st->KeyFitB,
+            st->KeyFitA > 0 ? st->KeyFitB / st->KeyFitA : 0., SUBHALO_COST_KEY / SUBHALO_COST_ITER);
+    message(0, "Subhalo call summary: rounds: %ld in-place candidates in %d round(s), tree stage estimate %.1f MB (max over ranks).\n",
+            st->NCands, st->NRounds, st->TreeBytes / 1048576.);
+    if(so)
+        message(0, "Subhalo call summary: field SO: %ld centrals, %d pass-1 walks, %d pass-2 walks, %d bins.\n", st->FieldSOCentrals,
+                st->FieldSOPass1Walks, st->FieldSOPass2Walks, st->FieldSOBins);
+}
+
 /* ------------------------------------------------------------------ the driver */
 
 int
@@ -1995,6 +2173,7 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     const struct SubhaloParams * sp = &SubParams;
 
     walltime_measure("/Misc");
+    stage_begin_call();
     if(!tab->initialised)
         subhalo_table_init(tab, SUBHALO_TABLE_INITIAL_BYTES, Comm);
     /* The static home rule must hold at the start of every call. */
@@ -2030,11 +2209,14 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
             t->RefPos[d] = t->RefVel[d] = 0;
     }
 
+    stage_end(SUBHALO_STAGE_SETUP);
+
     /* Steps 0 and 2: tracer snapshot and weighted host vote, on the home ranks. */
     subhalo_host_vote(tab, Comm);
+    stage_end(SUBHALO_STAGE_VOTE);
     /* Step 3 (frames): previous-bound frames from the BoundTrackId sums. */
     subhalo_previous_frames(tab, Comm);
-    walltime_measure("/Subhalo/Vote");
+    stage_end(SUBHALO_STAGE_FRAMES);
 
     /* Step 1: orphan tracer lookup (Host, TracerPos, TracerVel, SnapTracerLost). It runs before
      * the plan can budget anything, so its peak (the ID index with its sort copy, one batch, the
@@ -2054,36 +2236,47 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
                        "Tags and track table are unchanged; this PIG will be marked incomplete. "
                        "Lower SubhaloLookupBatchBytes or run with more memory per rank.\n", SnapNum);
             SubStatus.LastCallComplete = 0;
+            stage_end(SUBHALO_STAGE_LOOKUP);
+            subhalo_finish_call(SnapNum, 0, NULL, NULL, NULL, Comm);
             return 0;
         }
     }
     int64_t nlook = 0, nfound = 0;
     subhalo_orphan_lookup(tab, SnapNum, atime, &nlook, &nfound, Comm);
     message(0, "Subhalo orphans: %ld tracers looked up, %ld found.\n", nlook, nfound);
-    walltime_measure("/Subhalo/Orphans");
+    stage_end(SUBHALO_STAGE_LOOKUP);
 
     /* Step 3: keys (pseudo-keys of the hostless tracks) and the plan. */
     const int64_t NHostless = subhalo_assign_keys(tab, fof->TotNgroups, Comm);
     struct SubhaloPlan plan = {0};
     subhalo_plan_set_frame(atime, hubble_function(CP, atime));
     if(subhalo_plan_build(&plan, fof, tab, NHostless, ddecomp, Comm)) {
-        /* audit Q1: the in-place stage of this plan cannot fit on some rank. Nothing in P has
-         * changed yet (no target, no encoded GrNr), so the domain needs no restore. */
-        message(0, "Subhalo finder: the in-place stage of snapshot %d does not fit in memory on rank %d (stage: %s); the call is "
-                   "skipped before the exchange. Tags and track table are unchanged; this PIG will be marked incomplete. "
-                   "Run with more memory per rank or more ranks.\n", SnapNum, plan.Admit.failrank,
-                plan.Admit.failstage >= 0 ? SubhaloCollStageName[plan.Admit.failstage] : "?");
+        /* audit Q1: the in-place stage of this plan cannot fit on some rank, or (Phase 5c) some
+         * rank is short of the plan's reserve. Nothing in P has changed yet (no target, no
+         * encoded GrNr), so the domain needs no restore. */
+        if(plan.Admit.failed)
+            message(0, "Subhalo finder: the in-place stage of snapshot %d does not fit in memory on rank %d (stage: %s)%s; the call is "
+                       "skipped before the exchange. Tags and track table are unchanged; this PIG will be marked incomplete. "
+                       "Run with more memory per rank or more ranks.\n", SnapNum, plan.Admit.failrank,
+                    plan.Admit.failstage >= 0 ? SubhaloCollStageName[plan.Admit.failstage] : "?",
+                    plan.Admit.reserve_failed ? " and the reserve admission failed too" : "");
+        else
+            message(0, "Subhalo finder: the reserve admission of snapshot %d failed: rank %d is %g MB short of the plan's reserve; the "
+                       "call is skipped before the exchange. Tags and track table are unchanged; this PIG will be marked incomplete. "
+                       "Run with more memory per rank or more ranks.\n", SnapNum, plan.Admit.reserve_rank,
+                    plan.Admit.reserve_short / 1048576.);
         subhalo_restore_field_grnr(&plan);
         subhalo_plan_free(&plan);
-        walltime_measure("/Subhalo/Plan");
         SubStatus.LastCallComplete = 0;
+        stage_end(SUBHALO_STAGE_PLAN);
+        subhalo_finish_call(SnapNum, 0, NULL, NULL, NULL, Comm);
         return 0;
     }
-    walltime_measure("/Subhalo/Plan");
+    stage_end(SUBHALO_STAGE_PLAN);
 
     /* Step 4: exchange whole serial keys, tags travel unchanged. */
     int failure = subhalo_plan_exchange(&plan, Comm);
-    walltime_measure("/Subhalo/Exchange");
+    stage_end(SUBHALO_STAGE_EXCHANGE);
 
     /* Step 5: commit point. Nothing persistent has been modified yet (the step-1 tracer state
      * of the orphans is stored on the home records, which the next complete call redoes). */
@@ -2093,20 +2286,21 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
         subhalo_restore_field_grnr(&plan);
         subhalo_plan_free(&plan);
         subhalo_restore_domain(ddecomp);
-        walltime_measure("/Subhalo/Restore");
         SubStatus.LastCallComplete = 0;
+        stage_end(SUBHALO_STAGE_RESTORE);
+        subhalo_finish_call(SnapNum, 0, NULL, NULL, NULL, Comm);
         return 0;
     }
 
     subhalo_local_sort();
     struct SubhaloKeySeg * segs = NULL;
     const int64_t nsegs = subhalo_build_segments(&plan, &segs);
-    walltime_measure("/Subhalo/Sort");
+    stage_end(SUBHALO_STAGE_SORT);
 
     /* Step 7a: member records (with the transient fields), fetched from the home ranks. */
     struct SubTrack * members = NULL;
     const int64_t nmembers = subhalo_fetch_members(segs, nsegs, plan.OrphanIds, plan.NOrphanIds, tab, &members, Comm);
-    walltime_measure("/Subhalo/Members");
+    stage_end(SUBHALO_STAGE_FETCH);
 
     struct SubhaloUnbindParams up;
     memset(&up, 0, sizeof(up));
@@ -2158,8 +2352,9 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     ctx.NRes = nres;
 
     /* Steps 7-8: serial keys, tags written straight into P. */
+    subhalo_serial_reset_stats();
     subhalo_process_serial(segs, nsegs, &ctx);
-    walltime_measure("/Subhalo/Serial");
+    stage_end(SUBHALO_STAGE_SERIAL);
 
     /* The travelled field particles and the group particles of the sub-tree keys get their GrNr
      * back; the slot index is freed before the restore. */
@@ -2170,17 +2365,16 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
      * (Phase 2b): their records, the hierarchy of the sub-tree results, the final tags of every
      * particle of an oversized key. */
     subhalo_restore_domain(ddecomp);
-    walltime_measure("/Subhalo/Restore");
+    stage_end(SUBHALO_STAGE_RESTORE);
     subhalo_collective_run(&plan, &ctx, ddecomp, tab, Comm);
     subhalo_free_bind_ord(&ctx);
-    walltime_measure("/Subhalo/InPlace");
+    stage_end(SUBHALO_STAGE_ROUNDS);
 
     /* Step 10: new TrackIds in host order. */
     const int64_t NTotalBefore = tab->NTotal;
     const int64_t nnew = subhalo_number_newborns(res, nres, fof->TotNgroups, NTotalBefore, Comm);
     tab->NTotal = NTotalBefore + nnew;
     subhalo_table_redistribute(tab, Comm);
-    walltime_measure("/Subhalo/Number");
 
     /* The final TrackId of every in-place winner, on every rank (orphan links, J8). */
     const int64_t K = plan.NInplace;
@@ -2202,10 +2396,11 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
         myfree(gw);
         myfree(w);
     }
+    stage_end(SUBHALO_STAGE_NUMBER);
 
     /* Step 11: descendants of the dead and sunk tracks (remote part and the majority). */
     subhalo_finish_descendants(res, nres, Comm);
-    walltime_measure("/Subhalo/Descendants");
+    stage_end(SUBHALO_STAGE_DESCENDANTS);
 
     /* Step 13 for the records resolved this call, then everything back to the home ranks. */
     int64_t nout = 0;
@@ -2221,6 +2416,7 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
             subhalo_history_update(&res[i].rec, SnapNum, res[i].MaxMergerMbound);
         out[nout++] = res[i].rec;
     }
+    stage_end(SUBHALO_STAGE_HISTORY);
     subhalo_table_store(tab, out, nout, Comm);
     myfree(out);
     /* The per-key buffers are no longer needed: release them (reverse order) before the
@@ -2235,23 +2431,27 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     myfree(segs);
     subhalo_plan_free(&plan);
     qsort(iplcopy, nipl, sizeof(struct InplaceWinnerEntry), cmp_iplwinner);
+    stage_end(SUBHALO_STAGE_STORE);
 
     /* Unclaimed tracks on the home ranks: resolved tracks without a key die (the hostless rule
      * of an unprocessed pseudo-key is unreachable since Phase 2b processes oversized pseudo-keys
      * in place). */
     int64_t nhostless = 0, ndead = 0;
     subhalo_update_unhosted(tab, SnapNum, atime, &nhostless, &ndead, Comm);
+    stage_end(SUBHALO_STAGE_UNHOSTED);
     /* The orphans' current host and central (J8). */
     int64_t norphsync = subhalo_sync_orphan_links(tab, iplcopy, nipl), norphsync_tot = 0;
     MPI_Allreduce(&norphsync, &norphsync_tot, 1, MPI_INT64, MPI_SUM, Comm);
     myfree(iplcopy);
-    walltime_measure("/Subhalo/Update");
+    stage_end(SUBHALO_STAGE_ORPHANSYNC);
 
     /* Step 12: field SO of the centrals of this call, on the restored domain, from the home
      * records (every record now describes this call; the PIG writer reads them afterwards). */
+    struct SubhaloSOStats sostats;
+    memset(&sostats, 0, sizeof(sostats));
     if(sp->SubhaloFieldSO) {
-        subhalo_field_so(tab->Track, tab->NLocal, ddecomp, atime, CP, sp, Comm);
-        walltime_measure("/Subhalo/FieldSO");
+        subhalo_field_so_full(tab->Track, tab->NLocal, ddecomp, atime, CP, sp, NULL, NULL, &sostats, Comm);
+        stage_end(SUBHALO_STAGE_FIELDSO);
     }
 
     /* Counts of this call on the home ranks. */
@@ -2266,7 +2466,7 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     MPI_Allreduce(loc, tot, 4, MPI_INT64, MPI_SUM, Comm);
     message(0, "Subhalo finder: snapshot %d done: %ld newborn, %ld sunk, %ld died (%ld without particles), %ld resolved (%ld hostless, %ld by the unprocessed-pseudo-key rule); %ld tracks in total.\n",
             SnapNum, nnew, tot[0], tot[1], ndead, tot[2], tot[3], nhostless, tab->NTotal);
-    stats_reduce(&locstats, &SubLastStats, Comm);
+    subhalo_finish_call(SnapNum, 1, &locstats, &plan, sp->SubhaloFieldSO ? &sostats : NULL, Comm);
     message(0, "Subhalo diagnostics: %ld unbindings, %ld at the iteration cap (worst Nbound/Nlast %g, track %ld); "
                "%ld of %ld final-pass bound particles with E >= 0; %ld tail claims across the final branch dropped; "
                "in-place tags written %ld (%ld stale field tags released); %ld orphan hosts updated; arena high water %.3f.\n",

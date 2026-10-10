@@ -21,7 +21,9 @@ Layout of a PIG written with SubhaloFinderOn = 1:
   Header attrs           NumSubhalosTotal, NumOrphansTotal, NumTracksTotal, NumPartSavedTotal,
                          SnapshotIndex, SubhaloLastCallSnapshot, SubhaloStateSnapshot,
                          SubhaloSchemaVersion, SubhaloStateComplete, SubhaloStateTime,
-                         TimeSincePreviousFinderCall, SubhaloParameters, ...
+                         TimeSincePreviousFinderCall, SubhaloParameters,
+                         SubhaloWallTime (s, max over ranks), SubhaloPeakBytes (main-allocator
+                         used high water, max over ranks) of the last finder call, ...
 
 A track's in-group slice in <t>/ is rows [SliceOffsetByType[t], + SliceLengthByType[t]) and its
 bound prefix the first SliceNboundByType[t] of them; FieldSlice* do the same in section 1.
@@ -111,6 +113,7 @@ HEADER_ATTRS = [
     "NumSubhalosTotal", "NumOrphansTotal", "NumTracksTotal", "NumPartSavedTotal",
     "SnapshotIndex", "SubhaloLastCallSnapshot", "SubhaloStateSnapshot", "SubhaloSchemaVersion",
     "SubhaloStateComplete", "SubhaloStateTime", "TimeSincePreviousFinderCall", "SubhaloParameters",
+    "SubhaloWallTime", "SubhaloPeakBytes",
 ]
 
 # Flags bits (design section 8, subhalo.h)
@@ -525,6 +528,8 @@ class SubhaloCatalogue(object):
         print("  SubhaloStateSnapshot %s  SubhaloLastCallSnapshot %s  TimeSincePreviousFinderCall %s" % (
             h.get("SubhaloStateSnapshot"), h.get("SubhaloLastCallSnapshot"),
             h.get("TimeSincePreviousFinderCall")), file=out)
+        if h.get("SubhaloWallTime") is not None:
+            print("  SubhaloWallTime %s s  SubhaloPeakBytes %s" % (h.get("SubhaloWallTime"), h.get("SubhaloPeakBytes")), file=out)
         print("  FOF groups %d  subhalos %d  orphans %d  NumTracksTotal %s" % (
             self.ngroups, self.nsubhalos, self.norphans, h.get("NumTracksTotal")), file=out)
         if self.nsubhalos:

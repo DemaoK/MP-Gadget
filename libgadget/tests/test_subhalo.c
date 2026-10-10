@@ -37,6 +37,13 @@
  * in place, two rounds; the hostless pseudo-key in place) assert the HBT outcome, and
  * p2_check_tags applies the D10 invariants to in-place records too.
  * test_subhalo_nocentral: Phase 3 audit P2 (no surviving central: CentralTrackId -1).
+ * Phase 5c (instrumentation, cost-aware packing, reserve admission): the per-call statistics
+ * (subhalo_last_call_stats) are checked after the calls of tests 11 and the mixed call, the PIG
+ * header's SubhaloWallTime and SubhaloPeakBytes in test 9, a cost-balance case (c) in test 7;
+ * test_subhalo_serial_keys runs subhalo_run_serial_keys directly at 1 to 4 threads (cost order per
+ * thread, the alone keys, LPT balance, the same outcome at every thread count) and
+ * test_subhalo_reserve_admission squeezes the free memory 2 MB below the plan's reserve (the
+ * collective stage alone still fits): the call fails before the exchange with the tags unchanged.
  * 11. test_subhalo_twohalo        plan test 5: two Hernquist clumps over three calls: persistent
  *                                 tracks, HBT properties, unbound tails, the D10 tag invariants.
  * 12. test_subhalo_overlap        plan test 6: B falls into A: satellite (Rank 1, Depth 1, parent
@@ -72,6 +79,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <omp.h>
 
 #include <bigfile-mpi.h>
 
@@ -353,6 +361,77 @@ run_finder_call(int snap, Cosmology * CP, int64_t * TotNgroups)
     fof_finish(&fof);
     domain_free(&ddecomp);
     return ret;
+}
+
+/* Phase 5c: the consistency of the per-call statistics of the last subhalo_find. */
+static void
+check_call_stats(const char * what, int complete)
+{
+    const struct SubhaloCallStats * st = subhalo_last_call_stats();
+    const int NTask = get_ntask();
+    int s;
+    double summean = 0;
+    CHECK(st->Complete == complete, "%s: stats Complete %d, expected %d\n", what, st->Complete, complete);
+    CHECK(st->WallTime > 0 && st->WallTimeMean > 0 && st->WallTimeMean <= st->WallTime * (1 + 1e-12),
+          "%s: wall time max %g mean %g\n", what, st->WallTime, st->WallTimeMean);
+    for(s = 0; s < SUBHALO_NSTAGE; s++) {
+        CHECK(st->StageMax[s] >= 0 && st->StageMean[s] <= st->StageMax[s] * (1 + 1e-12) + 1e-15 && st->StageMax[s] <= st->WallTime
+              && st->StagePeakBytes[s] <= (double) st->PeakBytes + 1,
+              "%s: stage %s: max %g s mean %g s (wall %g s), peak %g of %ld bytes\n", what, SubhaloStageName[s], st->StageMax[s],
+              st->StageMean[s], st->WallTime, st->StagePeakBytes[s], st->PeakBytes);
+        summean += st->StageMean[s];
+    }
+    CHECK(summean <= st->WallTimeMean * (1 + 1e-9) + 1e-12, "%s: the stages add up to %g s, the call took %g s\n", what, summean,
+          st->WallTimeMean);
+    CHECK(st->PeakBytes > 0 && st->PeakStage >= 0 && st->PeakStage < SUBHALO_NSTAGE && st->PeakRank >= 0 && st->PeakRank < NTask
+          && (int64_t) st->StagePeakBytes[st->PeakStage] == st->PeakBytes,
+          "%s: peak %ld bytes on rank %d in stage %d\n", what, st->PeakBytes, st->PeakRank, st->PeakStage);
+    if(complete) {
+        CHECK(fabs(st->ExchOutMean - st->ExchInMean) < 1e-6 && st->ExchOutMax >= st->ExchOutMean && st->ExchInMax >= st->ExchInMean,
+              "%s: exchange out %g/%g in %g/%g\n", what, st->ExchOutMax, st->ExchOutMean, st->ExchInMax, st->ExchInMean);
+        CHECK(st->NSerialKeys == st->NSerial && st->NAloneKeys <= st->NSerialKeys,
+              "%s: %ld serial keys run (%ld alone), the plan has %ld\n", what, st->NSerialKeys, st->NAloneKeys, st->NSerial);
+        CHECK(st->NSerialKeys == 0 || (st->KeyTimeMax > 0 && st->KeyTimeMaxN > 0 && st->KeyTimeMaxN <= st->LargestSerial),
+              "%s: longest key %g s with %ld particles, largest serial key %ld\n", what, st->KeyTimeMax, st->KeyTimeMaxN, st->LargestSerial);
+        CHECK((st->RankImbalance == 0 || st->RankImbalance >= 1 - 1e-9) && (st->ThreadImbalance == 0 || st->ThreadImbalance >= 1 - 1e-9)
+              && st->ThreadImbalanceMean <= st->ThreadImbalance * (1 + 1e-12),
+              "%s: imbalance rank %g thread %g (mean %g)\n", what, st->RankImbalance, st->ThreadImbalance, st->ThreadImbalanceMean);
+        CHECK(st->NCands == 0 || (st->NRounds > 0 && st->TreeBytes > 0), "%s: %ld candidates in %d rounds, tree %g bytes\n", what,
+              st->NCands, st->NRounds, st->TreeBytes);
+    }
+    else
+        CHECK(st->NCandidates == 0 && st->NSerialKeys == 0 && st->NSerial == 0 && st->ExchOutMax == 0 && st->ExchInMax == 0
+              && st->NCands == 0 && st->FieldSOPass1Walks == 0,
+              "%s: a failed call left counters (%ld unbindings, %ld keys, exchange %g)\n", what, st->NCandidates, st->NSerialKeys,
+              st->ExchOutMax);
+}
+
+/* Phase 5c: the PIG header's SubhaloWallTime and SubhaloPeakBytes are those of the last call. */
+static void
+check_header_cost(const char * dir, int snap, const char * what)
+{
+    double w = -1;
+    uint64_t pb = 0;
+    int ok = 1;
+    if(get_thistask() == 0) {
+        char * f = fastpm_strdup_printf("%s/PIG_%03d", dir, snap);
+        BigFile bf;
+        BigBlock bh;
+        if(0 != big_file_open(&bf, f) || 0 != big_file_open_block(&bf, &bh, "Header"))
+            endrun(1, "test: cannot open %s/Header\n", f);
+        if(0 != big_block_get_attr(&bh, "SubhaloWallTime", &w, "f8", 1) || 0 != big_block_get_attr(&bh, "SubhaloPeakBytes", &pb, "u8", 1))
+            ok = 0;
+        big_block_close(&bh);
+        big_file_close(&bf);
+        myfree(f);
+    }
+    MPI_Bcast(&ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&w, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&pb, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+    const struct SubhaloCallStats * st = subhalo_last_call_stats();
+    CHECK(ok && w == st->WallTime && w > 0 && pb == (uint64_t) st->PeakBytes && pb > 0,
+          "%s: header SubhaloWallTime %g SubhaloPeakBytes %lu (read %d), the call's %g s and %ld bytes\n", what, w, (unsigned long) pb, ok,
+          st->WallTime, st->PeakBytes);
 }
 
 static void
@@ -1987,6 +2066,220 @@ test_subhalo_plan_pack(void ** state)
         free(target);
         free(keys);
     }
+
+    /* (c) Phase 5c, cost balance: 8 head keys of 1000 particles, 120 of 100, a tail of 300 keys of
+     * 20, held round-robin; rank 0 has ten times the particle budget of the others. The old greedy
+     * (most free budget) put the whole head on rank 0; the cost-aware head and the water-filled
+     * tail must leave every rank within a few per cent of the mean estimated cost, inside the
+     * capacities. */
+    {
+        const int64_t nbig = 8, nmid = 120, nsmall = 300, nkeys = nbig + nmid + nsmall;
+        struct synkey * keys = calloc(nkeys, sizeof(struct synkey));
+        for(k = 0; k < nkeys; k++) {
+            const int holder = k % 4;
+            keys[k].cnt[holder][1] = k < nbig ? 1000 : (k < nbig + nmid ? 100 : 20);
+            keys[k].tags[holder] = 1;
+        }
+        struct SubhaloPlanRes allres[4];
+        memset(allres, 0, sizeof(allres));
+        for(r = 0; r < 4; r++) {
+            allres[r].MaxPart = r == 0 ? 200000 : 20000;
+            for(k = 0; k < nkeys; k++)
+                allres[r].grp[1] += keys[k].cnt[r][1];
+            allres[r].grp[6] = allres[r].grp[1];
+            allres[r].NumLive = allres[r].grp[6];
+            allres[r].freebytes = 1e15;
+        }
+        struct SubhaloPlanCfg cfg;
+        subhalo_plan_default_cfg(&cfg, nkeys, NTask);
+        cfg.GatherFraction = 0.5;
+        cfg.CollectiveMinPart = 0;
+        int * target = calloc(nkeys, sizeof(int)), * oversized = calloc(nkeys, sizeof(int));
+        synthetic_pack(keys, nkeys, &allres[ThisTask], &cfg, target, oversized, &stats);
+        check_synthetic_plan(keys, nkeys, allres, 0.5, target, oversized, "cost balance");
+        double cost[4] = {0, 0, 0, 0}, headcost[4] = {0, 0, 0, 0}, tot = 0, mx = 0;
+        int64_t nhead[4] = {0, 0, 0, 0};
+        for(k = 0; k < nkeys; k++) {
+            if(oversized[k] || target[k] < 0)
+                continue;
+            const int64_t len = keys[k].cnt[k % 4][1];
+            cost[target[k]] += subhalo_key_cost(len);
+            if(k < nbig + nmid) {
+                headcost[target[k]] += subhalo_key_cost(len);
+                nhead[target[k]]++;
+            }
+            tot += subhalo_key_cost(len);
+        }
+        for(r = 0; r < 4; r++)
+            if(cost[r] > mx)
+                mx = cost[r];
+        message(0, "cost balance: %ld serial, %ld in place; cost per rank %g %g %g %g (head %g %g %g %g, head keys %ld %ld %ld %ld), max/mean %.4f\n",
+                stats.NSerial, stats.NOversized, cost[0], cost[1], cost[2], cost[3], headcost[0], headcost[1], headcost[2], headcost[3],
+                nhead[0], nhead[1], nhead[2], nhead[3], mx / (tot / 4));
+        CHECK(stats.NSerial == nkeys && stats.NOversized == 0, "cost balance: %ld serial, %ld in place\n", stats.NSerial, stats.NOversized);
+        CHECK(mx / (tot / 4) < 1.03, "cost balance: the most loaded rank has %.4f x the mean cost\n", mx / (tot / 4));
+        /* every rank gets head keys (the old greedy gave all of them to rank 0) */
+        CHECK(nhead[1] > 0 && nhead[2] > 0 && nhead[3] > 0, "cost balance: head keys per rank %ld %ld %ld %ld\n", nhead[0], nhead[1],
+              nhead[2], nhead[3]);
+        free(oversized);
+        free(target);
+        free(keys);
+    }
+}
+
+/* ------------------------------------------------------------------ Phase 5c: the serial key scheduler */
+
+struct sk_log {
+    const char * base;
+    int64_t k;
+    int nthreads;
+};
+struct sk_ud {
+    struct sk_log * log;
+    int64_t nlog;
+    int64_t * done;
+    uint64_t * result;
+    int64_t bad;
+};
+
+/* Writes a per-key sequence into the arena (bytes_per_part 8) and records which queue (arena,
+ * alone or not) ran key k, in the order of the calls. */
+static void
+sk_fn(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloArena * arena, int nthreads, void * userdata)
+{
+    struct sk_ud * u = (struct sk_ud *) userdata;
+    int64_t slot;
+    #pragma omp atomic capture
+    slot = u->nlog++;
+    u->log[slot].base = arena->base;
+    u->log[slot].k = k;
+    u->log[slot].nthreads = nthreads;
+    #pragma omp atomic
+    u->done[k]++;
+    uint64_t * buf = (uint64_t *) subhalo_arena_get(arena, sizeof(uint64_t) * seg->n);
+    if(!buf) {
+        #pragma omp atomic
+        u->bad++;
+        return;
+    }
+    uint64_t h = 0;
+    int64_t i;
+    for(i = 0; i < seg->n; i++) {
+        buf[i] = splitmix64((uint64_t) seg->g * 1000003ULL + (uint64_t) i);
+        h = splitmix64(h ^ buf[i]);
+    }
+    u->result[k] = h;
+}
+
+static void
+test_subhalo_serial_keys(void ** state)
+{
+    const int64_t nsegs = 90;
+    struct SubhaloKeySeg * segs = calloc(nsegs, sizeof(struct SubhaloKeySeg));
+    int64_t k, nserial = 0, largest = 0;
+    for(k = 0; k < nsegs; k++) {
+        segs[k].g = k + 1;
+        /* two large keys, ties in n (equal cost, broken by g), a spread of small ones */
+        segs[k].n = k == 3 ? 150000 : (k == 50 ? 25000 : (k % 5 == 0 ? 500 : 1 + (int64_t) (urand(k, 5, 0) * 3000)));
+        segs[k].Length = segs[k].n;
+        segs[k].inplace = (k % 7 == 6);
+        segs[k].ipindex = -1;
+        if(!segs[k].inplace) {
+            nserial++;
+            if(segs[k].n > largest)
+                largest = segs[k].n;
+        }
+    }
+    uint64_t * ref = calloc(nsegs, sizeof(uint64_t));
+    const int saved = omp_get_max_threads();
+    int T;
+    for(T = 1; T <= 4; T++) {
+        omp_set_num_threads(T);
+        struct sk_ud u;
+        memset(&u, 0, sizeof(u));
+        u.log = calloc(nsegs, sizeof(struct sk_log));
+        u.done = calloc(nsegs, sizeof(int64_t));
+        u.result = calloc(nsegs, sizeof(uint64_t));
+        subhalo_serial_reset_stats();
+        subhalo_run_serial_keys(segs, nsegs, sizeof(uint64_t), NULL, sk_fn, &u);
+        const struct SubhaloSerialStats * ss = subhalo_serial_last_stats();
+        int64_t bad = u.bad, i, j;
+        /* every serial key once, no in-place segment */
+        for(k = 0; k < nsegs; k++)
+            LOCAL_CHECK(bad, u.done[k] == (segs[k].inplace ? 0 : 1), "serial keys, %d threads: key %ld run %ld times\n", T, k, u.done[k]);
+        /* the keys run alone are those above the thread's share of the cost */
+        double total = 0;
+        for(k = 0; k < nsegs; k++)
+            if(!segs[k].inplace)
+                total += subhalo_key_cost(segs[k].n);
+        int64_t nalone = 0;
+        for(i = 0; i < u.nlog; i++) {
+            const int64_t kk = u.log[i].k;
+            const int alone = T > 1 && subhalo_key_cost(segs[kk].n) > total / T;
+            nalone += alone;
+            LOCAL_CHECK(bad, (u.log[i].nthreads > 1) == alone && (alone ? u.log[i].nthreads == T : u.log[i].nthreads == 1),
+                        "serial keys, %d threads: key %ld (n %ld) ran with %d threads\n", T, kk, segs[kk].n, u.log[i].nthreads);
+        }
+        /* each queue (arena; alone or not) in non-increasing cost, ties by g; the threaded queues
+         * LPT-balanced: their estimated costs differ by at most the largest threaded key */
+        double qcost[8], maxjob = 0;
+        const char * qbase[8];
+        int nq = 0, q;
+        for(i = 0; i < u.nlog; i++) {
+            for(j = i + 1; j < u.nlog; j++) {
+                if(u.log[j].base != u.log[i].base || (u.log[j].nthreads > 1) != (u.log[i].nthreads > 1))
+                    continue;
+                const int64_t a = u.log[i].k, b = u.log[j].k;
+                LOCAL_CHECK(bad, segs[a].n > segs[b].n || (segs[a].n == segs[b].n && segs[a].g < segs[b].g),
+                            "serial keys, %d threads: key %ld (n %ld) ran before key %ld (n %ld) on one queue\n", T, b, segs[b].n, a, segs[a].n);
+                break;
+            }
+            if(u.log[i].nthreads > 1)
+                continue;
+            const double c = subhalo_key_cost(segs[u.log[i].k].n);
+            if(c > maxjob)
+                maxjob = c;
+            for(q = 0; q < nq; q++)
+                if(qbase[q] == u.log[i].base)
+                    break;
+            if(q == nq && nq < 8) {
+                qbase[nq] = u.log[i].base;
+                qcost[nq++] = 0;
+            }
+            if(q < 8)
+                qcost[q] += c;
+        }
+        if(nq == T) {
+            double lo = qcost[0], hi = qcost[0];
+            for(q = 1; q < nq; q++) {
+                if(qcost[q] < lo) lo = qcost[q];
+                if(qcost[q] > hi) hi = qcost[q];
+            }
+            LOCAL_CHECK(bad, hi - lo <= maxjob * (1 + 1e-12), "serial keys, %d threads: queue costs %g to %g, largest key %g\n", T, lo, hi, maxjob);
+        }
+        else
+            LOCAL_CHECK(bad, 0, "serial keys, %d threads: %d threaded queues\n", T, nq);
+        /* the outcome does not depend on the thread count */
+        for(k = 0; k < nsegs; k++) {
+            if(T == 1)
+                ref[k] = u.result[k];
+            else
+                LOCAL_CHECK(bad, u.result[k] == ref[k], "serial keys, %d threads: key %ld result differs\n", T, k);
+        }
+        LOCAL_CHECK(bad, ss->NKeys == nserial && ss->NAlone == nalone && ss->LargestN == largest && ss->NThreads == T
+                    && ss->KeyTimeMax >= 0 && ss->KeyTimeMaxN > 0 && (nalone == 0 || ss->AloneWall > 0),
+                    "serial keys, %d threads: stats %ld keys (%ld alone), largest %ld, %d threads\n", T, ss->NKeys, ss->NAlone, ss->LargestN,
+                    ss->NThreads);
+        message(0, "serial keys, %d threads: %ld keys, %ld alone, %d threaded queues, longest key %g s (%ld particles)\n", T, ss->NKeys,
+                ss->NAlone, nq, ss->KeyTimeMax, ss->KeyTimeMaxN);
+        assert_all_true(bad == 0);
+        free(u.result);
+        free(u.done);
+        free(u.log);
+    }
+    omp_set_num_threads(saved);
+    free(ref);
+    free(segs);
 }
 
 /* ------------------------------------------------------------------ test 8: hostless, swallowed, units (direct) */
@@ -2389,6 +2682,8 @@ test_subhalo_lifecycle_pig(void ** state)
         int64_t ngroups, nempty;
         int ret = lifecycle_call(stage, atime, &CP, er, dir, &ngroups, &nempty);
         CHECK(ret == 1, "life cycle stage %d: subhalo_find returned %d\n", stage, ret);
+        check_call_stats("life cycle", 1);
+        check_header_cost(dir, stage, "life cycle");
         if(er > 0)
             CHECK(nempty == 0, "life cycle stage %d: the emptied rank %d holds %ld particles\n", stage, er, nempty);
         const int expgroups[4] = {2, 1, 1, 0};
@@ -3018,6 +3313,14 @@ test_subhalo_twohalo(void ** state)
         int64_t ng, n;
         int ret = run_finder_call(call, &CP, &ng);
         CHECK(ret == 1 && ng == 2, "two haloes, call %d: ret %d, %ld groups\n", call, ret, ng);
+        check_call_stats("two haloes", 1);
+        {
+            const struct SubhaloCallStats * st = subhalo_last_call_stats();
+            CHECK(st->NSerialKeys == 2 && st->LargestSerial > P2_NB && st->NCands == 0 && st->FieldSOCentrals == 2
+                  && st->FieldSOPass1Walks > 0 && st->FieldSOBins > 0,
+                  "two haloes, call %d: stats %ld keys (largest %ld), %ld candidates, field SO %ld centrals %d walks %d bins\n", call,
+                  st->NSerialKeys, st->LargestSerial, st->NCands, st->FieldSOCentrals, st->FieldSOPass1Walks, st->FieldSOBins);
+        }
         struct tagrec * r = gather_tags(&n);
         CHECK(subhalo_get_table()->NTotal == 2, "two haloes, call %d: NTotal %ld\n", call, subhalo_get_table()->NTotal);
         struct SubTrack * rec = fetch_all_tracks(2);
@@ -3057,6 +3360,82 @@ test_subhalo_twohalo(void ** state)
         free(rec);
         free(r);
     }
+    p2_teardown();
+}
+
+/* Phase 5c: the reserve admission. The two haloes with A (2000 particles) in place: a first call
+ * completes and gives the plan's reserve on every rank; the second call runs with the free memory
+ * squeezed to 2 MB below that reserve, where the collective stage alone still fits: the call
+ * fails before the exchange (reserve_failed, the collective admission passed), the tags are
+ * unchanged, the statistics are those of a failed call; the third call, unsqueezed, completes. */
+static void
+test_subhalo_reserve_admission(void ** state)
+{
+    Cosmology CP;
+    p2_setup(&CP);
+    struct SubhaloParams sp = default_subhalo_params();
+    sp.SubhaloFieldSO = 1;
+    sp.SubhaloCollectiveMinPart = 1000;
+    subhalo_set_testpar(sp);
+    const double cen[2][3] = {{P2_cA[0], P2_cA[1], P2_cA[2]}, {P2_cB[0], P2_cB[1], P2_cB[2]}};
+    const double bulk[2][3] = {{0, 0, 0}, {0, 0, 0}};
+    p2_place(0.5, CP.GravInternal, cen, bulk);
+    int64_t ng, n, i;
+    int ret = run_finder_call(0, &CP, &ng);
+    const struct SubhaloCollAdmit * ad = subhalo_plan_last_admission();
+    CHECK(ret == 1 && ad->checked && !ad->failed && !ad->reserve_failed && ad->reserve_short < 0,
+          "reserve: the first call returned %d (checked %d failed %d reserve failed %d short %g)\n", ret, ad->checked, ad->failed,
+          ad->reserve_failed, ad->reserve_short);
+    check_call_stats("reserve, first call", 1);
+    CHECK(subhalo_last_call_stats()->NCands > 0, "reserve: no in-place candidate in the first call\n");
+    double need = ad->reserve_need;
+    MPI_Allreduce(MPI_IN_PLACE, &need, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    const double target = need - 2. * 1024 * 1024;
+
+    /* the squeezed call, at a = 0.55 */
+    p2_place(0.55, CP.GravInternal, cen, bulk);
+    DomainDecomp ddecomp = {0};
+    domain_decompose_full(&ddecomp, MPI_COMM_WORLD);
+    FOFGroups fof = fof_fof(&ddecomp, 1, MPI_COMM_WORLD);
+    struct tagrec * pre = gather_tags(&n);
+    const double fr = (double) mymalloc_freebytes();
+    void * block = fr > target ? mymalloc2("TestReserveSqueeze", (size_t) (fr - target)) : NULL;
+    message(0, "reserve: the plan's reserve is %g MB; free %g MB squeezed to %g MB\n", need / 1048576., fr / 1048576.,
+            (double) mymalloc_freebytes() / 1048576.);
+    ret = subhalo_find(&fof, &ddecomp, 1, 0.55, &CP, 0, MPI_COMM_WORLD);
+    if(block)
+        myfree(block);
+    fof_finish(&fof);
+    domain_free(&ddecomp);
+    ad = subhalo_plan_last_admission();
+    const struct SubhaloPlanSummary * ps = subhalo_plan_last_summary();
+    message(0, "reserve: ret %d; reserve failed %d on rank %d, short %g MB (this rank needs %g MB, had %g MB); collective checked %d "
+               "failed %d (needs %g MB of %g MB); plan %ld serial, %ld in place, %ld candidates\n", ret, ad->reserve_failed,
+            ad->reserve_rank, ad->reserve_short / 1048576., ad->reserve_need / 1048576., ad->pack_free / 1048576., ad->checked,
+            ad->failed, ad->need / 1048576., ad->avail / 1048576., ps->NSerial, ps->NOversized, ps->NCands);
+    CHECK(ret == 0 && !subhalo_last_call_complete() && !ps->Admitted, "reserve: the squeezed call returned %d\n", ret);
+    CHECK(ad->reserve_failed && ad->reserve_short >= 2. * 1024 * 1024 && ad->reserve_short < need,
+          "reserve: reserve failed %d, short %g bytes\n", ad->reserve_failed, ad->reserve_short);
+    CHECK(ad->checked && !ad->failed && ad->need <= ad->avail, "reserve: the collective admission (checked %d) failed %d: %g of %g bytes\n",
+          ad->checked, ad->failed, ad->need, ad->avail);
+    check_call_stats("reserve, squeezed call", 0);
+    CHECK(subhalo_last_call_stats()->StageMax[SUBHALO_STAGE_EXCHANGE] == 0 && subhalo_last_call_stats()->StageMax[SUBHALO_STAGE_PLAN] > 0,
+          "reserve: the failed call timed the exchange (%g s)\n", subhalo_last_call_stats()->StageMax[SUBHALO_STAGE_EXCHANGE]);
+    int64_t n2, bad = 0;
+    struct tagrec * post = gather_tags(&n2);
+    for(i = 0; i < n && i < n2; i++)
+        if(post[i].ID != pre[i].ID || post[i].GrNr != pre[i].GrNr || post[i].TrackId != pre[i].TrackId
+           || post[i].BindRank != pre[i].BindRank || post[i].BoundTrackId != pre[i].BoundTrackId)
+            bad++;
+    CHECK(n2 == n && bad == 0, "reserve: %ld particles changed by the failed call\n", bad);
+    free(post);
+    free(pre);
+
+    /* the memory back: the call completes */
+    ret = run_finder_call(1, &CP, &ng);
+    ad = subhalo_plan_last_admission();
+    CHECK(ret == 1 && subhalo_last_call_complete() && !ad->reserve_failed, "reserve: the next call returned %d\n", ret);
+    check_call_stats("reserve, next call", 1);
     p2_teardown();
 }
 
@@ -3824,6 +4203,9 @@ test_subhalo_mixed_call(void ** state)
         int64_t ng, nempty, n, i;
         int ret = lifecycle_call(call, atime, &CP, er, NULL, &ng, &nempty);
         CHECK(ret == 1 && ng == 4, "mixed call %d: ret %d, %ld groups\n", call, ret, ng);
+        check_call_stats("mixed call", 1);
+        CHECK(subhalo_last_call_stats()->NCands > 0 && subhalo_last_call_stats()->NRounds > 0,
+              "mixed call %d: stats %ld in-place candidates\n", call, subhalo_last_call_stats()->NCands);
         CHECK(er == 0 || nempty == 0, "mixed call %d: the emptied rank holds %ld particles\n", call, nempty);
         CHECK(subhalo_get_table()->NTotal == 10, "mixed call %d: NTotal %ld\n", call, subhalo_get_table()->NTotal);
         struct tagrec * r = gather_tags(&n);
@@ -4241,6 +4623,8 @@ int main(void) {
         cmocka_unit_test(test_subhalo_fallback),
         cmocka_unit_test(test_subhalo_itercap),
         cmocka_unit_test(test_subhalo_lookup),
+        cmocka_unit_test(test_subhalo_serial_keys),
+        cmocka_unit_test(test_subhalo_reserve_admission),
     };
     /* SUBHALO_TEST_ONLY=<substring> runs only the tests whose name contains it */
     const char * only = getenv("SUBHALO_TEST_ONLY");
