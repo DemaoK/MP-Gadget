@@ -23,20 +23,32 @@
  *  - Pass 2 classifies a particle into the crossing bin with the same function and the same
  *    (Rlo, Scale) as pass 1, so the pass-2 particle set of a crossing bin is exactly the pass-1
  *    one, and the cumulative mass at the outer edge agrees.
+ *  - Accumulation: both passes add particle masses in double, in the walk's results, their
+ *    merges and the analysis; only the record's f4 fields round. For vir and 200c pass 2
+ *    carries the per-type sub-bins only and the total sub-bins are their sums, so the refined
+ *    total and the per-type masses come from the same additions. Accuracy bound: a refined
+ *    (or pass-1) mass of N particles carries a relative summation error of at most about
+ *    N 2^-53 (in practice ~sqrt(N) 2^-53), which depends on the particle partition and the
+ *    traversal order only at that level, far below the f4 rounding of the output (2^-24);
+ *    the per-type masses sum to MSO within the f4 roundings. This is not bitwise
+ *    reproducibility across partitions for arbitrary masses (it is for dyadic masses, whose
+ *    sums are exact); test_subhalo_so.c checks both.
  *
  * Memory (per rank): 456 bytes per central for the whole call (struct so_row) plus 8 for the
  * pending list, and per query slot of a batch 4 + 8 + 4 NThreads bytes of index (the last for the
- * treewalk's queue copy when black holes exist) and max(NB NT 8, (5 + 2 NT) 64 x 4) bytes of
+ * treewalk's queue copy when black holes exist) and max(NB NT 8, (3 + 2 NT) 64 x 8) bytes of
  * accumulator, the batch capped at 1/8 of the free bytes after the tree build and at what
- * leaves the treewalk its reserve. Results: pass 1 NB NT 8 bytes, pass 2 (5 + 2 NT) 256 bytes
+ * leaves the treewalk its reserve. Results: pass 1 NB NT 8 bytes, pass 2 (3 + 2 NT) 512 bytes
  * (+ 8 each with DEBUG); queries 64 / 168 bytes. treewalk.c's ev_begin wants
  * (40960 + max(4097, 100 NThreads)) x (24 + (1 + ImportBufferBoost) (query + result)) free bytes
  * (subhalo_so_walk_bytes): with the defaults (64 bins, boost 2, <= 40 threads) and NT = 1,
- * 75 MiB for pass 1 and 254 MiB for pass 2; with NT = 6, 405 MiB and 584 MiB (before the type
- * compaction pass 1 always needed the NT = 6 figure). Before the walks the call checks that
- * requirement against the free memory after the tree build (all ranks): pass 1 halves its bins
- * down to 16 until it fits, pass 2 is skipped (pass-1 interpolation for every central) if it
- * does not fit, and the whole call is skipped (records at -1) if pass 1 does not fit at 16 bins. */
+ * 75 MiB for pass 1 and 353 MiB for pass 2; with NT = 6, 405 MiB and 1013 MiB (before the type
+ * compaction pass 1 always needed the NT = 6 figure; the float pass 2 needed 254 and 584 MiB).
+ * Before the walks the call checks that requirement against the free memory after the tree
+ * build (all ranks): pass 1 halves its bins down to 16 until it fits, pass 2 is skipped (pass-1
+ * interpolation for every central) if it does not fit, and the whole call is skipped (records
+ * at -1) if pass 1 does not fit at 16 bins.
+ */
 
 #include <mpi.h>
 #include <math.h>
@@ -149,10 +161,17 @@ typedef struct {
     int pad;
 } TreeWalkQuerySO2;
 
+/* Pass 2 accumulates in double, and a definition with per-type masses (vir, 200c) carries only
+ * its per-type sub-bins: its total sub-bins are their sums (so_run_batches), so the refined total
+ * and the per-type masses come from the same additions and sum to each other up to the double
+ * rounding of the final sum over types. The definitions without per-type masses carry their
+ * total sub-bins. */
+#define SO_NUNTYPED (SUBHALO_NSO - 2)
+
 typedef struct {
     TreeWalkResultBase base;
-    /* Sub[SUBHALO_NSO][SUBHALO_SO_NSUB] then SubT[2][SUBHALO_SO_NSUB][NT] */
-    float S[];
+    /* Sub[SO_NUNTYPED][SUBHALO_SO_NSUB] (200b, 500c, 2500c) then SubT[2][SUBHALO_SO_NSUB][NT] */
+    double S[];
 } TreeWalkResultSO2;
 
 /* Accumulator (result without its base) bytes of a pass. */
@@ -161,14 +180,25 @@ so_acc_bytes(int pass, int NB, int NT)
 {
     if(pass == 1)
         return (size_t) NB * NT * sizeof(double);
-    return (size_t) (SUBHALO_NSO + 2 * NT) * SUBHALO_SO_NSUB * sizeof(float);
+    return (size_t) (SO_NUNTYPED + 2 * NT) * SUBHALO_SO_NSUB * sizeof(double);
 }
 
-/* Offset (in floats) of the per-type sub-bins of type slot ts in a pass-2 accumulator. */
+/* Offset (in doubles) of the total sub-bins of definition d (without per-type masses) in a
+ * pass-2 accumulator. */
+static inline size_t
+so2_uoff(int d)
+{
+    int e, u = 0;
+    for(e = 0; e < d; e++)
+        u += so_typeslot(e) < 0;
+    return (size_t) u * SUBHALO_SO_NSUB;
+}
+
+/* Offset (in doubles) of the per-type sub-bins of type slot ts in a pass-2 accumulator. */
 static inline size_t
 so2_toff(int ts, int NT)
 {
-    return (size_t) SUBHALO_NSO * SUBHALO_SO_NSUB + (size_t) ts * SUBHALO_SO_NSUB * NT;
+    return (size_t) SO_NUNTYPED * SUBHALO_SO_NSUB + (size_t) ts * SUBHALO_SO_NSUB * NT;
 }
 
 size_t
@@ -299,8 +329,8 @@ static void
 so2_reduce(int place, TreeWalkResultSO2 * O, enum TreeWalkReduceMode mode, TreeWalk * tw)
 {
     const struct so_priv * pv = SO_PRIV(tw);
-    float * acc = (float *) (pv->acc + so_slot(pv, place) * pv->accsize);
-    const size_t n = so_acc_bytes(2, pv->NB, pv->ty.NT) / sizeof(float);
+    double * acc = (double *) (pv->acc + so_slot(pv, place) * pv->accsize);
+    const size_t n = so_acc_bytes(2, pv->NB, pv->ty.NT) / sizeof(double);
     size_t k;
     for(k = 0; k < n; k++)
         acc[k] += O->S[k];
@@ -322,7 +352,7 @@ so2_ngbiter(TreeWalkQuerySO2 * I, TreeWalkResultSO2 * O, TreeWalkNgbIterBase * i
     const int NT = pv->ty.NT;
     const int k = so_bin(iter->r, I->Rlo, I->Scale, pv->NB);
     const int tslot = pv->ty.slot[P[other].Type];
-    const float mass = P[other].Mass;
+    const double mass = P[other].Mass;
     int d;
     for(d = 0; d < SUBHALO_NSO; d++) {
         if(I->jc[d] != k)
@@ -332,10 +362,11 @@ so2_ngbiter(TreeWalkQuerySO2 * I, TreeWalkResultSO2 * O, TreeWalkNgbIterBase * i
             m = 0;
         if(m >= SUBHALO_SO_NSUB)
             m = SUBHALO_SO_NSUB - 1;
-        O->S[d * SUBHALO_SO_NSUB + m] += mass;
         const int ts = so_typeslot(d);
         if(ts >= 0)
             O->S[so2_toff(ts, NT) + (size_t) m * NT + tslot] += mass;
+        else
+            O->S[so2_uoff(d) + m] += mass;
     }
 }
 
@@ -405,7 +436,7 @@ so_m1(const double * M, const struct so_types * ty, int k, int t)
 
 /* Mass of type t in pass-2 sub-bin m of the per-type sub-bins subT[NSUB][NT]. */
 static inline double
-so_m2(const float * subT, const struct so_types * ty, int m, int t)
+so_m2(const double * subT, const struct so_types * ty, int m, int t)
 {
     return ty->slot[t] >= 0 ? subT[(size_t) ty->NT * m + ty->slot[t]] : 0;
 }
@@ -492,8 +523,8 @@ so_pass1_analyse(struct so_row * row, const double * M, int NB, const struct so_
 
 /* Final values of definition d of a row; sub/subT are the pass-2 sub-bins ([NSUB], [NSUB][NT]) or NULL. */
 static void
-so_finish_def(const struct so_row * row, int d, int NB, const struct so_types * ty, double rho, const float * sub,
-              const float * subT, struct SubTrack * rec)
+so_finish_def(const struct so_row * row, int d, int NB, const struct so_types * ty, double rho, const double * sub,
+              const double * subT, struct SubTrack * rec)
 {
     const int ts = so_typeslot(d);
     float * mtype = ts == 0 ? rec->MTypeSOVir : (ts == 1 ? rec->MTypeSO200c : NULL);
@@ -618,13 +649,29 @@ so_run_batches(int pass, struct so_priv * pv, int64_t * batchbuf, const int64_t 
                 row->redo = so_pass1_analyse(row, M, NB, &pv->ty, rho, rhomin, par->SubhaloSOMaxDoublings, BoxSize, soft);
             }
             else {
-                const float * acc = (const float *) (pv->acc + s * pv->accsize);
+                const double * acc = (const double *) (pv->acc + s * pv->accsize);
                 int d;
                 for(d = 0; d < SUBHALO_NSO; d++) {
                     const int ts = so_typeslot(d);
                     const int refined = row->jc[d] >= 1 && row->jc[d] < NB;
-                    so_finish_def(row, d, NB, &pv->ty, rho[d], refined ? acc + d * SUBHALO_SO_NSUB : NULL,
-                                  (refined && ts >= 0) ? acc + so2_toff(ts, NT) : NULL, row->rec);
+                    if(!refined) {
+                        so_finish_def(row, d, NB, &pv->ty, rho[d], NULL, NULL, row->rec);
+                        continue;
+                    }
+                    if(ts < 0) {
+                        so_finish_def(row, d, NB, &pv->ty, rho[d], acc + so2_uoff(d), NULL, row->rec);
+                        continue;
+                    }
+                    /* the total sub-bins are the sums of the per-type ones */
+                    const double * subT = acc + so2_toff(ts, NT);
+                    double sub[SUBHALO_SO_NSUB];
+                    int m, u;
+                    for(m = 0; m < SUBHALO_SO_NSUB; m++) {
+                        sub[m] = 0;
+                        for(u = 0; u < NT; u++)
+                            sub[m] += subT[(size_t) m * NT + u];
+                    }
+                    so_finish_def(row, d, NB, &pv->ty, rho[d], sub, subT, row->rec);
                 }
             }
         }

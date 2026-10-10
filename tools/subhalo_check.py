@@ -51,12 +51,16 @@ input could not be read.
                               RSO, MTypeSO* -1 off centrals, sum(MTypeSO200c) = MSO[200c],
                               sum(MTypeSOVir) = MSO[vir]; Flags bits 3 and 4 only on centrals, bit 4
                               set exactly when an MSO definition is -1; group C zero for absent types,
-                              MostMassiveBHID set exactly when a black hole is bound; no NaN. Only defined values (!= -1) are tested, so a catalogue written
-                              before Phase 3 passes. MSO below MBoundSO is a warning.
+                              MostMassiveBHID (UINT64_MAX the only 'none'; 0 is a real ID) set exactly
+                              when a black hole is bound; no NaN. Only defined values (!= -1) are
+                              tested, so a catalogue written before Phase 3 passes. MSO below MBoundSO
+                              is a warning.
   tree OUTPUTDIR|PIG...       Phase 4: the track history over a PIG sequence. Tracks present at every
                               output after birth; resolved nodes their own descendant; deaths with
-                              SnapDeath = the first orphan output, DescendantTrackId / SinkTrackId
-                              resolved there, unchanged afterwards; MboundPeak / VmaxPeak running
+                              SnapDeath = the first orphan output, DescendantTrackId resolved there,
+                              SinkTrackId present there (resolved, or an orphan that died in the same
+                              call: same-call sink chains L -> P -> C, without cycles), both unchanged
+                              afterwards; MboundPeak / VmaxPeak running
                               maxima; SnapAcc, SnapFirstAcc, SnapLastIsolation, SnapLastMajorMerger
                               against the Rank history (subhalo_history_update).
   compare PIG_A PIG_B         check 5: every Subhalo/* and Orphan/* column equal after sorting by
@@ -1578,9 +1582,10 @@ def check_props(pigdir, ck, vmax_rtol=1e-3, field_warn=0.02):
         bad = _defined(v) & ((v < 0) | ((v > 0) & (nbt[:, t] == 0)))
         ck.check(not np.any(bad), "%s: %d subhalos with %s negative or non-zero without bound type-%d particles"
                  % (tag, np.count_nonzero(bad), c, t))
-    # MostMassiveBHID: (MyIDType) -1 without a bound black hole (subhalo_props_baryons; 0 accepted too)
+    # MostMassiveBHID: (MyIDType) -1, the only sentinel, without a bound black hole
+    # (subhalo_props_baryons); 0 is a real particle ID
     bhid = S["MostMassiveBHID"]
-    none = (bhid == np.iinfo(bhid.dtype).max) | (bhid == 0)
+    none = bhid == np.iinfo(bhid.dtype).max
     bad = ~none & (nbt[:, 5] == 0)
     ck.check(not np.any(bad), "%s: %d subhalos with a MostMassiveBHID but no bound black hole (e.g. TrackId %s)"
              % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
@@ -1656,6 +1661,20 @@ def check_tree(inputs, ck, show=5):
         p = np.clip(np.searchsorted(ks, q), 0, max(ks.size - 1, 0))
         return (ks.size > 0) & (ks[p] == q) if ks.size else np.zeros(np.shape(q), bool)
 
+    # node index of (output, track), -1 when the track has no node there (a negative or unknown
+    # TrackId included)
+    nkey_mul = int(tid.max()) + 2
+    nkey = out * nkey_mul + tid
+    nkey_order = np.argsort(nkey, kind="stable")
+    nkey_sorted = nkey[nkey_order]
+
+    def node_at(o, t):
+        o, t = np.asarray(o, np.int64), np.asarray(t, np.int64)
+        q = o * nkey_mul + t
+        p = np.clip(np.searchsorted(nkey_sorted, q), 0, max(nkey_sorted.size - 1, 0))
+        hit = (t >= 0) & (t < nkey_mul) & (nkey_sorted[p] == q)
+        return np.where(hit, nkey_order[p], -1)
+
     # -- presence: a track appears at consecutive outputs up to the last one, born resolved
     gap = ~first & ~hasprev
     rule(gap, "track missing at an output between two of its nodes")
@@ -1694,11 +1713,37 @@ def check_tree(inputs, ck, show=5):
     bad = np.zeros(tid.size, bool)
     bad[np.nonzero(m)[0][~ok]] = True
     rule(bad, "DescendantTrackId not resolved at the SnapDeath output")
-    m = inseq & (sinkt >= 0)
-    ok = resolved_at(dout[m], sinkt[m])
+    # SinkTrackId is the historical sink edge (the ancestor the track sank into during the call),
+    # not the final bound owner: the target need not survive the call. In a same-call chain
+    # L -> P -> C, P sinks after L sank into it, so P is an orphan at the output too
+    # (subhalo_track.c merge_subtree; HBT subhalo_merge.cpp). Required: the target has a node at
+    # the SnapSink output; if it is an orphan there, it died in the same call (SnapDeath = this
+    # SnapSink: only a track alive at the call's start takes sinkers); following orphan targets
+    # never comes back to a track already on the chain.
+    m = np.nonzero(inseq & (sinkt >= 0))[0]
+    tgt = node_at(dout[m], sinkt[m])
     bad = np.zeros(tid.size, bool)
-    bad[np.nonzero(m)[0][~ok]] = True
-    rule(bad, "SinkTrackId not resolved at the SnapSink output")
+    bad[m[tgt < 0]] = True
+    rule(bad, "SinkTrackId has no node (resolved or orphan) at the SnapSink output")
+    hasn = tgt >= 0
+    mo, to = m[hasn], tgt[hasn]
+    otgt = ~res[to]
+    bad = np.zeros(tid.size, bool)
+    bad[mo[otgt & (death[to] != death[mo])]] = True
+    rule(bad, "SinkTrackId target is an orphan at the SnapSink output that did not die in the same call")
+    bad = np.zeros(tid.size, bool)
+    for k, j in zip(mo[otgt].tolist(), to[otgt].tolist()):
+        seen = {k}
+        while j >= 0 and not res[j] and sinkt[j] >= 0 and death[j] == death[k]:
+            if j in seen:
+                bad[k] = True
+                break
+            seen.add(j)
+            j = int(node_at(dout[k], sinkt[j]))
+    rule(bad, "same-call sink chain with a cycle")
+    nchain = int(np.count_nonzero(dies & (sinkt >= 0) & np.isin(np.arange(tid.size), mo[otgt])))
+    if nchain:
+        ck.note("%d sunk tracks whose sink target sank or died in the same call (same-call sink chains)" % nchain)
     rule(dies & (desct == tid), "dead track whose DescendantTrackId is itself")
     nsunk = np.count_nonzero(dies & (sinkt >= 0))
     ndiff = np.count_nonzero(dies & (sinkt >= 0) & (desct != sinkt))

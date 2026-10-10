@@ -39,7 +39,8 @@ Matching (--match):
 Per matched pair (ours / Rockstar, both converted to Rockstar's units): Mvir (--mass), M200b, M200c,
 M500c, M2500c (MBoundSO[1..4]), Rvir (RBoundSO[0]), Vmax (VmaxVir), Rs_Klypin (RsKlypin against
 rs_klypin, and against Rockstar's NFW fit Rs), Spin (SpinPeebles), Spin_Bullock, b_to_a, c_to_a,
-b_to_a(500c), c_to_a(500c), Xoff, Voff; p10/p50/p90 of each ratio over pairs where both sides are
+b_to_a(500c), c_to_a(500c), Xoff, Voff (VmaxVir and Voff are physical km/s in our catalogue as in
+Rockstar's, so they are not converted); p10/p50/p90 of each ratio over pairs where both sides are
 defined (> 0), with the counts of pairs where our value is undefined (-1 until Phase 3 fills the
 column), Rockstar's is (0), or our column is absent from the file. Rockstar's values are
 bound-only (BOUND_PROPS 1); its host's set includes its subhalos' particles while our central's
@@ -320,6 +321,7 @@ class Units(object):
         ulen = g("UnitLength_in_cm", KPC_CM)
         self.pos = ulen / MPC_CM
         self.rad = ulen / KPC_CM
+        # internal (particle) velocities only: the catalogue's velocity columns are km/s already
         self.vel = g("UnitVelocity_in_cm_per_s", 1e5) / 1e5
         self.box_mpc = g("BoxSize", np.nan) * self.pos
         self.a = g("Time", np.nan)
@@ -327,7 +329,10 @@ class Units(object):
         self.mpart = float(mt[1]) * self.mass if mt.size > 1 and mt[1] > 0 else np.nan
 
 
-# (label, our column, Rockstar key, kind); kind selects the unit conversion of our value
+# (label, our column, Rockstar key, kind); kind selects the unit conversion of our value:
+# "mass", "rad" from the run's units; "kms" a catalogue velocity column, written in physical km/s
+# by the property pass (subhalo_props.c) and not converted again; "vel" an internal velocity
+# (UnitVelocity_in_cm_per_s), which no catalogue column compared here is; "one" dimensionless
 QUANTITIES = [
     ("Mvir", None, "mvir", "mass"),
     ("M200b", "MBoundSO[1]", "m200b", "mass"),
@@ -335,7 +340,7 @@ QUANTITIES = [
     ("M500c", "MBoundSO[3]", "m500c", "mass"),
     ("M2500c", "MBoundSO[4]", "m2500c", "mass"),
     ("Rvir", "RBoundSO[0]", "rvir", "rad"),
-    ("Vmax", "VmaxVir", "vmax", "vel"),
+    ("Vmax", "VmaxVir", "vmax", "kms"),
     ("Rs_Klypin", "RsKlypin", "rs_klypin", "rad"),
     ("Rs(fit)", "RsKlypin", "rs", "rad"),
     ("Spin", "SpinPeebles", "spin", "one"),
@@ -345,12 +350,12 @@ QUANTITIES = [
     ("b_to_a(500c)", "BtoA500", "b_to_a(500c)", "one"),
     ("c_to_a(500c)", "CtoA500", "c_to_a(500c)", "one"),
     ("Xoff", "Xoff", "xoff", "rad"),
-    ("Voff", "Voff", "voff", "vel"),
+    ("Voff", "Voff", "voff", "kms"),
 ]
 
 
 def _conv(units, kind):
-    return {"mass": units.mass, "rad": units.rad, "vel": units.vel, "one": 1.0}[kind]
+    return {"mass": units.mass, "rad": units.rad, "vel": units.vel, "kms": 1.0, "one": 1.0}[kind]
 
 
 # ---------------------------------------------------------------------------------- matching

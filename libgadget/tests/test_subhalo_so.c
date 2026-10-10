@@ -37,7 +37,11 @@
  *     free it skips the field SO (every central at -1, SO flags clear, others untouched).
  *  6. A rank without particles (an interior rank emptied after the domain decomposition, as in
  *     test_subhalo.c): its centrals are routed to another rank and the results are identical,
- *     with the records spread over the ranks and with all of them on the empty rank. */
+ *     with the records spread over the ranks and with all of them on the empty rank.
+ *  7. Non-dyadic, mixed-mass and mixed-type refined shells (test_subhalo_field_so_mixed):
+ *     refined masses within one f4 ulp of the long-double particle sums, the per-type sum
+ *     invariant, and agreement between particle partitions (see the comment before that test).
+ *     The dyadic fixture above keeps the exact, bit-for-bit mapping checks. */
 
 #include <stdarg.h>
 #include <stddef.h>
@@ -626,6 +630,14 @@ test_subhalo_field_so(void ** state)
     tp.FractionalGravitySoftening = 1. / 50;
     set_gravshort_treepar(tp);
     gravshort_set_softenings(50.);       /* GravitySoftening = 1 kpc/h */
+    /* the treewalk reserve with the parameter's default boost (logged for subhalo_so.c's
+     * comment), then the boost of these tests: ImportBufferBoost is never set here, so
+     * treewalk.c uses 0, and the 650 MB test allocator would not hold pass 2's reserve at 2 */
+    subhalo_so_set_import_buffer_boost(2);
+    message(0, "treewalk reserve with boost 2, 64 bins: NT = 1 pass 1 %zu pass 2 %zu; NT = 6 pass 1 %zu pass 2 %zu bytes\n",
+            subhalo_so_walk_bytes(1, 64, 1), subhalo_so_walk_bytes(2, 64, 1), subhalo_so_walk_bytes(1, 64, 6),
+            subhalo_so_walk_bytes(2, 64, 6));
+    subhalo_so_set_import_buffer_boost(0);
 
     Cosmology CP = test_cosmology();
     double rho[SUBHALO_NSO], rhoA3[SUBHALO_NSO];
@@ -848,9 +860,407 @@ test_subhalo_field_so(void ** state)
     PartManager->NumPart = 0;
 }
 
+/* ------------------------------------------------------------------ non-dyadic refined shells */
+
+/* Test 7 (audit P3). One central with non-dyadic, mixed masses of types 1, 2 and 3:
+ *   core    NM_CORE particles uniform in r inside 0.8 of the inner edge of the 200c crossing bin;
+ *   shell1  NM_SH1 particles (half type 1, half type 3) in one pass-2 sub-bin (3) of that bin;
+ *   shell2a NM_SH2A particles in the middle of the pass-1 bin before the vir crossing bin;
+ *   shell2b NM_SH2B particles (types 2 and 3) in sub-bin 3 of the vir crossing bin;
+ *   a background (type 2) only beyond the search radius.
+ * The masses are scaled so that the 200c crossing lies in sub-bin 40 of its bin (core + shell1
+ * = K200c r200c^3) and the vir crossing in sub-bin 40 of its bin, with the cumulative density at
+ * each crossing bin's inner edge above the threshold. The sub-bins after the shell are empty, so
+ * the interpolation returns the accumulated mass (the audit's trigger): MSO200c = M(core +
+ * shell1), MSOvir = MSO200b = the whole clump, per type alike. 200b crosses in an empty bin.
+ *
+ * Accuracy bound (documented in subhalo_so.c): the sub-bins accumulate in double, so a refined
+ * mass carries a relative summation error of at most ~N 2^-53 (N particles, 2e-11 here, ~1e-15
+ * in practice) whatever the partition, below the f4 rounding of the record (2^-24). Checks, for
+ * the default domain, the local particle order reversed and (NTask >= 2) a rank emptied:
+ *   - MSO vir/200c/200b and MTypeSOVir/MTypeSO200c within one f4 ulp (2^-23 relative) of the
+ *     long-double sums of the particle masses;
+ *   - the per-type masses sum to MSO within 2^-22 relative (the f4 roundings);
+ *   - every MSO (also 500c, 2500c, interpolated in the core) within 1e-6 relative of the
+ *     default-domain result.
+ * The float accumulation of the previous pass 2 misses these by orders of magnitude (100000
+ * additions of ~1e-5 of the total each). */
+
+#define NM_CORE 40000
+#define NM_SH1 100000
+#define NM_SH2A 20000
+#define NM_SH2B 40000
+#define NM_BG 8192
+#define NM_TOT (NM_CORE + NM_SH1 + NM_SH2A + NM_SH2B + NM_BG)
+#define NM_MBOUND 10.
+
+static const double CenM[3] = {400, 520, 610};
+
+struct mixed_geom {
+    double R, Rlo, Scale;
+    double rs1, r200, rs2a, rs2b, rvir, rcore;
+    double fcore, fsh1, fsh2a, fsh2b;     /* mass scale of each population */
+};
+
+/* Radius of population member k (0..n) of a population: the shells are thin (1e-6 relative). */
+static void
+mixed_particle(int64_t id, const struct mixed_geom * gm, double pos[3], int * type, double * mass)
+{
+    int64_t k = id;
+    double r;
+    const double u = urand(id, 11, 0);
+    if(k < NM_CORE) {
+        r = 2 + (gm->rcore - 2) * u;
+        *type = (k % 3 == 0) ? 3 : 1;
+        *mass = gm->fcore * (*type == 3 ? 1.7 : 1.) * (1 + 0.3 * urand(id, 12, 0));
+    }
+    else if((k -= NM_CORE) < NM_SH1) {
+        r = gm->rs1 * (1 + 1e-6 * u);
+        *type = (k % 2) ? 3 : 1;
+        *mass = gm->fsh1 * (1 + 0.5 * urand(id, 12, 0));
+    }
+    else if((k -= NM_SH1) < NM_SH2A) {
+        r = gm->rs2a * (1 + 1e-6 * u);
+        *type = (k % 2) ? 2 : 1;
+        *mass = gm->fsh2a * (1 + 0.4 * urand(id, 12, 0));
+    }
+    else if((k -= NM_SH2A) < NM_SH2B) {
+        r = gm->rs2b * (1 + 1e-6 * u);
+        *type = (k % 2) ? 3 : 2;
+        *mass = gm->fsh2b * (1 + 0.6 * urand(id, 12, 0));
+    }
+    else {
+        /* background beyond the search radius */
+        int d;
+        *type = 2;
+        *mass = 0.013 * (1 + urand(id, 12, 0));
+        uint64_t s = 0;
+        do {
+            double r2 = 0;
+            for(d = 0; d < 3; d++) {
+                pos[d] = BOX * urand(id, 13 + s, d);
+                const double dx = nearest(pos[d] - CenM[d]);
+                r2 += dx * dx;
+            }
+            s++;
+            if(r2 > (gm->R + 20) * (gm->R + 20))
+                break;
+        } while(1);
+        return;
+    }
+    const double ct = 2 * urand(id, 2, 0) - 1, st = sqrt(1 - ct * ct), ph = 2 * M_PI * urand(id, 3, 0);
+    pos[0] = wrap(CenM[0] + r * st * cos(ph));
+    pos[1] = wrap(CenM[1] + r * st * sin(ph));
+    pos[2] = wrap(CenM[2] + r * ct);
+}
+
+/* Population of particle id: 0 core, 1 shell1, 2 shell2a, 3 shell2b, 4 background. */
+static int
+mixed_pop(int64_t id)
+{
+    if(id < NM_CORE) return 0;
+    if((id -= NM_CORE) < NM_SH1) return 1;
+    if((id -= NM_SH1) < NM_SH2A) return 2;
+    if((id -= NM_SH2A) < NM_SH2B) return 3;
+    return 4;
+}
+
+/* Sum of the masses (all types if type < 0) of the populations 0..maxpop, in long double, from
+ * the generator (the reference; the masses stored in P are these doubles). */
+static long double
+mixed_sum(const struct mixed_geom * gm, int maxpop, int type)
+{
+    long double s = 0;
+    int64_t id;
+    for(id = 0; id < NM_TOT; id++) {
+        if(mixed_pop(id) > maxpop)
+            break;
+        double pos[3], m;
+        int t;
+        mixed_particle(id, gm, pos, &t, &m);
+        if(type < 0 || t == type)
+            s += m;
+    }
+    return s;
+}
+
+/* Bin edges as subhalo_so.c: inner edge of pass-1 bin k and the outer edge of sub-bin m of it. */
+static double
+mixed_edge(const struct mixed_geom * gm, int k)
+{
+    return gm->Rlo * exp(k / gm->Scale);
+}
+
+static double
+mixed_sub(const struct mixed_geom * gm, int k, double frac)
+{
+    const double a = mixed_edge(gm, k), b = mixed_edge(gm, k + 1);
+    return a + frac * (b - a);
+}
+
+static void
+mixed_geometry(struct mixed_geom * gm, const double rho[SUBHALO_NSO], const struct SubhaloParams * par)
+{
+    double rhomin = rho[0];
+    int d;
+    for(d = 1; d < SUBHALO_NSO; d++)
+        rhomin = fmin(rhomin, rho[d]);
+    const double soft = FORCE_SOFTENING() / 2.8;
+    const int NB = par->SubhaloSOBins;
+    memset(gm, 0, sizeof(*gm));
+    gm->R = par->SubhaloSOSearchFactor * cbrt(3. * NM_MBOUND / (4. * M_PI * rhomin));
+    gm->Rlo = fmin(soft, 0.25 * gm->R);
+    gm->Scale = NB / log(gm->R / gm->Rlo);
+    const double K200c = 4. / 3. * M_PI * rho[2], Kvir = 4. / 3. * M_PI * rho[0];
+    /* 200c: the bin containing 45 kpc/h; shell in sub-bin 3, crossing in sub-bin 40 */
+    const int k1 = (int) floor(log(45. / gm->Rlo) * gm->Scale);
+    gm->rs1 = mixed_sub(gm, k1, 3.5 / SUBHALO_SO_NSUB);
+    gm->r200 = mixed_sub(gm, k1, 40.5 / SUBHALO_SO_NSUB);
+    gm->rcore = 0.8 * mixed_edge(gm, k1);
+    const double M1 = K200c * gm->r200 * gm->r200 * gm->r200;
+    /* vir: the bin containing 1.6 r200c */
+    const int k2 = (int) floor(log(1.6 * gm->r200 / gm->Rlo) * gm->Scale);
+    gm->rs2a = mixed_sub(gm, k2 - 1, 0.5);
+    gm->rs2b = mixed_sub(gm, k2, 3.5 / SUBHALO_SO_NSUB);
+    gm->rvir = mixed_sub(gm, k2, 40.5 / SUBHALO_SO_NSUB);
+    const double M2 = Kvir * gm->rvir * gm->rvir * gm->rvir;
+    /* core 0.9 M1, shell1 0.1 M1; shell2a up to 0.9 M2, shell2b the rest. The mean raw masses
+     * (1 + 0.3 u) (x1.7 for a third), (1 + 0.5 u), (1 + 0.4 u), (1 + 0.6 u) */
+    gm->fcore = 0.9 * M1 / (NM_CORE * (1.15 * (2. / 3 + 1.7 / 3)));
+    gm->fsh1 = 0.1 * M1 / (NM_SH1 * 1.25);
+    gm->fsh2a = (0.9 * M2 - M1) / (NM_SH2A * 1.2);
+    gm->fsh2b = 0.1 * M2 / (NM_SH2B * 1.3);
+    message(0, "mixed: R %g Rlo %g bins %d; 200c bin %d shell %g crossing %g; vir bin %d shells %g %g crossing %g; "
+               "M1 %g M2 %g\n", gm->R, gm->Rlo, NB, k1, gm->rs1, gm->r200, k2, gm->rs2a, gm->rs2b, gm->rvir, M1, M2);
+    CHECK(k2 > k1 + 1 && gm->fsh2a > 0 && gm->rvir * 1.25 < gm->R, "mixed: geometry k1 %d k2 %d fsh2a %g\n", k1, k2, gm->fsh2a);
+}
+
+static void
+mixed_setup_particles(const struct mixed_geom * gm)
+{
+    int NTask, ThisTask;
+    MPI_Comm_size(MPI_COMM_WORLD, &NTask);
+    MPI_Comm_rank(MPI_COMM_WORLD, &ThisTask);
+    particle_alloc_memory(PartManager, BOX, NM_TOT + 1000);
+    PartManager->NumPart = 0;
+    int d;
+    for(d = 0; d < 3; d++)
+        PartManager->CurrentParticleOffset[d] = Offset[d];
+    slots_init(0.01 * PartManager->MaxPart, SlotsManager);
+    slots_set_enabled(0, sizeof(struct sph_particle_data), SlotsManager);
+    slots_set_enabled(4, sizeof(struct star_particle_data), SlotsManager);
+    slots_set_enabled(5, sizeof(struct bh_particle_data), SlotsManager);
+    int64_t atleast[6] = {16, 0, 0, 0, 16, 16};
+    slots_reserve(1, atleast, SlotsManager);
+    int64_t id;
+    for(id = 0; id < NM_TOT; id++) {
+        /* a blocked initial layout (the domain decomposition redistributes it) */
+        if((int)(id * NTask / NM_TOT) != ThisTask)
+            continue;
+        struct particle_data * p = &P[PartManager->NumPart++];
+        memset(p, 0, sizeof(*p));
+        double pos[3], mass;
+        int type;
+        mixed_particle(id, gm, pos, &type, &mass);
+        p->ID = id;
+        p->Type = type;
+        p->Mass = mass;
+        p->GrNr = -1;
+        p->TrackId = p->BoundTrackId = -1;
+        p->BindRank = -1;
+        for(d = 0; d < 3; d++)
+            p->Pos[d] = wrap(pos[d] + Offset[d]);
+    }
+    slots_setup_id(PartManager, SlotsManager);
+}
+
+struct mixed_result {
+    double MSO[SUBHALO_NSO], MTVir[6], MT200c[6], Rsearch;
+};
+
+/* One call with the central on rank `owner`; results gathered on every rank. */
+static void
+mixed_run(DomainDecomp * dd, int owner, const Cosmology * CP, const struct SubhaloParams * par, const double * rho,
+          struct mixed_result * res, struct SubhaloSOStats * st)
+{
+    int ThisTask;
+    MPI_Comm_rank(MPI_COMM_WORLD, &ThisTask);
+    struct SubTrack rec;
+    subhalo_track_clear(&rec, 0);
+    rec.Rank = 0;
+    rec.HostGroup = 0;
+    rec.Nbound = NM_TOT;
+    rec.Mbound = NM_MBOUND;
+    int d;
+    for(d = 0; d < 3; d++)
+        rec.CorePos[d] = CenM[d];
+    const int n = ThisTask == owner;
+    double Rs = 0;
+    subhalo_field_so_full(&rec, n, dd, 1.0, CP, par, rho, &Rs, st, MPI_COMM_WORLD);
+    struct mixed_result mine;
+    memset(&mine, 0, sizeof(mine));
+    if(n) {
+        for(d = 0; d < SUBHALO_NSO; d++)
+            mine.MSO[d] = rec.MSO[d];
+        for(d = 0; d < 6; d++) {
+            mine.MTVir[d] = rec.MTypeSOVir[d];
+            mine.MT200c[d] = rec.MTypeSO200c[d];
+        }
+        mine.Rsearch = Rs;
+    }
+    MPI_Allreduce(&mine, res, sizeof(mine) / sizeof(double), MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+}
+
+/* Checks of one partition against the references and the default-domain result (ref0 may be
+ * NULL). Returns the number of failures. */
+static int
+mixed_check(const struct mixed_result * r, const struct mixed_result * ref0, const struct mixed_geom * gm,
+            const long double Mref[SUBHALO_NSO], const long double MTref[2][6], const char * what)
+{
+    const double ulp = ldexp(1., -23);
+    int bad = 0, d, t;
+    if(fabs(r->Rsearch - gm->R) > 1e-12 * gm->R) {
+        message(0, "%s: search radius %g, expected %g (no doubling)\n", what, r->Rsearch, gm->R);
+        bad++;
+    }
+    for(d = 0; d < SUBHALO_NSO; d++) {
+        if(Mref[d] > 0) {
+            const double err = (double) ((r->MSO[d] - Mref[d]) / Mref[d]);
+            message(0, "%s: %s MSO %.9g reference %.12Lg rel err %+.2e (bound %.2e)\n", what, DefName[d], r->MSO[d], Mref[d], err, ulp);
+            if(!(fabs(err) <= ulp)) bad++;
+        }
+        else if(!(r->MSO[d] > 0)) {
+            message(0, "%s: %s MSO %g\n", what, DefName[d], r->MSO[d]);
+            bad++;
+        }
+        if(ref0 && !(fabs(r->MSO[d] - ref0->MSO[d]) <= 1e-6 * ref0->MSO[d])) {
+            message(0, "%s: %s MSO %.9g differs from the default domain's %.9g\n", what, DefName[d], r->MSO[d], ref0->MSO[d]);
+            bad++;
+        }
+    }
+    for(d = 0; d < 2; d++) {
+        const double * mt = d == 0 ? r->MTVir : r->MT200c;
+        const double mso = r->MSO[d == 0 ? 0 : 2];
+        double sum = 0;
+        for(t = 0; t < 6; t++) {
+            sum += mt[t];
+            const long double ref = MTref[d][t];
+            const double err = ref > 0 ? (double) fabsl((mt[t] - ref) / ref) : fabs(mt[t]);
+            if(!(err <= ulp)) {
+                message(0, "%s: %s type %d: %.9g reference %.12Lg rel err %.2e\n", what, d == 0 ? "vir" : "200c", t, mt[t], ref, err);
+                bad++;
+            }
+        }
+        if(!(fabs(sum - mso) <= 2 * ulp * mso)) {
+            message(0, "%s: %s per-type sum %.9g != MSO %.9g\n", what, d == 0 ? "vir" : "200c", sum, mso);
+            bad++;
+        }
+    }
+    return bad;
+}
+
+static void
+reverse_particles(void)
+{
+    int64_t i, n = PartManager->NumPart;
+    for(i = 0; i < n / 2; i++) {
+        struct particle_data tmp = P[i];
+        P[i] = P[n - 1 - i];
+        P[n - 1 - i] = tmp;
+    }
+}
+
+static void
+test_subhalo_field_so_mixed(void ** state)
+{
+    walltime_init(&CT);
+    struct DomainParams dp = {0};
+    dp.DomainOverDecompositionFactor = 1;
+    dp.DomainUseGlobalSorting = 0;
+    dp.TopNodeAllocFactor = 1.;
+    dp.SetAsideFactor = 1;
+    set_domain_par(dp);
+    init_forcetree_params(0.7);
+    struct gravshort_tree_params tp = get_gravshort_treepar();
+    tp.FractionalGravitySoftening = 1. / 50;
+    set_gravshort_treepar(tp);
+    gravshort_set_softenings(50.);
+    subhalo_so_set_import_buffer_boost(0);     /* as in test_subhalo_field_so */
+
+    Cosmology CP = test_cosmology();
+    double rho[SUBHALO_NSO];
+    test_thresholds(&CP, 1.0, rho);
+    struct SubhaloParams par;
+    memset(&par, 0, sizeof(par));
+    par.SubhaloSOBins = 64;
+    par.SubhaloSOSearchFactor = 2;
+    par.SubhaloSOMaxDoublings = 3;
+    par.SubhaloSORefineMinPart = 1000;
+
+    struct mixed_geom gm;
+    mixed_geometry(&gm, rho, &par);
+    /* references: 200c the core and shell1, vir and 200b the whole clump */
+    long double Mref[SUBHALO_NSO] = {0}, MTref[2][6];
+    int t, d;
+    Mref[2] = mixed_sum(&gm, 1, -1);
+    Mref[0] = Mref[1] = mixed_sum(&gm, 3, -1);
+    for(t = 0; t < 6; t++) {
+        MTref[0][t] = mixed_sum(&gm, 3, t);
+        MTref[1][t] = mixed_sum(&gm, 1, t);
+    }
+
+    mixed_setup_particles(&gm);
+    DomainDecomp ddecomp = {0};
+    domain_decompose_full(&ddecomp, MPI_COMM_WORLD);
+    int NTask, ThisTask;
+    MPI_Comm_size(MPI_COMM_WORLD, &NTask);
+    MPI_Comm_rank(MPI_COMM_WORLD, &ThisTask);
+    /* how the clump is spread */
+    int64_t nclump = 0, i;
+    for(i = 0; i < PartManager->NumPart; i++)
+        nclump += P[i].ID < NM_TOT - NM_BG;
+    message(1, "mixed: rank %d holds %ld of the clump's particles\n", ThisTask, nclump);
+
+    struct mixed_result r0, r1, r2;
+    struct SubhaloSOStats st;
+    mixed_run(&ddecomp, 0, &CP, &par, rho, &r0, &st);
+    CHECK(st.Nrefined == 1 && st.Ndoubled == 0 && st.NTypes == 3 && st.Pass2,
+          "mixed: %ld refined %ld doubled %d types pass 2 %d\n", st.Nrefined, st.Ndoubled, st.NTypes, st.Pass2);
+    int bad = mixed_check(&r0, NULL, &gm, Mref, MTref, "mixed default");
+    CHECK(bad == 0, "mixed default domain: %d failures\n", bad);
+
+    /* the local particle order reversed: other tree, other summation order */
+    reverse_particles();
+    mixed_run(&ddecomp, NTask - 1, &CP, &par, rho, &r1, &st);
+    bad = mixed_check(&r1, &r0, &gm, Mref, MTref, "mixed reversed");
+    CHECK(bad == 0, "mixed reversed order: %d failures\n", bad);
+    subhalo_so_set_max_batch(1);
+    mixed_run(&ddecomp, 0, &CP, &par, rho, &r1, &st);
+    subhalo_so_set_max_batch(0);
+    bad = mixed_check(&r1, &r0, &gm, Mref, MTref, "mixed reversed batch 1");
+    CHECK(bad == 0, "mixed reversed order, batches of one: %d failures\n", bad);
+
+    /* a rank emptied: its particles go to its neighbour */
+    if(NTask >= 2) {
+        empty_rank_domain(&ddecomp, NTask / 2);
+        mixed_run(&ddecomp, NTask / 2, &CP, &par, rho, &r2, &st);
+        bad = mixed_check(&r2, &r0, &gm, Mref, MTref, "mixed emptied rank");
+        CHECK(bad == 0, "mixed emptied rank: %d failures\n", bad);
+    }
+    for(d = 0; d < SUBHALO_NSO; d++)
+        message(0, "mixed: %s MSO %.9g\n", DefName[d], r0.MSO[d]);
+
+    domain_free(&ddecomp);
+    slots_free(SlotsManager);
+    myfree(PartManager->Base);
+    PartManager->Base = NULL;
+    PartManager->NumPart = 0;
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_subhalo_field_so),
+        cmocka_unit_test(test_subhalo_field_so_mixed),
     };
     return cmocka_run_group_tests_mpi(tests, NULL, NULL);
 }
