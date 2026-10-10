@@ -11,8 +11,12 @@
  *    active set of treewalk_run with haswork NULL, so the treewalk uses it as its queue as is.
  *    A rank with more queries than live particles (or than the batch cap) issues them in
  *    batches; every rank runs the same number of walks (global maximum of the batch counts).
+ *  - Ranks without a live particle: their centrals are routed (whole records) to the lowest
+ *    rank with a live particle, which walks them as its own and sends them back (subhalo_so.h).
  *  - Visits: treewalk_visit_nolist_ngbiter with NoNgblist = 1, accumulating directly in
  *    ngbiter; garbage (skipped by the visit already) and swallowed particles are excluded.
+ *  - Types: the results carry the masses of the particle types present among the live
+ *    particles of the whole run only (NT <= 6 slots; one for a DM-only run), which loses nothing.
  *  - Doubling: a manual redo loop. Each round walks every central still pending (in batches),
  *    then each central either is final or has its radius doubled and stays pending; the rounds
  *    end when no rank has a pending central. At most SubhaloSOMaxDoublings + 1 rounds.
@@ -20,13 +24,19 @@
  *    (Rlo, Scale) as pass 1, so the pass-2 particle set of a crossing bin is exactly the pass-1
  *    one, and the cumulative mass at the outer edge agrees.
  *
- * Memory (per rank): 448 bytes per central for the whole call (struct so_row) plus 8 for the
- * pending list, and per query slot of a batch 4 + 8 bytes of index and max(SubhaloSOBins x 48,
- * 4352) bytes of accumulator, the batch capped at 1/8 of the free bytes after the tree build.
- * The treewalk export buffers take the rest of the free memory as for any walk: query 64 / 168
- * bytes, result SubhaloSOBins x 48 / 4352 bytes for pass 1 / pass 2 (+ 8 each with DEBUG).
- * treewalk.c's ev_begin wants 40960 x (24 + (1 + ImportBufferBoost) (query + result)) free
- * bytes: with the defaults (64 bins, boost 2) 386 MB for pass 1 and 556 MB for pass 2. */
+ * Memory (per rank): 456 bytes per central for the whole call (struct so_row) plus 8 for the
+ * pending list, and per query slot of a batch 4 + 8 + 4 NThreads bytes of index (the last for the
+ * treewalk's queue copy when black holes exist) and max(NB NT 8, (5 + 2 NT) 64 x 4) bytes of
+ * accumulator, the batch capped at 1/8 of the free bytes after the tree build and at what
+ * leaves the treewalk its reserve. Results: pass 1 NB NT 8 bytes, pass 2 (5 + 2 NT) 256 bytes
+ * (+ 8 each with DEBUG); queries 64 / 168 bytes. treewalk.c's ev_begin wants
+ * (40960 + max(4097, 100 NThreads)) x (24 + (1 + ImportBufferBoost) (query + result)) free bytes
+ * (subhalo_so_walk_bytes): with the defaults (64 bins, boost 2, <= 40 threads) and NT = 1,
+ * 75 MiB for pass 1 and 254 MiB for pass 2; with NT = 6, 405 MiB and 584 MiB (before the type
+ * compaction pass 1 always needed the NT = 6 figure). Before the walks the call checks that
+ * requirement against the free memory after the tree build (all ranks): pass 1 halves its bins
+ * down to 16 until it fits, pass 2 is skipped (pass-1 interpolation for every central) if it
+ * does not fit, and the whole call is skipped (records at -1) if pass 1 does not fit at 16 bins. */
 
 #include <mpi.h>
 #include <math.h>
@@ -50,8 +60,15 @@
 #define SO_DEF_200C 2
 #define SO_MINBINS 8
 #define SO_MAXBINS 256
+/* pass 1 halves its bins down to this many when the treewalk reserve does not fit */
+#define SO_SHRINKBINS 16
+/* allocator slack on top of the computed requirements */
+#define SO_SLACK (1L << 20)
 
 static int64_t SOMaxBatch = 0;
+/* treewalk.c keeps ImportBufferBoost private: the parameter's default (gadget/params.c) unless
+ * subhalo_so_set_import_buffer_boost says otherwise */
+static double SOImportBufferBoost = 2.;
 
 static inline int64_t so_imin(int64_t a, int64_t b) { return a < b ? a : b; }
 static inline int64_t so_imax(int64_t a, int64_t b) { return a > b ? a : b; }
@@ -62,6 +79,12 @@ subhalo_so_set_max_batch(int64_t maxbatch)
     SOMaxBatch = maxbatch;
 }
 
+void
+subhalo_so_set_import_buffer_boost(double boost)
+{
+    SOImportBufferBoost = boost > 0 ? boost : 0;
+}
+
 /* Per-type slot of a definition: 0 for vir, 1 for 200c, -1 otherwise. */
 static inline int
 so_typeslot(int d)
@@ -69,21 +92,29 @@ so_typeslot(int d)
     return d == SO_DEF_VIR ? 0 : (d == SO_DEF_200C ? 1 : -1);
 }
 
-/* One central on this rank, alive for the whole call. */
+/* One central walked by this rank (its own or a routed one), alive for the whole call. */
 struct so_row {
     double Pos[3];                 /* core, translated comoving frame */
-    double R, Rlo, Scale;          /* search radius, inner log edge, SubhaloSOBins / ln(R / Rlo) */
+    double R, Rlo, Scale;          /* search radius, inner log edge, NB / ln(R / Rlo) */
     /* pass-1 outcome per definition: crossing bin [Rin, Rout], cumulative mass at Rin and the
      * bin's content, total and (vir, 200c) per type */
     double Rin[SUBHALO_NSO], Rout[SUBHALO_NSO], Cin[SUBHALO_NSO], Bin[SUBHALO_NSO];
     double CinT[2][SO_NT], BinT[2][SO_NT];
-    int64_t rec;                   /* index into recs */
-    int jc[SUBHALO_NSO];           /* crossing bin (j + 1); -1 none; SubhaloSOBins: cut off at R */
+    struct SubTrack * rec;         /* the record written */
+    double * rsearch;              /* where the final search radius goes, or NULL */
+    int jc[SUBHALO_NSO];           /* crossing bin (j + 1); -1 none; NB: cut off at R */
     int ndoubl;
     int redo;                      /* pending another pass-1 round */
     int refine;                    /* pass 2 */
     int cutoff;
     int pad;
+};
+
+/* The particle types present (globally) and their result slots. */
+struct so_types {
+    int NT;                        /* number of slots */
+    int slot[SO_NT];               /* slot of each type, -1 absent */
+    int type[SO_NT];               /* type of each slot */
 };
 
 /* Private data of the walks. */
@@ -95,6 +126,7 @@ struct so_priv {
     char * acc;                    /* accumulator of each slot */
     size_t accsize;
     int NB;
+    struct so_types ty;
 };
 
 #define SO_PRIV(tw) ((struct so_priv *) ((tw)->priv))
@@ -106,7 +138,7 @@ typedef struct {
 
 typedef struct {
     TreeWalkResultBase base;
-    double M[];                    /* [NB][SO_NT] */
+    double M[];                    /* [NB][NT] */
 } TreeWalkResultSO1;
 
 typedef struct {
@@ -119,9 +151,37 @@ typedef struct {
 
 typedef struct {
     TreeWalkResultBase base;
-    float Sub[SUBHALO_NSO][SUBHALO_SO_NSUB];
-    float SubT[2][SUBHALO_SO_NSUB][SO_NT];
+    /* Sub[SUBHALO_NSO][SUBHALO_SO_NSUB] then SubT[2][SUBHALO_SO_NSUB][NT] */
+    float S[];
 } TreeWalkResultSO2;
+
+/* Accumulator (result without its base) bytes of a pass. */
+static size_t
+so_acc_bytes(int pass, int NB, int NT)
+{
+    if(pass == 1)
+        return (size_t) NB * NT * sizeof(double);
+    return (size_t) (SUBHALO_NSO + 2 * NT) * SUBHALO_SO_NSUB * sizeof(float);
+}
+
+/* Offset (in floats) of the per-type sub-bins of type slot ts in a pass-2 accumulator. */
+static inline size_t
+so2_toff(int ts, int NT)
+{
+    return (size_t) SUBHALO_NSO * SUBHALO_SO_NSUB + (size_t) ts * SUBHALO_SO_NSUB * NT;
+}
+
+size_t
+subhalo_so_walk_bytes(int pass, int NB, int NT)
+{
+    const size_t q = pass == 1 ? sizeof(TreeWalkQuerySO1) : sizeof(TreeWalkQuerySO2);
+    const size_t r = (pass == 1 ? sizeof(TreeWalkResultSO1) : sizeof(TreeWalkResultSO2)) + so_acc_bytes(pass, NB, NT);
+    /* as ev_begin: bytes per buffer, the 40960-buffer reserve, then more than 4096 buffers and
+     * at least 100 per thread */
+    const size_t bpb = sizeof(struct data_index) + q + r + (size_t) ceil(SOImportBufferBoost * (q + r));
+    const int64_t nbuf = 4096 * 10 + so_imax(4096 + 1, 100 * (int64_t) omp_get_max_threads());
+    return (size_t) nbuf * bpb;
+}
 
 /* The pass-1 bin of radius r. Not inlined, so that pass 1 and pass 2 evaluate it with the same
  * instructions and classify every particle identically. */
@@ -184,7 +244,7 @@ so1_reduce(int place, TreeWalkResultSO1 * O, enum TreeWalkReduceMode mode, TreeW
 {
     const struct so_priv * pv = SO_PRIV(tw);
     double * acc = (double *) (pv->acc + so_slot(pv, place) * pv->accsize);
-    const int n = pv->NB * SO_NT;
+    const int n = pv->NB * pv->ty.NT;
     int k;
     /* the accumulators are zeroed before the walk, so primary and ghost results both add */
     for(k = 0; k < n; k++)
@@ -203,8 +263,10 @@ so1_ngbiter(TreeWalkQuerySO1 * I, TreeWalkResultSO1 * O, TreeWalkNgbIterBase * i
     const int other = iter->other;
     if(P[other].IsGarbage || P[other].Swallowed)
         return;
-    const int k = so_bin(iter->r, I->Rlo, I->Scale, SO_PRIV(lv->tw)->NB);
-    O->M[SO_NT * k + P[other].Type] += P[other].Mass;
+    const struct so_priv * pv = SO_PRIV(lv->tw);
+    const int k = so_bin(iter->r, I->Rlo, I->Scale, pv->NB);
+    /* every live particle's type has a slot (the types are those of the live particles) */
+    O->M[pv->ty.NT * k + pv->ty.slot[P[other].Type]] += P[other].Mass;
 }
 
 /* ------------------------------------------------------------------ pass 2 */
@@ -238,11 +300,10 @@ so2_reduce(int place, TreeWalkResultSO2 * O, enum TreeWalkReduceMode mode, TreeW
 {
     const struct so_priv * pv = SO_PRIV(tw);
     float * acc = (float *) (pv->acc + so_slot(pv, place) * pv->accsize);
-    const float * src = &O->Sub[0][0];
-    const int n = (sizeof(O->Sub) + sizeof(O->SubT)) / sizeof(float);
-    int k;
+    const size_t n = so_acc_bytes(2, pv->NB, pv->ty.NT) / sizeof(float);
+    size_t k;
     for(k = 0; k < n; k++)
-        acc[k] += src[k];
+        acc[k] += O->S[k];
 }
 
 static void
@@ -257,8 +318,10 @@ so2_ngbiter(TreeWalkQuerySO2 * I, TreeWalkResultSO2 * O, TreeWalkNgbIterBase * i
     const int other = iter->other;
     if(P[other].IsGarbage || P[other].Swallowed)
         return;
-    const int k = so_bin(iter->r, I->Rlo, I->Scale, SO_PRIV(lv->tw)->NB);
-    const int type = P[other].Type;
+    const struct so_priv * pv = SO_PRIV(lv->tw);
+    const int NT = pv->ty.NT;
+    const int k = so_bin(iter->r, I->Rlo, I->Scale, pv->NB);
+    const int tslot = pv->ty.slot[P[other].Type];
     const float mass = P[other].Mass;
     int d;
     for(d = 0; d < SUBHALO_NSO; d++) {
@@ -269,10 +332,10 @@ so2_ngbiter(TreeWalkQuerySO2 * I, TreeWalkResultSO2 * O, TreeWalkNgbIterBase * i
             m = 0;
         if(m >= SUBHALO_SO_NSUB)
             m = SUBHALO_SO_NSUB - 1;
-        O->Sub[d][m] += mass;
+        O->S[d * SUBHALO_SO_NSUB + m] += mass;
         const int ts = so_typeslot(d);
         if(ts >= 0)
-            O->SubT[ts][m][type] += mass;
+            O->S[so2_toff(ts, NT) + (size_t) m * NT + tslot] += mass;
     }
 }
 
@@ -293,14 +356,14 @@ so_walk(int pass, struct so_priv * pv, int64_t nq, ForceTree * tree)
         tw->fill = (TreeWalkFillQueryFunction) so1_fill;
         tw->reduce = (TreeWalkReduceResultFunction) so1_reduce;
         tw->query_type_elsize = sizeof(TreeWalkQuerySO1);
-        tw->result_type_elsize = sizeof(TreeWalkResultSO1) + (size_t) pv->NB * SO_NT * sizeof(double);
+        tw->result_type_elsize = sizeof(TreeWalkResultSO1) + so_acc_bytes(1, pv->NB, pv->ty.NT);
     }
     else {
         tw->ngbiter = (TreeWalkNgbIterFunction) so2_ngbiter;
         tw->fill = (TreeWalkFillQueryFunction) so2_fill;
         tw->reduce = (TreeWalkReduceResultFunction) so2_reduce;
         tw->query_type_elsize = sizeof(TreeWalkQuerySO2);
-        tw->result_type_elsize = sizeof(TreeWalkResultSO2);
+        tw->result_type_elsize = sizeof(TreeWalkResultSO2) + so_acc_bytes(2, pv->NB, pv->ty.NT);
     }
     tw->priv = pv;
     tw->tree = tree;
@@ -333,11 +396,25 @@ so_cross(double ra, double Ma, double rb, double Mb, double K)
     return M;
 }
 
-/* Pass-1 analysis of one row from its histogram M[NB][SO_NT]. Returns 1 if the row must be
+/* Mass of type t in pass-1 bin k of the histogram M[NB][NT] (0 for a type without a slot). */
+static inline double
+so_m1(const double * M, const struct so_types * ty, int k, int t)
+{
+    return ty->slot[t] >= 0 ? M[(size_t) ty->NT * k + ty->slot[t]] : 0;
+}
+
+/* Mass of type t in pass-2 sub-bin m of the per-type sub-bins subT[NSUB][NT]. */
+static inline double
+so_m2(const float * subT, const struct so_types * ty, int m, int t)
+{
+    return ty->slot[t] >= 0 ? subT[(size_t) ty->NT * m + ty->slot[t]] : 0;
+}
+
+/* Pass-1 analysis of one row from its histogram M[NB][NT]. Returns 1 if the row must be
  * walked again with a doubled radius (radius already updated), 0 if its pass-1 outcome is final. */
 static int
-so_pass1_analyse(struct so_row * row, const double * M, int NB, const double rho[SUBHALO_NSO], double rhomin,
-                 int MaxDoublings, double BoxSize, double soft)
+so_pass1_analyse(struct so_row * row, const double * M, int NB, const struct so_types * ty, const double rho[SUBHALO_NSO],
+                 double rhomin, int MaxDoublings, double BoxSize, double soft)
 {
     int j[SUBHALO_NSO];
     int d, k, t;
@@ -346,7 +423,7 @@ so_pass1_analyse(struct so_row * row, const double * M, int NB, const double rho
     double C = 0, Dlast = 0;
     for(k = 0; k < NB; k++) {
         for(t = 0; t < SO_NT; t++)
-            C += M[SO_NT * k + t];
+            C += so_m1(M, ty, k, t);
         const double e = so_edge(row, k, NB);
         const double D = C / (4. / 3. * M_PI * e * e * e);
         for(d = 0; d < SUBHALO_NSO; d++)
@@ -379,7 +456,7 @@ so_pass1_analyse(struct so_row * row, const double * M, int NB, const double rho
     for(k = 0; k < NB; k++) {
         double binm = 0;
         for(t = 0; t < SO_NT; t++)
-            binm += M[SO_NT * k + t];
+            binm += so_m1(M, ty, k, t);
         for(d = 0; d < SUBHALO_NSO; d++) {
             if(row->jc[d] != k)
                 continue;
@@ -392,12 +469,12 @@ so_pass1_analyse(struct so_row * row, const double * M, int NB, const double rho
             if(ts >= 0)
                 for(t = 0; t < SO_NT; t++) {
                     row->CinT[ts][t] = CT[t];
-                    row->BinT[ts][t] = M[SO_NT * k + t];
+                    row->BinT[ts][t] = so_m1(M, ty, k, t);
                 }
         }
         C += binm;
         for(t = 0; t < SO_NT; t++)
-            CT[t] += M[SO_NT * k + t];
+            CT[t] += so_m1(M, ty, k, t);
     }
     /* still above at R (cut off at the cap): the mass inside R */
     for(d = 0; d < SUBHALO_NSO; d++) {
@@ -413,10 +490,10 @@ so_pass1_analyse(struct so_row * row, const double * M, int NB, const double rho
     return 0;
 }
 
-/* Final values of definition d of a row; sub/subT are the pass-2 sub-bins or NULL. */
+/* Final values of definition d of a row; sub/subT are the pass-2 sub-bins ([NSUB], [NSUB][NT]) or NULL. */
 static void
-so_finish_def(const struct so_row * row, int d, int NB, double rho, const float * sub, const float * subT,
-              struct SubTrack * rec)
+so_finish_def(const struct so_row * row, int d, int NB, const struct so_types * ty, double rho, const float * sub,
+              const float * subT, struct SubTrack * rec)
 {
     const int ts = so_typeslot(d);
     float * mtype = ts == 0 ? rec->MTypeSOVir : (ts == 1 ? rec->MTypeSO200c : NULL);
@@ -456,7 +533,7 @@ so_finish_def(const struct so_row * row, int d, int NB, double rho, const float 
                 Ca += sub[m];
                 if(ts >= 0)
                     for(t = 0; t < SO_NT; t++)
-                        CaT[t] += subT[SO_NT * m + t];
+                        CaT[t] += so_m2(subT, ty, m, t);
             }
             if(mstar >= 0)
                 ra = mstar == SUBHALO_SO_NSUB - 1 ? row->Rout[d] : row->Rin[d] + (mstar + 1) * w;
@@ -472,7 +549,7 @@ so_finish_def(const struct so_row * row, int d, int NB, double rho, const float 
                 rb = mb == SUBHALO_SO_NSUB - 1 ? row->Rout[d] : row->Rin[d] + (mb + 1) * w;
                 Cb = Ca + sub[mb];
                 for(t = 0; t < SO_NT; t++)
-                    CbT[t] = CaT[t] + (ts >= 0 ? subT[SO_NT * mb + t] : 0);
+                    CbT[t] = CaT[t] + (ts >= 0 ? so_m2(subT, ty, mb, t) : 0);
             }
         }
         else {
@@ -514,9 +591,10 @@ so_is_central(const struct SubTrack * r)
 static int
 so_run_batches(int pass, struct so_priv * pv, int64_t * batchbuf, const int64_t * list, int64_t nlist, int64_t bcap,
                ForceTree * tree, const double rho[SUBHALO_NSO], double rhomin, const struct SubhaloParams * par,
-               double BoxSize, double soft, struct SubTrack * recs, MPI_Comm Comm)
+               double BoxSize, double soft, MPI_Comm Comm)
 {
     int64_t nbatch = (nlist > 0 && bcap > 0) ? (nlist + bcap - 1) / bcap : 0;
+    /* cannot happen: rows exist only on ranks with a live particle (the others route theirs) */
     if(nlist > 0 && bcap <= 0)
         endrun(5, "subhalo_field_so: %ld queries but no anchor particle on this rank\n", nlist);
     int64_t nbatch_max = 0;
@@ -531,23 +609,22 @@ so_run_batches(int pass, struct so_priv * pv, int64_t * batchbuf, const int64_t 
             batchbuf[s] = list[lo + s];
         so_walk(pass, pv, nq, tree);
         const int NB = pv->NB;
+        const int NT = pv->ty.NT;
         #pragma omp parallel for
         for(s = 0; s < nq; s++) {
             struct so_row * row = &pv->rows[batchbuf[s]];
             if(pass == 1) {
                 const double * M = (const double *) (pv->acc + s * pv->accsize);
-                row->redo = so_pass1_analyse(row, M, NB, rho, rhomin, par->SubhaloSOMaxDoublings, BoxSize, soft);
+                row->redo = so_pass1_analyse(row, M, NB, &pv->ty, rho, rhomin, par->SubhaloSOMaxDoublings, BoxSize, soft);
             }
             else {
                 const float * acc = (const float *) (pv->acc + s * pv->accsize);
-                struct SubTrack * rec = &recs[row->rec];
                 int d;
                 for(d = 0; d < SUBHALO_NSO; d++) {
                     const int ts = so_typeslot(d);
                     const int refined = row->jc[d] >= 1 && row->jc[d] < NB;
-                    so_finish_def(row, d, NB, rho[d], refined ? acc + d * SUBHALO_SO_NSUB : NULL,
-                                  (refined && ts >= 0) ? acc + SUBHALO_NSO * SUBHALO_SO_NSUB + ts * SUBHALO_SO_NSUB * SO_NT : NULL,
-                                  rec);
+                    so_finish_def(row, d, NB, &pv->ty, rho[d], refined ? acc + d * SUBHALO_SO_NSUB : NULL,
+                                  (refined && ts >= 0) ? acc + so2_toff(ts, NT) : NULL, row->rec);
                 }
             }
         }
@@ -555,20 +632,142 @@ so_run_batches(int pass, struct so_priv * pv, int64_t * batchbuf, const int64_t 
     return (int) nbatch_max;
 }
 
+/* No SO for this record (skipped call or no live particle anywhere). */
+static void
+so_clear_record(struct SubTrack * rec)
+{
+    int d;
+    for(d = 0; d < SUBHALO_NSO; d++)
+        rec->MSO[d] = rec->RSO[d] = -1;
+    for(d = 0; d < SO_NT; d++)
+        rec->MTypeSO200c[d] = rec->MTypeSOVir[d] = -1;
+}
+
+/* ------------------------------------------------------------------ routing */
+
+/* A central routed from a rank without a live particle to the host rank and back. */
+struct so_guest {
+    struct SubTrack rec;
+    double Rsearch;
+    int64_t idx;                   /* index in the origin's recs */
+};
+
+struct so_route {
+    int host;                      /* lowest rank with a live particle; -1 none */
+    int active;                    /* some rank routes its centrals */
+    int * cnt;                     /* [4][NTask] bytes: send count, send offset, recv count, recv offset */
+    struct so_guest * buf;         /* origin: the records sent; host: the records received */
+    int64_t nbuf;
+};
+
+/* Collective. Ranks with centrals but no live particle send them to the host. */
+static void
+so_route_out(struct so_route * rt, struct SubTrack * recs, int64_t n, int64_t ncen, int64_t nlive, MPI_Comm Comm)
+{
+    int NTask, ThisTask, t;
+    MPI_Comm_size(Comm, &NTask);
+    MPI_Comm_rank(Comm, &ThisTask);
+    memset(rt, 0, sizeof(*rt));
+    int64_t mine[2] = {nlive, ncen};
+    int64_t * all = ta_malloc("SOrankinfo", int64_t, 2 * NTask);
+    MPI_Allgather(mine, 2, MPI_INT64, all, 2, MPI_INT64, Comm);
+    rt->host = -1;
+    for(t = NTask - 1; t >= 0; t--)
+        if(all[2 * t] > 0)
+            rt->host = t;
+    for(t = 0; t < NTask; t++)
+        rt->active |= all[2 * t] == 0 && all[2 * t + 1] > 0;
+    int64_t nrecv = 0;
+    if(rt->host >= 0 && ThisTask == rt->host)
+        for(t = 0; t < NTask; t++)
+            if(all[2 * t] == 0)
+                nrecv += all[2 * t + 1];
+    ta_free(all);
+    if(!rt->active || rt->host < 0)
+        return;
+    const int64_t nsend = (nlive == 0) ? ncen : 0;
+    rt->nbuf = nsend + nrecv;
+    rt->buf = (struct so_guest *) mymalloc("SOguest", so_imax(rt->nbuf, 1) * sizeof(struct so_guest));
+    rt->cnt = (int *) mymalloc("SOroutecnt", 4 * NTask * sizeof(int));
+    int * scnt = rt->cnt, * soff = rt->cnt + NTask, * rcnt = rt->cnt + 2 * NTask, * roff = rt->cnt + 3 * NTask;
+    int64_t i, c = 0;
+    for(i = 0; i < n && nsend > 0; i++) {
+        if(!so_is_central(&recs[i]))
+            continue;
+        rt->buf[c].rec = recs[i];
+        rt->buf[c].Rsearch = -1;
+        rt->buf[c].idx = i;
+        c++;
+    }
+    for(t = 0; t < NTask; t++)
+        scnt[t] = soff[t] = 0;
+    if(nsend > 0) {
+        if((double) nsend * sizeof(struct so_guest) > 2e9)
+            endrun(5, "subhalo_field_so: %ld centrals to route from a rank without particles\n", nsend);
+        scnt[rt->host] = nsend * sizeof(struct so_guest);
+    }
+    MPI_Alltoall(scnt, 1, MPI_INT, rcnt, 1, MPI_INT, Comm);
+    int64_t off = 0;
+    for(t = 0; t < NTask; t++) {
+        roff[t] = off;
+        off += rcnt[t];
+    }
+    if(off != nrecv * (int64_t) sizeof(struct so_guest) || off > 2e9)
+        endrun(5, "subhalo_field_so: routing receives %ld bytes, expected %ld\n", off, nrecv * (int64_t) sizeof(struct so_guest));
+    /* an origin sends from buf and receives nothing; the host receives into buf */
+    MPI_Alltoallv(nsend > 0 ? rt->buf : NULL, scnt, soff, MPI_BYTE, nrecv > 0 ? rt->buf : NULL, rcnt, roff, MPI_BYTE, Comm);
+}
+
+/* Collective. The host sends the routed records back; the origins copy the SO fields, the SO
+ * flag bits and the search radius into their records. Frees the routing buffers. */
+static void
+so_route_back(struct so_route * rt, struct SubTrack * recs, double * Rsearch, MPI_Comm Comm)
+{
+    if(!rt->active || rt->host < 0)
+        return;
+    int NTask;
+    MPI_Comm_size(Comm, &NTask);
+    int * scnt = rt->cnt, * soff = rt->cnt + NTask, * rcnt = rt->cnt + 2 * NTask, * roff = rt->cnt + 3 * NTask;
+    int ThisTask;
+    MPI_Comm_rank(Comm, &ThisTask);
+    const int ishost = ThisTask == rt->host;
+    /* the reverse of so_route_out: the host sends what it received */
+    MPI_Alltoallv(ishost ? rt->buf : NULL, rcnt, roff, MPI_BYTE, ishost ? NULL : rt->buf, scnt, soff, MPI_BYTE, Comm);
+    if(!ishost) {
+        const int bits = SUBHALO_FLAG_SOCUTOFF | SUBHALO_FLAG_SONOCROSS;
+        int64_t g;
+        for(g = 0; g < rt->nbuf; g++) {
+            const struct so_guest * gu = &rt->buf[g];
+            struct SubTrack * r = &recs[gu->idx];
+            memcpy(r->MSO, gu->rec.MSO, sizeof(r->MSO));
+            memcpy(r->RSO, gu->rec.RSO, sizeof(r->RSO));
+            memcpy(r->MTypeSO200c, gu->rec.MTypeSO200c, sizeof(r->MTypeSO200c));
+            memcpy(r->MTypeSOVir, gu->rec.MTypeSOVir, sizeof(r->MTypeSOVir));
+            r->Flags = (r->Flags & ~bits) | (gu->rec.Flags & bits);
+            if(Rsearch)
+                Rsearch[gu->idx] = gu->Rsearch;
+        }
+    }
+    myfree(rt->cnt);
+    myfree(rt->buf);
+}
+
+/* ------------------------------------------------------------------ the call */
+
 void
 subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp, double atime,
                       const Cosmology * CP, const struct SubhaloParams * par, const double * rho_in,
                       double * Rsearch, struct SubhaloSOStats * stats, MPI_Comm Comm)
 {
     const double tstart = MPI_Wtime();
-    const int NB = par->SubhaloSOBins;
-    if(NB < SO_MINBINS || NB > SO_MAXBINS)
-        endrun(1, "SubhaloSOBins = %d must be in [%d, %d].\n", NB, SO_MINBINS, SO_MAXBINS);
+    const int NBpar = par->SubhaloSOBins;
+    if(NBpar < SO_MINBINS || NBpar > SO_MAXBINS)
+        endrun(1, "SubhaloSOBins = %d must be in [%d, %d].\n", NBpar, SO_MINBINS, SO_MAXBINS);
     if(!(par->SubhaloSOSearchFactor > 0) || par->SubhaloSOMaxDoublings < 0 || par->SubhaloSOMaxDoublings > 60)
         endrun(1, "SubhaloSOSearchFactor = %g must be positive and SubhaloSOMaxDoublings = %d in [0, 60].\n",
                par->SubhaloSOSearchFactor, par->SubhaloSOMaxDoublings);
     double rho[SUBHALO_NSO];
-    int d;
+    int d, t;
     if(rho_in)
         memcpy(rho, rho_in, sizeof(rho));
     else
@@ -583,25 +782,76 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
     const double BoxSize = PartManager->BoxSize;
     const double soft = FORCE_SOFTENING() / 2.8;
 
-    int64_t i, ncen = 0;
+    /* live particles and the types present among them (globally) */
+    int64_t i, nlive = 0;
+    int tmask = 0;
+    #pragma omp parallel for reduction(+: nlive) reduction(|: tmask)
+    for(i = 0; i < PartManager->NumPart; i++) {
+        if(P[i].IsGarbage || P[i].Swallowed)
+            continue;
+        nlive++;
+        tmask |= 1 << P[i].Type;
+    }
+    MPI_Allreduce(MPI_IN_PLACE, &tmask, 1, MPI_INT, MPI_BOR, Comm);
+    struct so_types ty = {0};
+    for(t = 0; t < SO_NT; t++) {
+        ty.slot[t] = -1;
+        if(tmask & (1 << t)) {
+            ty.type[ty.NT] = t;
+            ty.slot[t] = ty.NT++;
+        }
+    }
+
+    int64_t ncen = 0;
     for(i = 0; i < n; i++) {
         if(Rsearch)
             Rsearch[i] = -1;
-        if(so_is_central(&recs[i]))
+        if(so_is_central(&recs[i])) {
             ncen++;
+            recs[i].Flags &= ~(SUBHALO_FLAG_SOCUTOFF | SUBHALO_FLAG_SONOCROSS);
+        }
     }
 
+    /* the centrals of ranks without a live particle go to the host */
+    struct so_route rt;
+    so_route_out(&rt, recs, n, ncen, nlive, Comm);
+    int ThisTask;
+    MPI_Comm_rank(Comm, &ThisTask);
+    const int64_t nguest = (rt.active && ThisTask == rt.host) ? rt.nbuf : 0;
+    const int64_t nrows = nlive > 0 ? ncen + nguest : 0;
+    if(rt.host < 0 && ncen > 0)
+        message(1, "WARNING: subhalo field SO: no live particle on any rank, %ld centrals without SO.\n", ncen);
+    if(rt.host < 0)
+        for(i = 0; i < n; i++)
+            if(so_is_central(&recs[i]))
+                so_clear_record(&recs[i]);
+
     /* the rows (whole call), then the tree, then the batch buffers: freed in reverse */
-    struct so_row * rows = (struct so_row *) mymalloc("SOrows", so_imax(ncen, 1) * sizeof(struct so_row));
-    int64_t * list = (int64_t *) mymalloc("SOlist", so_imax(ncen, 1) * sizeof(int64_t));
+    struct so_row * rows = (struct so_row *) mymalloc("SOrows", so_imax(nrows, 1) * sizeof(struct so_row));
+    int64_t * list = (int64_t *) mymalloc("SOlist", so_imax(nrows, 1) * sizeof(int64_t));
     int64_t c = 0;
-    for(i = 0; i < n; i++) {
-        struct SubTrack * r = &recs[i];
-        if(!so_is_central(r))
+    /* own centrals first, then the guests */
+    int64_t g;
+    for(i = 0; i < n && nrows > 0; i++) {
+        if(!so_is_central(&recs[i]))
             continue;
+        rows[c].rec = &recs[i];
+        rows[c].rsearch = Rsearch ? &Rsearch[i] : NULL;
+        c++;
+    }
+    for(g = 0; g < nguest; g++) {
+        rows[c].rec = &rt.buf[g].rec;
+        rows[c].rsearch = &rt.buf[g].Rsearch;
+        rows[c].rec->Flags &= ~(SUBHALO_FLAG_SOCUTOFF | SUBHALO_FLAG_SONOCROSS);
+        c++;
+    }
+    for(c = 0; c < nrows; c++) {
         struct so_row * row = &rows[c];
+        struct SubTrack * r = row->rec;
+        double * rs = row->rsearch;
         memset(row, 0, sizeof(*row));
-        row->rec = i;
+        row->rec = r;
+        row->rsearch = rs;
         for(d = 0; d < 3; d++)
             row->Pos[d] = so_wrap(r->CorePos[d] + PartManager->CurrentParticleOffset[d], BoxSize);
         double R = par->SubhaloSOSearchFactor * cbrt(3. * r->Mbound / (4. * M_PI * rhomin));
@@ -611,34 +861,65 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
             R = 0.5 * BoxSize;
         row->R = R;
         row->Rlo = soft > 0 ? DMIN(soft, 0.25 * R) : 1e-3 * R;
-        row->Scale = NB / log(row->R / row->Rlo);
         list[c] = c;
-        c++;
-        r->Flags &= ~(SUBHALO_FLAG_SOCUTOFF | SUBHALO_FLAG_SONOCROSS);
     }
 
     ForceTree tree = {0};
     force_tree_full(&tree, ddecomp, 0, NULL);
 
-    /* batch capacity: live anchors, the test knob and 1/8 of the free memory */
-    const size_t acc1 = (size_t) NB * SO_NT * sizeof(double);
-    const size_t acc2 = sizeof(((TreeWalkResultSO2 *) 0)->Sub) + sizeof(((TreeWalkResultSO2 *) 0)->SubT);
-    const size_t accsize = acc1 > acc2 ? acc1 : acc2;
-    const size_t slotbytes = accsize + sizeof(int) + sizeof(int64_t);
-    int64_t bcap = ncen;
+    /* the treewalk's reserve (ev_begin) against the free memory after the tree build: pass 1
+     * halves its bins down to SO_SHRINKBINS until it fits on every rank, pass 2 runs only if it
+     * fits, and nothing runs if pass 1 does not fit at SO_SHRINKBINS bins */
+    const int64_t nthr = omp_get_max_threads();
+    const int64_t freeb = (int64_t) mymalloc_freebytes();
+    int64_t freemin = freeb;
+    MPI_Allreduce(MPI_IN_PLACE, &freemin, 1, MPI_INT64, MPI_MIN, Comm);
+    /* per query slot: index, anchor, the treewalk's queue copy and the accumulator */
+    const int64_t slotfix = sizeof(int) + sizeof(int64_t) + nthr * sizeof(int);
+    #define SO_NEED1(nb) ((int64_t) subhalo_so_walk_bytes(1, (nb), ty.NT) + slotfix + (int64_t) so_acc_bytes(1, (nb), ty.NT) + SO_SLACK)
+    int NB = NBpar;
+    while(NB > SO_SHRINKBINS && MPIU_Any(SO_NEED1(NB) > freeb, Comm))
+        NB = (int) so_imax(NB / 2, SO_SHRINKBINS);
+    const int skip = MPIU_Any(SO_NEED1(NB) > freeb, Comm);
+    const int64_t need2 = (int64_t) subhalo_so_walk_bytes(2, NB, ty.NT) + slotfix
+                        + (int64_t) so_imax(so_acc_bytes(1, NB, ty.NT), so_acc_bytes(2, NB, ty.NT)) + SO_SLACK;
+    const int dopass2 = !skip && !MPIU_Any(need2 > freeb, Comm);
+    if(NB != NBpar)
+        message(0, "Subhalo field SO: %d pass-1 bins need %ld free bytes for the treewalk, the least free on a rank is %ld: "
+                   "using %d bins for this call.\n", NBpar, SO_NEED1(NBpar), freemin, NB);
+    if(skip)
+        message(0, "WARNING: subhalo field SO SKIPPED for this call: pass 1 with %d bins needs %ld free bytes for the treewalk, "
+                   "the least free on a rank is %ld. MSO, RSO and MTypeSO of every central are -1.\n", NB, SO_NEED1(NB), freemin);
+    else if(!dopass2)
+        message(0, "WARNING: subhalo field SO: pass 2 needs %ld free bytes for the treewalk, the least free on a rank is %ld: "
+                   "no refinement this call (pass-1 interpolation for every central).\n", need2, freemin);
+    const int64_t needmax = dopass2 ? need2 : SO_NEED1(NB);
+    #undef SO_NEED1
+
+    for(c = 0; c < nrows; c++)
+        rows[c].Scale = NB / log(rows[c].R / rows[c].Rlo);
+
+    /* batch capacity: live anchors, the test knob, 1/8 of the free memory and what leaves the
+     * treewalk its reserve */
+    const size_t acc1 = so_acc_bytes(1, NB, ty.NT);
+    const size_t acc2 = so_acc_bytes(2, NB, ty.NT);
+    const size_t accsize = dopass2 && acc2 > acc1 ? acc2 : acc1;
+    const int64_t slotbytes = accsize + slotfix;
+    int64_t bcap = skip ? 0 : nrows;
     if(SOMaxBatch > 0 && bcap > SOMaxBatch)
         bcap = SOMaxBatch;
-    const int64_t memcap = so_imax((int64_t) (mymalloc_freebytes() / 8 / slotbytes), 1);
+    const int64_t avail = so_imin(freeb / 8, freeb - needmax);
+    const int64_t memcap = so_imax(avail / slotbytes, 1);
     if(bcap > memcap)
         bcap = memcap;
     int * anchor = (int *) mymalloc("SOanchor", so_imax(bcap, 1) * sizeof(int));
-    int64_t nlive = 0;
-    for(i = 0; i < PartManager->NumPart && nlive < bcap; i++) {
+    int64_t na = 0;
+    for(i = 0; i < PartManager->NumPart && na < bcap; i++) {
         if(P[i].IsGarbage || P[i].Swallowed)
             continue;
-        anchor[nlive++] = (int) i;
+        anchor[na++] = (int) i;
     }
-    bcap = nlive;
+    bcap = na;
     int64_t * batchbuf = (int64_t *) mymalloc("SObatch", so_imax(bcap, 1) * sizeof(int64_t));
     char * acc = (char *) mymalloc("SOacc", so_imax(bcap, 1) * accsize);
 
@@ -648,15 +929,16 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
     pv.anchor = anchor;
     pv.acc = acc;
     pv.NB = NB;
+    pv.ty = ty;
 
     /* pass 1 with the doubling rounds */
     int npass1 = 0, npass2 = 0;
-    int64_t npend = ncen;
+    int64_t npend = skip ? 0 : nrows;
     pv.accsize = acc1;
     while(1) {
         if(!MPIU_Any(npend > 0, Comm))
             break;
-        npass1 += so_run_batches(1, &pv, batchbuf, list, npend, bcap, &tree, rho, rhomin, par, BoxSize, soft, recs, Comm);
+        npass1 += so_run_batches(1, &pv, batchbuf, list, npend, bcap, &tree, rho, rhomin, par, BoxSize, soft, Comm);
         int64_t k, m = 0;
         for(k = 0; k < npend; k++)
             if(rows[list[k]].redo)
@@ -666,21 +948,26 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
 
     /* pass 2 for the large centrals with a crossing bin; the others finish here */
     int64_t nref = 0;
-    for(c = 0; c < ncen; c++) {
+    for(c = 0; c < nrows; c++) {
         struct so_row * row = &rows[c];
-        struct SubTrack * rec = &recs[row->rec];
+        struct SubTrack * rec = row->rec;
+        if(skip) {
+            so_clear_record(rec);
+            continue;
+        }
         int any = 0;
         for(d = 0; d < SUBHALO_NSO; d++)
             any |= row->jc[d] >= 1 && row->jc[d] < NB;
-        row->refine = any && rec->Nbound >= par->SubhaloSORefineMinPart;
+        row->refine = dopass2 && any && rec->Nbound >= par->SubhaloSORefineMinPart;
         if(row->refine)
             list[nref++] = c;
         else
             for(d = 0; d < SUBHALO_NSO; d++)
-                so_finish_def(row, d, NB, rho[d], NULL, NULL, rec);
+                so_finish_def(row, d, NB, &ty, rho[d], NULL, NULL, rec);
     }
     pv.accsize = acc2;
-    npass2 = so_run_batches(2, &pv, batchbuf, list, nref, bcap, &tree, rho, rhomin, par, BoxSize, soft, recs, Comm);
+    if(dopass2)
+        npass2 = so_run_batches(2, &pv, batchbuf, list, nref, bcap, &tree, rho, rhomin, par, BoxSize, soft, Comm);
 
     myfree(acc);
     myfree(batchbuf);
@@ -688,10 +975,10 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
     force_tree_free(&tree);
 
     /* flags and diagnostics */
-    int64_t cnt[5] = {ncen, nref, 0, 0, 0};
-    for(c = 0; c < ncen; c++) {
+    int64_t cnt[5] = {nrows, nref, 0, 0, 0};
+    for(c = 0; c < nrows && !skip; c++) {
         const struct so_row * row = &rows[c];
-        struct SubTrack * rec = &recs[row->rec];
+        struct SubTrack * rec = row->rec;
         int nocross = 0;
         for(d = 0; d < SUBHALO_NSO; d++)
             nocross |= row->jc[d] < 0;
@@ -702,24 +989,33 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
         cnt[2] += row->ndoubl > 0;
         cnt[3] += row->cutoff;
         cnt[4] += nocross;
-        if(Rsearch)
-            Rsearch[row->rec] = row->R;
+        if(row->rsearch)
+            *row->rsearch = row->R;
     }
     myfree(list);
     myfree(rows);
+    so_route_back(&rt, recs, Rsearch, Comm);
 
-    int64_t tot[5];
-    MPI_Allreduce(cnt, tot, 5, MPI_INT64, MPI_SUM, Comm);
-    message(0, "Subhalo field SO: %ld centrals, %ld refined, %ld doubled, %ld cut off at the cap, %ld without a crossing; "
-               "%d + %d walks, %.3g s.\n", tot[0], tot[1], tot[2], tot[3], tot[4], npass1, npass2, MPI_Wtime() - tstart);
+    int64_t tot[6];
+    int64_t cnt6[6] = {cnt[0], cnt[1], cnt[2], cnt[3], cnt[4], nguest};
+    MPI_Allreduce(cnt6, tot, 6, MPI_INT64, MPI_SUM, Comm);
+    message(0, "Subhalo field SO: %ld centrals (%ld routed from ranks without particles), %ld refined, %ld doubled, "
+               "%ld cut off at the cap, %ld without a crossing; %d bins, %d types; %d + %d walks, %.3g s.\n",
+               tot[0], tot[5], tot[1], tot[2], tot[3], tot[4], NB, ty.NT, npass1, npass2, MPI_Wtime() - tstart);
     if(stats) {
         stats->Ncentral = tot[0];
         stats->Nrefined = tot[1];
         stats->Ndoubled = tot[2];
         stats->Ncutoff = tot[3];
         stats->Nnocross = tot[4];
+        stats->Nrouted = tot[5];
         stats->Npass1Walks = npass1;
         stats->Npass2Walks = npass2;
+        stats->NBins = NB;
+        stats->NTypes = ty.NT;
+        stats->Pass2 = dopass2;
+        stats->Skipped = skip;
+        stats->FreeBytes = freemin;
     }
 }
 

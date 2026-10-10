@@ -31,9 +31,29 @@
  * The particle-level rule (outermost particle k with M(<=r_k) / (4/3 pi r_k^3) > rho) is
  * resolved to one sub-bin for refined centrals and to one pass-1 bin for the others; a density
  * excess confined to one bin whose outer edge is below the threshold is not seen (design 7.6,
- * "Resolution limit"). */
+ * "Resolution limit").
+ *
+ * Ranks without a live particle. Queries are anchored on local live particles (subhalo_so.c),
+ * so a rank holding centrals but no live particle (possible after a domain decomposition that
+ * leaves a rank empty) cannot issue them. Such a rank sends its centrals (whole records) to the
+ * lowest rank with a live particle, which walks them with its own, and receives them back; the
+ * results are those of the rank-local call, bit for bit when the mass sums are exact. If no rank
+ * has a live particle every central gets -1 (with a warning). The call never aborts for this.
+ *
+ * Memory. treewalk.c's ev_begin reserves 40960 buffers of 24 + (1 + ImportBufferBoost)
+ * (query + result) bytes from the free memory and needs room for 100 more per thread
+ * (subhalo_so_walk_bytes); it aborts when they are not free. After the tree build the call
+ * checks that requirement against the free memory of every rank: if pass 1 does not fit,
+ * SubhaloSOBins is halved for this call (down to 16) and logged; if pass 1 still does not fit
+ * the field SO is skipped for this call with a warning, MSO, RSO, MTypeSO200c and MTypeSOVir
+ * of every central -1 and Flags bits 3 and 4 clear; if pass 2 does not fit, no central is
+ * refined this call (pass-1 interpolation, with a warning). ImportBufferBoost is private to
+ * treewalk.c: the check assumes the parameter's default, 2, unless
+ * subhalo_so_set_import_buffer_boost is called (a larger boost than assumed is caught by the
+ * treewalk's own check, an abort with the walk's name and both numbers). */
 
 #include <mpi.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "subhalo.h"
 #include "domain.h"
@@ -60,8 +80,14 @@ struct SubhaloSOStats {
     int64_t Ndoubled;      /* centrals whose search radius was doubled at least once */
     int64_t Ncutoff;       /* centrals with SUBHALO_FLAG_SOCUTOFF */
     int64_t Nnocross;      /* centrals with SUBHALO_FLAG_SONOCROSS */
+    int64_t Nrouted;       /* centrals routed from ranks without a live particle */
+    int64_t FreeBytes;     /* least free bytes on a rank after the tree build */
     int Npass1Walks;       /* pass-1 treewalk_run calls (doubling rounds x batches) */
     int Npass2Walks;
+    int NBins;             /* pass-1 bins used (SubhaloSOBins, or fewer when memory is short) */
+    int NTypes;            /* particle types carried by the walks (those present) */
+    int Pass2;             /* pass 2 allowed by the memory check */
+    int Skipped;           /* the whole call skipped for lack of memory */
 };
 
 /* The same with the thresholds given (rho == NULL: subhalo_so_thresholds), the final search
@@ -74,5 +100,12 @@ void subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * dde
 /* Test knob: at most this many queries per treewalk_run (0 = no limit, the default); forces the
  * batched path that is otherwise taken only when a rank holds more centrals than particles. */
 void subhalo_so_set_max_batch(int64_t maxbatch);
+
+/* The ImportBufferBoost the memory check assumes (default 2, the parameter's default). */
+void subhalo_so_set_import_buffer_boost(double boost);
+
+/* Free bytes treewalk.c's ev_begin needs on this rank for a walk of the given pass (1 or 2)
+ * with NB pass-1 bins and NT particle types (not counting this module's own buffers). */
+size_t subhalo_so_walk_bytes(int pass, int NB, int NT);
 
 #endif

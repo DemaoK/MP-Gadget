@@ -28,12 +28,16 @@ input could not be read.
                               same group, CentralTrackId the Rank 0 member of its HostGroup, Rank
                               dense per group with Ranks 1.. by Mbound descending; hostless tracks
                               are their own centrals.
-  tags PIGDIR [...]           Phase 2a (D10): own-tag BindRank dense with the exclusive bound
-                              prefix first, BoundTrackId the tag, an ancestor of it, or -1, the
-                              SubhaloMinNumTracerPart lowest ranks of each track of a tracer type
-                              (SubhaloTracerTypes), NboundExclusive <= Nbound, and the full bound
-                              list (every row with BoundTrackId == T, inside T's key) has Nbound
-                              members, NboundType per type, NboundTracer tracers, MboundType mass.
+  tags PIGDIR [...]           Phase 2a (D10, J12): BindRank is the energy order of all own-tag
+                              particles of a track (dense 0..n-1, every type), the exclusive bound
+                              prefix (BoundTrackId == TrackId) first; the first
+                              SubhaloMinNumTracerPart (default 10) particles of a tracer type
+                              (SubhaloTracerTypes) in that order are bound to the track and
+                              MostBoundID is the first of them (the tracer reservation decides
+                              ownership only, not the order). BoundTrackId is the tag, an ancestor
+                              of it, or -1; NboundExclusive <= Nbound; the full bound list (every
+                              row with BoundTrackId == T, inside T's key) has Nbound members,
+                              NboundType per type, NboundTracer tracers, MboundType mass.
                               --phase1 for Phase 1 PIGs (section 1 holds stale tags there).
   orphans PIGDIR [...]        Orphan/*: TracerPos inside the box, SnapTracerLost -1 or <= the
                               snapshot, Snap* ordering, SinkTrackId / DescendantTrackId /
@@ -1234,6 +1238,13 @@ def check_tags(pigdir, ck, ntracers=None, tracer_rank=True, mass_rtol=1e-4, phas
                 ck.check(not np.any(badt), "%s: in %d tracks one of the first %d tracer-type (%s) rows in BindRank order "
                          "is not bound to the track (e.g. %s)"
                          % (tag, len(np.unique(T[to][badt])), ntracers, ttypes, np.unique(T[to][badt])[:5].tolist()))
+                # MostBoundID is the first tracer-type own-tag particle in BindRank order
+                if "MostBoundID" in S and "ID" in P:
+                    trows = lookup(tid, tut)
+                    mbid = P["ID"][to[tfirst]]
+                    badm = S["MostBoundID"][trows].astype(np.uint64) != mbid.astype(np.uint64)
+                    ck.check(not np.any(badm), "%s: %d tracks whose MostBoundID is not their first tracer-type own-tag "
+                             "particle in BindRank order (e.g. %s)" % (tag, np.count_nonzero(badm), tut[badm][:5].tolist()))
         # per type exclusive and tail counts
         for t in range(NTYPES):
             m = typ[o] == t
@@ -1719,8 +1730,17 @@ def check_tree(inputs, ck, show=5):
     mfa, vfa = N["MboundFirstAcc"], N["VmaxFirstAcc"]
     rule(cen & ((sacc != snap) | (macc != mb) | (vacc != vm)), "central or hostless node whose SnapAcc/MboundAcc/VmaxAcc are not its current state")
     rule(sat & hasprev & ((sacc != sacc[pv]) | (macc != macc[pv]) | (vacc != vacc[pv])), "satellite whose accretion state changed")
-    rule(~res & hasprev & ((sacc != sacc[pv]) | (sfa != sfa[pv]) | (sli != sli[pv]) | (slmm != slmm[pv])),
-         "orphan whose SnapAcc, SnapFirstAcc, SnapLastIsolation or SnapLastMajorMerger changed")
+    rule(~res & hasprev & ((sacc != sacc[pv]) | (sfa != sfa[pv]) | (slmm != slmm[pv])),
+         "orphan whose SnapAcc, SnapFirstAcc or SnapLastMajorMerger changed")
+    # SnapLastIsolation is constant on orphan nodes after the death node; at the death node a
+    # track that died or sank inside a group with another central is a satellite there (HBT,
+    # subhalo_tracking.cpp: the new orphan is nested in its host and gets the previous output
+    # if it had only ever been central), so -1 may become the previous output, nothing else.
+    rule(cont & (sli != sli[pv]), "orphan whose SnapLastIsolation changed after its death output")
+    hosted_by_other = dies & (N["HostGroup"] >= 0) & (N["CentralTrackId"] >= 0) & (N["CentralTrackId"] != tid)
+    set_at_death = dies & (sli != sli[pv])
+    rule(set_at_death & ((sli[pv] >= 0) | (sli != prev_snap_of[out])),
+         "death node whose SnapLastIsolation changed other than from -1 to the previous output")
     newsat = sat & hasprev & (sfa[pv] < 0)
     rule(newsat & ((sfa != sacc[pv]) | (mfa != macc[pv]) | (vfa != vacc[pv])), "first satellite output whose SnapFirstAcc state is not the previous accretion state")
     rule(hasprev & (sfa[pv] >= 0) & ((sfa != sfa[pv]) | (mfa != mfa[pv]) | (vfa != vfa[pv])), "SnapFirstAcc state changed after it was set")
@@ -1752,17 +1772,18 @@ def check_tree(inputs, ck, show=5):
     rule(sat & hasprev & (slmm != slmm[pv]), "satellite whose SnapLastMajorMerger changed")
     rule(cen & hasprev & (slmm != slmm[pv]) & (slmm != snap), "central whose SnapLastMajorMerger moved to an earlier output")
     rule((slmm > snap), "SnapLastMajorMerger after the output")
-    # HBT sets SnapshotOfLastIsolation for a track that dies as a member of another host (an
-    # orphan is ranked as a satellite there); the finder leaves the death record's history alone.
-    hosted_by_other = dies & (N["HostGroup"] >= 0) & (N["CentralTrackId"] >= 0) & (N["CentralTrackId"] != tid)
-    n_hbt = int(np.count_nonzero(hosted_by_other & (sli == -1)))
-    if n_hbt:
-        ck.warn("%d of %d tracks that died inside another track's host keep SnapLastIsolation = -1; HBT would set "
-                "it to the previous output (an orphan is ranked as a satellite at its death)" % (
-                    n_hbt, np.count_nonzero(hosted_by_other)))
+    # the death rule against the death node's host (HostGroup / CentralTrackId at the death
+    # output): set exactly for the tracks that had only ever been central and died inside a group
+    # with another central
+    rule(set_at_death & ~hosted_by_other,
+         "death node whose SnapLastIsolation was set although it did not die inside another central's group")
+    rule(hosted_by_other & (sli[pv] < 0) & (sli == -1),
+         "track that died inside another central's group keeps SnapLastIsolation = -1 (HBT sets the previous output)")
     nres = int(np.count_nonzero(res & hasprev & ~res[pv]))
-    print("  %d deaths (%d sunk, %d with DescendantTrackId -1), %d resurrections, %d first-satellite events" % (
-        np.count_nonzero(dies), nsunk, np.count_nonzero(dies & (desct < 0)), nres, np.count_nonzero(newsat)))
+    print("  %d deaths (%d sunk, %d with DescendantTrackId -1, %d inside another central's group, %d of them "
+          "SnapLastIsolation set at death), %d resurrections, %d first-satellite events" % (
+        np.count_nonzero(dies), nsunk, np.count_nonzero(dies & (desct < 0)), np.count_nonzero(hosted_by_other),
+        np.count_nonzero(set_at_death), nres, np.count_nonzero(newsat)))
 
 
 def cmd_tree(args):
@@ -1957,12 +1978,16 @@ def main(argv=None):
                         "saved rows; Phase 2a votes that need an unsaved particle are then inconclusive)")
     s = sub.add_parser("hierarchy", help="Phase 2a: Rank/Depth/parent/central consistency")
     s.add_argument("pigdirs", nargs="+")
-    s = sub.add_parser("tags", help="Phase 2a: D10 tag rule, BindRank, BoundTrackId, full bound lists")
+    s = sub.add_parser("tags", help="Phase 2a: D10 tag rule; BindRank the energy order of all own-tag particles "
+                                    "(bound prefix first), the first tracer-type ones bound with MostBoundID the "
+                                    "first of them; BoundTrackId; full bound lists")
     s.add_argument("pigdirs", nargs="+")
     s.add_argument("--ntracers", type=int, default=None,
-                   help="lowest ranks that must be tracers (default SubhaloMinNumTracerPart, else 10)")
+                   help="tracer-type particles, first in BindRank order, that must be bound to the track "
+                        "(default SubhaloMinNumTracerPart, else 10)")
     s.add_argument("--no-tracer-rank", action="store_true",
-                   help="skip the tracer-type rule for the lowest ranks (Phase 1 hydro PIGs rank by distance)")
+                   help="skip the tracer rule (the first tracer-type particles bound, MostBoundID the first of them; "
+                        "Phase 1 hydro PIGs rank by distance)")
     s.add_argument("--phase1", action="store_true",
                    help="Phase 1 PIGs: ignore section 1, whose rows keep the stale tags of the last call that processed "
                         "them, and skip the tracer-rank rule (Phase 1 ranks by distance over every type)")

@@ -8,9 +8,15 @@ Usage:
       one snapshot. HBT is HBT's SubhaloPath (per-snapshot directories NNN/), one NNN/ directory,
       or one SubSnap_NNN.*.hdf5 file (its sibling files are read too); NNN is the PIG's
       SnapshotIndex plus --hbt-snap-offset.
-  subhalo_compare_hbt.py --track-pairs PIG_prev PIG_next HBT [options]
-      both snapshots, then TrackId persistence: a pair (our TrackId, HBT TrackId) matched at the
-      first output should be matched again at the second when both tracks are still resolved.
+  subhalo_compare_hbt.py --track-pairs PIG_a PIG_b [PIG_c ...] HBT [options]
+      every snapshot of the sequence (in order), then across each consecutive pair of outputs:
+      temporal identity (a pair (our TrackId, HBT TrackId) matched at one output should be
+      matched again at the next when both tracks are still resolved; the fraction and every
+      break are listed), deaths (tracks that died at the later output on both sides, their
+      SinkTrackId and DescendantTrackId mapped through the pair map of the earlier output) and
+      orphan hosts (our orphan HostGroup against HBT's HostHaloId of the Nbound == 0 row, the
+      tracks paired by the TrackId pairs of the earlier outputs). HBT may also be given as the
+      first positional argument.
 
 Matching (--match):
   tracers (default)  each side's ten most-bound tracers vote, with HBT's weights 1/(1 + sqrt(i)),
@@ -34,6 +40,14 @@ SubhaloPotentialSampleSize), in place (Flags), iteration cap (Flags), few tracer
 SubhaloCoreSize bound tracers on either side, the sinking core fill-up), spawned stars (type-4
 particles in our set absent from HBT's), else unexplained.
 
+Links and history, at every snapshot for the matched pairs: NestedParentTrackId (mapped through
+the pair map of that snapshot), HostGroup against HostHaloId (both FOF GroupIDs), Rank and Depth;
+MboundPeak / LastMaxMass and VmaxPeak / LastMaxVmaxPhysical (quantiles and the fractions within
+1% and 10%), SnapLastIsolation, SnapBirth, SnapDeath and SnapSink against HBT's SnapshotOf*
+(minus --hbt-snap-offset); the same history for the orphan pairs of a sequence. Every block is
+reported for all pairs, for HBT Nbound >= --min-np and for the near-threshold population
+--near-np <= HBT Nbound < --min-np (default 20-99) separately; --list caps the listed mismatches.
+
 Exit status: 0 when the acceptance figure (and, with --track-pairs, the persistence fraction
 against --persist-frac) is met or --report-only is given; 1 when it is not; 2 when an input could
 not be read.
@@ -45,6 +59,7 @@ Examples:
   python3 tools/subhalo_compare_hbt.py output/PIG_004 hbt/ --phase1 --report-only
   python3 tools/subhalo_compare_hbt.py output/PIG_004 hbt/ --match jaccard --pairs-out pairs_004.txt
   python3 tools/subhalo_compare_hbt.py --track-pairs output/PIG_003 output/PIG_004 hbt/
+  python3 tools/subhalo_compare_hbt.py hbt/ --track-pairs output/PIG_00?
 """
 
 from __future__ import print_function
@@ -162,6 +177,11 @@ class Ours(object):
         self.rank = S["Rank"].astype(np.int64)
         mism = np.count_nonzero(self.nfull != self.nbound)
         self.nfull_mismatch = mism
+        self.O = cat.orphans
+        self.otid = self.O["TrackId"].astype(np.int64) if cat.norphans else np.zeros(0, np.int64)
+
+    def orow(self, trackids):
+        return _lookup(self.otid, np.arange(self.otid.size), trackids)
 
     def row(self, trackids):
         return _lookup(self.tid, np.arange(self.tid.size), trackids)
@@ -227,6 +247,11 @@ class HBT(object):
         self.vmax = self.subs["VmaxPhysical"].astype(np.float64) if "VmaxPhysical" in self.subs.dtype.names else np.full(self.ntot, np.nan)
         self.rank = self.subs["Rank"].astype(np.int64)
         self.alive = self.nbound > 0
+        o = np.argsort(self.trackid, kind="stable")
+        self.tid_sorted, self.tid_row = self.trackid[o], o.astype(np.int64)
+
+    def row(self, trackids):
+        return _lookup(self.tid_sorted, self.tid_row, trackids)
 
     def owner(self, ids):
         return _lookup(self.ids_sorted, self.owner_sorted, ids)
@@ -374,7 +399,12 @@ def report(ours, hbt, M, args, out=sys.stdout):
     print("  matched pairs %d: %.1f%% of HBT subhalos (Nbound > 0), %.1f%% of HBT subhalos with Nbound >= %d" % (
         M.h.size, 100.0 * M.h.size / max(alive.size, 1), 100.0 * np.count_nonzero(matched_h[big]) / max(big.size, 1),
         args.min_np), file=out)
-    for lab, sel in (("all", np.ones(M.h.size, bool)), (">= %d" % args.min_np, isbig)):
+    isnear = (hbt.nbound[M.h] >= args.near_np) & (hbt.nbound[M.h] < args.min_np)
+    near = alive[(hbt.nbound[alive] >= args.near_np) & (hbt.nbound[alive] < args.min_np)]
+    print("  near threshold: %d HBT subhalos with %d <= Nbound < %d, matched %.1f%%" % (
+        near.size, args.near_np, args.min_np, 100.0 * np.count_nonzero(matched_h[near]) / max(near.size, 1)), file=out)
+    for lab, sel in (("all", np.ones(M.h.size, bool)), (">= %d" % args.min_np, isbig),
+                     ("%d-%d" % (args.near_np, args.min_np - 1), isnear)):
         print("  pairs %-6s n=%-5d Jaccard p10/p50/p90 %s mean %s   Nbound ratio p10/p50/p90 %s   Vmax ratio p10/p50/p90 %s (%d with Vmax)" % (
             lab, np.count_nonzero(sel), _q(M.jac[sel]), "%.3f" % M.jac[sel].mean() if np.any(sel) else "n/a",
             _q(ratio[sel]), _q(vr[sel][np.isfinite(vr[sel])]), np.count_nonzero(np.isfinite(vr[sel]))), file=out)
@@ -417,6 +447,10 @@ def report(ours, hbt, M, args, out=sys.stdout):
         args.min_np, ", ".join("%s %d" % (c, cls[c]) for c in D3_CLASSES if cls[c]) or "none"), file=out)
     print("  D3 classes of unmatched HBT subhalos >= %d: %s" % (
         args.min_np, ", ".join("%s %d" % (c, v) for c, v in ucls.items() if v) or "none"), file=out)
+    nacc_near = np.count_nonzero(good & isnear)
+    print("  near threshold (%d <= HBT Nbound < %d): %d of %d matched with Jaccard >= %.2f and Nbound within %.0f%%: %.1f%%"
+          % (args.near_np, args.min_np, nacc_near, near.size, args.jaccard_min, 100 * args.nbound_tol,
+             100.0 * nacc_near / max(near.size, 1)), file=out)
     if spawned:
         print("  note: %d of our subhalos bind type-4 particles absent from HBT's lists (%d particles)"
               % (len(spawned), sum(spawned.values())), file=out)
@@ -450,63 +484,316 @@ def load(pigdir, hbtpath, args):
     return ours, hbt
 
 
-def track_pairs(args):
-    A, HA = load(args.track_pairs[0], args.paths[0], args)
-    B, HB = load(args.track_pairs[1], args.paths[0], args)
-    MA = match(A, HA, args.match, args.ntracers)
-    MB = match(B, HB, args.match, args.ntracers)
-    print("== %s" % args.track_pairs[0])
-    report(A, HA, MA, args)
-    print("== %s" % args.track_pairs[1])
-    fracB = report(B, HB, MB, args)
-    # pairs at the first output, by TrackIds
-    nxt = dict(zip(B.tid[MB.o].tolist(), HB.trackid[MB.h].tolist()))
-    hb_alive = dict(zip(HB.trackid.tolist(), HB.alive.tolist()))
-    big = HA.nbound[MA.h] >= args.min_np
-    cnt = {"persist": 0, "both dead or sunk": 0, "only ours dead or sunk": 0, "only HBT's dead or sunk": 0,
-           "ours unmatched": 0, "other partner": 0}
-    examples = []
-    for k in range(MA.h.size):
-        if args.min_np and not big[k]:
+# ---------------------------------------------------------------------------------- links, history
+UNMAPPED = -(2 ** 62)
+
+
+def pair_map(ours, hbt, M):
+    """{our TrackId: HBT TrackId} of the matched pairs."""
+    return dict(zip(ours.tid[M.o].tolist(), hbt.trackid[M.h].tolist()))
+
+
+def _map_ids(ids, *maps):
+    """Our TrackIds through the first map that holds them: -1 stays -1, UNMAPPED when none does."""
+    out = np.full(np.shape(ids), UNMAPPED, np.int64)
+    for k, t in enumerate(np.asarray(ids, np.int64).tolist()):
+        if t < 0:
+            out[k] = -1
             continue
-        to, th = int(A.tid[MA.o[k]]), int(HA.trackid[MA.h[k]])
-        o_alive = B.row([to])[0] >= 0
-        h_alive = bool(hb_alive.get(th, False))
-        if not o_alive and not h_alive:
-            cnt["both dead or sunk"] += 1
-        elif not o_alive:
-            cnt["only ours dead or sunk"] += 1
-        elif not h_alive:
-            cnt["only HBT's dead or sunk"] += 1
-        elif to not in nxt:
-            cnt["ours unmatched"] += 1
-            examples.append((to, th, "unmatched"))
-        elif nxt[to] != th:
-            cnt["other partner"] += 1
-            examples.append((to, th, "now HBT %d" % nxt[to]))
+        for mp in maps:
+            if t in mp:
+                out[k] = mp[t]
+                break
+    return out
+
+
+def _hsnap(v, off):
+    """HBT snapshot numbers in our SnapshotIndex (-1 kept)."""
+    v = np.asarray(v, np.int64)
+    return np.where(v >= 0, v - off, -1)
+
+
+def _pct(e, n):
+    return "%5.1f%%" % (100.0 * e / n) if n else "  n/a"
+
+
+def _pops(nb, args):
+    nb = np.asarray(nb)
+    return [("all", np.ones(nb.size, bool)), (">=%d" % args.min_np, nb >= args.min_np),
+            ("%d-%d" % (args.near_np, args.min_np - 1), (nb >= args.near_np) & (nb < args.min_np))]
+
+
+def _eq_line(name, eq, valid, pops, out, note=""):
+    parts = []
+    for lab, m in pops:
+        v = valid & m
+        n, e = int(np.count_nonzero(v)), int(np.count_nonzero(eq & v))
+        parts.append("%s %d/%d %s" % (lab, e, n, _pct(e, n)))
+    print("    %-30s equal  %s%s" % (name, "   ".join(parts), note), file=out)
+
+
+def _ratio_line(name, r, valid, pops, out):
+    parts = []
+    for lab, m in pops:
+        v = valid & m & np.isfinite(r)
+        x = r[v]
+        n = x.size
+        parts.append("%s n=%d p10/p50/p90 %s within 1%% %s 10%% %s" % (
+            lab, n, _q(x), _pct(np.count_nonzero(np.abs(x - 1) <= 0.01), n).strip(),
+            _pct(np.count_nonzero(np.abs(x - 1) <= 0.1), n).strip()))
+    print("    %-30s ratio  %s" % (name, ";  ".join(parts)), file=out)
+
+
+def _list(out, title, rows, args):
+    if not rows:
+        return
+    print("      %s (%d%s):" % (title, len(rows), ", first %d" % args.list if len(rows) > args.list else ""), file=out)
+    for r in rows[:args.list]:
+        print("        %s" % r, file=out)
+
+
+def link_block(ours, hbt, M, pmap, args, out=sys.stdout):
+    """Links of the matched pairs at one snapshot, through that snapshot's pair map."""
+    o, h = M.o, M.h
+    S, H = ours.S, hbt.subs
+    pops = _pops(hbt.nbound[h], args)
+    print("  links of the %d matched pairs (%s):" % (h.size, " / ".join(lab for lab, _ in pops)), file=out)
+    if h.size == 0:
+        return
+    ones = np.ones(h.size, bool)
+    pid, hpid = S["NestedParentTrackId"][o].astype(np.int64), H["NestedParentTrackId"][h].astype(np.int64)
+    mp = _map_ids(pid, pmap)
+    valid = mp != UNMAPPED
+    eq = np.where(pid < 0, hpid < 0, mp == hpid)
+    _eq_line("NestedParentTrackId", eq, valid, pops, out,
+             "   (%d with our parent unmatched)" % np.count_nonzero(~valid))
+    hg, hh = S["HostGroup"][o].astype(np.int64), H["HostHaloId"][h].astype(np.int64)
+    _eq_line("HostGroup / HostHaloId", hg == hh, ones, pops, out)
+    rk, hrk = ours.rank[o], hbt.rank[h]
+    _eq_line("Rank", rk == hrk, ones, pops, out)
+    dp, hdp = S["Depth"][o].astype(np.int64), H["Depth"][h].astype(np.int64)
+    _eq_line("Depth", dp == hdp, ones, pops, out)
+    rows = []
+    for k in np.nonzero(~(eq | ~valid) | (hg != hh) | (rk != hrk) | (dp != hdp))[0].tolist():
+        rows.append("our %d / HBT %d (HBT Nbound %d): pid %d->%s vs %d, host %d vs %d, rank %d vs %d, depth %d vs %d" % (
+            ours.tid[o[k]], hbt.trackid[h[k]], hbt.nbound[h[k]], pid[k], "?" if mp[k] == UNMAPPED else mp[k], hpid[k],
+            hg[k], hh[k], rk[k], hrk[k], dp[k], hdp[k]))
+    _list(out, "pairs with a link difference", rows, args)
+
+
+def history_block(title, oT, hrows, ours_tab, hbt, args, out=sys.stdout, nb=None):
+    """History columns of paired tracks: ours_tab rows oT (Subhalo or Orphan table), HBT rows hrows."""
+    H = hbt.subs
+    off = args.hbt_snap_offset
+    pops = _pops(nb, args) if nb is not None else [("all", np.ones(len(hrows), bool))]
+    print("  history of %s (%d, %s):" % (title, len(hrows), " / ".join(lab for lab, _ in pops)), file=out)
+    if len(hrows) == 0:
+        return
+    ones = np.ones(len(hrows), bool)
+    lm = H["LastMaxMass"][hrows].astype(np.float64)
+    r = ours_tab["MboundPeak"][oT].astype(np.float64) / np.where(lm > 0, lm, np.nan)
+    _ratio_line("MboundPeak / LastMaxMass", r, ones, pops, out)
+    lv = H["LastMaxVmaxPhysical"][hrows].astype(np.float64)
+    r = ours_tab["VmaxPeak"][oT].astype(np.float64) / np.where(lv > 0, lv, np.nan)
+    _ratio_line("VmaxPeak / LastMaxVmaxPhys", r, ones, pops, out)
+    rows = []
+    for ours_col, hbt_col in (("SnapLastIsolation", "SnapshotOfLastIsolation"), ("SnapBirth", "SnapshotOfBirth"),
+                              ("SnapDeath", "SnapshotOfDeath"), ("SnapSink", "SnapshotOfSink")):
+        a = ours_tab[ours_col][oT].astype(np.int64)
+        b = _hsnap(H[hbt_col][hrows], off)
+        eq = a == b
+        _eq_line("%s / %s" % (ours_col, hbt_col[len("SnapshotOf"):]), eq, ones, pops, out)
+        for k in np.nonzero(~eq)[0].tolist():
+            rows.append("our %d / HBT %d: %s %d vs %d" % (ours_tab["TrackId"][oT[k]], hbt.trackid[hrows[k]], ours_col, a[k], b[k]))
+    _list(out, "snapshot differences", rows, args)
+
+
+def death_block(B, HB, cum_prev, map_prev, map_cur, args, out=sys.stdout):
+    """Tracks that died (or sank) at B's output on either side, paired by the earlier TrackId pairs."""
+    snap, off = B.snap, args.hbt_snap_offset
+    H = HB.subs
+    od = np.nonzero(B.O["SnapDeath"].astype(np.int64) == snap)[0] if B.otid.size else np.zeros(0, np.int64)
+    hd = np.nonzero((HB.nbound == 0) & (_hsnap(H["SnapshotOfDeath"], off) == snap))[0]
+    rev = {v: k for k, v in cum_prev.items()}
+    cnt = {"both": 0, "ours only (HBT partner resolved)": 0, "ours only (HBT partner dead earlier)": 0,
+           "ours, no earlier partner": 0, "HBT only (our partner resolved)": 0, "HBT only (our partner dead earlier)": 0,
+           "HBT, no earlier partner": 0}
+    both_o, both_h = [], []
+    rows = []
+    for r in od.tolist():
+        T = int(B.otid[r])
+        if T not in cum_prev:
+            cnt["ours, no earlier partner"] += 1
+            continue
+        hr = int(HB.row([cum_prev[T]])[0])
+        if hr >= 0 and HB.nbound[hr] == 0 and _hsnap([H["SnapshotOfDeath"][hr]], off)[0] == snap:
+            cnt["both"] += 1
+            both_o.append(r)
+            both_h.append(hr)
+        elif hr >= 0 and HB.nbound[hr] > 0:
+            cnt["ours only (HBT partner resolved)"] += 1
+            rows.append("our %d died, HBT %d resolved (Nbound %d)" % (T, cum_prev[T], HB.nbound[hr]))
         else:
-            cnt["persist"] += 1
-    both = cnt["persist"] + cnt["ours unmatched"] + cnt["other partner"]
-    pf = cnt["persist"] / float(max(both, 1))
-    print("== TrackId persistence %s -> %s (pairs with HBT Nbound >= %d at the first output)" % (
-        args.track_pairs[0], args.track_pairs[1], args.min_np))
-    print("  %s" % ", ".join("%s %d" % kv for kv in cnt.items()))
-    print("  persisting: %d of %d pairs whose tracks are both still resolved: %.1f%% (target %.0f%%)"
-          % (cnt["persist"], both, 100 * pf, 100 * args.persist_frac))
-    for to, th, why in examples[:args.show or 10]:
-        print("    our %d / HBT %d: %s" % (to, th, why))
-    ok = fracB >= args.accept_frac and pf >= args.persist_frac
+            cnt["ours only (HBT partner dead earlier)"] += 1
+    for hr in hd.tolist():
+        Th = int(HB.trackid[hr])
+        if Th not in rev:
+            cnt["HBT, no earlier partner"] += 1
+            continue
+        T = rev[Th]
+        if B.orow([T])[0] >= 0 and B.O["SnapDeath"][B.orow([T])[0]] == snap:
+            continue
+        if B.row([T])[0] >= 0:
+            cnt["HBT only (our partner resolved)"] += 1
+            rows.append("HBT %d died, our %d resolved (Nbound %d)" % (Th, T, B.nbound[B.row([T])[0]]))
+        else:
+            cnt["HBT only (our partner dead earlier)"] += 1
+    print("  deaths at SnapshotIndex %d: ours %d, HBT %d; %s" % (
+        snap, od.size, hd.size, ", ".join("%s %d" % kv for kv in cnt.items())), file=out)
+    _list(out, "deaths on one side only", rows, args)
+    if not both_o:
+        return
+    bo, bh = np.array(both_o), np.array(both_h)
+    ones = np.ones(bo.size, bool)
+    pops = [("both died", ones)]
+    sk, hsk = B.O["SinkTrackId"][bo].astype(np.int64), H["SinkTrackId"][bh].astype(np.int64)
+    ds, hds = B.O["DescendantTrackId"][bo].astype(np.int64), H["DescendantTrackId"][bh].astype(np.int64)
+    msk, mds = _map_ids(sk, map_prev, map_cur), _map_ids(ds, map_prev, map_cur)
+    _eq_line("sunk (SinkTrackId >= 0)", (sk >= 0) == (hsk >= 0), ones, pops, out)
+    eqs = np.where(sk < 0, hsk < 0, msk == hsk)
+    _eq_line("SinkTrackId (mapped)", eqs, msk != UNMAPPED, pops, out,
+             "   (%d unmapped)" % np.count_nonzero(msk == UNMAPPED))
+    eqd = np.where(ds < 0, hds < 0, mds == hds)
+    _eq_line("DescendantTrackId (mapped)", eqd, mds != UNMAPPED, pops, out,
+             "   (%d unmapped)" % np.count_nonzero(mds == UNMAPPED))
+    rows = []
+    for k in np.nonzero(~eqs | ~eqd)[0].tolist():
+        rows.append("our %d / HBT %d: sink %d->%s vs %d, descendant %d->%s vs %d" % (
+            B.otid[bo[k]], HB.trackid[bh[k]], sk[k], "?" if msk[k] == UNMAPPED else msk[k], hsk[k],
+            ds[k], "?" if mds[k] == UNMAPPED else mds[k], hds[k]))
+    _list(out, "deaths with a link difference", rows, args)
+
+
+def orphan_block(B, HB, cum_prev, args, out=sys.stdout):
+    """Orphans at B's output paired by the earlier TrackId pairs: hosts and history."""
+    H = HB.subs
+    po, ph = [], []
+    alive_h = 0
+    nopair = 0
+    for r in range(B.otid.size):
+        T = int(B.otid[r])
+        if T not in cum_prev:
+            nopair += 1
+            continue
+        hr = int(HB.row([cum_prev[T]])[0])
+        if hr < 0:
+            nopair += 1
+        elif HB.nbound[hr] > 0:
+            alive_h += 1
+        else:
+            po.append(r)
+            ph.append(hr)
+    print("  orphans at SnapshotIndex %d: ours %d, HBT %d; paired %d, HBT partner resolved %d, no earlier partner %d" % (
+        B.snap, B.otid.size, np.count_nonzero(HB.nbound == 0), len(po), alive_h, nopair), file=out)
+    if not po:
+        return
+    po, ph = np.array(po), np.array(ph)
+    ones = np.ones(po.size, bool)
+    hg, hh = B.O["HostGroup"][po].astype(np.int64), H["HostHaloId"][ph].astype(np.int64)
+    _eq_line("orphan HostGroup / HostHaloId", hg == hh, ones, [("all", ones), ("hosted (HBT)", hh >= 0)], out,
+             "   (ours -1: %d, HBT -1: %d)" % (np.count_nonzero(hg < 0), np.count_nonzero(hh < 0)))
+    rows = ["our %d / HBT %d: HostGroup %d vs HostHaloId %d" % (B.otid[po[k]], HB.trackid[ph[k]], hg[k], hh[k])
+            for k in np.nonzero(hg != hh)[0].tolist()]
+    _list(out, "orphans with a host difference", rows, args)
+    history_block("the orphan pairs", po, ph, B.O, HB, args, out)
+
+
+def sequence(args, pigs, hbtpath):
+    cats, matches, maps = [], [], []
+    frac = 0.0
+    for pig in pigs:
+        ours, hbt = load(pig, hbtpath, args)
+        M = match(ours, hbt, args.match, args.ntracers)
+        print("== %s" % pig)
+        frac = report(ours, hbt, M, args)
+        pm = pair_map(ours, hbt, M)
+        link_block(ours, hbt, M, pm, args)
+        history_block("the matched pairs", M.o, M.h, ours.S, hbt, args, nb=hbt.nbound[M.h])
+        cats.append((ours, hbt))
+        matches.append(M)
+        maps.append(pm)
+    cum = {}
+    tot_persist, tot_both = 0, 0
+    for i in range(1, len(pigs)):
+        A, HA = cats[i - 1]
+        B, HB = cats[i]
+        MA = matches[i - 1]
+        cum.update(maps[i - 1])
+        nxt = maps[i]
+        hb_alive = dict(zip(HB.trackid.tolist(), HB.alive.tolist()))
+        print("== %s -> %s" % (pigs[i - 1], pigs[i]))
+        nbA = HA.nbound[MA.h]
+        persist_line = []
+        breaks = []
+        for lab, sel in _pops(nbA, args):
+            cnt = {"persist": 0, "both dead or sunk": 0, "only ours dead or sunk": 0, "only HBT's dead or sunk": 0,
+                   "ours unmatched": 0, "other partner": 0}
+            for k in np.nonzero(sel)[0].tolist():
+                to, th = int(A.tid[MA.o[k]]), int(HA.trackid[MA.h[k]])
+                o_alive = B.row([to])[0] >= 0
+                h_alive = bool(hb_alive.get(th, False))
+                why = None
+                if not o_alive and not h_alive:
+                    cnt["both dead or sunk"] += 1
+                elif not o_alive:
+                    cnt["only ours dead or sunk"] += 1
+                    why = "ours dead or sunk, HBT's resolved"
+                elif not h_alive:
+                    cnt["only HBT's dead or sunk"] += 1
+                    why = "HBT's dead or sunk, ours resolved"
+                elif to not in nxt:
+                    cnt["ours unmatched"] += 1
+                    why = "ours unmatched at the next output"
+                elif nxt[to] != th:
+                    cnt["other partner"] += 1
+                    why = "now paired with HBT %d" % nxt[to]
+                else:
+                    cnt["persist"] += 1
+                if why and lab == "all":
+                    breaks.append("our %d / HBT %d (HBT Nbound %d): %s" % (to, th, HA.nbound[MA.h[k]], why))
+            both = cnt["persist"] + cnt["ours unmatched"] + cnt["other partner"]
+            if lab == ">=%d" % args.min_np:
+                tot_persist += cnt["persist"]
+                tot_both += both
+            persist_line.append("%s: %d of %d %s (%s)" % (lab, cnt["persist"], both, _pct(cnt["persist"], both).strip(),
+                                                         ", ".join("%s %d" % kv for kv in cnt.items() if kv[0] != "persist" and kv[1])
+                                                         or "no break"))
+        print("  temporal identity, pairs persisting where both tracks are still resolved (by HBT Nbound at the earlier output):",
+              file=sys.stdout)
+        for line in persist_line:
+            print("    %s" % line)
+        _list(sys.stdout, "identity breaks", breaks, args)
+        death_block(B, HB, cum, maps[i - 1], nxt, args)
+        orphan_block(B, HB, cum, args)
+    pf = tot_persist / float(max(tot_both, 1))
+    print("== TrackId persistence over the sequence (HBT Nbound >= %d): %d of %d, %.1f%% (target %.0f%%)"
+          % (args.min_np, tot_persist, tot_both, 100 * pf, 100 * args.persist_frac))
+    ok = frac >= args.accept_frac and pf >= args.persist_frac
     return 0 if (ok or args.report_only) else 1
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("paths", nargs="+", help="PIG_xxx HBT (one snapshot), or HBT alone with --track-pairs")
-    p.add_argument("--track-pairs", nargs=2, metavar=("PIG_PREV", "PIG_NEXT"),
-                   help="compare both snapshots and check that matched TrackId pairs persist")
+    p.add_argument("paths", nargs="*", help="PIG_xxx HBT (one snapshot), or HBT alone with --track-pairs")
+    p.add_argument("--track-pairs", nargs="+", metavar="PIG",
+                   help="a sequence of PIGs in order (then the HBT path, unless given positionally): every "
+                        "snapshot, temporal identity, deaths and orphan hosts across consecutive outputs")
     p.add_argument("--match", choices=["tracers", "jaccard"], default="tracers")
     p.add_argument("--ntracers", type=int, default=10, help="tracers per subhalo for matching (default 10)")
     p.add_argument("--min-np", type=int, default=100, help="HBT Nbound threshold of the summary (default 100)")
+    p.add_argument("--near-np", type=int, default=20,
+                   help="lower end of the near-threshold population --near-np <= HBT Nbound < --min-np (default 20)")
+    p.add_argument("--list", type=int, default=20, help="mismatches and identity breaks listed per block (default 20)")
     p.add_argument("--jaccard-min", type=float, default=0.8)
     p.add_argument("--nbound-tol", type=float, default=0.2)
     p.add_argument("--accept-frac", type=float, default=0.9)
@@ -520,16 +807,25 @@ def main(argv=None):
     args = p.parse_args(argv)
     try:
         if args.track_pairs:
-            if len(args.paths) != 1:
-                p.error("with --track-pairs give only the HBT path")
+            pigs = list(args.track_pairs)
+            if len(args.paths) == 1:
+                hbtpath = args.paths[0]
+            elif len(args.paths) == 0 and len(pigs) >= 3:
+                hbtpath = pigs.pop()
+            else:
+                p.error("with --track-pairs give two or more PIGs and the HBT path")
+            if len(pigs) < 2:
+                p.error("--track-pairs needs at least two PIGs")
             if args.pairs_out:
                 p.error("--pairs-out is for one snapshot")
-            return track_pairs(args)
+            return sequence(args, pigs, hbtpath)
         if len(args.paths) != 2:
             p.error("give PIG_xxx and the HBT path")
         ours, hbt = load(args.paths[0], args.paths[1], args)
         M = match(ours, hbt, args.match, args.ntracers)
         frac = report(ours, hbt, M, args)
+        link_block(ours, hbt, M, pair_map(ours, hbt, M), args)
+        history_block("the matched pairs", M.o, M.h, ours.S, hbt, args, nb=hbt.nbound[M.h])
         return 0 if (frac >= args.accept_frac or args.report_only) else 1
     except (SubhaloFormatError, InputError, IOError, OSError) as e:
         print("error: %s" % e)

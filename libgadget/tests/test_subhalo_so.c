@@ -30,7 +30,14 @@
  *     SubhaloSOSearchFactor = 0.3 the radius is doubled and the results again match the brute
  *     force.
  *  4. subhalo_field_so (thresholds from subhalo_so_thresholds) equals the explicit-threshold
- *     call when the thresholds agree with this test's formulas. */
+ *     call when the thresholds agree with this test's formulas.
+ *  5. The memory check: with a large mymalloc block leaving just the treewalk reserve of pass 1
+ *     at 16 bins free after the tree build, the call halves its bins to 16, skips pass 2 and
+ *     still matches the brute force (with the tolerance of 16 pass-1 bins); with half of that
+ *     free it skips the field SO (every central at -1, SO flags clear, others untouched).
+ *  6. A rank without particles (an interior rank emptied after the domain decomposition, as in
+ *     test_subhalo.c): its centrals are routed to another rank and the results are identical,
+ *     with the records spread over the ranks and with all of them on the empty rank. */
 
 #include <stdarg.h>
 #include <stddef.h>
@@ -53,6 +60,7 @@
 #include <libgadget/slotsmanager.h>
 #include <libgadget/cosmology.h>
 #include <libgadget/gravity.h>
+#include <libgadget/utils/mymalloc.h>
 #include "stub.h"
 
 static struct ClockTable CT;
@@ -452,6 +460,26 @@ run_case(DomainDecomp * ddecomp, const struct SubTrack * G, int (*owner)(int, in
 static int owner_spread(int k, int NTask) { return k % NTask; }
 static int owner_last(int k, int NTask) { return NTask - 1; }
 static int owner_first(int k, int NTask) { return 0; }
+static int EmptyRank = -1;
+static int owner_empty(int k, int NTask) { return EmptyRank; }
+
+/* Move every particle of rank `er` to rank er - 1 by giving its top leaves to that rank (the
+ * leaves of a task are a contiguous range), so that `er` is an empty rank (test_subhalo.c). */
+static void
+empty_rank_domain(DomainDecomp * dd, int er)
+{
+    int NTask;
+    MPI_Comm_size(MPI_COMM_WORLD, &NTask);
+    if(er <= 0 || er >= NTask)
+        return;
+    int j;
+    for(j = dd->Tasks[er].StartLeaf; j < dd->Tasks[er].EndLeaf; j++)
+        dd->TopLeaves[j].Task = er - 1;
+    dd->Tasks[er - 1].EndLeaf = dd->Tasks[er].EndLeaf;
+    dd->Tasks[er].StartLeaf = dd->Tasks[er].EndLeaf;
+    if(domain_maintain(dd, NULL))
+        endrun(1, "test: could not empty rank %d\n", er);
+}
 
 static uint64_t
 checksum(const struct result * res)
@@ -733,6 +761,83 @@ test_subhalo_field_so(void ** state)
         for(d = 0; d < SUBHALO_NSO; d++)
             CHECK(fabs(res2[k].MSO[d] - res1[k].MSO[d]) <= 1e-5 * fabs(res1[k].MSO[d]),
                   "plain call: record %d %s: %g vs %g\n", k, DefName[d], res2[k].MSO[d], res1[k].MSO[d]);
+
+    /* 5. the memory check: the free bytes after the tree build of this configuration, then a
+     * block leaving the pass-1 reserve at 16 bins (+ 4 MiB), then half of that */
+    run_case(&ddecomp, G, owner_spread, &CP, &par, rho, res1, &st);
+    CHECK(st.NBins == 64 && st.Pass2 && !st.Skipped && st.Nrouted == 0,
+          "defaults: %d bins pass 2 %d skipped %d routed %ld\n", st.NBins, st.Pass2, st.Skipped, st.Nrouted);
+    const int64_t free0 = st.FreeBytes;
+    const int NT = st.NTypes;
+    CHECK(NT == 4, "%d particle types present, expected 4 (gas, DM, background, black hole)\n", NT);
+    const int64_t fit16 = subhalo_so_walk_bytes(1, 16, NT) + (4L << 20);
+    message(0, "memory check: %ld bytes free after the tree build; pass 1 needs %zu (64 bins) %zu (32) %zu (16), pass 2 %zu\n",
+            free0, subhalo_so_walk_bytes(1, 64, NT), subhalo_so_walk_bytes(1, 32, NT), subhalo_so_walk_bytes(1, 16, NT),
+            subhalo_so_walk_bytes(2, 16, NT));
+    CHECK(free0 > fit16 + (8L << 20) && (int64_t) subhalo_so_walk_bytes(1, 32, NT) > fit16,
+          "memory check: %ld free bytes do not allow the test (16 bins need %ld)\n", free0, fit16);
+    {
+        void * block = mymalloc("SOtestblock", free0 - fit16);
+        struct result resm[NREC];
+        run_case(&ddecomp, G, owner_spread, &CP, &par, rho, resm, &st);
+        myfree(block);
+        CHECK(st.NBins == 16 && !st.Pass2 && !st.Skipped && st.Nrefined == 0 && st.Ncentral == 4,
+              "shrink: %d bins pass 2 %d skipped %d refined %ld (free %ld)\n", st.NBins, st.Pass2, st.Skipped, st.Nrefined, st.FreeBytes);
+        struct SubhaloParams p16 = par;
+        p16.SubhaloSOBins = 16;
+        p16.SubhaloSORefineMinPart = 1 << 30;
+        bad = compare_brute(resm, g, ng, voidpos, &p16, rho, "shrunk to 16 bins");
+        CHECK(bad == 0, "shrunk to 16 bins: %d failures against the brute force\n", bad);
+        /* the same as an explicit 16-bin pass-1-only call */
+        run_case(&ddecomp, G, owner_spread, &CP, &p16, rho, res2, &st);
+        CHECK(same_results(resm, res2), "shrunk call differs from the explicit 16-bin pass-1 call\n");
+
+        block = mymalloc("SOtestblock", free0 - fit16 / 2);
+        run_case(&ddecomp, G, owner_spread, &CP, &par, rho, resm, &st);
+        myfree(block);
+        CHECK(st.Skipped && st.Npass1Walks == 0 && st.Npass2Walks == 0, "skip: skipped %d, %d + %d walks\n",
+              st.Skipped, st.Npass1Walks, st.Npass2Walks);
+        for(k = 0; k < NREC; k++) {
+            const struct result * r = &resm[k];
+            const double v = is_central(k) ? -1 : -7;
+            int ok = 1;
+            for(d = 0; d < SUBHALO_NSO; d++)
+                ok &= r->MSO[d] == v && r->RSO[d] == v;
+            for(d = 0; d < 6; d++)
+                ok &= r->MT200c[d] == v && r->MTVir[d] == v;
+            const int fl = SUBHALO_FLAG_ITERCAP | (is_central(k) ? 0 : SUBHALO_FLAG_SOCUTOFF | SUBHALO_FLAG_SONOCROSS);
+            ok &= (int) r->Flags == fl && r->Rsearch == -1;
+            CHECK(ok, "skip: record %d MSO %g flags %d Rsearch %g\n", k, r->MSO[0], (int) r->Flags, r->Rsearch);
+        }
+    }
+
+    /* 6. a rank without particles */
+    int NTask, ThisTask;
+    MPI_Comm_size(MPI_COMM_WORLD, &NTask);
+    MPI_Comm_rank(MPI_COMM_WORLD, &ThisTask);
+    if(NTask >= 2) {
+        EmptyRank = NTask / 2;
+        empty_rank_domain(&ddecomp, EmptyRank);
+        /* the particles sent away stay as garbage until a gc */
+        int64_t nloc = 0, nempty;
+        for(i = 0; i < PartManager->NumPart && ThisTask == EmptyRank; i++)
+            nloc += !P[i].IsGarbage;
+        MPI_Allreduce(&nloc, &nempty, 1, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
+        CHECK(nempty == 0, "the emptied rank %d holds %ld live particles\n", EmptyRank, nempty);
+        int64_t nown = 0;
+        for(k = 0; k < NREC; k++)
+            nown += is_central(k) && owner_spread(k, NTask) == EmptyRank;
+        run_case(&ddecomp, G, owner_spread, &CP, &par, rho, res2, &st);
+        CHECK(st.Nrouted == nown && st.Ncentral == 4, "empty rank %d: %ld routed, expected %ld\n", EmptyRank, st.Nrouted, nown);
+        CHECK(same_results(res1, res2), "empty rank %d: results differ with the records spread\n", EmptyRank);
+        run_case(&ddecomp, G, owner_empty, &CP, &par, rho, res3, &st);
+        CHECK(st.Nrouted == 4, "empty rank %d: %ld routed with every record on it\n", EmptyRank, st.Nrouted);
+        CHECK(same_results(res1, res3), "empty rank %d: results differ with every record on it\n", EmptyRank);
+        subhalo_so_set_max_batch(1);
+        run_case(&ddecomp, G, owner_empty, &CP, &par, rho, res4, &st);
+        subhalo_so_set_max_batch(0);
+        CHECK(same_results(res1, res4), "empty rank %d: results differ with batches of one\n", EmptyRank);
+    }
 
     free(G);
     free(g);
