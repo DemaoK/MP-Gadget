@@ -350,6 +350,7 @@ subhalo_track_clear(struct SubTrack * t, int64_t TrackId)
     fill_float(t->RSO, SUBHALO_NSO, -1);
     fill_float(t->MTypeSO200c, 6, -1);
     fill_float(t->MTypeSOVir, 6, -1);
+    t->RsSO = t->RsKlypinSO = t->VmaxSO = t->RmaxSO = -1;
     /* group E */
     t->MboundPeak = t->VmaxAtMboundPeak = t->VmaxPeak = -1;
     t->MboundAcc = t->VmaxAcc = t->MboundFirstAcc = t->VmaxFirstAcc = -1;

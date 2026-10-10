@@ -79,6 +79,7 @@ SUBHALO_COLUMNS = [
     ("AxisA", "f4", 3), ("AxisA500", "f4", 3),
     ("InertiaTensor", "f4", 6),
     ("Rs", "f4", 1), ("RockstarCoreVel", "f4", 3), ("BulkVel", "f4", 3), ("Vrms", "f4", 1),
+    ("RsSO", "f4", 1), ("RsKlypinSO", "f4", 1), ("VmaxSO", "f4", 1), ("RmaxSO", "f4", 1),
     ("StarFormationRate", "f4", 1), ("GasMetalMass", "f4", 1), ("StellarMetalMass", "f4", 1),
     ("BlackholeMass", "f4", 1), ("BlackholeAccretionRate", "f4", 1), ("MassHeIonized", "f4", 1),
     ("GasMetalElemMass", "f4", 9), ("StellarMetalElemMass", "f4", 9),
@@ -107,8 +108,9 @@ ORPHAN_COLUMNS = [
     ("SnapLastIsolation", "i4", 1), ("SnapTracerLost", "i4", 1),
 ] + _GROUP_E
 
-# Appendix B marks these optional.
-OPTIONAL_COLUMNS = ("GeomParentTrackId", "GeomUpParentTrackId")
+# Appendix B marks these optional; the decision-44 SO profile columns are absent from catalogues
+# written before them (read leniently: the props rules then skip them).
+OPTIONAL_COLUMNS = ("GeomParentTrackId", "GeomUpParentTrackId", "RsSO", "RsKlypinSO", "VmaxSO", "RmaxSO")
 
 PARTICLE_TAG_BLOCKS = [("TrackId", "i8"), ("BindRank", "i4"), ("BoundTrackId", "i8")]
 

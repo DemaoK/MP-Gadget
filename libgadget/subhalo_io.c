@@ -191,6 +191,10 @@ SUBTRACK_PROPERTY(Rs, Rs, float, 1)
 SUBTRACK_PROPERTY(RockstarCoreVel, RockstarCoreVel[0], float, 3)
 SUBTRACK_PROPERTY(BulkVel, BulkVel[0], float, 3)
 SUBTRACK_PROPERTY(Vrms, Vrms, float, 1)
+SUBTRACK_PROPERTY(RsSO, RsSO, float, 1)
+SUBTRACK_PROPERTY(RsKlypinSO, RsKlypinSO, float, 1)
+SUBTRACK_PROPERTY(VmaxSO, VmaxSO, float, 1)
+SUBTRACK_PROPERTY(RmaxSO, RmaxSO, float, 1)
 /* group C */
 SUBTRACK_PROPERTY(StarFormationRate, StarFormationRate, float, 1)
 SUBTRACK_PROPERTY(GasMetalMass, GasMetalMass, float, 1)
@@ -322,6 +326,11 @@ subhalo_register_table_blocks(struct IOTable * T)
     SUBREG(RockstarCoreVel, "f4", 3, s, T);
     SUBREG(BulkVel, "f4", 3, s, T);
     SUBREG(Vrms, "f4", 1, s, T);
+    /* decision 44: the Rockstar-comparable profile of the field-SO virial sphere (centrals) */
+    SUBREG(RsSO, "f4", 1, s, T);
+    SUBREG(RsKlypinSO, "f4", 1, s, T);
+    SUBREG(VmaxSO, "f4", 1, s, T);
+    SUBREG(RmaxSO, "f4", 1, s, T);
     SUBREG(StarFormationRate, "f4", 1, s, T);
     SUBREG(GasMetalMass, "f4", 1, s, T);
     SUBREG(StellarMetalMass, "f4", 1, s, T);

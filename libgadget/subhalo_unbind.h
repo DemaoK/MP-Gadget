@@ -267,18 +267,26 @@ double subhalo_klypin_f_to_c(double f);
 
 /* Rockstar's NFW shape fit (nfw.c:51-144) and the velocity trio (properties.c:199-244, 417-458)
  * on the bound set (Phase 5 plan section 1 item 1): Rs, RockstarCoreVel, BulkVel, Vrms of rec.
- * The aperture is the bound virial sphere: the radially sorted bound particles (radii from the
- * core of subhalo_core, floored at GravitySoftening = h / 2.8, ties by ID) up to and including
- * the outermost virial crossing (the rule of subhalo_props_rockstar, crossing particle included
- * as D4), Nvir of them, of mass Mvir and radius Rvir = (3 Mvir / (4 pi rho[0]))^(1/3).
- *  - BulkVel: the mass-weighted mean Vel of the aperture; Vrms: sqrt(sum_d sum m (v_d -
- *    BulkVel_d)^2 / Mvir) over the aperture (no Hubble term, as Rockstar).
- *  - RockstarCoreVel: the mass-weighted mean Vel of the aperture particles with r < 0.1 Rvir,
- *    or of the innermost min(SUBHALO_ROCKSTAR_CORE_MINPART, Nvir) when fewer are inside.
- *  - Rs: the fit of subhalo_nfw_fit on the equal-mass bins of the aperture
- *    (subhalo_nfw_bin_plan, subhalo_nfw_threshold, subhalo_nfw_edge) from the Klypin start
- *    (subhalo_klypin_rs); -1 when Nvir < SUBHALO_NFW_MINPART or the fit fails.
- * All four stay -1 without a virial crossing (or Nbound == 0). Velocities physical peculiar
+ * The apertures are Rockstar's (decision 44, reversing decision 36a and design D4's "crossing
+ * particle included" for these four columns): with the radially sorted bound particles (radii
+ * from the core of subhalo_core, floored at GravitySoftening = h / 2.8, ties by ID) and kc the
+ * outermost virial crossing (the rule of subhalo_props_rockstar; Mvir = M(<= r_kc) and Rvir =
+ * (3 Mvir / (4 pi rho[0]))^(1/3), as MBoundSO[vir] / RBoundSO[vir], which keep the crossing
+ * particle), the velocity aperture is the Nap = kc particles inside the crossing particle
+ * (properties.c's j < dens_tot) and the fit's aperture the Nfit = kc - 1 particles inside the one
+ * before it (nfw.c's i < total_p - 1 with total_p = dens_tot), of mass Mfit.
+ *  - BulkVel: the mass-weighted mean Vel of the velocity aperture; Vrms: sqrt(sum_d sum m (v_d -
+ *    BulkVel_d)^2 / M) over it, M its own mass (no Hubble term, as Rockstar; Rockstar divides
+ *    both sums by Mvir, the mass with the crossing particle, a 1 / Nvir bias not copied).
+ *  - RockstarCoreVel: the mass-weighted mean Vel of the velocity aperture's particles with r <
+ *    0.1 Rvir, or of its innermost min(SUBHALO_ROCKSTAR_CORE_MINPART, Nap) when fewer are inside.
+ *  - Rs: the fit of subhalo_nfw_fit on the equal-mass bins of the fit's aperture
+ *    (subhalo_nfw_bin_plan with Nfit, Mfit and its largest mass, subhalo_nfw_threshold,
+ *    subhalo_nfw_edge) from the Klypin start (subhalo_klypin_rs, Mvir and Rvir); -1 when Nfit <
+ *    SUBHALO_NFW_MINPART (Rockstar falls back to the Klypin value there; ours is RsKlypin) or the
+ *    fit fails.
+ * All four stay -1 without a virial crossing, when the crossing is the innermost bound particle
+ * (an empty velocity aperture) or Nbound == 0. Velocities physical peculiar
  * km/s (subhalo_vel_to_kms(a) on Vel), Rs comoving in the run's length unit. The core is
  * recomputed (as subhalo_props_rockstar does), so rec's other columns are not read. Scratch:
  * SUBHALO_PROPS_BYTES_PER_PART * Nbound from the arena, rewound on return; endrun if short.
@@ -291,8 +299,8 @@ double subhalo_klypin_f_to_c(double f);
  * recipe is a compensated (Neumaier) double sum in both modes (subhalo_ksum_*): the cumulative
  * mass M(<= r) that sets the aperture, Mvir and the bin closing (the distributed one merges
  * per-rank pairs in rank order through the prefix scan), the aperture's mass and velocity
- * moments and the core's; the bin plan uses the same reduced quantities in both (Mvir, the
- * largest mass), the bin edges, the fit and the velocity trio the same functions
+ * moments and the core's; the bin plan uses the same reduced quantities in both (Mfit, the
+ * cumulative mass at the fit aperture's last particle, and the largest mass), the bin edges, the fit and the velocity trio the same functions
  * (subhalo_nfw_edge, subhalo_nfw_fit, subhalo_deferred_velocities). Guarantee: for an identical
  * bound set, core and radial order, the two modes give identical columns whenever the
  * compensated sums are exact, in particular for equal particle masses (DM-only runs), where
@@ -303,7 +311,8 @@ double subhalo_klypin_f_to_c(double f);
  * 1e-9 of a threshold (test_collective_props_identity checks both cases across three layouts).
  * The bound set and core themselves come from different trees in the two modes and may differ.
  *
- * Deviations from Rockstar's recipe (beyond the aperture, the bound set of HBT membership):
+ * Deviations from Rockstar's recipe (beyond the bound set of HBT membership and the centre, the
+ * 20-most-bound-tracer core instead of Rockstar's 6D-subgroup centre):
  *  - the bin edge interpolation (subhalo_nfw_edge) is applied in the run's length unit; nfw.c
  *    subtracts the excess-mass interpolation computed from the radii in Mpc/h from a midpoint it
  *    has converted to kpc/h, an upstream unit bug that effectively drops the correction (for radii
@@ -311,7 +320,21 @@ double subhalo_klypin_f_to_c(double f);
  *    20 kpc/h; audit R5), so part of any remaining Rs difference against Rockstar comes from the
  *    edges, not from membership alone;
  *  - the fit (subhalo_nfw_fit) is in double and returns -1 for degenerate or nonfinite input
- *    instead of Rockstar's start radius or a NaN (audit R6). */
+ *    instead of Rockstar's start radius or a NaN (audit R6);
+ *  - the bound-set radii are floored at the softening in the bin edges (nfw.c uses the unfloored
+ *    radii; the bins below 3 softenings weigh 0.1 in both, no measurable effect);
+ *  - BulkVel / Vrms normalised by the velocity aperture's own mass (above).
+ * The SO-sphere versions (RsSO, RsKlypinSO, VmaxSO, RmaxSO of the field SO's pass 3, decision 44,
+ * subhalo_so.h) use the same fit and Klypin functions on every particle inside RSO[vir] (Rockstar's
+ * host set: satellites, unbound and non-FOF particles included) with these further deviations:
+ *  - the aperture is the interpolated field-SO RSO[vir] (all particles with r <= RSO[vir]), not
+ *    the particle crossing, and Rockstar's two-particle off-by-one does not apply;
+ *  - the profile is a histogram (SUBHALO_SO_NPROF log bins over 3 decades): the equal-mass bin
+ *    edges are where the histogram's M(<r), interpolated linearly in ln r inside a profile bin,
+ *    reaches each closing mass (the histogram form of nfw.c's excess-mass edge interpolation, in
+ *    place of the particle radii); the edges are unfloored;
+ *  - VmaxSO / RmaxSO are the maximum over the profile's bin edges (radii floored at the
+ *    softening), resolution one bin (0.025 dex in r); RsKlypinSO starts from MSO[vir], RSO[vir]. */
 void subhalo_props_deferred(struct SubTrack * rec, const struct SubCandidate * c,
                             const struct SubhaloUnbindParams * up, const double rho[SUBHALO_NSO],
                             int CoreSize, struct SubhaloArena * arena);

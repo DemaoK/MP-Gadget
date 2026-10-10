@@ -41,7 +41,19 @@
  *  7. Non-dyadic, mixed-mass and mixed-type refined shells (test_subhalo_field_so_mixed):
  *     refined masses within one f4 ulp of the long-double particle sums, the per-type sum
  *     invariant, and agreement between particle partitions (see the comment before that test).
- *     The dyadic fixture above keeps the exact, bit-for-bit mapping checks. */
+ *     The dyadic fixture above keeps the exact, bit-for-bit mapping checks.
+ *  8. Pass 3 (decision 44, test_subhalo_field_so_profile): a stratified analytic NFW sphere
+ *     (rs = 25 kpc/h, truncated at 16 rs, 40000 particles of a non-dyadic mass, across the
+ *     periodic boundary) with the virial threshold placed at 8 rs: RsSO within 3 % and RsKlypinSO
+ *     within 5 % of rs, VmaxSO within 0.2 % of the analytic maximum of sqrt(G M(<r) / (a r)) (and
+ *     not above it by more than the 1 / N sampling), RmaxSO within one profile bin (ln(1000) / 120)
+ *     of 2.1626 rs; the four columns -1 for a satellite at the same centre, a central whose sphere
+ *     holds fewer than 100 particles (a 60-particle clump, MSO[vir] > 0) and a central without a
+ *     crossing; bitwise identical columns with the records spread, all on one rank, batches of one
+ *     query, the local particle order reversed and a rank emptied (a checksum is logged, "SO
+ *     profile checksum", identical with any number of ranks: fixed-point sums); the memory rule:
+ *     with only pass 1's reserve free the four columns are -1 (MSO still set), with pass 3's but
+ *     not pass 2's they are set. */
 
 #include <stdarg.h>
 #include <stddef.h>
@@ -57,6 +69,7 @@
 #include <libgadget/subhalo.h>
 #include <libgadget/subhalo_unbind.h>
 #include <libgadget/subhalo_so.h>
+#include <libgadget/subhalo_internal.h>
 #include <libgadget/walltime.h>
 #include <libgadget/domain.h>
 #include <libgadget/forcetree.h>
@@ -1271,10 +1284,288 @@ test_subhalo_field_so_mixed(void ** state)
     PartManager->NumPart = 0;
 }
 
+/* ------------------------------------------------------------------ 8. pass 3 (decision 44) */
+
+#define NN_N 40000
+#define NN_CL 60                  /* the small clump */
+#define NN_TOT (NN_N + NN_CL)
+#define NN_RS 25.
+#define NN_XT 16.                 /* truncation radius / rs */
+#define NN_XV 8.                  /* the virial radius / rs (threshold below) */
+#define NN_M (1e-3 / 3)           /* non-dyadic */
+#define NN_NREC 4
+static const double CenN[3] = {990, 500, 20};       /* across the boundary in x and z */
+static const double CenCl[3] = {300, 700, 400};
+static const double CenVoid[3] = {300, 200, 700};
+
+static double
+nn_m(double x)
+{
+    return log1p(x) - x / (1 + x);
+}
+
+/* stratified radii: particle i of the sphere at M(<r) / M(<rt) = (i + 0.5) / N */
+static void
+nn_particle(int64_t id, double pos[3])
+{
+    double r, u[3];
+    const double * cen;
+    if(id < NN_N) {
+        const double target = (id + 0.5) / NN_N * nn_m(NN_XT);
+        double lo = 0, hi = NN_XT;
+        int it;
+        for(it = 0; it < 100; it++) {
+            const double mid = 0.5 * (lo + hi);
+            if(nn_m(mid) < target) lo = mid; else hi = mid;
+        }
+        r = 0.5 * (lo + hi) * NN_RS;
+        cen = CenN;
+    }
+    else {
+        r = 5. * cbrt(urand(id, 31, 0));
+        cen = CenCl;
+    }
+    const double ct = 2 * urand(id, 32, 0) - 1, st = sqrt(1 - ct * ct), ph = 2 * M_PI * urand(id, 33, 0);
+    u[0] = st * cos(ph);
+    u[1] = st * sin(ph);
+    u[2] = ct;
+    int d;
+    for(d = 0; d < 3; d++)
+        pos[d] = wrap(cen[d] + r * u[d]);
+}
+
+static void
+nn_setup_particles(void)
+{
+    int NTask, ThisTask;
+    MPI_Comm_size(MPI_COMM_WORLD, &NTask);
+    MPI_Comm_rank(MPI_COMM_WORLD, &ThisTask);
+    particle_alloc_memory(PartManager, BOX, NN_TOT + 1000);
+    PartManager->NumPart = 0;
+    int d;
+    for(d = 0; d < 3; d++)
+        PartManager->CurrentParticleOffset[d] = Offset[d];
+    slots_init(0.01 * PartManager->MaxPart, SlotsManager);
+    slots_set_enabled(0, sizeof(struct sph_particle_data), SlotsManager);
+    slots_set_enabled(4, sizeof(struct star_particle_data), SlotsManager);
+    slots_set_enabled(5, sizeof(struct bh_particle_data), SlotsManager);
+    int64_t atleast[6] = {16, 0, 0, 0, 16, 16};
+    slots_reserve(1, atleast, SlotsManager);
+    int64_t id;
+    for(id = 0; id < NN_TOT; id++) {
+        if((int)(id % NTask) != ThisTask)
+            continue;
+        struct particle_data * p = &P[PartManager->NumPart++];
+        memset(p, 0, sizeof(*p));
+        double pos[3];
+        nn_particle(id, pos);
+        p->ID = id;
+        p->Type = 1;
+        p->Mass = NN_M;
+        p->GrNr = -1;
+        p->TrackId = p->BoundTrackId = -1;
+        p->BindRank = -1;
+        for(d = 0; d < 3; d++)
+            p->Pos[d] = wrap(pos[d] + Offset[d]);
+    }
+    slots_setup_id(PartManager, SlotsManager);
+}
+
+struct nn_result {
+    double col[NN_NREC][4];        /* RsSO, RsKlypinSO, VmaxSO, RmaxSO */
+    double MSO[NN_NREC], RSO[NN_NREC];
+};
+
+static int nn_owner_spread(int k, int NTask) { return k % NTask; }
+static int nn_owner_last(int k, int NTask) { return NTask - 1; }
+
+/* records: 0 the NFW central, 1 a satellite at its centre, 2 the clump's central, 3 a central in a void */
+static void
+nn_run(DomainDecomp * dd, int (*owner)(int, int), const Cosmology * CP, const struct SubhaloParams * par, const double * rho,
+       struct nn_result * res, struct SubhaloSOStats * st)
+{
+    int NTask, ThisTask, k, d;
+    MPI_Comm_size(MPI_COMM_WORLD, &NTask);
+    MPI_Comm_rank(MPI_COMM_WORLD, &ThisTask);
+    struct SubTrack loc[NN_NREC];
+    int idx[NN_NREC], n = 0;
+    const double * cen[NN_NREC] = {CenN, CenN, CenCl, CenVoid};
+    const int nb[NN_NREC] = {NN_N, 500, NN_CL, 30};
+    for(k = 0; k < NN_NREC; k++) {
+        if(owner(k, NTask) != ThisTask)
+            continue;
+        struct SubTrack * t = &loc[n];
+        subhalo_track_clear(t, k);
+        t->Rank = k == 1;
+        t->HostGroup = k;
+        t->Nbound = nb[k];
+        t->Mbound = nb[k] * NN_M;
+        t->RsSO = t->RsKlypinSO = t->VmaxSO = t->RmaxSO = -7;
+        for(d = 0; d < 3; d++)
+            t->CorePos[d] = cen[k][d];
+        idx[n++] = k;
+    }
+    subhalo_field_so_full(loc, n, dd, 1.0, CP, par, rho, NULL, st, MPI_COMM_WORLD);
+    struct nn_result mine;
+    memset(&mine, 0, sizeof(mine));
+    for(k = 0; k < n; k++) {
+        double * c = mine.col[idx[k]];
+        c[0] = loc[k].RsSO;
+        c[1] = loc[k].RsKlypinSO;
+        c[2] = loc[k].VmaxSO;
+        c[3] = loc[k].RmaxSO;
+        mine.MSO[idx[k]] = loc[k].MSO[0];
+        mine.RSO[idx[k]] = loc[k].RSO[0];
+    }
+    MPI_Allreduce(&mine, res, sizeof(mine) / sizeof(double), MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+}
+
+static int
+nn_same(const struct nn_result * a, const struct nn_result * b, const char * what)
+{
+    int k, j, bad = 0;
+    for(k = 0; k < NN_NREC; k++)
+        for(j = 0; j < 4; j++)
+            if(a->col[k][j] != b->col[k][j]) {
+                message(1, "%s: record %d column %d %.9g vs %.9g\n", what, k, j, a->col[k][j], b->col[k][j]);
+                bad++;
+            }
+    return bad;
+}
+
+static void
+test_subhalo_field_so_profile(void ** state)
+{
+    walltime_init(&CT);
+    struct DomainParams dp = {0};
+    dp.DomainOverDecompositionFactor = 1;
+    dp.DomainUseGlobalSorting = 0;
+    dp.TopNodeAllocFactor = 1.;
+    dp.SetAsideFactor = 1;
+    set_domain_par(dp);
+    init_forcetree_params(0.7);
+    struct gravshort_tree_params tp = get_gravshort_treepar();
+    tp.FractionalGravitySoftening = 1. / 50;
+    set_gravshort_treepar(tp);
+    gravshort_set_softenings(50.);       /* GravitySoftening = 1 kpc/h */
+    subhalo_so_set_import_buffer_boost(2);
+    message(0, "treewalk reserve with boost 2: pass 3 %zu bytes (any NB, NT); 64 bins NT = 1: pass 1 %zu, pass 2 %zu\n",
+            subhalo_so_walk_bytes(3, 64, 1), subhalo_so_walk_bytes(1, 64, 1), subhalo_so_walk_bytes(2, 64, 1));
+    subhalo_so_set_import_buffer_boost(0);
+
+    Cosmology CP = test_cosmology();
+    /* the virial threshold: the sphere's mean density inside NN_XV rs; the others any positive */
+    const double Mt = NN_N * NN_M;
+    const double Rv = NN_XV * NN_RS;
+    const double rhov = Mt * nn_m(NN_XV) / nn_m(NN_XT) / (4. / 3 * M_PI * Rv * Rv * Rv);
+    const double rho[SUBHALO_NSO] = {rhov, 0.7 * rhov, 1.5 * rhov, 4 * rhov, 20 * rhov};
+    struct SubhaloParams par;
+    memset(&par, 0, sizeof(par));
+    par.SubhaloSOBins = 64;
+    par.SubhaloSOSearchFactor = 2;
+    par.SubhaloSOMaxDoublings = 3;
+    par.SubhaloSORefineMinPart = 1000;
+
+    nn_setup_particles();
+    DomainDecomp ddecomp = {0};
+    domain_decompose_full(&ddecomp, MPI_COMM_WORLD);
+    int NTask;
+    MPI_Comm_size(MPI_COMM_WORLD, &NTask);
+
+    struct nn_result r0, r1;
+    struct SubhaloSOStats st;
+    nn_run(&ddecomp, nn_owner_spread, &CP, &par, rho, &r0, &st);
+    CHECK(st.Pass3 && st.Nprofiled == 2 && st.Nprofile == 1 && st.Npass3Walks >= 1,
+          "profile: pass 3 %d, %ld profiled, %ld with >= 100 particles, %d walks\n", st.Pass3, st.Nprofiled, st.Nprofile, st.Npass3Walks);
+    /* the analytic values: the maximum of G M(<r) / (a r) of the sampled profile's continuum */
+    const double G = CP.GravInternal, vu = subhalo_vel_to_kms(1.0);
+    double best = 0, xbest = 0, x;
+    for(x = 1.0; x < 4.0; x += 1e-5) {
+        const double v = nn_m(x) / x;
+        if(v > best) {
+            best = v;
+            xbest = x;
+        }
+    }
+    const double Vmax = sqrt(G * Mt / nn_m(NN_XT) * best / NN_RS) * vu;
+    const double * c = r0.col[0];
+    const double binw = log(1000.) / SUBHALO_SO_NPROF;
+    message(0, "profile: MSO[vir] %.6g (analytic %.6g) RSO[vir] %.6g (%.6g); RsSO %.6g (rs %g, %+.2f%%), RsKlypinSO %.6g (%+.2f%%), "
+               "VmaxSO %.6g (analytic %.6g, %+.3f%%), RmaxSO %.6g (%.6g, %+.2f bins)\n",
+            r0.MSO[0], Mt * nn_m(NN_XV) / nn_m(NN_XT), r0.RSO[0], Rv, c[0], NN_RS, 100 * (c[0] / NN_RS - 1), c[1],
+            100 * (c[1] / NN_RS - 1), c[2], Vmax, 100 * (c[2] / Vmax - 1), c[3], xbest * NN_RS, log(c[3] / (xbest * NN_RS)) / binw);
+    CHECK(c[0] > 0 && fabs(c[0] / NN_RS - 1) < 0.03, "RsSO %g, rs %g\n", c[0], NN_RS);
+    CHECK(c[1] > 0 && fabs(c[1] / NN_RS - 1) < 0.05, "RsKlypinSO %g, rs %g\n", c[1], NN_RS);
+    CHECK(fabs(c[2] / Vmax - 1) < 2e-3 && c[2] < Vmax * (1 + 1e-4), "VmaxSO %g, analytic %g\n", c[2], Vmax);
+    CHECK(fabs(log(c[3] / (xbest * NN_RS))) <= binw, "RmaxSO %g, analytic %g\n", c[3], xbest * NN_RS);
+    /* the -1 rules: satellite, the 60-particle clump (it has a virial result), the void */
+    int k, j;
+    CHECK(r0.MSO[2] > 0 && r0.RSO[2] > 0 && r0.MSO[3] == -1, "profile: clump MSO %g RSO %g, void MSO %g\n", r0.MSO[2], r0.RSO[2], r0.MSO[3]);
+    for(k = 1; k < NN_NREC; k++)
+        for(j = 0; j < 4; j++)
+            CHECK(r0.col[k][j] == (k == 1 ? -7 : -1), "profile: record %d column %d is %g\n", k, j, r0.col[k][j]);
+    uint64_t h = 1469598103934665603ULL;
+    {
+        const unsigned char * b = (const unsigned char *) r0.col;
+        size_t i;
+        for(i = 0; i < sizeof(r0.col); i++)
+            h = (h ^ b[i]) * 1099511628211ULL;
+    }
+    message(0, "SO profile checksum: %016lx\n", (unsigned long) h);
+
+    /* layouts: all records on the last rank, batches of one query, the local particle order
+     * reversed, a rank emptied: bitwise the same columns */
+    nn_run(&ddecomp, nn_owner_last, &CP, &par, rho, &r1, &st);
+    CHECK(nn_same(&r0, &r1, "profile, records on the last rank") == 0, "profile: records on the last rank differ\n");
+    subhalo_so_set_max_batch(1);
+    nn_run(&ddecomp, nn_owner_last, &CP, &par, rho, &r1, &st);
+    subhalo_so_set_max_batch(0);
+    CHECK(nn_same(&r0, &r1, "profile, batches of one") == 0 && st.Npass3Walks >= 2, "profile: batches of one differ (%d walks)\n",
+          st.Npass3Walks);
+    reverse_particles();
+    nn_run(&ddecomp, nn_owner_spread, &CP, &par, rho, &r1, &st);
+    CHECK(nn_same(&r0, &r1, "profile, reversed particles") == 0, "profile: reversed particle order differs\n");
+
+    /* the memory rule: only pass 1's reserve free (pass 3 skipped: its columns -1, MSO set), then
+     * pass 3's but not pass 2's (pass 3 runs on the pass-1 RSO) */
+    const int64_t free0 = st.FreeBytes;
+    const int64_t fit1 = subhalo_so_walk_bytes(1, 64, 1) + (4L << 20);
+    const int64_t fit3 = subhalo_so_walk_bytes(3, 64, 1) + (4L << 20);
+    CHECK(free0 > fit3 + (8L << 20) && (int64_t) subhalo_so_walk_bytes(3, 64, 1) > fit1
+          && (int64_t) subhalo_so_walk_bytes(2, 64, 1) > fit3,
+          "profile memory: %ld free, pass 1 %ld pass 3 %ld pass 2 %zu do not allow the test\n", free0, fit1, fit3,
+          subhalo_so_walk_bytes(2, 64, 1));
+    void * block = mymalloc("SOtestblock", free0 - fit1);
+    nn_run(&ddecomp, nn_owner_spread, &CP, &par, rho, &r1, &st);
+    myfree(block);
+    CHECK(!st.Pass2 && !st.Pass3 && !st.Skipped && st.NBins == 64 && st.Npass3Walks == 0 && r1.MSO[0] > 0
+          && r1.col[0][0] == -1 && r1.col[0][1] == -1 && r1.col[0][2] == -1 && r1.col[0][3] == -1,
+          "profile without pass 3: pass 2 %d pass 3 %d skipped %d bins %d, MSO %g, RsSO %g VmaxSO %g\n", st.Pass2, st.Pass3,
+          st.Skipped, st.NBins, r1.MSO[0], r1.col[0][0], r1.col[0][2]);
+    block = mymalloc("SOtestblock", free0 - fit3);
+    nn_run(&ddecomp, nn_owner_spread, &CP, &par, rho, &r1, &st);
+    myfree(block);
+    CHECK(!st.Pass2 && st.Pass3 && r1.col[0][0] > 0 && r1.col[0][2] > 0 && fabs(r1.col[0][0] / NN_RS - 1) < 0.05,
+          "profile with pass 3 only: pass 2 %d pass 3 %d, RsSO %g VmaxSO %g\n", st.Pass2, st.Pass3, r1.col[0][0], r1.col[0][2]);
+
+    if(NTask >= 2) {
+        empty_rank_domain(&ddecomp, NTask / 2);
+        nn_run(&ddecomp, nn_owner_spread, &CP, &par, rho, &r1, &st);
+        CHECK(nn_same(&r0, &r1, "profile, emptied rank") == 0, "profile: emptied rank differs\n");
+    }
+
+    domain_free(&ddecomp);
+    slots_free(SlotsManager);
+    myfree(PartManager->Base);
+    PartManager->Base = NULL;
+    PartManager->NumPart = 0;
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_subhalo_field_so),
         cmocka_unit_test(test_subhalo_field_so_mixed),
+        cmocka_unit_test(test_subhalo_field_so_profile),
     };
     return cmocka_run_group_tests_mpi(tests, NULL, NULL);
 }

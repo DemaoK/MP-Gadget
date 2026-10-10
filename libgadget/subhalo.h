@@ -165,6 +165,8 @@ struct SubTrack {
     /* group D: field SO, centrals only */
     float   MSO[SUBHALO_NSO], RSO[SUBHALO_NSO];
     float   MTypeSO200c[6], MTypeSOVir[6];
+    /* Rockstar-comparable profile of the virial sphere (decision 44, subhalo_so.h pass 3) */
+    float   RsSO, RsKlypinSO, VmaxSO, RmaxSO;
     /* group E: history (design 7.7) */
     float   MboundPeak, VmaxAtMboundPeak, VmaxPeak, MboundAcc, VmaxAcc, MboundFirstAcc, VmaxFirstAcc;
     int32_t SnapMboundPeak, SnapVmaxPeak, SnapAcc, SnapFirstAcc, SnapLastMajorMerger;

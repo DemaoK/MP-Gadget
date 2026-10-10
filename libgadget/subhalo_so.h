@@ -28,6 +28,32 @@
  *    M(r) = 4/3 pi rho r^3; MSO = that mass, RSO = (3 MSO / (4 pi rho))^(1/3); the per-type
  *    masses are those at the lower edge plus the same fraction of the bin's per-type content.
  *
+ * Pass 3 (decision 44: Rockstar-comparable profile quantities of the host sphere), for every
+ * central with MSO[vir] > 0 and RSO[vir] > 0: one walk about the same centre (CorePos, the same
+ * periodic wrap) over all live particles with r <= RSO[vir] (the published f4 value), all types,
+ * satellites' and unbound particles included, accumulating their number, their largest mass and
+ * their total mass in SUBHALO_SO_NPROF logarithmic bins between Rin = SUBHALO_SO_PROF_RIN RSO[vir]
+ * and RSO[vir] (r <= Rin in bin 0). From that profile (subhalo_so.c so_profile_finish):
+ *  - VmaxSO, RmaxSO: the maximum of G M(<= e) / (a e) over the bin edges e (radii floored at
+ *    GravitySoftening, edges whose enclosed density exceeds rho[vir], Rockstar's vmax rule),
+ *    VmaxSO in km/s, RmaxSO comoving; resolution one bin, ln(1000) / SUBHALO_SO_NPROF = 0.0576
+ *    in ln r (5.9 % in RmaxSO; VmaxSO is evaluated at the edges and can only be below the
+ *    profile's maximum, by a second-order amount at a smooth peak);
+ *  - RsKlypinSO: subhalo_klypin_rs(RSO[vir], MSO[vir], max M / r, RmaxSO);
+ *  - RsSO: Rockstar's NFW fit (subhalo_nfw_fit from RsKlypinSO) on the equal-mass bins of
+ *    subhalo_nfw_bin_plan for the N particles inside RSO[vir] (their mass and largest mass),
+ *    each bin edge where the profile's M(<r) reaches the bin's closing mass, interpolated
+ *    linearly in ln r inside the profile bin (in r^3 inside bin 0); deviations from nfw.c in
+ *    subhalo_unbind.h.
+ * All four are -1 for satellites (not queried), for centrals without a virial result, with fewer
+ * than SUBHALO_NFW_MINPART particles inside RSO[vir], when the call is skipped or pass 3 does not
+ * fit in memory (warning); RsSO alone is -1 when the fit fails. The masses are summed as 64-bit
+ * fixed-point integers (unit 2^-s of the run's mass unit, s fixed per call from the global
+ * particle count and largest mass so that no sum overflows; a particle's mass is rounded to the
+ * unit, relative error below 2^-(63 - log2 N_live) of the largest mass), so the profile, and hence
+ * the four columns, are bitwise the same for every particle partition, rank count, thread count
+ * and batch size, for any masses (stronger than passes 1 and 2, see subhalo_so.c).
+ *
  * The particle-level rule (outermost particle k with M(<=r_k) / (4/3 pi r_k^3) > rho) is
  * resolved to one sub-bin for refined centrals and to one pass-1 bin for the others; a density
  * excess confined to one bin whose outer edge is below the threshold is not seen (design 7.6,
@@ -47,7 +73,9 @@
  * SubhaloSOBins is halved for this call (down to 16) and logged; if pass 1 still does not fit
  * the field SO is skipped for this call with a warning, MSO, RSO, MTypeSO200c and MTypeSOVir
  * of every central -1 and Flags bits 3 and 4 clear; if pass 2 does not fit, no central is
- * refined this call (pass-1 interpolation, with a warning). ImportBufferBoost is private to
+ * refined this call (pass-1 interpolation, with a warning); if pass 3 does not fit, RsSO,
+ * RsKlypinSO, VmaxSO and RmaxSO are -1 this call (with a warning), nothing else changes.
+ * ImportBufferBoost is private to
  * treewalk.c: the check assumes the parameter's default, 2, unless
  * subhalo_so_set_import_buffer_boost is called (a larger boost than assumed is caught by the
  * treewalk's own check, an abort with the walk's name and both numbers). */
@@ -61,6 +89,11 @@
 
 /* Linear sub-bins of pass 2 across each crossing bin. */
 #define SUBHALO_SO_NSUB 64
+/* Pass 3 (decision 44): logarithmic profile bins inside RSO[vir] and their inner edge in units of
+ * RSO[vir]. 120 bins of 8-byte fixed-point masses plus the count and the largest mass: 976 bytes
+ * per result (984 with DEBUG), within the ~1 KB budget; 3 decades, 0.025 dex per bin. */
+#define SUBHALO_SO_NPROF 120
+#define SUBHALO_SO_PROF_RIN 1e-3
 
 /* Field SO for the centrals of this call. recs[0..n) are the rank's result records (any order);
  * only those with Rank == 0 && HostGroup >= 0 && Nbound > 0 are queried, the others are not
@@ -69,7 +102,8 @@
  * outside its domain) and CorePos in the output frame (CurrentParticleOffset removed, wrapped).
  * Builds a full tree (force_tree_full) and frees it. Collective over MPI_COMM_WORLD (the
  * treewalk framework communicates on MPI_COMM_WORLD; Comm must be it or an equivalent copy):
- * every rank must call it, also with n == 0. */
+ * every rank must call it, also with n == 0. Pass 3 also writes RsSO, RsKlypinSO, VmaxSO and
+ * RmaxSO of the queried records (-1 where undefined). */
 void subhalo_field_so(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp, double atime,
                       const Cosmology * CP, const struct SubhaloParams * par, MPI_Comm Comm);
 
@@ -88,6 +122,10 @@ struct SubhaloSOStats {
     int NTypes;            /* particle types carried by the walks (those present) */
     int Pass2;             /* pass 2 allowed by the memory check */
     int Skipped;           /* the whole call skipped for lack of memory */
+    int Pass3;             /* pass 3 allowed by the memory check */
+    int Npass3Walks;
+    int64_t Nprofiled;     /* centrals walked by pass 3 (those with a virial result) */
+    int64_t Nprofile;      /* of which with >= SUBHALO_NFW_MINPART particles inside RSO[vir] */
 };
 
 /* The same with the thresholds given (rho == NULL: subhalo_so_thresholds), the final search
@@ -104,8 +142,9 @@ void subhalo_so_set_max_batch(int64_t maxbatch);
 /* The ImportBufferBoost the memory check assumes (default 2, the parameter's default). */
 void subhalo_so_set_import_buffer_boost(double boost);
 
-/* Free bytes treewalk.c's ev_begin needs on this rank for a walk of the given pass (1 or 2)
- * with NB pass-1 bins and NT particle types (not counting this module's own buffers). */
+/* Free bytes treewalk.c's ev_begin needs on this rank for a walk of the given pass (1, 2 or 3)
+ * with NB pass-1 bins and NT particle types (not counting this module's own buffers; pass 3
+ * depends on neither). */
 size_t subhalo_so_walk_bytes(int pass, int NB, int NT);
 /* Phase 5d: the field SO walks' elastic export tables (sized by the treewalk from the free
  * memory) are taken out of the main allocator's low-water mark after every walk; these give the

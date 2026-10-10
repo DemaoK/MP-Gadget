@@ -39,7 +39,10 @@ Matching (--match):
 Per matched pair (ours / Rockstar, both converted to Rockstar's units): Mvir (--mass), M200b, M200c,
 M500c, M2500c (MBoundSO[1..4]), Rvir (RBoundSO[0]), Vmax (VmaxVir), Rs_Klypin (RsKlypin against
 rs_klypin), Rs(fit) (our Phase 5 NFW fit Rs against Rockstar's fitted rs), Klypin/fit (our RsKlypin
-against Rockstar's fitted rs, for reference), Vrms, Spin (SpinPeebles), Spin_Bullock, b_to_a,
+against Rockstar's fitted rs, for reference), and the decision-44 versions on the field-SO virial
+sphere of our centrals (every particle inside RSO[vir], Rockstar's host set): Rs(SO) (RsSO against
+rs), Rs_Klypin(SO) (RsKlypinSO against rs_klypin), Klypin(SO)/fit (RsKlypinSO against rs), Vmax(SO)
+(VmaxSO against vmax); Vrms, Spin (SpinPeebles), Spin_Bullock, b_to_a,
 c_to_a, b_to_a(500c), c_to_a(500c), Xoff, Voff (VmaxVir, Vrms and Voff are physical km/s in our
 catalogue as in Rockstar's, so they are not converted); p10/p50/p90 of each ratio over pairs where both sides are
 defined (> 0), with the counts of pairs where our value is undefined (-1 until Phase 3 fills the
@@ -53,7 +56,9 @@ strict Mvir_all, MSO[1..4] against M200b..M2500c unless every halo has M200b = M
 RSO[0] against (3 M / 4 pi rho_vir)^(1/3) of the strict mass when the Header has SOThresholds.
 
 Phase 5 summary (centrals <-> hosts within the tolerance, our Nbound >= --min-np): the median ratio
-and the fraction of pairs within 20 % (Rs(fit), Rs_Klypin, Klypin/fit) and 5 % (Vrms), and
+and the fraction of pairs within 20 % (Rs(fit), Rs_Klypin, Klypin/fit and the SO versions Rs(SO),
+Rs_Klypin(SO), Klypin(SO)/fit), 5 % (Vrms) and 5 % (Vmax, Vmax(SO)), bound-set and SO versions side by
+side, and
 |RockstarCoreVel - Rockstar VX/VY/VZ| / Rockstar vrms (Rockstar's VX is its core velocity). Rockstar
 falls back to its Klypin rs below 100 bound particles while our Rs is -1 there ('ours und').
 
@@ -61,7 +66,9 @@ Exit status: 0 when the fraction of our centrals with Nbound >= --min-np matched
 within the tolerance is at least --accept-frac and the median Mvir ratio (and with --field the median
 MSO[0] ratio) is within --median-tol of 1, the median Rs(fit) ratio within --rs-median-tol and the
 median Vrms ratio within --vrms-median-tol (each skipped when fewer than 10 pairs define it or its
-tolerance is <= 0), or
+tolerance is <= 0); for hosts the Rs tolerance applies to the SO version Rs(SO) (decision 44: the
+quantity computed on Rockstar's host set), falling back to the bound-set Rs(fit) with a note for a
+catalogue without RsSO; --rs-bound-median-tol (default 0, off) adds the bound-set Rs(fit) target; or
 --report-only is given; 1 otherwise; 2 when an input could not be read.
 
 Phase 1 catalogues (every FOF group one subhalo): pass --phase1 so that only section 0 of the
@@ -352,6 +359,10 @@ QUANTITIES = [
     ("Rs_Klypin", "RsKlypin", "rs_klypin", "rad"),
     ("Rs(fit)", "Rs", "rs", "rad"),
     ("Klypin/fit", "RsKlypin", "rs", "rad"),
+    ("Vmax(SO)", "VmaxSO", "vmax", "kms"),
+    ("Rs_Klypin(SO)", "RsKlypinSO", "rs_klypin", "rad"),
+    ("Rs(SO)", "RsSO", "rs", "rad"),
+    ("Klypin(SO)/fit", "RsKlypinSO", "rs", "rad"),
     ("Vrms", "Vrms", "vrms", "kms"),
     ("Spin", "SpinPeebles", "spin", "one"),
     ("Spin_Bullock", "SpinBullock", "spin_bullock", "one"),
@@ -612,7 +623,14 @@ def report(side, ours, rs, M, args, box, out=sys.stdout, field=None):
     ratio_table(side, rs, M.o[sel_s], M.r[sel_s], qs, out, "satellites <-> subhalos (secondary): %d pairs" % sel_s.size)
     medians = [("Mvir", res.get("Mvir", np.zeros(0)), args.median_tol)]
     phase5_summary(side, rs, M.o[sel_c], M.r[sel_c], res, out)
-    medians.append(("Rs(fit)", res.get("Rs(fit)", np.zeros(0)), args.rs_median_tol))
+    # decision 44: the Rs target applies to the SO version (Rockstar's host set) where present
+    if "RsSO" in side.S:
+        medians.append(("Rs(SO)", res.get("Rs(SO)", np.zeros(0)), args.rs_median_tol))
+        medians.append(("Rs(fit)", res.get("Rs(fit)", np.zeros(0)), args.rs_bound_median_tol))
+    else:
+        print("  note: no RsSO column (a catalogue before decision 44): --rs-median-tol applies to the bound-set Rs(fit)",
+              file=out)
+        medians.append(("Rs(fit)", res.get("Rs(fit)", np.zeros(0)), args.rs_median_tol))
     medians.append(("Vrms", res.get("Vrms", np.zeros(0)), args.vrms_median_tol))
     if field is not None:
         res_f = field_report(side, field, args, box, out)
@@ -660,13 +678,15 @@ def phase5_summary(side, rs, o, r, res, out):
     """The Phase 5 columns over the central-host pairs (o, r): median ratio and the fraction within
     20 % (radii) or 5 % (Vrms) of the pairs where both sides define the value; the core velocity
     offset against Rockstar's VX/VY/VZ (its core velocity) in units of Rockstar's vrms."""
-    print("Phase 5 (centrals <-> hosts, %d pairs):" % o.size, file=out)
-    for label, tol in (("Rs(fit)", 0.2), ("Rs_Klypin", 0.2), ("Klypin/fit", 0.2), ("Vrms", 0.05)):
+    print("Phase 5 (centrals <-> hosts, %d pairs; bound set, then the field-SO virial sphere of decision 44):" % o.size,
+          file=out)
+    for label, tol in (("Rs(fit)", 0.2), ("Rs(SO)", 0.2), ("Rs_Klypin", 0.2), ("Rs_Klypin(SO)", 0.2), ("Klypin/fit", 0.2),
+                       ("Klypin(SO)/fit", 0.2), ("Vmax", 0.05), ("Vmax(SO)", 0.05), ("Vrms", 0.05)):
         rat = res.get(label)
         if rat is None or rat.size == 0:
-            print("    %-11s no pairs define it" % label, file=out)
+            print("    %-14s no pairs define it" % label, file=out)
             continue
-        print("    %-11s %4d pairs: median ratio %.3f, within %2.0f%%: %.1f%%" % (
+        print("    %-14s %4d pairs: median ratio %.3f, within %2.0f%%: %.1f%%" % (
             label, rat.size, float(np.median(rat)), 100 * tol, 100.0 * np.count_nonzero(np.abs(rat - 1) <= tol) / rat.size),
             file=out)
     # the velocities are signed: valid where our virial aperture exists (Vrms >= 0) and every component
@@ -769,7 +789,10 @@ def main(argv=None):
     p.add_argument("--median-tol", type=float, default=0.1,
                    help="target |median ratio - 1| for Mvir and, with --field, MSO[0]; <= 0 disables (default 0.1)")
     p.add_argument("--rs-median-tol", type=float, default=0.2,
-                   help="target |median Rs(fit) ratio - 1| (Phase 5; default 0.2; <= 0 disables)")
+                   help="target |median Rs ratio - 1| of hosts: Rs(SO) (RsSO, decision 44), or the bound-set Rs(fit) "
+                   "for a catalogue without RsSO (default 0.2; <= 0 disables)")
+    p.add_argument("--rs-bound-median-tol", type=float, default=0.0,
+                   help="target |median bound-set Rs(fit) ratio - 1| when RsSO is present (default 0: off)")
     p.add_argument("--vrms-median-tol", type=float, default=0.05,
                    help="target |median Vrms ratio - 1| (Phase 5; default 0.05; <= 0 disables)")
     p.add_argument("--rs-snap", type=int, default=None, help="Rockstar snapshot number (default: SnapshotIndex + offset)")

@@ -1254,9 +1254,11 @@ _Static_assert(COLL_PROPS_CAND_BYTES <= SUBHALO_INPLACE_CAND_PROPS_BYTES,
 
 /* The Phase 5 recipes of subhalo_props_deferred on the radial ordered set of the round (rr[0, nr)
  * sorted by (label, r, ID), pos the global positions within each label, Mc the cumulative masses
- * M(<= r)), after the profile (rp->kc, Mso, prof, hs) is known: the aperture is pos <= kc[vir].
+ * M(<= r)), after the profile (rp->kc, Mso, prof, hs) is known: Rockstar's apertures (decision 44,
+ * as the serial deferred_on_order), pos < kc[vir] for the velocities and pos < kc[vir] - 1 for the
+ * NFW fit, of mass Mfit = Mc at pos kc[vir] - 2.
  * Four reductions over the labels: (1) the aperture velocity sums about the core velocity and the
- * count inside 0.1 Rvir, (2) the largest particle mass, (3) the position closing each equal-mass
+ * count inside 0.1 Rvir, (2) the largest particle mass and Mfit, (3) the position closing each equal-mass
  * bin (the first with Mc >= subhalo_nfw_threshold), (4) the radii around each closing position
  * and the core velocity sums; the fit itself (subhalo_nfw_fit) is replicated per label. Results
  * in rp->dfr (km/s, the run's length unit), -1 where undefined. Collective. */
@@ -1291,15 +1293,16 @@ deferred_distributed(const struct Coll * C, const struct CoreOut * core, const s
         Rv[2 * c] = kc[3 * c] >= 0 ? cbrt(3 * rp->Mso[SUBHALO_NSO * c] / (4 * M_PI * rho[0])) : -1;
     }
 
-    /* (1) the aperture: velocity sums about the core velocity, the count inside 0.1 Rvir, as
-     * compensated pairs merged in rank order (audit R4); (2) the largest particle mass
-     * (X[c * (NB + 1)]) */
+    /* (1) the velocity aperture pos < kc: velocity sums about the core velocity, the count inside
+     * 0.1 Rvir, as compensated pairs merged in rank order (audit R4); (2) over the fit's aperture
+     * pos < kc - 1 the largest particle mass (X[c * (NB + 1)]) and the profile's M(<= r) at its
+     * last position kc - 2 (X[c * (NB + 1) + 1], held by one record: a MAX of it and zeros) */
     memset(A, 0, sizeof(double) * NA * nc);
     for(c = 0; c < nc; c++)
-        X[(NB + 1) * c] = 0;
+        X[(NB + 1) * c] = X[(NB + 1) * c + 1] = 0;
     for(k = 0; k < nr; k++) {
         c = (int64_t) rr[k].key[2];
-        if(pos[k] > kc[3 * c])
+        if(pos[k] >= kc[3 * c])
             continue;
         const double * cp = core->d + CORE_ND * c;
         const double m = rr[k].m;
@@ -1312,27 +1315,31 @@ deferred_distributed(const struct Coll * C, const struct CoreOut * core, const s
             subhalo_ksum_add(a + 4 + 2 * d, m * dv);
             subhalo_ksum_add(a + 10 + 2 * d, m * dv * dv);
         }
-        if(m > X[(NB + 1) * c])
+        if(pos[k] < kc[3 * c] - 1 && m > X[(NB + 1) * c])
             X[(NB + 1) * c] = m;
+        if(pos[k] == kc[3 * c] - 2)
+            X[(NB + 1) * c + 1] = Mc[k];
     }
     MPI_Allreduce(A, AG, COLL_DFR_NA * nc, KsumType, KsumOp, C->Comm);
-    for(c = 0; c < nc; c++)
-        XG[c] = X[(NB + 1) * c];
-    MPI_Allreduce(XG, V, nc, MPI_DOUBLE, MPI_MAX, C->Comm);
+    for(c = 0; c < nc; c++) {
+        XG[2 * c] = X[(NB + 1) * c];
+        XG[2 * c + 1] = X[(NB + 1) * c + 1];
+    }
+    MPI_Allreduce(XG, V, 2 * nc, MPI_DOUBLE, MPI_MAX, C->Comm);
     for(c = 0; c < nc; c++) {
         kc[3 * c + 1] = 0;
         kc[3 * c + 2] = 0;
         Rv[2 * c + 1] = 0;
-        if(kc[3 * c] < 0)
+        if(kc[3 * c] < 1)
             continue;
-        const int64_t nvir = kc[3 * c] + 1;
+        const int64_t nap = kc[3 * c], nfit = kc[3 * c] - 1;
         const double * a = AG + NA * c;
         int64_t ncore = (int64_t) subhalo_ksum_value(a);
         if(ncore < SUBHALO_ROCKSTAR_CORE_MINPART)
-            ncore = nvir < SUBHALO_ROCKSTAR_CORE_MINPART ? nvir : SUBHALO_ROCKSTAR_CORE_MINPART;
+            ncore = nap < SUBHALO_ROCKSTAR_CORE_MINPART ? nap : SUBHALO_ROCKSTAR_CORE_MINPART;
         kc[3 * c + 1] = ncore;
-        /* the bin plan from the aperture's mass Mvir and the largest mass, as the serial recipe */
-        kc[3 * c + 2] = subhalo_nfw_bin_plan(nvir, rp->Mso[SUBHALO_NSO * c], V[c], &Rv[2 * c + 1]);
+        /* the bin plan from the fit aperture's mass Mfit and largest mass, as the serial recipe */
+        kc[3 * c + 2] = subhalo_nfw_bin_plan(nfit, V[2 * c + 1], V[2 * c], &Rv[2 * c + 1]);
     }
 
     /* (3) the closing positions: the first local record of each label reaching each threshold,
@@ -1349,7 +1356,7 @@ deferred_distributed(const struct Coll * C, const struct CoreOut * core, const s
                 lab = c;
                 nextb = 1;
             }
-            if(pos[k] > kc[3 * c])
+            if(pos[k] >= kc[3 * c] - 1)
                 continue;
             while(nextb <= kc[3 * c + 2] && Mc[k] >= subhalo_nfw_threshold(nextb, Rv[2 * c + 1])) {
                 X[(NB + 1) * c + nextb] = -(double) pos[k];
@@ -1394,7 +1401,7 @@ deferred_distributed(const struct Coll * C, const struct CoreOut * core, const s
     MPI_Allreduce(V, VG, NV * nc, MPI_DOUBLE, MPI_SUM, C->Comm);
     MPI_Allreduce(W, WG, COLL_DFR_NW * nc, KsumType, KsumOp, C->Comm);
     for(c = 0; c < nc; c++) {
-        if(kc[3 * c] < 0)
+        if(kc[3 * c] < 1)
             continue;
         const double * v = VG + NV * c;
         const double * a = AG + NA * c, * w = WG + NW * c;
@@ -1739,7 +1746,8 @@ round_props(const struct Coll * C, const struct CoreOut * core, struct RoundProp
     }
     myfree(G2);
     myfree(MX);
-    /* inside the virial aperture (crossing particle included): JVir in the CoreVel frame, the mean
+    /* inside the virial aperture (crossing particle included, D4; deferred_distributed takes
+     * Rockstar's apertures, decision 44): JVir in the CoreVel frame, the mean
      * offsets (properties.c:417-458) */
     {
         double * jl = (double *) mymalloc("SubCollJvLoc", sizeof(double) * 9 * (nc + 1));

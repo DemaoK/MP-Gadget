@@ -59,10 +59,19 @@ input could not be read.
                               MostMassiveBHID (UINT64_MAX the only 'none'; 0 is a real ID) set exactly
                               when a black hole is bound; no NaN. Only defined values (!= -1) are
                               tested, so a catalogue written before Phase 3 passes. MSO below MBoundSO
-                              is a warning. Phase 5: Vrms, BulkVel, RockstarCoreVel defined exactly
-                              with RBoundSO[vir] (Vrms >= 0); Rs -1 below 100 bound particles, else
-                              > 0 and below 1.5 RBoundSO[vir] (-1 there is a warning);
-                              |RockstarCoreVel - CoreVel| > Vrms a warning; skipped when all -1.
+                              is a warning. Phase 5: Vrms, BulkVel, RockstarCoreVel defined only with
+                              RBoundSO[vir] (Vrms >= 0), and with it unless the bound virial mass is
+                              about one particle (Rockstar's aperture excludes the crossing particle);
+                              Rs -1 below 102 bound particles, else > 0 and below 1.5 RBoundSO[vir]
+                              (-1 there is a warning); |RockstarCoreVel - CoreVel| > Vrms a warning;
+                              skipped when all -1. Decision 44 (RsSO, RsKlypinSO, VmaxSO, RmaxSO, the
+                              field-SO virial sphere's profile): -1 off centrals and without MSO/RSO[vir];
+                              VmaxSO, RmaxSO, RsKlypinSO defined together, RsSO only with them;
+                              RmaxSO and RsSO in (0, RSO[vir]]; -1 for a central with MSO[vir] above
+                              200 particle masses (when the call profiled any central) an error,
+                              defined below 50 a warning; VmaxSO >= 10^-0.0125 VmaxVir where RmaxVir
+                              <= RSO[vir] / 2 (the same centre, a superset of the particles, one
+                              profile bin of resolution); skipped when the columns are absent.
   tree OUTPUTDIR|PIG...       Phase 4: the track history over a PIG sequence. Tracks present at every
                               output after birth; resolved nodes their own descendant; deaths with
                               SnapDeath = the first orphan output, DescendantTrackId resolved there,
@@ -1654,6 +1663,7 @@ def check_props(pigdir, ck, vmax_rtol=1e-3, field_warn=0.02):
     ck.check(not np.any(bad), "%s: %d subhalos with bound black holes and group C filled but no MostMassiveBHID (e.g. TrackId %s)"
              % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
     _check_props_deferred(ck, tag, S, tid)
+    _check_props_so_profile(ck, tag, S, tid, central)
     cnt = lambda c: int(np.count_nonzero(np.any(_defined(_rows2d(S[c])), axis=1)))  # noqa: E731
     print("  %s: %d subhalos (%d centrals); thresholds %s; defined: MBoundSO %d, VmaxVir %d, Rhalf %d, SpinPeebles %d, "
           "SpinBullock %d, RsKlypin %d, BtoA %d, BtoA500 %d, InertiaTensor %d, MSO %d (centrals), Flags bit 3 %d, bit 4 %d"
@@ -1706,9 +1716,15 @@ def _check_props_deferred(ck, tag, S, tid, corevel_warn=1.0):
     rv = S["RBoundSO"][:, 0].astype(np.float64)
     hasr = _defined(rv) & (rv > 0)
     nb = S["Nbound"].astype(np.int64)
-    bad = _defined(vrms) != hasr
-    ck.check(not np.any(bad), "%s: %d subhalos with Vrms defined %s RBoundSO[vir] (e.g. TrackId %s)"
-             % (tag, np.count_nonzero(bad), "without" if np.any(_defined(vrms) & ~hasr) else "-1 with", tid[bad][:5].tolist()))
+    bad = _defined(vrms) & ~hasr
+    ck.check(not np.any(bad), "%s: %d subhalos with Vrms defined without RBoundSO[vir] (e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    # Rockstar's aperture (decision 44) excludes the crossing particle: Vrms is -1 with RBoundSO[vir]
+    # only when the crossing is the innermost bound particle, i.e. MBoundSO[vir] is one particle
+    mpart = _max_particle_mass(S)
+    bad = hasr & ~_defined(vrms) & (S["MBoundSO"][:, 0].astype(np.float64) > 1.5 * mpart)
+    ck.check(not np.any(bad), "%s: %d subhalos with RBoundSO[vir] (MBoundSO[vir] above one particle) but Vrms -1 (e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
     aper = deferred_velocity_aperture(vrms)
     for name, v in (("BulkVel", bv), ("RockstarCoreVel", rcv)):
         fin = np.all(np.isfinite(v), axis=1)
@@ -1718,13 +1734,14 @@ def _check_props_deferred(ck, tag, S, tid, corevel_warn=1.0):
         bad = ~aper & ~np.all(v == -1, axis=1)
         ck.check(not np.any(bad), "%s: %d subhalos without a virial aperture (Vrms -1) but %s not the all -1 sentinel (e.g. TrackId %s)"
                  % (tag, np.count_nonzero(bad), name, tid[bad][:5].tolist()))
-    bad = hasr & ~(vrms >= 0)
-    ck.check(not np.any(bad), "%s: %d subhalos with RBoundSO[vir] > 0 but Vrms < 0 (e.g. TrackId %s)"
+    bad = _defined(vrms) & ~(vrms >= 0)
+    ck.check(not np.any(bad), "%s: %d subhalos with a negative Vrms other than -1 (e.g. TrackId %s)"
              % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
     drs = _defined(rs)
-    bad = drs & (nb < NFW_MINPART)
+    # the fit's aperture holds the bound particles inside the one before the crossing (nfw.c)
+    bad = drs & (nb < NFW_MINPART + 2)
     ck.check(not np.any(bad), "%s: %d subhalos with Rs defined below %d bound particles (e.g. TrackId %s)"
-             % (tag, np.count_nonzero(bad), NFW_MINPART, tid[bad][:5].tolist()))
+             % (tag, np.count_nonzero(bad), NFW_MINPART + 2, tid[bad][:5].tolist()))
     bad = drs & ~hasr
     ck.check(not np.any(bad), "%s: %d subhalos with Rs but no RBoundSO[vir] (e.g. TrackId %s)"
              % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
@@ -1754,6 +1771,104 @@ def _check_props_deferred(ck, tag, S, tid, corevel_warn=1.0):
     print("  %s: Phase 5 defined: Rs %d (of %d with Nbound >= %d), Vrms %d, BulkVel %d, RockstarCoreVel %d"
           % (tag, np.count_nonzero(drs), np.count_nonzero(big), NFW_MINPART, np.count_nonzero(_defined(vrms)),
              np.count_nonzero(deferred_velocity_valid(vrms, bv)), np.count_nonzero(deferred_velocity_valid(vrms, rcv))))
+
+
+def _type_masses(S):
+    """Mean particle mass per subhalo and type (MboundType / NboundType where NboundType > 0), as a
+    flat array of the defined values: exact for types of one particle mass (DM)."""
+    if "MboundType" not in S or "NboundType" not in S:
+        return np.zeros(0)
+    mt, nt = S["MboundType"].astype(np.float64), S["NboundType"].astype(np.float64)
+    ok = (nt > 0) & (mt > 0)
+    return mt[ok] / nt[ok]
+
+
+def _max_particle_mass(S):
+    m = _type_masses(S)
+    return float(m.max()) if m.size else np.inf
+
+
+# decision 44 (subhalo_so.h pass 3): profile bins over 3 decades inside RSO[vir]
+SO_NPROF = 120
+SO_PROF_DEX = 3.0 / SO_NPROF
+SO_PROFILE_COLS = ("RsSO", "RsKlypinSO", "VmaxSO", "RmaxSO")
+
+
+def _check_props_so_profile(ck, tag, S, tid, central, rtol=1e-5):
+    """Decision 44: the Rockstar-comparable profile of the field-SO virial sphere (field SO pass 3).
+     - all four -1 off centrals and for centrals without MSO[vir] > 0 and RSO[vir] > 0;
+     - VmaxSO, RmaxSO and RsKlypinSO defined together (fewer than 100 particles inside RSO[vir] or no
+       pass 3 leaves all four -1); RsSO only with them (-1 alone when the fit fails);
+     - 0 < RmaxSO <= RSO[vir] and 0 < RsSO <= RSO[vir] (the fit is bounded by the outer bin edge);
+     - the particle count inside RSO[vir] is not in the catalogue: -1 for a central whose MSO[vir] holds
+       more than 200 of the largest particle mass is an error when the snapshot profiled any central
+       (pass 3 ran), 100-200 a warning; defined with MSO[vir] below 50 of the smallest mass a warning;
+     - VmaxSO >= 10^(-SO_PROF_DEX / 2) VmaxVir (1 - 1e-3) where both are defined and RmaxVir <= RSO[vir] / 2:
+       the same centre and a superset of the bound particles give M_SO(< e) >= M_bound(< r) for every
+       edge e >= r, so between two edges G M / r can exceed the edge maximum by at most one bin's
+       ratio in r (VmaxVir^2 <= VmaxSO^2 10^SO_PROF_DEX); the RSO[vir] / 2 margin keeps the edge above
+       the density threshold. The ratio's distribution is printed."""
+    if any(c not in S for c in SO_PROFILE_COLS):
+        ck.note("%s: no decision-44 SO profile columns (%s); rules skipped"
+                % (tag, ", ".join(c for c in SO_PROFILE_COLS if c not in S)))
+        return
+    rs, rk, vm, rm = (S[c].astype(np.float64) for c in SO_PROFILE_COLS)
+    mso, rso = S["MSO"][:, 0].astype(np.float64), S["RSO"][:, 0].astype(np.float64)
+    hasso = central & (mso > 0) & (rso > 0)
+    for name, v in zip(SO_PROFILE_COLS, (rs, rk, vm, rm)):
+        bad = ~central & (v != -1)
+        ck.check(not np.any(bad), "%s: %d non-central subhalos with %s != -1 (e.g. TrackId %s)"
+                 % (tag, np.count_nonzero(bad), name, tid[bad][:5].tolist()))
+        bad = central & ~hasso & (v != -1)
+        ck.check(not np.any(bad), "%s: %d centrals without MSO/RSO[vir] but %s != -1 (e.g. TrackId %s)"
+                 % (tag, np.count_nonzero(bad), name, tid[bad][:5].tolist()))
+        bad = (v != -1) & ~(np.isfinite(v) & (v > 0))
+        ck.check(not np.any(bad), "%s: %d subhalos with %s neither -1 nor finite > 0 (e.g. TrackId %s)"
+                 % (tag, np.count_nonzero(bad), name, tid[bad][:5].tolist()))
+    dv = vm != -1
+    bad = (dv != (rm != -1)) | (dv != (rk != -1))
+    ck.check(not np.any(bad), "%s: %d subhalos with VmaxSO, RmaxSO, RsKlypinSO not defined together (e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    bad = (rs != -1) & ~dv
+    ck.check(not np.any(bad), "%s: %d subhalos with RsSO but no VmaxSO (e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    for name, v in (("RmaxSO", rm), ("RsSO", rs)):
+        bad = (v != -1) & hasso & ~(v <= rso * (1 + rtol))
+        ck.check(not np.any(bad), "%s: %d centrals with %s beyond RSO[vir] (e.g. TrackId %s)"
+                 % (tag, np.count_nonzero(bad), name, tid[bad][:5].tolist()))
+    tm = _type_masses(S)
+    if tm.size and np.any(hasso):
+        mmax, mmin = float(tm.max()), float(tm.min())
+        miss = hasso & ~dv
+        hard = miss & (mso > 200 * mmax)
+        soft = miss & (mso > 100 * mmax) & ~hard
+        if np.any(dv):
+            ck.check(not np.any(hard), "%s: %d centrals with MSO[vir] above 200 particle masses but VmaxSO -1 (e.g. TrackId %s)"
+                     % (tag, np.count_nonzero(hard), tid[hard][:5].tolist()))
+        elif np.any(hard):
+            ck.warn("%s: no central profiled (pass 3 skipped for memory?): %d centrals with MSO[vir] above 200 particle "
+                    "masses have VmaxSO -1" % (tag, np.count_nonzero(hard)))
+        if np.any(soft):
+            ck.warn("%s: %d centrals with MSO[vir] of 100-200 particle masses but VmaxSO -1 (fewer than 100 particles "
+                    "inside RSO[vir]?; e.g. TrackId %s)" % (tag, np.count_nonzero(soft), tid[soft][:5].tolist()))
+        low = dv & (mso < 50 * mmin)
+        if np.any(low):
+            ck.warn("%s: %d centrals with VmaxSO defined but MSO[vir] below 50 particle masses (e.g. TrackId %s)"
+                    % (tag, np.count_nonzero(low), tid[low][:5].tolist()))
+    if "VmaxVir" in S and "RmaxVir" in S:
+        vv, rv = S["VmaxVir"].astype(np.float64), S["RmaxVir"].astype(np.float64)
+        both = dv & (vv > 0) & (rv > 0) & hasso
+        inner = both & (rv <= 0.5 * rso)
+        lim = 10 ** (-SO_PROF_DEX / 2) * (1 - 1e-3)
+        bad = inner & (vm < lim * vv)
+        ck.check(not np.any(bad), "%s: %d centrals with VmaxSO below %.4f VmaxVir (RmaxVir <= RSO[vir] / 2; e.g. TrackId %s)"
+                 % (tag, np.count_nonzero(bad), lim, tid[bad][:5].tolist()))
+        if np.any(both):
+            q = vm[both] / vv[both]
+            print("  %s: VmaxSO / VmaxVir median %.4f, 10th / 90th percentile %.4f / %.4f, min %.4f over %d centrals"
+                  % (tag, np.median(q), np.percentile(q, 10), np.percentile(q, 90), q.min(), q.size))
+    print("  %s: decision 44 defined: VmaxSO %d, RsSO %d of %d centrals with MSO/RSO[vir]"
+          % (tag, np.count_nonzero(dv), np.count_nonzero(rs != -1), np.count_nonzero(hasso)))
 
 
 def cmd_props(args):
