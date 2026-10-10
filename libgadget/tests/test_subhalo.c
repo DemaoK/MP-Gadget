@@ -1,4 +1,5 @@
-/* Unit tests for the runtime subhalo finder, Phase 1 (halofinder_phase1_plan.md section 5).
+/* Unit tests for the runtime subhalo finder: Phase 1 (halofinder_phase1_plan.md section 5) and
+ * Phase 2a (halofinder_phase2a_plan.md section 5, tests 5-7 as tests 11-13 here).
  *
  * Run as: mpirun -np 4 .objs/test_subhalo
  *
@@ -22,6 +23,26 @@
  *                                 both PIG branches, and corrupted states (truncated payload,
  *                                 duplicate TrackIds, wrong dtype) rejected.
  * 10. test_subhalo_many_keys      200 keys (> 32 per rank): the tail packing on real particles.
+ *
+ * Phase 2a (halofinder_phase2a_plan.md) replaced the membership rule of every serial key, so
+ * tests 5, 9 and 10 assert the Phase 2a outcome of their scenarios: BindRank in energy order (the
+ * most bound tenth near the core) instead of distance order, CorePos near rather than equal to
+ * CoMPos, field particles retagged with their track's key (A's displaced particles at stage 3
+ * move fast and are its unbound tail), B landing on A as a full ball at stage 4 and sinking into
+ * A (the central chosen by the kinetic distance), the dispersed hostless tracks on a 40 kpc/h
+ * lattice (bound, unambiguous centre), and thresholds of 5 particles for the 6..10-particle
+ * clumps of test 10. Tests 6 to 8 are unchanged (the in-place keys keep the Phase 1 rule).
+ * 11. test_subhalo_twohalo        plan test 5: two Hernquist clumps over three calls: persistent
+ *                                 tracks, HBT properties, unbound tails, the D10 tag invariants.
+ * 12. test_subhalo_overlap        plan test 6: B falls into A: satellite (Rank 1, Depth 1, parent
+ *                                 0) with a tail partly bound by the central; the next call's
+ *                                 frame from the BoundTrackId sums; the restart join.
+ * 13. test_subhalo_sink_orphan    plan test 7: B on A's core sinks (orphan, DescendantTrackId 0),
+ *                                 its tracer is followed, then it is resurrected alone in a new
+ *                                 group (no newborn).
+ * Tests 11-13 log a checksum of the tags and records ("Phase 2a test checksum"): identical
+ * with OMP_NUM_THREADS 1 and 2 and with 2, 3 and 4 ranks. SUBHALO_TEST_ONLY=<substring> runs
+ * only the matching tests.
  *
  * The range checks of subhalo_sort_key abort through endrun (MPI_Abort), so they cannot run
  * in-process. Set SUBHALO_TEST_SORTKEY_OVERFLOW=grnr|trackid|bindrank to run only a test that
@@ -60,6 +81,7 @@
 #include <libgadget/partmanager.h>
 #include <libgadget/slotsmanager.h>
 #include <libgadget/cosmology.h>
+#include <libgadget/gravity.h>
 #include "stub.h"
 
 static struct ClockTable CT;
@@ -114,6 +136,7 @@ default_subhalo_params(void)
     sp.SubhaloSinkSymmetric = 0;
     sp.SubhaloCoreSize = 20;
     sp.SubhaloReassignGas = 1;
+    sp.SubhaloNumNeighboursForReassignment = 10;
     sp.SubhaloUnbindWithThermal = 0;
     sp.SubhaloFieldSO = 1;
     sp.SubhaloSOBins = 64;
@@ -1141,7 +1164,6 @@ t5_field_in_B(MyIDType id, double out[3])
 static void
 t5_position(MyIDType id, int stage, double out[3])
 {
-    int d;
     if(id < T5_NA) {
         if(stage == 3 && id < T5_NDISP) {
             out[0] = 50. + 100. * (id % 10);
@@ -1158,18 +1180,20 @@ t5_position(MyIDType id, int stage, double out[3])
             rand_in_ball(id, 2, 0.8 * T5_RA, T5_cA, out);
             return;
         }
+        if(stage == 4) {
+            /* Phase 2a: B lands on A as a full ball, so that the cores coincide and A sinks */
+            rand_in_ball(id, 7, T5_RB, T5_cA, out);
+            return;
+        }
         rand_in_ball(id, 1, T5_RB, T5_cB, out);
-        if(stage == 4)
-            for(d = 0; d < 3; d++)
-                out[d] += T5_cA[d] - T5_cB[d];
         return;
     }
     int64_t k = id - T5_NA - T5_NB;
     if(stage >= 3 && k < T5_NFMOVE) {
-        t5_field_in_B(id, out);
         if(stage == 4)
-            for(d = 0; d < 3; d++)
-                out[d] += T5_cA[d] - T5_cB[d];
+            rand_in_ball(id, 7, T5_RB, T5_cA, out);
+        else
+            t5_field_in_B(id, out);
         return;
     }
     t5_field_lattice(k, out);
@@ -1179,23 +1203,25 @@ t5_position(MyIDType id, int stage, double out[3])
 static void
 t5_expect(MyIDType id, int stage, int * label, int64_t * track)
 {
+    /* Phase 2a: at stage 4 the central decision (kinetic distance among the major members)
+     * picks track 0 and track 1 sinks into it */
     if(id < T5_NA) {
         *label = (stage == 3 && id < T5_NDISP) ? -1 : 0;
-        *track = stage == 4 ? 1 : 0;
+        *track = 0;
         return;
     }
     if(id < T5_NA + T5_NB) {
         int cap = t5_is_cap(id);
         if(stage <= 1) { *label = 1; *track = 1; }
         else if(stage <= 3) { *label = cap ? 0 : 1; *track = cap ? 0 : 1; }
-        else { *label = 0; *track = 1; }
+        else { *label = 0; *track = 0; }
         return;
     }
     int64_t k = id - T5_NA - T5_NB;
     int moved = k < T5_NFMOVE;
     if(stage < 3 || !moved) { *label = -1; *track = -1; }
     else if(stage == 3) { *label = 1; *track = 1; }
-    else { *label = 0; *track = 1; }
+    else { *label = 0; *track = 0; }
 }
 
 static void
@@ -1218,8 +1244,13 @@ static void
 t5_move_to_stage(int stage)
 {
     int64_t i;
-    for(i = 0; i < PartManager->NumPart; i++)
+    for(i = 0; i < PartManager->NumPart; i++) {
         t5_position(P[i].ID, stage, P[i].Pos);
+        /* Phase 2a: the particles displaced from A into the field at stage 3 fly away fast, so
+         * that they are unbound (A's tail) rather than bound at hundreds of kpc by a cold clump */
+        P[i].Vel[0] = (stage == 3 && P[i].ID < T5_NDISP) ? 2000 : 0;
+        P[i].Vel[1] = P[i].Vel[2] = 0;
+    }
 }
 
 static int
@@ -1319,7 +1350,11 @@ check_hosted_record(const struct SubTrack * rec, int64_t t, int64_t grnr, const 
     CHECK(rec->SnapLastIsolation == -1, "stage %d track %ld: SnapLastIsolation %d, expected -1 (never a satellite)\n", stage, t, rec->SnapLastIsolation);
     for(d = 0; d < 3; d++) {
         CHECK(fabs(rec->CoMPos[d] - mean[d]) < 1e-4, "stage %d track %ld: CoMPos[%d] %.8g, mean %.8g\n", stage, t, d, rec->CoMPos[d], mean[d]);
-        CHECK(fabs(rec->CorePos[d] - rec->CoMPos[d]) < 1e-4, "stage %d track %ld: CorePos[%d] %.8g != CoMPos %.8g\n", stage, t, d, rec->CorePos[d], rec->CoMPos[d]);
+        if(inplace)
+            CHECK(fabs(rec->CorePos[d] - rec->CoMPos[d]) < 1e-4, "stage %d track %ld: CorePos[%d] %.8g != CoMPos %.8g\n", stage, t, d, rec->CorePos[d], rec->CoMPos[d]);
+        else
+            /* Phase 2a: the core of the 20 most bound lies near the centre of a cold clump */
+            CHECK(fabs(rec->CorePos[d] - rec->CoMPos[d]) < 5, "stage %d track %ld: CorePos[%d] %.8g far from CoMPos %.8g\n", stage, t, d, rec->CorePos[d], rec->CoMPos[d]);
         /* the particles have zero velocity */
         CHECK(fabs(rec->CoMVel[d]) < 1e-6, "stage %d track %ld: CoMVel[%d] = %g\n", stage, t, d, rec->CoMVel[d]);
     }
@@ -1333,19 +1368,25 @@ check_hosted_record(const struct SubTrack * rec, int64_t t, int64_t grnr, const 
             stage, t, (unsigned long) rec->MostBoundID, (unsigned long) mb->ID);
     for(d = 0; d < 3; d++)
         CHECK(fabs(rec->MostBoundPos[d] - mb->Pos[d]) < 1e-4, "stage %d track %ld: MostBoundPos[%d]\n", stage, t, d);
-    /* BindRank is the order of increasing distance from the centre. */
-    double * dk = malloc(n * sizeof(double));
-    for(i = 0; i < n; i++)
-        dk[i] = -1;
-    for(i = 0; i < ntot; i++)
-        if(all[i].GrNr == grnr && all[i].BindRank >= 0 && all[i].BindRank < n)
-            dk[all[i].BindRank] = dist2(all[i].Pos, rec->CorePos);
-    int bad = 0;
-    for(i = 1; i < n; i++)
-        if(dk[i] < dk[i - 1] - 1e-9 * (1 + dk[i - 1]))
-            bad++;
-    free(dk);
-    CHECK(bad == 0, "stage %d track %ld: %d BindRank inversions against the distance from CorePos\n", stage, t, bad);
+    /* Phase 2a: BindRank is the energy order; in a cold uniform clump the most bound tenth lies
+     * closer to the core than the least bound tenth. */
+    double near = 0, far = 0;
+    int64_t nnear = 0, nfar = 0;
+    for(i = 0; i < ntot; i++) {
+        if(all[i].GrNr != grnr || all[i].BindRank < 0)
+            continue;
+        if(all[i].BindRank < n / 10) {
+            near += sqrt(dist2(all[i].Pos, rec->CorePos));
+            nnear++;
+        }
+        else if(all[i].BindRank >= n - n / 10) {
+            far += sqrt(dist2(all[i].Pos, rec->CorePos));
+            nfar++;
+        }
+    }
+    CHECK(nnear > 0 && nfar > 0 && near / nnear < 0.5 * far / nfar,
+          "stage %d track %ld: the most bound tenth is not concentrated (mean distance %g vs %g)\n", stage, t,
+          nnear ? near / nnear : -1, nfar ? far / nfar : -1);
 }
 
 /* Full check of one stage of the two-clump scenario. prev: the stage before (or NULL). */
@@ -1399,12 +1440,12 @@ t5_check_stage(int stage, int ret, int64_t TotNgroups, const struct tagrec * r, 
             LOCAL_CHECK(bad, r[i].BoundTrackId == -1, "stage %d: untagged particle %ld has BoundTrackId %ld\n", stage, i, r[i].BoundTrackId);
         else if(label >= 0)
             LOCAL_CHECK(bad, r[i].BoundTrackId == track, "stage %d: particle %ld BoundTrackId %ld != TrackId %ld\n", stage, i, r[i].BoundTrackId, track);
-        else if(prev) {
-            /* tagged, outside any group: GrNr = -1 particles keep their tags untouched (plan 1 step 3) */
-            LOCAL_CHECK(bad, r[i].TrackId == prev[i].TrackId && r[i].BindRank == prev[i].BindRank && r[i].BoundTrackId == prev[i].BoundTrackId,
-                    "stage %d: field particle %ld tags changed from (%ld %d %ld) to (%ld %d %ld)\n", stage, i,
-                    prev[i].TrackId, prev[i].BindRank, prev[i].BoundTrackId, r[i].TrackId, r[i].BindRank, r[i].BoundTrackId);
-        }
+        else
+            /* Phase 2a: a tagged field particle travels with its track's key and is retagged
+             * there; the fast displaced particles are the unbound tail of their track */
+            LOCAL_CHECK(bad, r[i].BoundTrackId == -1 && r[i].BindRank >= 0,
+                    "stage %d: field particle %ld: TrackId %ld BindRank %d BoundTrackId %ld, expected an unbound tail\n", stage, i,
+                    r[i].TrackId, r[i].BindRank, r[i].BoundTrackId);
     }
     CHECK(bad == 0, "stage %d: particle tags wrong\n", stage);
     CHECK(check_group_invariants(r, n) == 0, "stage %d: group invariants violated\n", stage);
@@ -1416,26 +1457,28 @@ t5_check_stage(int stage, int ret, int64_t TotNgroups, const struct tagrec * r, 
     int t;
     for(t = 0; t < 2; t++) {
         CHECK(rec[t].SnapBirth == 0, "stage %d track %d: SnapBirth %d\n", stage, t, rec[t].SnapBirth);
-        if(stage == 4 && t == 0)
+        if(stage == 4 && t == 1)
             continue;
         /* the label whose group this track holds */
         int lab = (stage == 4) ? 0 : t;
         check_hosted_record(&rec[t], t, grnr[lab], r, n, stage, inplace);
     }
     if(stage == 4) {
-        CHECK(rec[0].Nbound == 0, "stage 4: sunk track 0 has Nbound %d\n", rec[0].Nbound);
-        CHECK(rec[0].SinkTrackId == 1, "stage 4: track 0 SinkTrackId %ld, expected 1\n", rec[0].SinkTrackId);
-        CHECK(rec[0].SnapSink == 4 && rec[0].SnapDeath == 4, "stage 4: track 0 SnapSink %d SnapDeath %d\n", rec[0].SnapSink, rec[0].SnapDeath);
+        CHECK(rec[1].Nbound == 0, "stage 4: sunk track 1 has Nbound %d\n", rec[1].Nbound);
+        CHECK(rec[1].SinkTrackId == 0, "stage 4: track 1 SinkTrackId %ld, expected 0\n", rec[1].SinkTrackId);
+        CHECK(rec[1].SnapSink == 4 && rec[1].SnapDeath == 4, "stage 4: track 1 SnapSink %d SnapDeath %d\n", rec[1].SnapSink, rec[1].SnapDeath);
+        CHECK(rec[1].DescendantTrackId == 0, "stage 4: track 1 DescendantTrackId %ld, expected 0\n", rec[1].DescendantTrackId);
     } else {
         CHECK(rec[0].SnapSink == -1 && rec[0].SnapDeath == -1 && rec[1].SnapSink == -1 && rec[1].SnapDeath == -1,
                 "stage %d: a live track has SnapSink/SnapDeath set\n", stage);
     }
-    /* History (plan 1 step 13): Mbound peaks. Track 0: 600, 600, 720, 720 (690 now); track 1:
-     * 360, 360, 360 (240 now), 840, 1560. SnapMboundPeak is not checked where two calls tie. */
-    static const float peak0[5] = {600, 600, 720, 720, 720};
-    static const float peak1[5] = {360, 360, 360, 840, 1560};
-    static const int snap0[5] = {0, -9, 2, 2, 2};
-    static const int snap1[5] = {0, -9, 0, 3, 4};
+    /* History (plan 1 step 13): Mbound peaks. Track 0: 600, 600, 720, 720 (690 now), 1560;
+     * track 1: 360, 360, 360 (240 now), 840, 840 (sunk). SnapMboundPeak is not checked where
+     * two calls tie. */
+    static const float peak0[5] = {600, 600, 720, 720, 1560};
+    static const float peak1[5] = {360, 360, 360, 840, 840};
+    static const int snap0[5] = {0, -9, 2, 2, 4};
+    static const int snap1[5] = {0, -9, 0, 3, 3};
     CHECK(fabs(rec[0].MboundPeak - peak0[stage]) < 1e-2, "stage %d track 0: MboundPeak %g, expected %g\n", stage, rec[0].MboundPeak, peak0[stage]);
     CHECK(fabs(rec[1].MboundPeak - peak1[stage]) < 1e-2, "stage %d track 1: MboundPeak %g, expected %g\n", stage, rec[1].MboundPeak, peak1[stage]);
     if(snap0[stage] >= 0)
@@ -2149,9 +2192,10 @@ lc_position(MyIDType id, int stage, double out[3])
     const double cA[3] = {250, 250, 250}, cB[3] = {750, 750, 750};
     if(id < LC_NA) {
         if(stage >= 3) {
-            /* A dispersed: no group left anywhere */
-            out[0] = 30. + 90. * (id % 10);
-            out[1] = 30. + 90. * (id / 10);
+            /* A dispersed: no group left anywhere (Phase 2a: a 40 kpc lattice, still bound as a
+             * hostless track and smaller than half the box, so its centre is unambiguous) */
+            out[0] = 30. + 40. * (id % 10);
+            out[1] = 30. + 40. * (id / 10);
             out[2] = 150.;
             return;
         }
@@ -2161,8 +2205,8 @@ lc_position(MyIDType id, int stage, double out[3])
     if(id < LC_NA + LC_NB) {
         if(stage >= 1) {
             const int64_t k = id - LC_NA;
-            out[0] = 50. + 90. * (k % 10);
-            out[1] = 50. + 90. * (k / 10);
+            out[0] = 50. + 40. * (k % 10);
+            out[1] = 50. + 40. * (k / 10);
             out[2] = 850.;
             return;
         }
@@ -2528,6 +2572,10 @@ test_subhalo_many_keys(void ** state)
     common_physics_setup();
     int NTask = get_ntask(), ThisTask = get_thistask();
     struct SubhaloParams sp = default_subhalo_params();
+    /* Phase 2a: clumps of 6..10 particles survive the unbinding with these thresholds */
+    sp.SubhaloMinNumPart = 5;
+    sp.SubhaloMinNumTracerPart = 5;
+    sp.SubhaloNumTracerHostFinding = 5;
     subhalo_set_testpar(sp);
     Cosmology CP = test_cosmology();
     int64_t firsts[T10_NCLUMP + 1];
@@ -2593,6 +2641,613 @@ test_subhalo_many_keys(void ** state)
     teardown_pman();
 }
 
+/* ------------------------------------------------------------------ tests 11-13: Phase 2a (plan section 5, tests 5-7) */
+
+/* Two Hernquist clumps in equilibrium (sampled from the isotropic distribution function as in
+ * tests/test_subhalo_unbind.c, with this file's deterministic per-ID random numbers instead of
+ * gsl), truncated at 4 scale radii, plus a field lattice. A: 2000 particles, M = 1e12 Msun/h,
+ * scale 5 kpc/h (physical); B: 600, M = 2e11, scale 1.5 kpc/h; every seventh clump particle is gas (a non-tracer); the first P2_HOT
+ * particles of each clump sit in its core at three times the escape speed (an unbound tail).
+ * Positions are physical offsets divided by the call's scale factor (comoving), velocities
+ * Vel = a v_pec. */
+#define P2_NA 2000
+#define P2_NB 600
+#define P2_NF 4096
+#define P2_NTOT (P2_NA + P2_NB + P2_NF)
+#define P2_HOT 30
+#define P2_MA 100.
+#define P2_SA 5.
+#define P2_MB 20.
+#define P2_SB 1.5
+static const double P2_cA[3] = {375., 375., 375.};
+static const double P2_cB[3] = {750., 750., 750.};
+
+struct p2rng {
+    uint64_t s;
+};
+
+static double
+p2_uniform(struct p2rng * r)
+{
+    r->s = splitmix64(r->s);
+    return (r->s >> 11) * (1.0 / 9007199254740992.0);
+}
+
+/* Hernquist DF in units G = M = a = 1 up to a constant, q2 = -E in (0, 1). */
+static double
+p2_hq_df(double q2)
+{
+    if(q2 <= 0)
+        return 0;
+    if(q2 >= 1)
+        q2 = 1 - 1e-15;
+    const double q = sqrt(q2), omq = 1 - q2;
+    const double br = 3 * asin(q) + q * sqrt(omq) * (1 - 2 * q2) * (8 * q2 * q2 - 8 * q2 - 3);
+    return br > 0 ? pow(omq, -2.5) * br : 0;
+}
+
+static double
+p2_hq_speed(double r, struct p2rng * rng)
+{
+    const double psi = 1. / (1. + r);
+    const double vesc = sqrt(2 * psi);
+    double gmax = 0;
+    int k;
+    for(k = 0; k <= 600; k++) {
+        const double v2 = vesc * vesc * pow(10., -12. + 12. * k / 600.);
+        const double g = v2 * p2_hq_df(psi - 0.5 * v2);
+        if(g > gmax) gmax = g;
+    }
+    gmax *= 1.5;
+    for(;;) {
+        const double v = vesc * p2_uniform(rng);
+        if(p2_uniform(rng) * gmax < v * v * p2_hq_df(psi - 0.5 * v * v))
+            return v;
+    }
+}
+
+static void
+p2_direction(struct p2rng * rng, double u[3])
+{
+    const double ct = 2 * p2_uniform(rng) - 1, st = sqrt(1 - ct * ct);
+    const double ph = 2 * M_PI * p2_uniform(rng);
+    u[0] = st * cos(ph);
+    u[1] = st * sin(ph);
+    u[2] = ct;
+}
+
+/* 0: clump A, 1: clump B, -1: field */
+static int
+p2_clump(MyIDType id)
+{
+    if(id < P2_NA) return 0;
+    if(id < P2_NA + P2_NB) return 1;
+    return -1;
+}
+
+static int
+p2_type(MyIDType id)
+{
+    return (p2_clump(id) >= 0 && id % 7 == 3) ? 0 : 1;
+}
+
+/* Physical offset, peculiar velocity and mass of a clump particle relative to its clump. */
+static void
+p2_clump_particle(MyIDType id, double G, double x[3], double v[3], double * mass)
+{
+    const int c = p2_clump(id);
+    const double M = c == 0 ? P2_MA : P2_MB, a = c == 0 ? P2_SA : P2_SB;
+    const int64_t N = c == 0 ? P2_NA : P2_NB;
+    const int64_t k = c == 0 ? (int64_t) id : (int64_t) id - P2_NA;
+    const double rmax = 4 * a, Xmax = pow(rmax / (rmax + a), 2);
+    struct p2rng rng = {splitmix64(id * 0x100000001B3ULL + 77)};
+    double ux[3], uv[3];
+    int d;
+    p2_direction(&rng, ux);
+    p2_direction(&rng, uv);
+    *mass = M * Xmax / N;
+    if(k < P2_HOT) {
+        /* hot core particle: three times the central escape speed */
+        const double r = 0.5 * a * p2_uniform(&rng);
+        for(d = 0; d < 3; d++) {
+            x[d] = r * ux[d];
+            v[d] = 3 * sqrt(2 * G * M / a) * uv[d];
+        }
+        return;
+    }
+    /* the cusp is cut at a few hundredths of the scale radius: the host's FOF tree (two
+     * threads) runs out of nodes on near-coincident particles */
+    const double u = 0.003 + 0.997 * p2_uniform(&rng);
+    const double s = sqrt(Xmax * u);
+    const double r = s / (1 - s);
+    const double sp = p2_hq_speed(r, &rng) * sqrt(G * M / a);
+    for(d = 0; d < 3; d++) {
+        x[d] = a * r * ux[d];
+        v[d] = sp * uv[d];
+    }
+}
+
+static double
+p2_wrap(double x)
+{
+    while(x >= BOXSIZE) x -= BOXSIZE;
+    while(x < 0) x += BOXSIZE;
+    return x;
+}
+
+/* Place every local particle for a call at scale factor atime: clump c centred at cen[c]
+ * (comoving) with bulk peculiar velocity bulk[c]; the field on a 62.5 kpc/h lattice at rest, off the domain cell boundaries (enough
+ * field particles on every rank for the host's threaded FOF tree). */
+static void
+p2_place(double atime, double G, const double cen[2][3], const double bulk[2][3])
+{
+    int64_t i;
+    for(i = 0; i < PartManager->NumPart; i++) {
+        struct particle_data * p = &P[i];
+        const int c = p2_clump(p->ID);
+        int d;
+        if(c < 0) {
+            const int64_t k = (int64_t) p->ID - P2_NA - P2_NB;
+            p->Pos[0] = 31.25 + 62.5 * (k % 16);
+            p->Pos[1] = 31.25 + 62.5 * ((k / 16) % 16);
+            p->Pos[2] = 31.25 + 62.5 * (k / 256);
+            p->Vel[0] = p->Vel[1] = p->Vel[2] = 0;
+            continue;
+        }
+        double x[3], v[3], m;
+        p2_clump_particle(p->ID, G, x, v, &m);
+        p->Mass = m;
+        for(d = 0; d < 3; d++) {
+            p->Pos[d] = p2_wrap(cen[c][d] + x[d] / atime);
+            p->Vel[d] = atime * (bulk[c][d] + v[d]);
+        }
+    }
+}
+
+static struct gravshort_tree_params P2_SavedTree;
+
+/* Physics, parameters (defaults; softening 0.3 kpc/h) and the particles with their gas slots. */
+static void
+p2_setup(Cosmology * CP)
+{
+    common_physics_setup();
+    petaio_init();
+    struct SubhaloParams sp = default_subhalo_params();
+    subhalo_set_testpar(sp);
+    *CP = test_cosmology();
+    P2_SavedTree = get_gravshort_treepar();
+    struct gravshort_tree_params tp = P2_SavedTree;
+    tp.FractionalGravitySoftening = 0.006;
+    set_gravshort_treepar(tp);
+    gravshort_set_softenings(50.);
+    int NTask = get_ntask(), ThisTask = get_thistask();
+    setup_pman(4 * P2_NTOT, BOXSIZE);
+    /* room for every gas particle on one rank (a whole key may land anywhere) */
+    int64_t atleast[6] = {P2_NTOT, 0, 0, 0, 128, 128};
+    slots_reserve(1, atleast, SlotsManager);
+    MyIDType id;
+    int64_t ngas = 0;
+    for(id = 0; id < P2_NTOT; id++) {
+        if((int)(id % NTask) != ThisTask)
+            continue;
+        double pos[3] = {0, 0, 0};
+        add_dm_particle(id, pos);
+        struct particle_data * p = &P[PartManager->NumPart - 1];
+        p->Type = p2_type(id);
+        if(p->Type == 0)
+            p->PI = ngas++;
+    }
+    SlotsManager->info[0].size = ngas;
+    slots_setup_id(PartManager, SlotsManager);
+    subhalo_init(-1, -1, "/nonexistent", MPI_COMM_WORLD);
+}
+
+static void
+p2_teardown(void)
+{
+    set_gravshort_treepar(P2_SavedTree);
+    gravshort_set_softenings(50.);
+    teardown_pman();
+}
+
+/* The D10 invariants on the gathered particles against the records: own-tag BindRank dense with
+ * the exclusive bound rows first and the SubhaloMinNumTracerPart lowest ranks tracers (type 1);
+ * BoundTrackId the tag, an ancestor of it or -1, bound owners resolved; Nbound, NboundTracer,
+ * NboundExclusive, NtailType from the particles. Returns the number of violations. */
+static int
+p2_check_tags(const struct tagrec * r, int64_t n, const struct SubTrack * rec, int64_t nt, const char * what)
+{
+    int bad = 0;
+    int64_t t, i;
+    int64_t * order = malloc((n + 1) * sizeof(int64_t));
+    for(t = 0; t < nt; t++) {
+        int64_t nown = 0, nb = 0, nbt = 0, nex = 0, ntl = 0;
+        for(i = 0; i < n; i++) {
+            if(r[i].BoundTrackId == t) {
+                nb++;
+                if(r[i].Type == 1) nbt++;
+            }
+            if(r[i].TrackId == t) {
+                if(r[i].BindRank < 0 || r[i].BindRank >= n) {
+                    LOCAL_CHECK(bad, 0, "%s: track %ld particle %lu BindRank %d\n", what, t, (unsigned long) r[i].ID, r[i].BindRank);
+                    continue;
+                }
+                order[nown++] = i;
+                if(r[i].BoundTrackId == t) nex++;
+                else ntl++;
+            }
+        }
+        if(rec[t].Nbound == 0) {
+            LOCAL_CHECK(bad, nown == 0 && nb == 0, "%s: orphan %ld still has %ld own-tag and %ld bound rows\n", what, t, nown, nb);
+            continue;
+        }
+        LOCAL_CHECK(bad, nb == rec[t].Nbound && nbt == rec[t].NboundTracer, "%s: track %ld: %ld bound rows (%ld tracers), Nbound %d NboundTracer %d\n",
+                    what, t, nb, nbt, rec[t].Nbound, rec[t].NboundTracer);
+        LOCAL_CHECK(bad, nex == rec[t].NboundExclusive, "%s: track %ld: %ld exclusive rows, NboundExclusive %d\n", what, t, nex, rec[t].NboundExclusive);
+        int64_t tl = 0;
+        int k;
+        for(k = 0; k < 6; k++)
+            tl += rec[t].NtailType[k];
+        LOCAL_CHECK(bad, ntl == tl, "%s: track %ld: %ld tail rows, NtailType sum %ld\n", what, t, ntl, tl);
+        /* dense ranks: place by BindRank */
+        int64_t * byrank = malloc((nown + 1) * sizeof(int64_t));
+        for(i = 0; i < nown; i++)
+            byrank[i] = -1;
+        for(i = 0; i < nown; i++) {
+            const int32_t b = r[order[i]].BindRank;
+            if(b < nown && byrank[b] < 0) byrank[b] = order[i];
+            else LOCAL_CHECK(bad, 0, "%s: track %ld: BindRank %d duplicated or beyond %ld\n", what, t, b, nown);
+        }
+        for(i = 0; i < nown; i++) {
+            if(byrank[i] < 0) continue;
+            const struct tagrec * q = &r[byrank[i]];
+            LOCAL_CHECK(bad, (q->BoundTrackId == t) == (i < nex), "%s: track %ld: BindRank %ld bound %d, exclusive prefix %ld\n",
+                        what, t, i, q->BoundTrackId == t, nex);
+            if(i < 10)
+                LOCAL_CHECK(bad, q->Type == 1, "%s: track %ld: BindRank %ld is a type %d particle, not a tracer\n", what, t, i, q->Type);
+        }
+        LOCAL_CHECK(bad, byrank[0] >= 0 && r[byrank[0]].ID == rec[t].MostBoundID, "%s: track %ld: MostBoundID is not BindRank 0\n", what, t);
+        free(byrank);
+    }
+    for(i = 0; i < n; i++) {
+        const int64_t T = r[i].TrackId, B = r[i].BoundTrackId;
+        if(T < 0) {
+            LOCAL_CHECK(bad, B == -1, "%s: untagged particle %lu bound to %ld\n", what, (unsigned long) r[i].ID, B);
+            continue;
+        }
+        if(B < 0 || B == T)
+            continue;
+        LOCAL_CHECK(bad, B < nt && rec[B].Nbound > 0, "%s: particle %lu bound to unresolved %ld\n", what, (unsigned long) r[i].ID, B);
+        int64_t u = T;
+        int steps = 0;
+        while(u >= 0 && u != B && steps++ <= nt)
+            u = rec[u].NestedParentTrackId;
+        LOCAL_CHECK(bad, u == B, "%s: particle %lu tagged %ld bound to %ld, not an ancestor\n", what, (unsigned long) r[i].ID, T, B);
+    }
+    free(order);
+    return bad;
+}
+
+/* A checksum of the tags and the main record columns, logged so that runs with different thread
+ * counts can be compared. */
+static void
+p2_log_checksum(const char * what, const struct tagrec * r, int64_t n, const struct SubTrack * rec, int64_t nt)
+{
+    uint64_t h = 0;
+    int64_t i;
+    for(i = 0; i < n; i++)
+        h = splitmix64(h ^ (uint64_t) r[i].ID ^ ((uint64_t) r[i].TrackId << 20) ^ ((uint64_t) r[i].BindRank << 40) ^ ((uint64_t) r[i].BoundTrackId << 8));
+    for(i = 0; i < nt; i++) {
+        uint64_t m;
+        double x = rec[i].Mbound + 1e-3 * rec[i].Vmax + rec[i].CorePos[0];
+        memcpy(&m, &x, sizeof(m));
+        h = splitmix64(h ^ m ^ (uint64_t) rec[i].Nbound ^ ((uint64_t) rec[i].Rank << 32));
+    }
+    message(0, "Phase 2a test checksum %s: %016lx\n", what, (unsigned long) h);
+}
+
+/* A record of a resolved central hosted by its own group, with HBT properties set. */
+static void
+p2_check_central(const struct SubTrack * rec, int64_t t, int64_t grnr, int64_t glen, const char * what)
+{
+    CHECK(rec->TrackId == t && rec->HostGroup == grnr && rec->Rank == 0 && rec->Depth == 0 && rec->NestedParentTrackId == -1
+          && rec->CentralTrackId == t && rec->SnapDeath == -1 && rec->DescendantTrackId == t,
+          "%s: track %ld: HostGroup %ld (group %ld) Rank %d Depth %d pid %ld upid %ld SnapDeath %d\n", what, t, rec->HostGroup, grnr,
+          rec->Rank, rec->Depth, rec->NestedParentTrackId, rec->CentralTrackId, rec->SnapDeath);
+    CHECK(rec->Nbound > 0.8 * glen && rec->Nbound <= glen, "%s: track %ld: Nbound %d for a group of %ld\n", what, t, rec->Nbound, glen);
+    CHECK(rec->Vmax > 0 && rec->Rmax > 0 && rec->CoreSigmaX > 0 && rec->CoreSigmaV > 0 && rec->Ekin > 0 && rec->Epot < 0
+          && rec->KinToPot > 0.2 && rec->KinToPot < 1.5,
+          "%s: track %ld: Vmax %g Rmax %g SigmaX %g SigmaV %g Ekin %g Epot %g KinToPot %g\n", what, t, rec->Vmax, rec->Rmax,
+          rec->CoreSigmaX, rec->CoreSigmaV, rec->Ekin, rec->Epot, rec->KinToPot);
+}
+
+static int64_t
+p2_group_of(const struct tagrec * r, int64_t n, int clump, int64_t * len)
+{
+    /* the group holding the clump's most common GrNr; its length */
+    int64_t i, g = -1;
+    for(i = 0; i < n && g < 0; i++)
+        if(p2_clump(r[i].ID) == clump && r[i].GrNr >= 0 && (int64_t) r[i].ID == (clump == 0 ? 0 : P2_NA))
+            g = r[i].GrNr;
+    *len = 0;
+    for(i = 0; i < n; i++)
+        if(r[i].GrNr == g)
+            (*len)++;
+    return g;
+}
+
+/* Test 5 of the plan: two persistent tracks over three calls. */
+static void
+test_subhalo_twohalo(void ** state)
+{
+    Cosmology CP;
+    p2_setup(&CP);
+    const double cen[2][3] = {{P2_cA[0], P2_cA[1], P2_cA[2]}, {P2_cB[0], P2_cB[1], P2_cB[2]}};
+    const double bulk[2][3] = {{0, 0, 0}, {0, 0, 0}};
+    int call;
+    for(call = 0; call < 3; call++) {
+        p2_place(0.5 + 0.05 * call, CP.GravInternal, cen, bulk);
+        int64_t ng, n;
+        int ret = run_finder_call(call, &CP, &ng);
+        CHECK(ret == 1 && ng == 2, "two haloes, call %d: ret %d, %ld groups\n", call, ret, ng);
+        struct tagrec * r = gather_tags(&n);
+        CHECK(subhalo_get_table()->NTotal == 2, "two haloes, call %d: NTotal %ld\n", call, subhalo_get_table()->NTotal);
+        struct SubTrack * rec = fetch_all_tracks(2);
+        int64_t lenA, lenB;
+        const int64_t gA = p2_group_of(r, n, 0, &lenA), gB = p2_group_of(r, n, 1, &lenB);
+        p2_check_central(&rec[0], 0, gA, lenA, "two haloes");
+        p2_check_central(&rec[1], 1, gB, lenB, "two haloes");
+        /* the hot core particles are each track's unbound tail */
+        int64_t i, ntail[2] = {0, 0};
+        int bad = 0;
+        for(i = 0; i < n; i++) {
+            const int c = p2_clump(r[i].ID);
+            if(c < 0) {
+                LOCAL_CHECK(bad, r[i].TrackId == -1, "two haloes: field particle %lu tagged %ld\n", (unsigned long) r[i].ID, r[i].TrackId);
+                continue;
+            }
+            const int64_t k = c == 0 ? (int64_t) r[i].ID : (int64_t) r[i].ID - P2_NA;
+            if(k < P2_HOT)
+                LOCAL_CHECK(bad, r[i].TrackId == c && r[i].BoundTrackId == -1, "two haloes: hot particle %lu: TrackId %ld BoundTrackId %ld\n",
+                            (unsigned long) r[i].ID, r[i].TrackId, r[i].BoundTrackId);
+            if(r[i].TrackId == c && r[i].BoundTrackId == -1)
+                ntail[c]++;
+        }
+        CHECK(bad == 0, "two haloes, call %d: particle tags\n", call);
+        CHECK(ntail[0] >= P2_HOT && ntail[1] >= P2_HOT, "two haloes, call %d: tails %ld %ld\n", call, ntail[0], ntail[1]);
+        CHECK(p2_check_tags(r, n, rec, 2, "two haloes") == 0, "two haloes, call %d: tag invariants\n", call);
+        char what[64];
+        snprintf(what, sizeof(what), "two haloes call %d", call);
+        p2_log_checksum(what, r, n, rec, 2);
+        free(rec);
+        free(r);
+    }
+    p2_teardown();
+}
+
+/* The CoM of the particles bound to track t (mass-weighted, nearest images about the first). */
+static void
+p2_bound_com(const struct tagrec * r, const double * mass, int64_t n, int64_t t, double com[3], int64_t * cnt)
+{
+    int64_t i;
+    int d;
+    double ref[3] = {0, 0, 0}, s[3] = {0, 0, 0}, M = 0;
+    *cnt = 0;
+    for(i = 0; i < n; i++) {
+        if(r[i].BoundTrackId != t) continue;
+        if(*cnt == 0)
+            for(d = 0; d < 3; d++) ref[d] = r[i].Pos[d];
+        for(d = 0; d < 3; d++)
+            s[d] += mass[i] * NEAREST(r[i].Pos[d] - ref[d], BOXSIZE);
+        M += mass[i];
+        (*cnt)++;
+    }
+    for(d = 0; d < 3; d++)
+        com[d] = p2_wrap(ref[d] + (M > 0 ? s[d] / M : 0));
+}
+
+/* Test 6 of the plan: B falls into A (one FOF group): a satellite with a stripped tail, part of
+ * it bound by the central under the satellite's tag; the frames of the next call from the
+ * BoundTrackId sums; the restart join keeps BoundTrackId. */
+static void
+test_subhalo_overlap(void ** state)
+{
+    Cosmology CP;
+    p2_setup(&CP);
+    const char * dir = getenv("SUBHALO_TEST_DIR") ? getenv("SUBHALO_TEST_DIR") : "test_subhalo_p2";
+    rm_tree(dir);
+    if(get_thistask() == 0 && mkdir(dir, 0755) != 0 && errno != EEXIST)
+        endrun(1, "test: cannot create %s\n", dir);
+    MPI_Barrier(MPI_COMM_WORLD);
+    double cen[2][3] = {{P2_cA[0], P2_cA[1], P2_cA[2]}, {P2_cB[0], P2_cB[1], P2_cB[2]}};
+    double bulk[2][3] = {{0, 0, 0}, {0, 0, 0}};
+    p2_place(0.5, CP.GravInternal, cen, bulk);
+    int64_t ng, nempty;
+    int ret = lifecycle_call(0, 0.5, &CP, 0, dir, &ng, &nempty);
+    CHECK(ret == 1 && ng == 2, "overlap: first call\n");
+    /* B at 5 kpc/h (physical) from A's centre on a circular orbit: its tidal radius (about 3
+     * kpc/h) is inside its truncation radius (6 kpc/h), so its outskirts are stripped */
+    const double atime = 0.55, dphys = 5.;
+    const double MinA = P2_MA * pow(dphys / (dphys + P2_SA), 2);
+    const double vc = sqrt(CP.GravInternal * MinA / dphys);
+    cen[1][0] = P2_cA[0] + dphys / atime;
+    cen[1][1] = P2_cA[1];
+    cen[1][2] = P2_cA[2];
+    bulk[1][1] = vc;
+    p2_place(atime, CP.GravInternal, cen, bulk);
+    /* 60 of B's particles have been pulled out towards A's centre and move against B: unbound
+     * to B, bound to A (what the satellite passes up and the central binds) */
+    {
+        int64_t i;
+        for(i = 0; i < PartManager->NumPart; i++) {
+            const int64_t k = (int64_t) P[i].ID - P2_NA;
+            if(p2_clump(P[i].ID) != 1 || k < P2_HOT || k >= P2_HOT + 60)
+                continue;
+            double x[3];
+            const double c0[3] = {0, 0, 0};
+            rand_in_ball(P[i].ID, 41, 1.0, c0, x);
+            int d;
+            for(d = 0; d < 3; d++) {
+                P[i].Pos[d] = p2_wrap(P2_cA[d] + (x[d] + (d == 0 ? 1. : 0)) / atime);
+                P[i].Vel[d] = atime * (d == 1 ? -vc : 0);
+            }
+        }
+    }
+    ret = lifecycle_call(1, atime, &CP, 0, dir, &ng, &nempty);
+    CHECK(ret == 1 && ng == 1, "overlap: %ld groups after the infall, expected 1\n", ng);
+    int64_t n, i;
+    struct tagrec * r = gather_tags(&n);
+    struct SubTrack * rec = fetch_all_tracks(2);
+    int64_t lenA;
+    const int64_t g = p2_group_of(r, n, 0, &lenA);
+    CHECK(rec[0].Rank == 0 && rec[0].Depth == 0 && rec[0].HostGroup == g && rec[0].CentralTrackId == 0,
+          "overlap: track 0 Rank %d Depth %d HostGroup %ld\n", rec[0].Rank, rec[0].Depth, rec[0].HostGroup);
+    CHECK(rec[1].Nbound > 0 && rec[1].Rank == 1 && rec[1].Depth == 1 && rec[1].NestedParentTrackId == 0 && rec[1].CentralTrackId == 0
+          && rec[1].HostGroup == g && rec[1].SnapDeath == -1,
+          "overlap: track 1 Nbound %d Rank %d Depth %d pid %ld upid %ld HostGroup %ld (group %ld)\n", rec[1].Nbound, rec[1].Rank,
+          rec[1].Depth, rec[1].NestedParentTrackId, rec[1].CentralTrackId, rec[1].HostGroup, g);
+    int64_t ntail1 = 0, nover = 0;
+    for(i = 0; i < n; i++) {
+        if(r[i].TrackId == 1 && r[i].BoundTrackId != 1) ntail1++;
+        if(r[i].TrackId == 1 && r[i].BoundTrackId == 0) nover++;
+    }
+    message(0, "Overlap: satellite Nbound %d (exclusive %d), tail %ld of which %ld bound by the central; central Nbound %d exclusive %d\n",
+            rec[1].Nbound, rec[1].NboundExclusive, ntail1, nover, rec[0].Nbound, rec[0].NboundExclusive);
+    CHECK(ntail1 > P2_HOT, "overlap: the satellite has no stripped tail (%ld)\n", ntail1);
+    CHECK(nover >= 10, "overlap: only %ld satellite tail particles are bound by the central\n", nover);
+    CHECK(rec[0].Nbound > rec[0].NboundExclusive, "overlap: central Nbound %d not above NboundExclusive %d\n", rec[0].Nbound, rec[0].NboundExclusive);
+    CHECK(p2_check_tags(r, n, rec, 2, "overlap") == 0, "overlap: tag invariants\n");
+    p2_log_checksum("overlap", r, n, rec, 2);
+
+    /* the next call's frame of the central from the BoundTrackId sums, against the CoM of its
+     * full bound list computed here (the particles have not moved) */
+    {
+        double * mass = malloc((n + 1) * sizeof(double));
+        /* particle masses: the clump masses are those of p2_clump_particle */
+        for(i = 0; i < n; i++) {
+            double x[3], v[3], m = 1;
+            if(p2_clump(r[i].ID) >= 0)
+                p2_clump_particle(r[i].ID, CP.GravInternal, x, v, &m);
+            mass[i] = m;
+        }
+        double com[3];
+        int64_t cnt;
+        p2_bound_com(r, mass, n, 0, com, &cnt);
+        struct SubTrackTable * tab = subhalo_get_table();
+        subhalo_previous_frames(tab, MPI_COMM_WORLD);
+        struct SubTrack * fr = fetch_all_tracks(2);
+        int d;
+        for(d = 0; d < 3; d++)
+            CHECK(fabs(NEAREST(fr[0].RefPos[d] - com[d], BOXSIZE)) < 1e-6 && fabs(NEAREST(fr[0].RefPos[d] - PartManager->CurrentParticleOffset[d] - rec[0].CoMPos[d], BOXSIZE)) < 1e-3,
+                  "overlap: frame[%d] %.9g, bound CoM %.9g, CoMPos %.9g\n", d, fr[0].RefPos[d], com[d], rec[0].CoMPos[d]);
+        CHECK(fr[0].NPrev == cnt && cnt == rec[0].Nbound, "overlap: NPrev %ld, bound rows %ld, Nbound %d\n", fr[0].NPrev, cnt, rec[0].Nbound);
+        free(fr);
+        free(mass);
+    }
+    free(rec);
+    free(r);
+    /* restart join on the PIG written by the call */
+    check_restart_roundtrip(dir, 1, "overlap PIG_001");
+    p2_teardown();
+    rm_tree(dir);
+}
+
+/* Test 7 of the plan: B placed on A's core with its velocity sinks; its tracer is followed at
+ * the next call; isolated with 30 field particles in a new group it is resurrected. */
+static void
+test_subhalo_sink_orphan(void ** state)
+{
+    Cosmology CP;
+    p2_setup(&CP);
+    double cen[2][3] = {{P2_cA[0], P2_cA[1], P2_cA[2]}, {P2_cB[0], P2_cB[1], P2_cB[2]}};
+    double bulk[2][3] = {{0, 0, 0}, {0, 0, 0}};
+    p2_place(0.5, CP.GravInternal, cen, bulk);
+    int64_t ng, n, i;
+    int ret = run_finder_call(0, &CP, &ng);
+    CHECK(ret == 1 && ng == 2, "sink: first call\n");
+    /* call 1: B on A's centre at rest */
+    cen[1][0] = P2_cA[0]; cen[1][1] = P2_cA[1]; cen[1][2] = P2_cA[2];
+    p2_place(0.55, CP.GravInternal, cen, bulk);
+    ret = run_finder_call(1, &CP, &ng);
+    CHECK(ret == 1 && ng == 1, "sink: one group expected (%ld)\n", ng);
+    struct tagrec * r = gather_tags(&n);
+    struct SubTrack * rec = fetch_all_tracks(2);
+    CHECK(subhalo_get_table()->NTotal == 2, "sink: NTotal %ld\n", subhalo_get_table()->NTotal);
+    CHECK(rec[1].Nbound == 0 && rec[1].SinkTrackId == 0 && rec[1].SnapSink == 1 && rec[1].SnapDeath == 1 && rec[1].DescendantTrackId == 0,
+          "sink: track 1 Nbound %d SinkTrackId %ld SnapSink %d SnapDeath %d DescendantTrackId %ld\n", rec[1].Nbound, rec[1].SinkTrackId,
+          rec[1].SnapSink, rec[1].SnapDeath, rec[1].DescendantTrackId);
+    /* B has a fifth of A's mass: not a major merger at SubhaloMajorMergerRatio 0.3 */
+    CHECK(rec[0].Nbound > P2_NA && rec[0].SnapLastMajorMerger == -1, "sink: central Nbound %d SnapLastMajorMerger %d\n", rec[0].Nbound, rec[0].SnapLastMajorMerger);
+    CHECK(p2_check_tags(r, n, rec, 2, "sink") == 0, "sink: tag invariants\n");
+    const MyIDType tracer = rec[1].MostBoundID;
+    int64_t ti = -1;
+    for(i = 0; i < n; i++)
+        if(r[i].ID == tracer) ti = i;
+    CHECK(ti >= 0 && r[ti].Type == 1, "sink: the orphan's tracer %lu is not a live DM particle\n", (unsigned long) tracer);
+    int d;
+    for(d = 0; d < 3; d++)
+        CHECK(fabs(rec[1].TracerPos[d] - p2_wrap(r[ti].Pos[d] - PartManager->CurrentParticleOffset[d])) < 1e-3,
+              "sink: TracerPos[%d] %g, tracer at %g\n", d, rec[1].TracerPos[d], r[ti].Pos[d]);
+    p2_log_checksum("sink", r, n, rec, 2);
+    free(rec);
+    free(r);
+
+    /* call 2: everything shifted by 5 kpc/h; the orphan follows its tracer */
+    for(i = 0; i < PartManager->NumPart; i++)
+        P[i].Pos[0] = p2_wrap(P[i].Pos[0] + 5.);
+    ret = run_finder_call(2, &CP, &ng);
+    CHECK(ret == 1 && ng == 1, "orphan: call 2\n");
+    r = gather_tags(&n);
+    rec = fetch_all_tracks(2);
+    int64_t lenA;
+    const int64_t g = p2_group_of(r, n, 0, &lenA);
+    for(i = 0; i < n; i++)
+        if(r[i].ID == tracer) ti = i;
+    CHECK(rec[1].Nbound == 0 && rec[1].SnapTracerLost == -1 && rec[1].HostGroup == g, "orphan: Nbound %d SnapTracerLost %d HostGroup %ld (group %ld)\n",
+          rec[1].Nbound, rec[1].SnapTracerLost, rec[1].HostGroup, g);
+    for(d = 0; d < 3; d++)
+        CHECK(fabs(rec[1].TracerPos[d] - p2_wrap(r[ti].Pos[d] - PartManager->CurrentParticleOffset[d])) < 1e-3,
+              "orphan: TracerPos[%d] %g, tracer now at %g\n", d, rec[1].TracerPos[d], r[ti].Pos[d]);
+    free(rec);
+    free(r);
+
+    /* call 3: the tracer and 30 field particles in a cold ball far away: a new group whose only
+     * member is the orphan, which is resurrected as its central (no newborn) */
+    const double ball[3] = {500., 100., 900.};
+    for(i = 0; i < PartManager->NumPart; i++) {
+        const int64_t k = (int64_t) P[i].ID - P2_NA - P2_NB;
+        const int isfield = p2_clump(P[i].ID) < 0 && k < 30;
+        if(P[i].ID != tracer && !isfield)
+            continue;
+        double x[3];
+        const double c0[3] = {0, 0, 0};
+        rand_in_ball(P[i].ID, 31, 1.0, c0, x);
+        for(d = 0; d < 3; d++) {
+            P[i].Pos[d] = ball[d] + x[d];
+            P[i].Vel[d] = 0;
+        }
+        P[i].Mass = 0.05;
+    }
+    ret = run_finder_call(3, &CP, &ng);
+    CHECK(ret == 1 && ng == 2, "resurrection: call 3, %ld groups\n", ng);
+    r = gather_tags(&n);
+    CHECK(subhalo_get_table()->NTotal == 2, "resurrection: NTotal %ld (a newborn was created)\n", subhalo_get_table()->NTotal);
+    rec = fetch_all_tracks(2);
+    for(i = 0; i < n; i++)
+        if(r[i].ID == tracer) ti = i;
+    CHECK(rec[1].Nbound >= 20 && rec[1].Nbound <= 31 && rec[1].SnapDeath == -1 && rec[1].SinkTrackId == -1 && rec[1].Rank == 0
+          && rec[1].HostGroup == r[ti].GrNr && rec[1].CentralTrackId == 1 && rec[1].SnapBirth == 0,
+          "resurrection: track 1 Nbound %d SnapDeath %d SinkTrackId %ld Rank %d HostGroup %ld (tracer group %ld)\n", rec[1].Nbound,
+          rec[1].SnapDeath, rec[1].SinkTrackId, rec[1].Rank, rec[1].HostGroup, r[ti].GrNr);
+    CHECK(r[ti].TrackId == 1 && r[ti].BoundTrackId == 1, "resurrection: tracer tagged %ld bound %ld\n", r[ti].TrackId, r[ti].BoundTrackId);
+    CHECK(rec[0].Nbound > 0 && rec[0].HostGroup != rec[1].HostGroup, "resurrection: track 0 Nbound %d HostGroup %ld\n", rec[0].Nbound, rec[0].HostGroup);
+    CHECK(p2_check_tags(r, n, rec, 2, "resurrection") == 0, "resurrection: tag invariants\n");
+    p2_log_checksum("resurrection", r, n, rec, 2);
+    free(rec);
+    free(r);
+    p2_teardown();
+}
+
 int main(void) {
     if(getenv("SUBHALO_TEST_SORTKEY_OVERFLOW")) {
         const struct CMUnitTest overflow[] = {
@@ -2611,6 +3266,19 @@ int main(void) {
         cmocka_unit_test(test_subhalo_unhosted_direct),
         cmocka_unit_test(test_subhalo_lifecycle_pig),
         cmocka_unit_test(test_subhalo_many_keys),
+        cmocka_unit_test(test_subhalo_twohalo),
+        cmocka_unit_test(test_subhalo_overlap),
+        cmocka_unit_test(test_subhalo_sink_orphan),
     };
+    /* SUBHALO_TEST_ONLY=<substring> runs only the tests whose name contains it */
+    const char * only = getenv("SUBHALO_TEST_ONLY");
+    if(only && only[0]) {
+        struct CMUnitTest sel[sizeof(tests) / sizeof(tests[0])];
+        size_t i, ns = 0;
+        for(i = 0; i < sizeof(tests) / sizeof(tests[0]); i++)
+            if(strstr(tests[i].name, only))
+                sel[ns++] = tests[i];
+        return _cmocka_run_group_tests_mpi("selected", sel, ns, NULL, NULL);
+    }
     return cmocka_run_group_tests_mpi(tests, NULL, NULL);
 }

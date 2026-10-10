@@ -6,10 +6,11 @@
  * Design: halofinder_design.md (sections referenced below as "design 7.2" etc).
  * Phase 1 plan: halofinder_phase1_plan.md.
  *
- * Phase 1 implements the plumbing and a "FOF-as-subhalo" membership rule (every FOF group is
- * one subhalo, no unbinding). The particle tags, the track table, the whole-key exchange, the
- * catalogue tables, the particle blocks and the restart join are final; the membership rule is
- * replaced in Phase 2a.
+ * Phase 1 implemented the plumbing and a "FOF-as-subhalo" membership rule. Phase 2a
+ * (halofinder_phase2a_plan.md) replaces the rule for every serial key by the HBT-HERONS recipe:
+ * tracer host vote, orphan lookup, previous-bound frames, pseudo-keys for hostless tracks, the
+ * post-order unbinding with sinking, the D10 tag rule, descendants and the HBT properties.
+ * Oversized keys keep the Phase 1 in-place rule until Phase 2b.
  *
  * Conventions:
  *  - every communicating function takes the communicator explicitly;
@@ -55,6 +56,7 @@ struct SubhaloParams {
     int    SubhaloSinkSymmetric;         /* 0 */
     int    SubhaloCoreSize;              /* 20 */
     int    SubhaloReassignGas;           /* 1 */
+    int    SubhaloNumNeighboursForReassignment; /* 10 (HBT NumNeighboursForReassignment) */
     int    SubhaloUnbindWithThermal;     /* 0 */
     int    SubhaloFieldSO;               /* 1 */
     int    SubhaloSOBins;                /* 64 */
@@ -88,6 +90,8 @@ const struct SubhaloParams * subhalo_get_params(void);
 #define SUBHALO_SCHEMA_VERSION 1
 #define SUBHALO_NSO 5                 /* vir, 200b, 200c, 500c, 2500c */
 #define SUBHALO_NOTRACK (-1L)
+/* Upper bound on SubhaloNumTracerHostFinding: the tracer IDs of step 0 live in the record. */
+#define SUBHALO_MAXTRACERS 16
 /* Provisional TrackId of a newborn candidate with global ordinal g (design 7.2 step 3). */
 #define SUBHALO_PROVISIONAL(g) (-(2L + (int64_t)(g)))
 #define SUBHALO_IS_PROVISIONAL(t) ((t) < -1L)
@@ -158,9 +162,20 @@ struct SubTrack {
     float   TracerVel[3];
     int32_t SnapTracerLost;
     /* ---- transient, never written: valid only inside one subhalo_find call ---- */
-    int64_t Host;                    /* host vote result this call (GrNr or -1) */
+    int64_t Host;                    /* host vote result this call (GrNr or -1); an orphan's tracer GrNr */
     int32_t NboundPrev;              /* Nbound at the previous call, frozen for the central choice */
     int32_t Alive;                   /* 1 if this track won a key or is hostless-resolved this call */
+    /* Phase 2a (plan section 1, steps 0-3): previous-bound frame from the BoundTrackId sums, in the
+     * translated comoving frame and internal Vel units (the unbinding kernel's frame) */
+    double RefPos[3], RefVel[3];
+    int64_t NPrev;                   /* live particles with BoundTrackId == TrackId */
+    double MPrev;                    /* and their mass */
+    MyIDType TracerIDs[SUBHALO_MAXTRACERS];  /* step 0: the most-bound own tracers, rank order */
+    int32_t NTracers;
+    int32_t pad2a;
+    int64_t Key;                     /* processing key of the track's field particles: Host for a hosted
+                                      * resolved track, the pseudo-key of a hostless resolved track,
+                                      * -1 for orphans and dead tracks */
 };
 
 /* Initialise every column of a record to "absent" (-1 / 0 as appropriate) with the given TrackId. */

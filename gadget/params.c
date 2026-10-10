@@ -234,6 +234,7 @@ create_gadget_parameter_set()
     param_declare_int(ps, "SubhaloSinkSymmetric", OPTIONAL, 0, "0 = HBT code behaviour, 1 = documented symmetric sinking test.");
     param_declare_int(ps, "SubhaloCoreSize", OPTIONAL, 20, "Core particles for the centre and sinking.");
     param_declare_int(ps, "SubhaloReassignGas", OPTIONAL, 1, "HBT ReassignParticles for non-tracers (serial groups only).");
+    param_declare_int(ps, "SubhaloNumNeighboursForReassignment", OPTIONAL, 10, "Nearest tracers searched by SubhaloReassignGas (HBT NumNeighboursForReassignment).");
     param_declare_int(ps, "SubhaloUnbindWithThermal", OPTIONAL, 0, "Add the gas internal energy to the kinetic term when unbinding.");
     param_declare_int(ps, "SubhaloFieldSO", OPTIONAL, 1, "Run the field spherical overdensity tree walk for centrals.");
     param_declare_int(ps, "SubhaloSOBins", OPTIONAL, 64, "Logarithmic radial bins of the field SO pass 1.");
