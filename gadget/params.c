@@ -11,6 +11,7 @@
 #include <libgadget/density.h>
 #include <libgadget/hydra.h>
 #include <libgadget/fof.h>
+#include <libgadget/subhalo.h>
 #include <libgadget/init.h>
 #include <libgadget/run.h>
 #include <libgadget/timebinmgr.h>
@@ -211,6 +212,37 @@ create_gadget_parameter_set()
     param_declare_double(ps, "MinFoFMassForNewSeed", OPTIONAL, 2, "Minimal halo mass for seeding tracer particles in internal mass units.");
     param_declare_double(ps, "MinMStarForNewSeed", OPTIONAL, 5e-4, "Minimal stellar mass in halo for seeding black holes in internal mass units.");
     param_declare_double(ps, "TimeBetweenSeedingSearch", OPTIONAL, 1.04, "Scale factor fraction increase between Seeding Attempts.");
+
+    /* Runtime subhalo finder (halofinder_design.md section 10). */
+    param_declare_int(ps, "SubhaloFinderOn", OPTIONAL, 0, "Run the subhalo finder at every PART/PIG output. Requires SnapshotWithFOF = 1 and FOFSaveParticles = 1.");
+    param_declare_double(ps, "SubhaloMaxGatherFraction", OPTIONAL, 0.5, "Fraction of the particle slots left free on a rank after its own group particles have left that may be filled by whole groups.");
+    param_declare_double(ps, "SubhaloCollectiveMinPart", OPTIONAL, 0, "Testing knob: candidate keys above this particle count are processed in place even if they would fit a rank. 0 = off.");
+    param_declare_int(ps, "SubhaloMaxUnbindIterations", OPTIONAL, 50, "Iteration cap of the unbinding loop.");
+    param_declare_int(ps, "SubhaloRestartFresh", OPTIONAL, 0, "If 1, start with an empty track table when no complete finder state is found at restart; otherwise abort.");
+    param_declare_int(ps, "SubhaloTracerTypes", OPTIONAL, 2+16, "Bitmask of tracer particle types.");
+    param_declare_int(ps, "SubhaloPotentialTypes", OPTIONAL, 1+2+16+32, "Bitmask of particle types that source the potential and are unbound.");
+    param_declare_int(ps, "SubhaloMinNumPart", OPTIONAL, 20, "Minimum number of bound particles of a resolved subhalo.");
+    param_declare_int(ps, "SubhaloMinNumTracerPart", OPTIONAL, 10, "Minimum number of bound tracer particles of a resolved subhalo.");
+    param_declare_int(ps, "SubhaloNumTracerHostFinding", OPTIONAL, 10, "Tracers used in the host vote and for descendants. Must not exceed SubhaloMinNumTracerPart.");
+    param_declare_double(ps, "SubhaloLookupBatchBytes", OPTIONAL, 64.*1024*1024, "Per-rank bound in bytes on one batch of gathered tracer lookup misses.");
+    param_declare_double(ps, "SubhaloMajorProgenitorMassRatio", OPTIONAL, 0.8, "Central candidacy mass ratio.");
+    param_declare_double(ps, "SubhaloBoundMassPrecision", OPTIONAL, 0.995, "Unbinding convergence criterion.");
+    param_declare_double(ps, "SubhaloSourceRelaxFactor", OPTIONAL, 3, "Source size as a multiple of Nbound.");
+    param_declare_int(ps, "SubhaloPotentialSampleSize", OPTIONAL, 1000, "Potential subsampling size; 0 disables subsampling.");
+    param_declare_double(ps, "SubhaloTreeOpenAngle", OPTIONAL, 0.45, "Geometric opening angle of the serial octree and of the in-place walk.");
+    param_declare_int(ps, "SubhaloMergeTrapped", OPTIONAL, 1, "Enable sinking of trapped satellites.");
+    param_declare_int(ps, "SubhaloSinkSymmetric", OPTIONAL, 0, "0 = HBT code behaviour, 1 = documented symmetric sinking test.");
+    param_declare_int(ps, "SubhaloCoreSize", OPTIONAL, 20, "Core particles for the centre and sinking.");
+    param_declare_int(ps, "SubhaloReassignGas", OPTIONAL, 1, "HBT ReassignParticles for non-tracers (serial groups only).");
+    param_declare_int(ps, "SubhaloUnbindWithThermal", OPTIONAL, 0, "Add the gas internal energy to the kinetic term when unbinding.");
+    param_declare_int(ps, "SubhaloFieldSO", OPTIONAL, 1, "Run the field spherical overdensity tree walk for centrals.");
+    param_declare_int(ps, "SubhaloSOBins", OPTIONAL, 64, "Logarithmic radial bins of the field SO pass 1.");
+    param_declare_double(ps, "SubhaloSOSearchFactor", OPTIONAL, 2, "Field SO search radius in units of the radius implied by the inclusive bound mass.");
+    param_declare_int(ps, "SubhaloSOMaxDoublings", OPTIONAL, 3, "Maximum number of field SO search-radius doublings per central.");
+    param_declare_int(ps, "SubhaloSORefineMinPart", OPTIONAL, 1000, "Centrals at least this large get the field SO pass-2 refinement.");
+    param_declare_double(ps, "SubhaloMajorMergerRatio", OPTIONAL, 0.3, "Mass ratio for SnapLastMajorMerger.");
+    param_declare_int(ps, "SubhaloGeometricParents", OPTIONAL, 0, "Also compute consistent-trees-style geometric pid/upid.");
+    param_declare_int(ps, "SubhaloDebugForceExchangeFailure", OPTIONAL, 0, "Debug: send every serial key to rank 0 and take the exchange failure path.");
 
     /*Black holes*/
     param_declare_int(ps, "BlackHoleOn", REQUIRED, 1, "Master switch to enable black hole formation and feedback. If this is on, type 5 particles are treated as black holes.");
@@ -436,6 +468,7 @@ void read_parameter_file(char *fname, int * ShowBacktrace, double * MaxMemSizePe
     set_uvbg_params(ps);
     set_winds_params(ps);
     set_fof_params(ps);
+    set_subhalo_params(ps);
     set_blackhole_params(ps);
     set_metal_return_params(ps);
     set_stats_params(ps);

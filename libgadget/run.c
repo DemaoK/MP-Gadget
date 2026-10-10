@@ -30,6 +30,7 @@
 #include "slotsmanager.h"
 #include "hci.h"
 #include "fof.h"
+#include "subhalo.h"
 #include "cooling_qso_lightup.h"
 #include "lightcone.h"
 #include "neutrinos_lra.h"
@@ -318,6 +319,10 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
     int NumCurrentTiStep = 0;
     /*Is gas physics enabled?*/
     int GasEnabled = SlotsManager->info[0].enabled;
+
+    /* Subhalo finder: tags to -1, then (finder on) load the state of the latest complete PIG
+     * with number <= RestartSnapNum and join the tags onto the particles. */
+    subhalo_init(RestartSnapNum, RestartSnapNum, All.OutputDir, MPI_COMM_WORLD);
 
     HCIManager HCI_DEFAULT_MANAGER[1] = {0};
     hci_init(HCI_DEFAULT_MANAGER, All.OutputDir, All.TimeLimitCPU, All.AutoSnapshotTime, All.SnapshotWithFOF);
@@ -703,6 +708,11 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
         if(WriteSnapshot)
             write_checkpoint(SnapshotFileCount, WriteFOF, All.MetalReturnOn, atime, &All.CP, All.OutputDir, All.OutputDebugFields);
 
+        /* Subhalo finder (design D6): after the PART write, before the PIG write. It restores
+         * the domain itself before returning. */
+        if(WriteFOF && subhalo_finder_on())
+            subhalo_find(&fof, ddecomp, SnapshotFileCount, atime, &All.CP, MPI_COMM_WORLD);
+
         /* Save FOF tables after checkpoint so that if there is a FOF save bug we have particle tables available to debug it*/
         if(WriteFOF) {
             int domain_needed = fof_save_groups(&fof, All.OutputDir, All.FOFFileBase, SnapshotFileCount, &All.CP, atime, header->MassTable, All.MetalReturnOn, MPI_COMM_WORLD);
@@ -813,6 +823,10 @@ runtests(const int RestartSnapNum, const inttime_t Ti_Current, const struct head
 void
 runfof(const int RestartSnapNum, const inttime_t Ti_Current, const struct header_data * header)
 {
+    /* Offline subhalo finder mode: the state comes from the latest complete PIG before this
+     * snapshot, and the finder recomputes the catalogue of snapshot RestartSnapNum. */
+    subhalo_init(RestartSnapNum, RestartSnapNum - 1, All.OutputDir, MPI_COMM_WORLD);
+
     PetaPM pm = {0};
     gravpm_init_periodic(&pm, PartManager->BoxSize, All.Asmth, All.Nmesh, All.CP.GravInternal);
     DomainDecomp ddecomp[1] = {0};
@@ -847,6 +861,8 @@ runfof(const int RestartSnapNum, const inttime_t Ti_Current, const struct header
             myfree(GradRho);
     }
     FOFGroups fof = fof_fof(ddecomp, 1, MPI_COMM_WORLD);
+    if(subhalo_finder_on())
+        subhalo_find(&fof, ddecomp, RestartSnapNum, header->TimeSnapshot, &All.CP, MPI_COMM_WORLD);
     fof_save_groups(&fof, All.OutputDir, All.FOFFileBase, RestartSnapNum, &All.CP, header->TimeSnapshot, header->MassTable, All.MetalReturnOn, MPI_COMM_WORLD);
     fof_finish(&fof);
 }

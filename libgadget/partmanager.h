@@ -60,6 +60,14 @@ struct particle_data
     /* Transient but hard to move to private arrays because it needs to
      * travel with the particle during exchange*/
     int64_t GrNr;
+    /* Subhalo finder tags (design D1; see subhalo.h). They travel with the particle through
+     * domain_exchange and are inherited by spawned particles (slots_split_particle copies the
+     * struct). TrackId: the track whose source holds the particle, -1 untagged.
+     * BindRank: position in that track's binding order. BoundTrackId: the track that bound
+     * the particle at the last finder call, or -1. */
+    int64_t TrackId;
+    int32_t BindRank;
+    int64_t BoundTrackId;
     MyFloat Potential;		/* Gravitational potential. This is the total potential only on a PM timestep,
                              * after gravtree+gravpm is called. We do not save the potential on short timesteps
                              * for hierarchical gravity as it would only be from active particles.*/

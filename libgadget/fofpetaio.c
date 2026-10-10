@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <string.h>
+#include <limits.h>
 
 #include <bigfile-mpi.h>
 
@@ -17,12 +18,15 @@
 #include "exchange.h"
 #include "fof.h"
 #include "walltime.h"
+#include "subhalo.h"
 
 static void fof_register_io_blocks(int MetalReturnOn, struct IOTable * IOTable);
 static void fof_write_header(BigFile * bf, int64_t TotNgroups, const double atime, const double * MassTable, Cosmology * CP, MPI_Comm Comm);
 static void build_buffer_fof(FOFGroups * fof, BigArray * array, IOTableEntry * ent, struct conversions * conv);
 /* Allocate a new halo structure and move particles there*/
 static int fof_distribute_particles(struct part_manager_type * halo_pman, struct slots_manager_type * halo_sman, int64_t NpigLocal, int64_t * atleast, MPI_Comm Comm);
+/* Write the subhalo tables when the particle blocks are not written (no slices recorded). */
+static void fof_subhalo_tables_only(BigFile * bf, MPI_Comm Comm);
 
 static void fof_radix_Group_GrNr(const void * a, void * radix, void * arg) {
     uint64_t * u = (uint64_t *) radix;
@@ -30,9 +34,40 @@ static void fof_radix_Group_GrNr(const void * a, void * radix, void * arg) {
     u[0] = f->GrNr;
 }
 
+/* subhalo_finder_on(), hoisted out of the per-particle selection: set by fof_save_particles
+ * before petaio_build_selection calls fof_select_func.*/
+static int fof_select_finder = 0;
+
 int fof_select_func(int i, const struct particle_data * Parts)
 {
+    /* With the subhalo finder on, tagged particles outside groups are saved too (design D7). */
+    if(fof_select_finder)
+        return subhalo_save_select(i, Parts);
     return Parts[i].GrNr >= 0 && Parts[i].Swallowed == 0;
+}
+
+/* Particles that take part in the PIG exchange: in a group, or, with the subhalo finder on,
+ * selected by subhalo_save_select (in a group or tagged, and not swallowed). */
+static inline int
+fof_pig_member(int i, const struct particle_data * Parts, const int finder)
+{
+    if(finder)
+        return subhalo_save_select(i, Parts);
+    return Parts[i].GrNr >= 0;
+}
+
+/* The snapshot number at the end of a PIG name OutputDir/FOFFileBase_%03d, -1 if absent. */
+static int
+fof_pig_snapnum(const char * fname)
+{
+    const char * us = strrchr(fname, '_');
+    if(!us || !us[1])
+        return -1;
+    char * end;
+    long num = strtol(us + 1, &end, 10);
+    if(*end != '\0' || num < 0 || num > INT_MAX)
+        return -1;
+    return num;
 }
 
 int fof_save_particles(FOFGroups * fof, char * fname, int SaveParticles, Cosmology * CP, double atime, const double * MassTable, int MetalReturnOn, MPI_Comm Comm) {
@@ -48,6 +83,10 @@ int fof_save_particles(FOFGroups * fof, char * fname, int SaveParticles, Cosmolo
     if(0 != big_file_mpi_create(&bf, fname, Comm)) {
         endrun(0, "Failed to open file at %s\n", fname);
     }
+    const int finder = subhalo_finder_on();
+    fof_select_finder = finder;
+    if(finder)
+        subhalo_set_output_snapshot(fof_pig_snapnum(fname));
     myfree(fname);
     struct conversions conv = {0};
     conv.atime = atime;
@@ -75,9 +114,13 @@ int fof_save_particles(FOFGroups * fof, char * fname, int SaveParticles, Cosmolo
 
     /* Store whether we need a new domain_maintain after we return*/
     int domain_needed = 0;
+    /* Whether the particle blocks were written (the subhalo state needs them)*/
+    int particles_written = 0;
     if(SaveParticles) {
         struct IOTable IOTable = {0};
         register_io_blocks(&IOTable, 1, MetalReturnOn);
+        if(finder)
+            subhalo_register_particle_blocks(&IOTable);
         struct part_manager_type * halo_pman = NULL;
         struct slots_manager_type * halo_sman = NULL;
         int64_t NpigLocal = 0;
@@ -85,7 +128,7 @@ int fof_save_particles(FOFGroups * fof, char * fname, int SaveParticles, Cosmolo
         /* Count how many particles we have: array reductions are an openmp 4.5 feature.*/
         #pragma omp parallel for reduction(+: NpigLocal, atleast[:6])
         for(i = 0; i < PartManager->NumPart; i ++) {
-            if(P[i].GrNr >= 0) {
+            if(fof_pig_member(i, P, finder)) {
                 NpigLocal++;
                 int type = P[i].Type;
                 /* How many of slot type?*/
@@ -114,6 +157,14 @@ int fof_save_particles(FOFGroups * fof, char * fname, int SaveParticles, Cosmolo
             halo_sman = &nslotman;
         }
         if(fof_distribute_particles(halo_pman, halo_sman, NpigLocal, atleast, Comm)) {
+            if(finder) {
+                /* The catalogue exists but the state is incomplete without the particle tags.*/
+                fof_subhalo_tables_only(&bf, Comm);
+                destroy_io_blocks(&IOTable);
+                subhalo_finalize_output(&bf, 0, Comm);
+                big_file_mpi_close(&bf, Comm);
+                return domain_needed;
+            }
             destroy_io_blocks(&IOTable);
             return domain_needed;
         }
@@ -125,6 +176,13 @@ int fof_save_particles(FOFGroups * fof, char * fname, int SaveParticles, Cosmolo
         petaio_build_selection(selection, ptype_offset, ptype_count, halo_pman->Base, halo_pman->NumPart, fof_select_func);
 
         walltime_measure("/FOF/IO/argind");
+
+        if(finder) {
+            /* Slices first: the tables carry them and are written before the particle blocks.*/
+            subhalo_record_slices(halo_pman, selection, ptype_offset, ptype_count, Comm);
+            subhalo_write_tables(&bf, Comm);
+            walltime_measure("/FOF/IO/WriteSubhalo");
+        }
 
         for(i = 0; i < IOTable.used; i ++) {
             /* only process the particle blocks */
@@ -149,7 +207,15 @@ int fof_save_particles(FOFGroups * fof, char * fname, int SaveParticles, Cosmolo
         }
         walltime_measure("/FOF/IO/WriteParticles");
         destroy_io_blocks(&IOTable);
+        particles_written = 1;
     }
+    else if(finder) {
+        fof_subhalo_tables_only(&bf, Comm);
+    }
+
+    /* The completion marker is the last thing written (design D7).*/
+    if(finder)
+        subhalo_finalize_output(&bf, subhalo_last_call_complete() && particles_written, Comm);
 
     big_file_mpi_close(&bf, Comm);
 
@@ -162,10 +228,21 @@ int fof_save_particles(FOFGroups * fof, char * fname, int SaveParticles, Cosmolo
 struct PartIndex {
     uint64_t origin;
     union {
-        int64_t sortKey;
+        /* sortKey[1] is the most significant word (mpsort compares little-endian).
+         * Only sortKey[0] (= GrNr) is used with the subhalo finder off.*/
+        uint64_t sortKey[2];
         int targetTask;
     };
 };
+
+static void
+fof_subhalo_tables_only(BigFile * bf, MPI_Comm Comm)
+{
+    /* No particle blocks: every slice is reset to empty.*/
+    int64_t zero[6] = {0};
+    subhalo_record_slices(PartManager, NULL, zero, zero, Comm);
+    subhalo_write_tables(bf, Comm);
+}
 
 static int fof_sorted_layout(int i, const void * userdata) {
     struct part_manager_type * halo_pman = (struct part_manager_type *) userdata;
@@ -173,10 +250,14 @@ static int fof_sorted_layout(int i, const void * userdata) {
     return halo_pman->Base[i].TopLeaf;
 }
 
+/* arg points to the number of key words: 1 (8 bytes, GrNr) or 2 (16 bytes, subhalo key).*/
 static void fof_radix_sortkey(const void * c1, void * out, void * arg) {
     uint64_t * u = (uint64_t *) out;
     const struct PartIndex * pi = (const struct PartIndex *) c1;
-    *u = pi->sortKey;
+    const int nwords = *(const int *) arg;
+    u[0] = pi->sortKey[0];
+    if(nwords > 1)
+        u[1] = pi->sortKey[1];
 }
 static void fof_radix_origin(const void * c1, void * out, void * arg) {
     uint64_t * u = (uint64_t *) out;
@@ -220,7 +301,7 @@ order_by_type_and_grnr(const void *a, const void *b)
 
 /* Build the target task structure by doing a double parallel sort */
 static void
-fof_find_target_task(struct PartIndex * pi, int64_t pi_size, const uint64_t task_origin_offset, MPI_Comm Comm)
+fof_find_target_task(struct PartIndex * pi, int64_t pi_size, const uint64_t task_origin_offset, int nkeywords, MPI_Comm Comm)
 {
     int64_t i;
     int ThisTask;
@@ -228,7 +309,7 @@ fof_find_target_task(struct PartIndex * pi, int64_t pi_size, const uint64_t task
 
     /* sort pi to decide targetTask */
     mpsort_mpi(pi, pi_size, sizeof(struct PartIndex),
-            fof_radix_sortkey, 8, NULL, Comm);
+            fof_radix_sortkey, 8 * nkeywords, &nkeywords, Comm);
 
     #pragma omp parallel for
     for(i = 0; i < pi_size; i ++) {
@@ -253,7 +334,7 @@ fof_find_target_task(struct PartIndex * pi, int64_t pi_size, const uint64_t task
 }
 
 static void
-fof_copy_target_task(struct part_manager_type * halo_pman, struct PartIndex * pi, const int64_t pi_size, const uint64_t task_origin_offset, MPI_Comm Comm)
+fof_copy_target_task(struct part_manager_type * halo_pman, struct PartIndex * pi, const int64_t pi_size, const uint64_t task_origin_offset, const int finder, MPI_Comm Comm)
 {
     int64_t i = 0;
 #ifdef DEBUG
@@ -267,7 +348,7 @@ fof_copy_target_task(struct part_manager_type * halo_pman, struct PartIndex * pi
     MPI_Comm_rank(Comm, &ThisTask);
     #pragma omp parallel for
     for(i = 0; i < halo_pman->NumPart; i ++) {
-        if(halo_pman->Base[i].GrNr < 0)
+        if(!fof_pig_member(i, halo_pman->Base, finder))
             halo_pman->Base[i].TopLeaf = ThisTask;
     }
     #pragma omp parallel for
@@ -297,13 +378,20 @@ fof_distribute_particles(struct part_manager_type * halo_pman, struct slots_mana
     int ThisTask;
     MPI_Comm_rank(Comm, &ThisTask);
     const uint64_t task_origin_offset = PartManager->MaxPart + 1Lu;
+    /* With the subhalo finder on the exchange sorts by the 16-byte key of design 9.*/
+    const int finder = subhalo_finder_on();
 
     struct PartIndex * pi = (struct PartIndex *) mymalloc2("PartIndex", sizeof(struct PartIndex) * NpigLocal);
     /* Build the index: unfortunately not parallel*/
     NpigLocal = 0;
     for(i = 0; i < PartManager->NumPart; i ++) {
-        if(P[i].GrNr >= 0) {
-            pi[NpigLocal].sortKey = PartManager->Base[i].GrNr;
+        if(fof_pig_member(i, P, finder)) {
+            if(finder)
+                subhalo_sort_key(&PartManager->Base[i], pi[NpigLocal].sortKey);
+            else {
+                pi[NpigLocal].sortKey[0] = PartManager->Base[i].GrNr;
+                pi[NpigLocal].sortKey[1] = 0;
+            }
             /* This should be the index of the current particle in the particle_data struct.
              * If we are re-using the PartManager, we need it to be the index in P.
              * If we have a new struct, we will do a copy. */
@@ -319,7 +407,7 @@ fof_distribute_particles(struct part_manager_type * halo_pman, struct slots_mana
     MPI_Allreduce(&GrNrMax, &GrNrMaxGlobal, 1, MPI_INT64, MPI_MAX, Comm);
     message(0, "GrNrMax is %ld\n", GrNrMaxGlobal);
 
-    fof_find_target_task(pi, NpigLocal, task_origin_offset, Comm);
+    fof_find_target_task(pi, NpigLocal, task_origin_offset, finder ? 2 : 1, Comm);
     const double FOFPartAllocFactor = (double) PartManager->MaxPart / PartManager->NumPart;
 
     /* Initialise the new halo structure*/
@@ -333,7 +421,7 @@ fof_distribute_particles(struct part_manager_type * halo_pman, struct slots_mana
     }
 
     /* Now copy the TargetTask we constructed in pi into the new halo_pman*/
-    fof_copy_target_task(halo_pman, pi, NpigLocal, task_origin_offset, Comm);
+    fof_copy_target_task(halo_pman, pi, NpigLocal, task_origin_offset, finder, Comm);
     /* Free pi so that we have space for slots*/
     myfree(pi);
 
@@ -357,7 +445,7 @@ fof_distribute_particles(struct part_manager_type * halo_pman, struct slots_mana
         NpigLocal = 0;
 
         for(i = 0; i < PartManager->NumPart; i ++) {
-            if(P[i].GrNr < 0)
+            if(!fof_pig_member(i, P, finder))
                 continue;
             /* Store TargetTask as it will be over-written.
             * We freed pi above so that we could overlap PI with the slots memory.*/
@@ -386,8 +474,9 @@ fof_distribute_particles(struct part_manager_type * halo_pman, struct slots_mana
         return 1;
     }
 
-    /* Sort locally by group number*/
-    qsort_openmp(halo_pman->Base, halo_pman->NumPart, sizeof(struct particle_data), order_by_type_and_grnr);
+    /* Sort locally by group number (with the subhalo finder: by the same 16-byte key as the exchange)*/
+    qsort_openmp(halo_pman->Base, halo_pman->NumPart, sizeof(struct particle_data),
+            finder ? subhalo_order_by_type_and_key : order_by_type_and_grnr);
 #ifdef DEBUG
     GrNrMax = -1;
     int64_t GrNrMaxGlobalAfter = -1;
@@ -458,6 +547,9 @@ static void fof_write_header(BigFile * bf, int64_t TotNgroups, const double atim
     big_block_set_attr(&bh, "CMBTemperature", &CP->CMBTemperature, "f8", 1);
     big_block_set_attr(&bh, "OmegaBaryon", &CP->OmegaBaryon, "f8", 1);
     big_block_set_attr(&bh, "UsePeculiarVelocity", &pecvel, "i4", 1);
+    /* NumPartInGroupTotal keeps its FOF meaning; the finder adds NumPartSavedTotal and the rest.*/
+    if(subhalo_finder_on())
+        subhalo_write_header_attrs(&bh, PartManager, atime, Comm);
     big_block_mpi_close(&bh, Comm);
 }
 
