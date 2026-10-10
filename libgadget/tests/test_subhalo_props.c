@@ -1,0 +1,762 @@
+/* Unit tests of the Phase 3 subhalo properties (subhalo_props.c): Phase 3 plan section 5,
+ * tests 1 to 4, plus the group-C baryonic sums.
+ *
+ *  1. A sampled NFW sphere (c200c = 10, 50000 particles, truncated at 3 R200c): bound SO masses
+ *     and radii of all five definitions, VmaxVir, RsKlypin and Rhalf against the analytic
+ *     profile (the expected values are computed in the test from the NFW formulas).
+ *  2. A triaxial Gaussian (axis ratios 0.7 and 0.5, rotated axes, 20000 particles): the Allgood
+ *     shapes at Rvir and R500c and the inertia tensor against the input ratios and major axis.
+ *  3. A thin disc in solid-body rotation in a tilted plane with a dense non-rotating central clump
+ *     (the core): J and JVir against Omega R^2 / 2 M_disc / M_total along the normal, both spins
+ *     finite and positive (SpinBullock against the formula with the analytic j, SpinPeebles
+ *     against the HBT energies), Xoff/Voff near zero; then with the clump displaced in position
+ *     and velocity: Xoff and Voff equal to the known shift times M_disc / M_total.
+ *  4. subhalo_so_thresholds at a = 1 and a = 0.1 against the formulas of design 7.10.
+ *  5. subhalo_props_baryons on a handful of gas, star and BH particles.
+ *
+ * Every candidate goes through subhalo_final_pass first (energies and order as in production),
+ * then subhalo_props_hbt and subhalo_props_rockstar; the latter gets an arena of exactly
+ * SUBHALO_PROPS_BYTES_PER_PART per particle, which checks its scratch budget. Internal units
+ * kpc/h, 1e10 Msun/h, km/s, a = 1, H = 0 (the Hubble term does not enter these properties
+ * beyond the energies). Haloes are placed across a periodic boundary. Serial: mpirun -np 1. */
+
+#include <stdarg.h>
+#include <stddef.h>
+#include <setjmp.h>
+#include <cmocka.h>
+#include <math.h>
+#include <mpi.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include <gsl/gsl_rng.h>
+#include <gsl/gsl_randist.h>
+#include <gsl/gsl_eigen.h>
+
+#include <libgadget/partmanager.h>
+#include <libgadget/slotsmanager.h>
+#include <libgadget/cosmology.h>
+#include <libgadget/subhalo_unbind.h>
+#include <libgadget/utils/mymalloc.h>
+#include "stub.h"
+
+/* GRAVITY / UnitLength^3 * UnitMass * UnitTime^2 for kpc/h, 1e10 Msun/h, km/s (cosmology.c:19) */
+#define TEST_G (6.672e-8 / pow(3.085678e21, 3) * 1.989e43 * pow(3.085678e21 / 1e5, 2))
+#define BOXSIZE 20000.
+#define EPS 0.2          /* Plummer-equivalent softening; h = 2.8 EPS */
+#define CORESIZE 20
+
+static const double Centre[3] = {3.0, BOXSIZE - 5.0, 0.5 * BOXSIZE};
+static const double Bulk[3] = {100., -50., 30.};
+/* an orthonormal triad (u1 x u2 = -u3) for the tilted test systems */
+static const double U1[3] = {1. / 3, 2. / 3, 2. / 3};
+static const double U2[3] = {2. / 3, 1. / 3, -2. / 3};
+static const double U3[3] = {2. / 3, -2. / 3, 1. / 3};
+
+static struct SubhaloUnbindParams
+default_params(void)
+{
+    struct SubhaloUnbindParams up;
+    memset(&up, 0, sizeof(up));
+    up.atime = 1;
+    up.Hubble = 0;
+    up.G = TEST_G;
+    up.h = 2.8 * EPS;
+    up.BoxSize = BOXSIZE;
+    up.PotentialTypes = 1 + 2 + 16 + 32;
+    up.TracerTypes = 2 + 16;
+    up.MinNumPart = 20;
+    up.MinNumTracerPart = 10;
+    up.SampleSize = 1000;
+    up.MaxIter = 50;
+    up.OpenAngle = 0.45;
+    up.BoundMassPrecision = 0.995;
+    up.WithThermal = 0;
+    return up;
+}
+
+/* A flat LCDM cosmology without radiation, Omega0 = 0.3, h = 0.7, in the test units. */
+static void
+setup_cosmology(Cosmology * CP)
+{
+    memset(CP, 0, sizeof(*CP));
+    CP->CMBTemperature = 2.7255;
+    CP->Omega0 = 0.3;
+    CP->OmegaLambda = 0.7;
+    CP->OmegaBaryon = 0.045;
+    CP->HubbleParam = 0.7;
+    CP->RadiationOn = 0;
+    CP->Omega_fld = 0;
+    CP->w0_fld = -1;
+    CP->wa_fld = 0;
+    CP->Omega_ur = 0;
+    CP->MNu[0] = CP->MNu[1] = CP->MNu[2] = 0;
+    struct UnitSystem units = get_unitsystem(3.085678e21, 1.989e43, 1e5);
+    init_cosmology(CP, 0.01, units);
+}
+
+static double
+wrapb(double x)
+{
+    while(x >= BOXSIZE) x -= BOXSIZE;
+    while(x < 0) x += BOXSIZE;
+    return x;
+}
+
+static void
+setup_pman(int64_t MaxPart)
+{
+    particle_alloc_memory(PartManager, BOXSIZE, MaxPart);
+    PartManager->NumPart = MaxPart;
+    memset(P, 0, sizeof(P[0]) * MaxPart);
+}
+
+static void
+teardown_pman(void)
+{
+    myfree(PartManager->Base);
+    PartManager->Base = NULL;
+    PartManager->NumPart = 0;
+}
+
+/* ------------------------------------------------------------------ harness */
+
+/* Final pass, HBT and Rockstar properties of the candidate P[0, n) with every particle bound.
+ * The final pass gets the kernel's scratch budget, subhalo_props_rockstar exactly its own. */
+static void
+run_props(int64_t n, const double ref[3], const double rho[SUBHALO_NSO], struct SubTrack * rec, int64_t * Index, double * Energy)
+{
+    struct SubhaloUnbindParams up = default_params();
+    struct SubCandidate c;
+    memset(&c, 0, sizeof(c));
+    int64_t i;
+    int d;
+    for(i = 0; i < n; i++)
+        Index[i] = i;
+    c.Index = Index;
+    c.Energy = Energy;
+    c.N = c.Nbound = n;
+    for(d = 0; d < 3; d++) {
+        c.RefPos[d] = ref[d];
+        c.RefVel[d] = 0;
+    }
+    struct SubhaloArena arena;
+    arena.size = SUBHALO_UNBIND_SCRATCH_BYTES_PER_PART * n + 64;
+    arena.used = 0;
+    arena.base = (char *) mymalloc("TestArena", arena.size);
+    subhalo_final_pass(&c, &up, &arena);
+    assert_int_equal(arena.used, 0);
+    myfree(arena.base);
+
+    subhalo_track_clear(rec, 0);
+    const double Offset[3] = {0, 0, 0};
+    subhalo_props_hbt(rec, &c, &up, CORESIZE, Offset);
+    arena.size = SUBHALO_PROPS_BYTES_PER_PART * n;
+    arena.used = 0;
+    arena.base = (char *) mymalloc("TestArena", arena.size);
+    subhalo_props_rockstar(rec, &c, &up, rho, CORESIZE, Offset, &arena);
+    assert_int_equal(arena.used, 0);
+    myfree(arena.base);
+}
+
+static double
+dot3(const double a[3], const double b[3])
+{
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+/* ------------------------------------------------------------------ 1. NFW */
+
+static double
+nfw_m(double x)
+{
+    return log1p(x) - x / (1 + x);
+}
+
+#define NFW_C 10.
+#define NFW_M200 100.    /* 1e12 Msun/h */
+#define NFW_XT 30.       /* truncation radius in units of rs: 3 R200c */
+#define NFW_N 50000
+#define JEANS_NG 600
+
+struct NFW {
+    double M200, R200, rs, Mt;
+    double lr[JEANS_NG], ls2[JEANS_NG];   /* log r, log sigma_r^2 of the truncated profile */
+};
+
+static double
+nfw_mass(const struct NFW * h, double r)
+{
+    if(r > NFW_XT * h->rs)
+        r = NFW_XT * h->rs;
+    return h->M200 * nfw_m(r / h->rs) / nfw_m(NFW_C);
+}
+
+static double
+nfw_rho(const struct NFW * h, double r)
+{
+    const double x = r / h->rs;
+    return h->M200 / (4 * M_PI * h->rs * h->rs * h->rs * nfw_m(NFW_C)) / (x * (1 + x) * (1 + x));
+}
+
+/* Isotropic Jeans dispersion of the truncated sphere: rho sigma_r^2 = int_r^rt rho G M / r'^2 dr',
+ * tabulated on a log grid by the trapezoid rule from the truncation radius inwards. */
+static void
+nfw_jeans_table(struct NFW * h)
+{
+    const double lmin = log(1e-3 * h->rs), lmax = log(NFW_XT * h->rs);
+    double integ = 0;
+    int k;
+    for(k = JEANS_NG - 1; k >= 0; k--) {
+        const double lr = lmin + (lmax - lmin) * k / (JEANS_NG - 1);
+        const double r = exp(lr);
+        if(k < JEANS_NG - 1) {
+            const double r1 = exp(h->lr[k + 1]);
+            const double f0 = nfw_rho(h, r) * TEST_G * nfw_mass(h, r) / (r * r) * r;
+            const double f1 = nfw_rho(h, r1) * TEST_G * nfw_mass(h, r1) / (r1 * r1) * r1;
+            integ += 0.5 * (f0 + f1) * (h->lr[k + 1] - lr);
+        }
+        h->lr[k] = lr;
+        const double s2 = integ / nfw_rho(h, r);
+        h->ls2[k] = log(s2 > 1e-30 ? s2 : 1e-30);
+    }
+}
+
+static double
+nfw_sigma(const struct NFW * h, double r)
+{
+    const double lmin = h->lr[0], lmax = h->lr[JEANS_NG - 1];
+    double u = (log(r) - lmin) / (lmax - lmin) * (JEANS_NG - 1);
+    if(u < 0) u = 0;
+    if(u > JEANS_NG - 1.001) u = JEANS_NG - 1.001;
+    const int k = (int) u;
+    const double f = u - k;
+    return sqrt(exp(h->ls2[k] * (1 - f) + h->ls2[k + 1] * f));
+}
+
+/* Radius (bisection) where the analytic mean enclosed density equals rho. */
+static double
+nfw_so_radius(const struct NFW * h, double rho)
+{
+    double lo = 1e-3 * h->rs, hi = NFW_XT * h->rs;
+    int it;
+    for(it = 0; it < 200; it++) {
+        const double mid = 0.5 * (lo + hi);
+        if(nfw_mass(h, mid) / (4. / 3 * M_PI * mid * mid * mid) > rho)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    return 0.5 * (lo + hi);
+}
+
+static void
+test_nfw(void ** state)
+{
+    Cosmology CP;
+    setup_cosmology(&CP);
+    double rho[SUBHALO_NSO];
+    subhalo_so_thresholds(&CP, 1.0, rho);
+    struct NFW h;
+    h.M200 = NFW_M200;
+    h.R200 = cbrt(3 * NFW_M200 / (4 * M_PI * rho[2]));
+    h.rs = h.R200 / NFW_C;
+    h.Mt = h.M200 * nfw_m(NFW_XT) / nfw_m(NFW_C);
+    nfw_jeans_table(&h);
+
+    const int64_t n = NFW_N;
+    setup_pman(n);
+    gsl_rng * rng = gsl_rng_alloc(gsl_rng_mt19937);
+    gsl_rng_set(rng, 4242);
+    const double m = h.Mt / n;
+    int64_t i;
+    int d, s;
+    for(i = 0; i < n; i++) {
+        /* inverse cumulative mass by bisection in x = r / rs */
+        const double target = gsl_rng_uniform_pos(rng) * nfw_m(NFW_XT);
+        double lo = 0, hi = NFW_XT;
+        int it;
+        for(it = 0; it < 60; it++) {
+            const double mid = 0.5 * (lo + hi);
+            if(nfw_m(mid) < target) lo = mid;
+            else hi = mid;
+        }
+        const double r = 0.5 * (lo + hi) * h.rs;
+        const double sig = nfw_sigma(&h, r);
+        const double ct = 2 * gsl_rng_uniform(rng) - 1, st = sqrt(1 - ct * ct), ph = 2 * M_PI * gsl_rng_uniform(rng);
+        const double u[3] = {st * cos(ph), st * sin(ph), ct};
+        P[i].Type = 1;
+        P[i].Mass = m;
+        P[i].ID = i + 1;
+        for(d = 0; d < 3; d++) {
+            P[i].Pos[d] = wrapb(Centre[d] + r * u[d]);
+            P[i].Vel[d] = Bulk[d] + gsl_ran_gaussian(rng, sig);
+        }
+    }
+    gsl_rng_free(rng);
+
+    int64_t * Index = (int64_t *) mymalloc("Index", sizeof(int64_t) * n);
+    double * Energy = (double *) mymalloc("Energy", sizeof(double) * n);
+    struct SubTrack rec;
+    run_props(n, Centre, rho, &rec, Index, Energy);
+
+    /* SO masses and radii (all five definitions lie inside the truncation radius) */
+    const char * name[SUBHALO_NSO] = {"vir", "200b", "200c", "500c", "2500c"};
+    for(s = 0; s < SUBHALO_NSO; s++) {
+        const double R = nfw_so_radius(&h, rho[s]);
+        const double M = nfw_mass(&h, R);
+        message(0, "NFW %-5s: MBoundSO %.4f expected %.4f (%+.2f%%), RBoundSO %.3f expected %.3f (%+.2f%%)\n",
+                name[s], rec.MBoundSO[s], M, 100 * (rec.MBoundSO[s] / M - 1), rec.RBoundSO[s], R, 100 * (rec.RBoundSO[s] / R - 1));
+        assert_true(fabs(rec.MBoundSO[s] / M - 1) < 0.02);
+        assert_true(fabs(rec.RBoundSO[s] / R - 1) < 0.01);
+    }
+    /* Vmax: max_x m(x) / x at x = 2.16258 */
+    double best = 0;
+    for(i = 1; i < 200000; i++) {
+        const double x = 1e-5 * i;
+        if(nfw_m(x) / x > best) best = nfw_m(x) / x;
+    }
+    const double Vmax = sqrt(TEST_G * h.M200 / (nfw_m(NFW_C) * h.rs) * best);
+    const double Mhalf = 0.5 * h.Mt;
+    double lo = 0, hi = NFW_XT * h.rs;
+    for(i = 0; i < 200; i++) {
+        const double mid = 0.5 * (lo + hi);
+        if(nfw_mass(&h, mid) < Mhalf) lo = mid;
+        else hi = mid;
+    }
+    const double Rhalf = 0.5 * (lo + hi);
+    message(0, "NFW VmaxVir %.2f expected %.2f (%+.2f%%), RmaxVir %.2f (2.1626 rs = %.2f), RsKlypin %.3f rs %.3f (%+.1f%%), "
+               "Rhalf %.2f expected %.2f (%+.2f%%), Renclose %.1f (rt %.1f)\n",
+            rec.VmaxVir, Vmax, 100 * (rec.VmaxVir / Vmax - 1), rec.RmaxVir, 2.1626 * h.rs, rec.RsKlypin, h.rs,
+            100 * (rec.RsKlypin / h.rs - 1), rec.Rhalf, Rhalf, 100 * (rec.Rhalf / Rhalf - 1), rec.Renclose, NFW_XT * h.rs);
+    assert_true(fabs(rec.VmaxVir / Vmax - 1) < 0.02);
+    assert_true(fabs(rec.RsKlypin / h.rs - 1) < 0.15);
+    assert_true(fabs(rec.Rhalf / Rhalf - 1) < 0.02);
+    assert_true(rec.Renclose <= NFW_XT * h.rs * 1.001 && rec.Renclose > 0.95 * NFW_XT * h.rs);
+    assert_true(rec.VmaxVir <= rec.Vmax * (1 + 1e-6));
+    /* a non-rotating sphere: round, little spin, centred */
+    message(0, "NFW shapes %.3f %.3f (500c %.3f %.3f), SpinPeebles %.4f SpinBullock %.4f Xoff %.3f Voff %.2f\n",
+            rec.BtoA, rec.CtoA, rec.BtoA500, rec.CtoA500, rec.SpinPeebles, rec.SpinBullock, rec.Xoff, rec.Voff);
+    assert_true(rec.BtoA > 0.9 && rec.CtoA > 0.85 && rec.BtoA500 > 0.9 && rec.CtoA500 > 0.85);
+    assert_true(rec.SpinPeebles >= 0 && rec.SpinPeebles < 0.02);
+    assert_true(rec.SpinBullock >= 0 && rec.SpinBullock < 0.02);
+    assert_true(rec.Xoff < 0.02 * rec.RBoundSO[0]);
+    myfree(Energy);
+    myfree(Index);
+    teardown_pman();
+}
+
+/* ------------------------------------------------------------------ 2. triaxial Gaussian */
+
+static void
+test_triaxial(void ** state)
+{
+    Cosmology CP;
+    setup_cosmology(&CP);
+    double rho[SUBHALO_NSO];
+    subhalo_so_thresholds(&CP, 1.0, rho);
+    const int64_t n = 20000;
+    const double sig[3] = {40., 28., 20.};   /* along U1, U2, U3: ratios 0.7, 0.5 */
+    const double M = 100.;
+    setup_pman(n);
+    gsl_rng * rng = gsl_rng_alloc(gsl_rng_mt19937);
+    gsl_rng_set(rng, 777);
+    int64_t i;
+    int d, e;
+    for(i = 0; i < n; i++) {
+        double y[3];
+        for(e = 0; e < 3; e++)
+            y[e] = gsl_ran_gaussian(rng, sig[e]);
+        P[i].Type = 1;
+        P[i].Mass = M / n;
+        P[i].ID = i + 1;
+        for(d = 0; d < 3; d++) {
+            P[i].Pos[d] = wrapb(Centre[d] + y[0] * U1[d] + y[1] * U2[d] + y[2] * U3[d]);
+            P[i].Vel[d] = Bulk[d] + gsl_ran_gaussian(rng, 50.);
+        }
+    }
+    gsl_rng_free(rng);
+    int64_t * Index = (int64_t *) mymalloc("Index", sizeof(int64_t) * n);
+    double * Energy = (double *) mymalloc("Energy", sizeof(double) * n);
+    struct SubTrack rec;
+    run_props(n, Centre, rho, &rec, Index, Energy);
+
+    const double cosA = fabs(rec.AxisA[0] * U1[0] + rec.AxisA[1] * U1[1] + rec.AxisA[2] * U1[2]);
+    const double cosA5 = fabs(rec.AxisA500[0] * U1[0] + rec.AxisA500[1] * U1[1] + rec.AxisA500[2] * U1[2]);
+    const double norm = sqrt(rec.AxisA[0] * rec.AxisA[0] + rec.AxisA[1] * rec.AxisA[1] + rec.AxisA[2] * rec.AxisA[2]);
+    message(0, "Triaxial: Rvir %.1f R500c %.1f; BtoA %.4f CtoA %.4f (0.7, 0.5), axis off by %.2f deg; "
+               "BtoA500 %.4f CtoA500 %.4f, axis off by %.2f deg\n",
+            rec.RBoundSO[0], rec.RBoundSO[3], rec.BtoA, rec.CtoA, acos(fmin(cosA, 1.)) * 180 / M_PI,
+            rec.BtoA500, rec.CtoA500, acos(fmin(cosA5, 1.)) * 180 / M_PI);
+    assert_true(rec.RBoundSO[0] > 0 && rec.RBoundSO[3] > 0);
+    assert_true(fabs(rec.BtoA - 0.7) < 0.03 && fabs(rec.CtoA - 0.5) < 0.03);
+    assert_true(fabs(rec.BtoA500 - 0.7) < 0.03 && fabs(rec.CtoA500 - 0.5) < 0.03);
+    assert_true(cosA > cos(5 * M_PI / 180) && cosA5 > cos(5 * M_PI / 180));
+    assert_true(fabs(norm - 1) < 1e-5);
+
+    /* the inertia tensor of the full set: eigenvalues sigma_i^2 */
+    double T[9] = {rec.InertiaTensor[0], rec.InertiaTensor[3], rec.InertiaTensor[4],
+                   rec.InertiaTensor[3], rec.InertiaTensor[1], rec.InertiaTensor[5],
+                   rec.InertiaTensor[4], rec.InertiaTensor[5], rec.InertiaTensor[2]};
+    double eval[3], evec[9];
+    gsl_matrix_view mv = gsl_matrix_view_array(T, 3, 3);
+    gsl_vector_view ev = gsl_vector_view_array(eval, 3);
+    gsl_matrix_view em = gsl_matrix_view_array(evec, 3, 3);
+    gsl_eigen_symmv_workspace * ws = gsl_eigen_symmv_alloc(3);
+    gsl_eigen_symmv(&mv.matrix, &ev.vector, &em.matrix, ws);
+    gsl_eigen_symmv_sort(&ev.vector, &em.matrix, GSL_EIGEN_SORT_VAL_DESC);
+    gsl_eigen_symmv_free(ws);
+    const double v0[3] = {evec[0], evec[3], evec[6]};
+    const double cosT = fabs(dot3(v0, U1));
+    message(0, "Triaxial inertia tensor: eigenvalues %.2f %.2f %.2f (expected %.0f %.0f %.0f), sqrt ratios %.4f %.4f, "
+               "axis off by %.2f deg\n", eval[0], eval[1], eval[2], sig[0] * sig[0], sig[1] * sig[1], sig[2] * sig[2],
+            sqrt(eval[1] / eval[0]), sqrt(eval[2] / eval[0]), acos(fmin(cosT, 1.)) * 180 / M_PI);
+    assert_true(fabs(sqrt(eval[1] / eval[0]) - 0.7) < 0.03 && fabs(sqrt(eval[2] / eval[0]) - 0.5) < 0.03);
+    assert_true(fabs(eval[0] / (sig[0] * sig[0]) - 1) < 0.05);
+    assert_true(cosT > cos(5 * M_PI / 180));
+    myfree(Energy);
+    myfree(Index);
+    teardown_pman();
+}
+
+/* ------------------------------------------------------------------ 3. rotating disc */
+
+#define DISC_N 20000
+#define DISC_R 30.
+#define DISC_M 50.
+#define DISC_VEDGE 200.
+
+/* A uniform disc of radius DISC_R in the plane (U1, U2), thickness 0.01 DISC_R, rotating
+ * rigidly about n = U1 x U2 with edge speed DISC_VEDGE, centred on Centre with velocity Bulk,
+ * into P[0, DISC_N). */
+static void
+make_disc(gsl_rng * rng)
+{
+    const double Omega = DISC_VEDGE / DISC_R;
+    double nrm[3];
+    nrm[0] = U1[1] * U2[2] - U1[2] * U2[1];
+    nrm[1] = U1[2] * U2[0] - U1[0] * U2[2];
+    nrm[2] = U1[0] * U2[1] - U1[1] * U2[0];
+    int64_t i;
+    int d;
+    for(i = 0; i < DISC_N; i++) {
+        const double R = DISC_R * sqrt(gsl_rng_uniform(rng)), ph = 2 * M_PI * gsl_rng_uniform(rng);
+        const double z = gsl_ran_gaussian(rng, 0.01 * DISC_R);
+        double x[3], v[3];
+        for(d = 0; d < 3; d++)
+            x[d] = R * cos(ph) * U1[d] + R * sin(ph) * U2[d] + z * nrm[d];
+        /* v = Omega n x x */
+        v[0] = Omega * (nrm[1] * x[2] - nrm[2] * x[1]);
+        v[1] = Omega * (nrm[2] * x[0] - nrm[0] * x[2]);
+        v[2] = Omega * (nrm[0] * x[1] - nrm[1] * x[0]);
+        P[i].Type = 1;
+        P[i].Mass = DISC_M / DISC_N;
+        P[i].ID = i + 1;
+        for(d = 0; d < 3; d++) {
+            P[i].Pos[d] = wrapb(Centre[d] + x[d]);
+            P[i].Vel[d] = Bulk[d] + v[d];
+        }
+    }
+}
+
+/* A dense non-rotating clump of n particles (total mass M, Gaussian radius 0.3) at Centre + dX U1
+ * moving with Bulk + dV U2, into P[first, first + n). */
+static void
+make_clump(gsl_rng * rng, int64_t first, int64_t n, double M, double dX, double dV)
+{
+    int64_t i;
+    int d;
+    for(i = first; i < first + n; i++) {
+        P[i].Type = 1;
+        P[i].Mass = M / n;
+        P[i].ID = i + 1;
+        for(d = 0; d < 3; d++) {
+            P[i].Pos[d] = wrapb(Centre[d] + dX * U1[d] + gsl_ran_gaussian(rng, 0.3));
+            P[i].Vel[d] = Bulk[d] + dV * U2[d];
+        }
+    }
+}
+
+static void
+test_disc(void ** state)
+{
+    Cosmology CP;
+    setup_cosmology(&CP);
+    double rho[SUBHALO_NSO];
+    subhalo_so_thresholds(&CP, 1.0, rho);
+    /* The disc alone has a flat potential minimum: its 20 most-bound particles are picked by the
+     * discreteness noise of the potential over a few kpc/h, which is a poorly defined centre. A
+     * dense non-rotating clump of 0.2 M_disc (500 particles, radius 0.3 kpc/h) supplies the core:
+     * at the disc centre first (symmetric system), then displaced. */
+    const int64_t nclump = 500, n = DISC_N + nclump;
+    const double Mclump = 0.2 * DISC_M;
+    const double frac = DISC_M / (DISC_M + Mclump);
+    setup_pman(n);
+    gsl_rng * rng = gsl_rng_alloc(gsl_rng_mt19937);
+    gsl_rng_set(rng, 99);
+    make_disc(rng);
+    make_clump(rng, DISC_N, nclump, Mclump, 0, 0);
+    const double Omega = DISC_VEDGE / DISC_R;
+    double nrm[3] = {-U3[0], -U3[1], -U3[2]};   /* U1 x U2 */
+    int64_t i;
+    int d;
+    /* the sample's own Omega <R^2> M_disc / M_total besides the analytic Omega R^2 / 2 M_disc / M_total
+     * (the clump at the centre carries no angular momentum) */
+    double R2 = 0;
+    for(i = 0; i < DISC_N; i++) {
+        double x[3];
+        for(d = 0; d < 3; d++)
+            x[d] = NEAREST(P[i].Pos[d] - Centre[d], BOXSIZE);
+        const double z = dot3(x, nrm);
+        R2 += dot3(x, x) - z * z;
+    }
+    R2 /= DISC_N;
+    const double jan = Omega * DISC_R * DISC_R / 2 * frac;
+
+    int64_t * Index = (int64_t *) mymalloc("Index", sizeof(int64_t) * n);
+    double * Energy = (double *) mymalloc("Energy", sizeof(double) * n);
+    struct SubTrack rec;
+    run_props(n, Centre, rho, &rec, Index, Energy);
+    const double J[3] = {rec.J[0], rec.J[1], rec.J[2]};
+    const double jpar = dot3(J, nrm);
+    const double jperp = sqrt(fmax(dot3(J, J) - jpar * jpar, 0));
+    const double JV[3] = {rec.JVir[0], rec.JVir[1], rec.JVir[2]};
+    message(0, "Disc: J.n %.2f analytic Omega R^2/2 Md/M %.2f (%+.2f%%), sample %.2f; |J_perp| %.3f; JVir.n %.2f\n",
+            jpar, jan, 100 * (jpar / jan - 1), Omega * R2 * frac, jperp, dot3(JV, nrm));
+    assert_true(fabs(jpar / jan - 1) < 0.01);
+    assert_true(jperp < 0.01 * jan);
+    assert_true(fabs(dot3(JV, nrm) / jan - 1) < 0.01);
+    /* spins: Bullock from the analytic j and the bound virial mass and radius (the whole system is
+     * inside Rvir); Peebles from the HBT energies of the same candidate */
+    const double lB = jan / sqrt(2 * TEST_G * rec.MBoundSO[0] * rec.RBoundSO[0]);
+    const double lP = sqrt(dot3(J, J)) * sqrt(fabs(rec.Ekin + rec.Epot)) / (TEST_G * rec.Mbound);
+    message(0, "Disc: SpinBullock %.4f (with the analytic j %.4f), SpinPeebles %.4f (from Ekin + Epot %.4f); "
+               "Mvir %.3f of %.3f, Xoff %.3f Voff %.3f\n", rec.SpinBullock, lB, rec.SpinPeebles, lP,
+            rec.MBoundSO[0], rec.Mbound, rec.Xoff, rec.Voff);
+    assert_true(rec.SpinBullock > 0 && subhalo_isfinite(rec.SpinBullock));
+    assert_true(rec.SpinPeebles > 0 && subhalo_isfinite(rec.SpinPeebles));
+    assert_true(fabs(rec.SpinBullock / lB - 1) < 0.02);
+    assert_true(fabs(rec.SpinPeebles / lP - 1) < 1e-4);
+    assert_true(fabs(rec.MBoundSO[0] / rec.Mbound - 1) < 1e-6);
+    assert_true(rec.Xoff >= 0 && rec.Xoff < 0.01 * DISC_R);
+    assert_true(rec.Voff >= 0 && rec.Voff < 0.01 * DISC_VEDGE);
+
+    /* the clump displaced by dX along U1 and moving with dV along U2 relative to the disc: the
+     * core follows the clump, so Xoff = dX M_disc / M_total and Voff = dV M_disc / M_total */
+    const double dX = 6., dV = 80.;
+    make_clump(rng, DISC_N, nclump, Mclump, dX, dV);
+    gsl_rng_free(rng);
+    run_props(n, Centre, rho, &rec, Index, Energy);
+    double coff[3];
+    for(d = 0; d < 3; d++)
+        coff[d] = NEAREST(rec.CorePos[d] - Centre[d], BOXSIZE);
+    message(0, "Displaced core: (CorePos - centre) . U1 = %.3f (%.1f), Xoff %.3f expected %.3f (%+.2f%%), "
+               "Voff %.3f expected %.3f (%+.2f%%), Mvir %.3f of %.3f\n", dot3(coff, U1), dX,
+            rec.Xoff, dX * frac, 100 * (rec.Xoff / (dX * frac) - 1), rec.Voff, dV * frac, 100 * (rec.Voff / (dV * frac) - 1),
+            rec.MBoundSO[0], rec.Mbound);
+    assert_true(fabs(dot3(coff, U1) - dX) < 0.1);
+    assert_true(fabs(rec.Xoff / (dX * frac) - 1) < 0.03);
+    assert_true(fabs(rec.Voff / (dV * frac) - 1) < 0.03);
+    myfree(Energy);
+    myfree(Index);
+    teardown_pman();
+}
+
+/* ------------------------------------------------------------------ 4. thresholds */
+
+static void
+test_thresholds(void ** state)
+{
+    Cosmology CP;
+    setup_cosmology(&CP);
+    const double as[2] = {1.0, 0.1};
+    int k, s;
+    for(k = 0; k < 2; k++) {
+        const double a = as[k];
+        double rho[SUBHALO_NSO];
+        subhalo_so_thresholds(&CP, a, rho);
+        /* the formulas of design 7.10, from the definitions */
+        const double H = hubble_function(&CP, a);
+        const double rc = 3 * H * H * a * a * a / (8 * M_PI * CP.GravInternal);
+        const double rm = CP.Omega0 * 3 * CP.Hubble * CP.Hubble / (8 * M_PI * CP.GravInternal);
+        const double Om = CP.Omega0 / (a * a * a) * pow(CP.Hubble / H, 2);
+        const double x = Om - 1;
+        const double Dvir = 18 * M_PI * M_PI + 82 * x - 39 * x * x;
+        const double expect[SUBHALO_NSO] = {Dvir * rc, 200 * rm, 200 * rc, 500 * rc, 2500 * rc};
+        message(0, "Thresholds at a = %.1f: Omega_m(a) %.5f Delta_vir %.3f (x critical); rho vir %.4e 200b %.4e 200c %.4e "
+                   "500c %.4e 2500c %.4e; 200b / rho_crit_c = %.3f\n", a, Om, rho[0] / rc, rho[0], rho[1], rho[2], rho[3],
+                rho[4], rho[1] / rc);
+        for(s = 0; s < SUBHALO_NSO; s++)
+            assert_true(fabs(rho[s] / expect[s] - 1) < 1e-12);
+        /* the comoving critical density at a = 1 is 3 H0^2 / (8 pi G) = 27.75 h^2 Msun / kpc^3, i.e.
+         * 2.775e-8 in 1e10 Msun/h / (kpc/h)^3 */
+        if(a == 1.0) {
+            assert_true(fabs(rc / 2.7754e-8 - 1) < 1e-3);
+            /* Omega_m = 0.3: Delta_vir = 18 pi^2 - 82 0.7 - 39 0.49 = 101.1 (H(1) differs from H0 by
+             * the massless neutrinos hubble_function adds even without radiation: 1e-5) */
+            assert_true(fabs(rho[0] / rc - (18 * M_PI * M_PI - 82 * 0.7 - 39 * 0.49)) < 0.01);
+            /* 200b = 60 rho_crit < vir < 200c < 500c < 2500c */
+            assert_true(rho[1] < rho[0] && rho[0] < rho[2] && rho[2] < rho[3] && rho[3] < rho[4]);
+            assert_true(fabs(rho[1] / rc - 60) < 0.01);
+        }
+        else {
+            /* matter domination: Delta_vir -> 18 pi^2 = 177.65, 200b -> 200c from below */
+            assert_true(fabs(rho[0] / rc - 18 * M_PI * M_PI) < 0.5);
+            assert_true(rho[0] < rho[1] && rho[1] < rho[2] && rho[2] / rho[1] < 1.01);
+        }
+        /* the mean density is constant in comoving units */
+        assert_true(fabs(rho[1] / (200 * CP.Omega0 * 2.7754e-8) - 1) < 1e-3);
+    }
+}
+
+/* ------------------------------------------------------------------ 5. baryons */
+
+static void
+test_baryons(void ** state)
+{
+    /* 4 gas, 2 DM, 3 stars, 3 BHs */
+    int64_t NLocal[6] = {4, 2, 0, 0, 3, 3};
+    const int64_t n = 12;
+    PartManager->MaxPart = 64;
+    PartManager->NumPart = n;
+    PartManager->BoxSize = BOXSIZE;
+    PartManager->Base = (struct particle_data *) mymalloc("P", PartManager->MaxPart * sizeof(struct particle_data));
+    memset(PartManager->Base, 0, sizeof(struct particle_data) * PartManager->MaxPart);
+    slots_init(0.01 * PartManager->MaxPart, SlotsManager);
+    slots_set_enabled(0, sizeof(struct sph_particle_data), SlotsManager);
+    slots_set_enabled(4, sizeof(struct star_particle_data), SlotsManager);
+    slots_set_enabled(5, sizeof(struct bh_particle_data), SlotsManager);
+    slots_reserve(1, NLocal, SlotsManager);
+    slots_setup_topology(PartManager, NLocal, SlotsManager);
+    int64_t i;
+    int j;
+    for(i = 0; i < n; i++) {
+        P[i].ID = 100 + i;
+        P[i].Mass = 1 + 0.1 * i;
+    }
+    slots_setup_id(PartManager, SlotsManager);
+    double esfr = 0, eheiii = 0, egz = 0, esz = 0, ebh = 0, emdot = 0, egze0 = 0, esze8 = 0;
+    for(i = 0; i < n; i++) {
+        const double m = P[i].Mass;
+        if(P[i].Type == 0) {
+            SPHP(i).Sfr = 0.5 * i;
+            SPHP(i).Metallicity = 0.01 * (i + 1);
+            for(j = 0; j < NMETALS; j++)
+                SPHP(i).Metals[j] = 0.001 * (j + 1) * (i + 1);
+            P[i].HeIIIionized = (i % 2);
+            esfr += 0.5 * i;
+            eheiii += (i % 2) * m;
+            egz += 0.01 * (i + 1) * m;
+            egze0 += 0.001 * (i + 1) * m;
+        }
+        else if(P[i].Type == 4) {
+            STARP(i).Metallicity = 0.02 * (i + 1);
+            for(j = 0; j < NMETALS; j++)
+                STARP(i).Metals[j] = 0.002 * (j + 1) * (i + 1);
+            esz += 0.02 * (i + 1) * m;
+            esze8 += 0.002 * 9 * (i + 1) * m;
+        }
+        else if(P[i].Type == 5) {
+            /* the second BH is the most massive (tie with the third, which has the larger ID) */
+            BHP(i).Mass = (i == 9) ? 0.01 : 0.03;
+            BHP(i).Mdot = 0.1 * i;
+            ebh += BHP(i).Mass;
+            emdot += 0.1 * i;
+        }
+    }
+    int64_t Index[12];
+    for(i = 0; i < n; i++)
+        Index[i] = n - 1 - i;
+    struct SubCandidate c;
+    memset(&c, 0, sizeof(c));
+    c.Index = Index;
+    c.N = c.Nbound = n;
+    struct SubTrack rec;
+    subhalo_track_clear(&rec, 0);
+    subhalo_props_baryons(&rec, &c, 1);
+    message(0, "Baryons: SFR %g (%g) HeIII %g (%g) GasZ %g (%g) StarZ %g (%g) BH %g (%g) Mdot %g (%g) MostMassiveBHID %lu\n",
+            rec.StarFormationRate, esfr, rec.MassHeIonized, eheiii, rec.GasMetalMass, egz, rec.StellarMetalMass, esz,
+            rec.BlackholeMass, ebh, rec.BlackholeAccretionRate, emdot, (unsigned long) rec.MostMassiveBHID);
+    assert_true(fabs(rec.StarFormationRate - esfr) < 1e-5 * esfr);
+    assert_true(fabs(rec.MassHeIonized - eheiii) < 1e-5 * eheiii);
+    assert_true(fabs(rec.GasMetalMass - egz) < 1e-5 * egz);
+    assert_true(fabs(rec.StellarMetalMass - esz) < 1e-5 * esz);
+    assert_true(fabs(rec.GasMetalElemMass[0] - egze0) < 1e-5 * egze0);
+    assert_true(fabs(rec.StellarMetalElemMass[8] - esze8) < 1e-5 * esze8);
+    assert_true(fabs(rec.BlackholeMass - ebh) < 1e-5 * ebh);
+    assert_true(fabs(rec.BlackholeAccretionRate - emdot) < 1e-5 * emdot);
+    assert_true(rec.MostMassiveBHID == 100 + 10);
+    /* without metal return the metal columns stay absent */
+    subhalo_props_baryons(&rec, &c, 0);
+    assert_true(rec.GasMetalMass == -1 && rec.StellarMetalMass == -1 && rec.GasMetalElemMass[3] == -1);
+    assert_true(fabs(rec.StarFormationRate - esfr) < 1e-5 * esfr);
+    /* only DM bound: zero sums, no BH */
+    Index[0] = 4;
+    Index[1] = 5;
+    c.N = c.Nbound = 2;
+    subhalo_props_baryons(&rec, &c, 1);
+    assert_true(rec.StarFormationRate == 0 && rec.BlackholeMass == 0 && rec.GasMetalMass == 0);
+    assert_true(rec.MostMassiveBHID == (MyIDType) -1);
+    /* nothing bound: every column absent */
+    c.N = c.Nbound = 0;
+    subhalo_props_baryons(&rec, &c, 1);
+    assert_true(rec.StarFormationRate == -1 && rec.BlackholeMass == -1 && rec.StellarMetalElemMass[0] == -1);
+    slots_free(SlotsManager);
+    myfree(PartManager->Base);
+    PartManager->Base = NULL;
+    PartManager->NumPart = 0;
+}
+
+/* Nothing bound, and a tiny candidate without crossings: every Rockstar column stays -1. */
+static void
+test_absent(void ** state)
+{
+    Cosmology CP;
+    setup_cosmology(&CP);
+    double rho[SUBHALO_NSO];
+    subhalo_so_thresholds(&CP, 1.0, rho);
+    setup_pman(30);
+    int64_t i;
+    int d;
+    /* 30 light particles spread over 1 Mpc/h: mean density far below every threshold */
+    for(i = 0; i < 30; i++) {
+        P[i].Type = 1;
+        P[i].Mass = 1e-6;
+        P[i].ID = i + 1;
+        for(d = 0; d < 3; d++)
+            P[i].Pos[d] = wrapb(Centre[d] + 500. * sin(1.7 * i + d));
+    }
+    int64_t Index[30];
+    double Energy[30];
+    struct SubTrack rec;
+    run_props(30, Centre, rho, &rec, Index, Energy);
+    int s;
+    for(s = 0; s < SUBHALO_NSO; s++)
+        assert_true(rec.MBoundSO[s] == -1 && rec.RBoundSO[s] == -1);
+    assert_true(rec.VmaxVir == -1 && rec.RmaxVir == -1 && rec.JVir[0] == -1 && rec.SpinBullock == -1);
+    assert_true(rec.Xoff == -1 && rec.Voff == -1 && rec.RsKlypin == -1 && rec.BtoA == -1 && rec.AxisA500[2] == -1);
+    /* defined without a crossing */
+    assert_true(rec.Rhalf > 0 && rec.Renclose >= rec.Rhalf && rec.InertiaTensor[0] > 0 && rec.SpinPeebles >= 0);
+    /* nothing bound */
+    struct SubCandidate c;
+    memset(&c, 0, sizeof(c));
+    struct SubhaloUnbindParams up = default_params();
+    struct SubhaloArena arena = {NULL, 0, 0};
+    const double Offset[3] = {0, 0, 0};
+    rec.Rhalf = 5;
+    subhalo_props_rockstar(&rec, &c, &up, rho, CORESIZE, Offset, &arena);
+    assert_true(rec.Rhalf == -1 && rec.J[1] == -1 && rec.InertiaTensor[5] == -1);
+    teardown_pman();
+}
+
+int main(void) {
+    const struct CMUnitTest tests[] = {
+        cmocka_unit_test(test_thresholds),
+        cmocka_unit_test(test_nfw),
+        cmocka_unit_test(test_triaxial),
+        cmocka_unit_test(test_disc),
+        cmocka_unit_test(test_baryons),
+        cmocka_unit_test(test_absent),
+    };
+    return cmocka_run_group_tests_mpi(tests, NULL, NULL);
+}

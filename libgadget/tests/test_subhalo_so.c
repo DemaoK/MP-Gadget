@@ -1,0 +1,751 @@
+/* Unit test of the field spherical overdensity (subhalo_so.c; Phase 3 plan section 5, test 5).
+ *
+ * Run as: mpirun -np 4 .objs/test_subhalo_so   (also -np 1, 2, 3)
+ *
+ * A periodic box of 1000 kpc/h with a uniform background (type 2) and three clumps:
+ *   A  a Hernquist clump (type 1) with a live black hole at its centre; refined by pass 2;
+ *   B  a Hernquist clump, half gas (type 0), with a compact second concentration 100 kpc/h
+ *      from its centre, inside the search sphere, which moves the outermost 200b crossing
+ *      outwards; refined;
+ *   C  a small clump straddling the periodic boundary in x and z; pass-1 interpolation only;
+ * plus a central in the most empty point of the box (no crossing), a satellite, a hostless
+ * track and a dead track (not queried), a swallowed black hole of mass 1024 at B's centre and
+ * a garbage particle of mass 1024 at A's centre (both must be ignored), and a non-zero
+ * CurrentParticleOffset (CorePos is in the output frame, P[].Pos in the translated one).
+ * Particle masses are dyadic, so every mass sum is exact whatever its order.
+ *
+ * Checks:
+ *  1. Against a brute-force particle-level count on the gathered particles inside the final
+ *     search radius (Rockstar's rule: the outermost particle k with M(<=r_k) / (4/3 pi r_k^3)
+ *     > rho): MSO within the mass of one pass-1 bin around the crossing (log width
+ *     ln(R / Rlo) / SubhaloSOBins on either side) for unrefined centrals and within that of two
+ *     pass-2 sub-bins for refined ones; RSO = (3 MSO / (4 pi rho))^(1/3); the per-type masses
+ *     sum to MSO and match the brute-force per-type masses within the same tolerance; the
+ *     flags; the relative errors are logged.
+ *  2. Identical results (bit for bit) with the records spread over the ranks, all on one rank,
+ *     and with batches of 1 and 2 queries per walk; a checksum is logged ("SO test checksum")
+ *     that must be identical with any number of ranks.
+ *  3. The doubling cap: SubhaloSOSearchFactor = 0.02 and SubhaloSOMaxDoublings = 0 set
+ *     SUBHALO_FLAG_SOCUTOFF on A and B with MSO the exact mass inside the search radius; with
+ *     SubhaloSOSearchFactor = 0.3 the radius is doubled and the results again match the brute
+ *     force.
+ *  4. subhalo_field_so (thresholds from subhalo_so_thresholds) equals the explicit-threshold
+ *     call when the thresholds agree with this test's formulas. */
+
+#include <stdarg.h>
+#include <stddef.h>
+#include <setjmp.h>
+#include <cmocka.h>
+#include <math.h>
+#include <mpi.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+
+#include <libgadget/subhalo.h>
+#include <libgadget/subhalo_unbind.h>
+#include <libgadget/subhalo_so.h>
+#include <libgadget/walltime.h>
+#include <libgadget/domain.h>
+#include <libgadget/forcetree.h>
+#include <libgadget/partmanager.h>
+#include <libgadget/slotsmanager.h>
+#include <libgadget/cosmology.h>
+#include <libgadget/gravity.h>
+#include "stub.h"
+
+static struct ClockTable CT;
+
+#define CHECK(cond, ...) do { if(!(cond)) { message(1, __VA_ARGS__); } assert_true(cond); } while(0)
+
+#define BOX 1000.
+#define MPART (1. / 1024)          /* DM and gas */
+#define MBG (1. / 512)             /* background, type 2 */
+#define MBH (1. / 64)              /* the live black hole */
+#define NA 16384
+#define NB1 8192
+#define NB2 4096
+#define NC 512
+#define NBG 4096
+#define NREC 7
+
+static const double CenA[3] = {300, 300, 300};
+static const double CenB[3] = {700, 300, 600};
+static const double CenB2[3] = {800, 300, 600};
+static const double CenC[3] = {995, 500, 3};
+static const double Offset[3] = {37.5, -12.25, 501};
+
+/* ------------------------------------------------------------------ helpers */
+
+static uint64_t
+splitmix64(uint64_t x)
+{
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+static double
+urand(uint64_t id, uint64_t salt, uint64_t k)
+{
+    uint64_t h = splitmix64(splitmix64(id * 0x100000001B3ULL + salt) ^ (k * 0x9E3779B97F4A7C15ULL));
+    return (h >> 11) * (1.0 / 9007199254740992.0);
+}
+
+static double
+wrap(double x)
+{
+    while(x >= BOX) x -= BOX;
+    while(x < 0) x += BOX;
+    return x;
+}
+
+static double
+nearest(double dx)
+{
+    if(dx > 0.5 * BOX) return dx - BOX;
+    if(dx < -0.5 * BOX) return dx + BOX;
+    return dx;
+}
+
+static Cosmology
+test_cosmology(void)
+{
+    Cosmology CP;
+    memset(&CP, 0, sizeof(CP));
+    CP.CMBTemperature = 2.7255;
+    CP.Omega0 = 0.3;
+    CP.OmegaBaryon = 0.045;
+    CP.OmegaLambda = 0.7;
+    CP.HubbleParam = 0.7;
+    CP.RadiationOn = 0;
+    CP.w0_fld = -1;
+    struct UnitSystem units = get_unitsystem(3.085678e21, 1.989e43, 1e5);
+    init_cosmology(&CP, 0.01, units);
+    return CP;
+}
+
+/* The thresholds of design 7.10, written independently of subhalo_props.c. */
+static void
+test_thresholds(const Cosmology * CP, double a, double rho[SUBHALO_NSO])
+{
+    const double H = hubble_function(CP, a);
+    const double rhoc = 3 * H * H * a * a * a / (8 * M_PI * CP->GravInternal);
+    const double rhom = CP->Omega0 * 3 * CP->Hubble * CP->Hubble / (8 * M_PI * CP->GravInternal);
+    const double x = CP->Omega0 / (a * a * a) * CP->Hubble * CP->Hubble / (H * H) - 1;
+    rho[0] = (18 * M_PI * M_PI + 82 * x - 39 * x * x) * rhoc;
+    rho[1] = 200 * rhom;
+    rho[2] = 200 * rhoc;
+    rho[3] = 500 * rhoc;
+    rho[4] = 2500 * rhoc;
+}
+
+/* Particle id of the global set: position (output frame), type, mass. Deterministic. */
+static void
+make_particle(int64_t id, double pos[3], int * type, double * mass, int * swallowed)
+{
+    *swallowed = 0;
+    const double * cen = NULL;
+    double a = 0;
+    int64_t k = id;
+    *type = 1;
+    *mass = MPART;
+    if(k < NA) { cen = CenA; a = 20; }
+    else if((k -= NA) < NB1) { cen = CenB; a = 15; *type = (k % 2) ? 0 : 1; }
+    else if((k -= NB1) < NB2) { cen = CenB2; a = 4; }
+    else if((k -= NB2) < NC) { cen = CenC; a = 8; }
+    else if((k -= NC) < NBG) {
+        int d;
+        for(d = 0; d < 3; d++)
+            pos[d] = BOX * urand(id, 7, d);
+        *type = 2;
+        *mass = MBG;
+        return;
+    }
+    else {
+        k -= NBG;
+        int d;
+        *type = 5;
+        if(k == 0) {             /* live black hole at A */
+            for(d = 0; d < 3; d++) pos[d] = CenA[d] + 0.1;
+            *mass = MBH;
+        }
+        else {                   /* swallowed black hole at B */
+            for(d = 0; d < 3; d++) pos[d] = CenB[d] + 0.2;
+            *mass = 1024;
+            *swallowed = 1;
+        }
+        return;
+    }
+    /* Hernquist truncated at 10 a: M(<r) / M = r^2 / (r + a)^2 */
+    const double umax = (10. / 11.) * (10. / 11.);
+    const double s = sqrt(umax * urand(id, 1, 0));
+    const double r = a * s / (1 - s);
+    const double ct = 2 * urand(id, 2, 0) - 1, st = sqrt(1 - ct * ct), ph = 2 * M_PI * urand(id, 3, 0);
+    pos[0] = wrap(cen[0] + r * st * cos(ph));
+    pos[1] = wrap(cen[1] + r * st * sin(ph));
+    pos[2] = wrap(cen[2] + r * ct);
+}
+
+#define NTOT (NA + NB1 + NB2 + NC + NBG + 2)
+#define ID_GARBAGE 5      /* an A particle turned into garbage of mass 1024 at A's centre */
+
+static void
+setup_particles(void)
+{
+    int NTask, ThisTask;
+    MPI_Comm_size(MPI_COMM_WORLD, &NTask);
+    MPI_Comm_rank(MPI_COMM_WORLD, &ThisTask);
+    particle_alloc_memory(PartManager, BOX, NTOT + 1000);
+    PartManager->NumPart = 0;
+    int d;
+    for(d = 0; d < 3; d++)
+        PartManager->CurrentParticleOffset[d] = Offset[d];
+    slots_init(0.01 * PartManager->MaxPart, SlotsManager);
+    slots_set_enabled(0, sizeof(struct sph_particle_data), SlotsManager);
+    slots_set_enabled(4, sizeof(struct star_particle_data), SlotsManager);
+    slots_set_enabled(5, sizeof(struct bh_particle_data), SlotsManager);
+    int64_t atleast[6] = {NB1, 0, 0, 0, 16, 16};
+    slots_reserve(1, atleast, SlotsManager);
+    int64_t id, ngas = 0, nbh = 0;
+    for(id = 0; id < NTOT; id++) {
+        if((int)(id % NTask) != ThisTask)
+            continue;
+        struct particle_data * p = &P[PartManager->NumPart++];
+        memset(p, 0, sizeof(*p));
+        double pos[3], mass;
+        int type, swallowed;
+        make_particle(id, pos, &type, &mass, &swallowed);
+        p->ID = id;
+        p->Type = type;
+        p->Mass = mass;
+        p->Swallowed = swallowed;
+        p->GrNr = -1;
+        p->TrackId = p->BoundTrackId = -1;
+        p->BindRank = -1;
+        for(d = 0; d < 3; d++)
+            p->Pos[d] = wrap(pos[d] + Offset[d]);
+        if(type == 0)
+            p->PI = ngas++;
+        if(type == 5)
+            p->PI = nbh++;
+    }
+    SlotsManager->info[0].size = ngas;
+    SlotsManager->info[5].size = nbh;
+    slots_setup_id(PartManager, SlotsManager);
+}
+
+/* Gathered live and dead particles: output-frame position, mass, type, excluded flag. */
+struct gpart {
+    double x[3];
+    double m;
+    int type;
+    int excluded;
+};
+
+static struct gpart *
+gather_particles(int64_t * ntot)
+{
+    int NTask;
+    MPI_Comm_size(MPI_COMM_WORLD, &NTask);
+    const int64_t n = PartManager->NumPart;
+    struct gpart * loc = malloc((n + 1) * sizeof(struct gpart));
+    int64_t i;
+    int d;
+    for(i = 0; i < n; i++) {
+        for(d = 0; d < 3; d++)
+            loc[i].x[d] = wrap(P[i].Pos[d] - Offset[d]);
+        loc[i].m = P[i].Mass;
+        loc[i].type = P[i].Type;
+        loc[i].excluded = P[i].IsGarbage || P[i].Swallowed;
+    }
+    int nb = n * sizeof(struct gpart);
+    int * cnt = malloc(NTask * sizeof(int)), * off = malloc(NTask * sizeof(int));
+    MPI_Allgather(&nb, 1, MPI_INT, cnt, 1, MPI_INT, MPI_COMM_WORLD);
+    int64_t tot = 0;
+    for(d = 0; d < NTask; d++) {
+        off[d] = tot;
+        tot += cnt[d];
+    }
+    struct gpart * all = malloc(tot + sizeof(struct gpart));
+    MPI_Allgatherv(loc, nb, MPI_BYTE, all, cnt, off, MPI_BYTE, MPI_COMM_WORLD);
+    free(off);
+    free(cnt);
+    free(loc);
+    *ntot = tot / sizeof(struct gpart);
+    return all;
+}
+
+/* ------------------------------------------------------------------ brute force */
+
+struct rpair {
+    double r;
+    int64_t i;
+};
+
+static int
+cmp_rpair(const void * a, const void * b)
+{
+    const struct rpair * x = a, * y = b;
+    if(x->r != y->r)
+        return (x->r > y->r) - (x->r < y->r);
+    return (x->i > y->i) - (x->i < y->i);
+}
+
+struct brute {
+    double M[SUBHALO_NSO], R[SUBHALO_NSO];     /* -1 when no particle qualifies */
+    double Minside;                            /* mass inside Rsearch */
+    int above;                                 /* density at Rsearch above min(rho) */
+};
+
+/* Mass within r of cen (sorted pairs; inclusive). */
+static double
+mass_within(const struct rpair * rp, int64_t n, const struct gpart * g, double r, int type)
+{
+    double M = 0;
+    int64_t k;
+    for(k = 0; k < n && rp[k].r <= r; k++)
+        if(type < 0 || g[rp[k].i].type == type)
+            M += g[rp[k].i].m;
+    return M;
+}
+
+static struct rpair *
+radial_order(const struct gpart * g, int64_t ng, const double cen[3], double Rmax, int64_t * n)
+{
+    struct rpair * rp = malloc((ng + 1) * sizeof(struct rpair));
+    int64_t i, m = 0;
+    for(i = 0; i < ng; i++) {
+        if(g[i].excluded)
+            continue;
+        double r2 = 0;
+        int d;
+        for(d = 0; d < 3; d++) {
+            const double dx = nearest(g[i].x[d] - cen[d]);
+            r2 += dx * dx;
+        }
+        const double r = sqrt(r2);
+        if(r > Rmax)
+            continue;
+        rp[m].r = r;
+        rp[m].i = i;
+        m++;
+    }
+    qsort(rp, m, sizeof(rp[0]), cmp_rpair);
+    *n = m;
+    return rp;
+}
+
+static struct brute
+brute_force(const struct gpart * g, int64_t ng, const double cen[3], double Rsearch, const double rho[SUBHALO_NSO])
+{
+    struct brute b;
+    int64_t n, k;
+    int d;
+    struct rpair * rp = radial_order(g, ng, cen, Rsearch, &n);
+    for(d = 0; d < SUBHALO_NSO; d++)
+        b.M[d] = b.R[d] = -1;
+    double M = 0;
+    for(k = 0; k < n; k++) {
+        M += g[rp[k].i].m;
+        const double r = rp[k].r;
+        for(d = 0; d < SUBHALO_NSO; d++)
+            if(M > 4. / 3. * M_PI * rho[d] * r * r * r) {
+                b.M[d] = M;
+                b.R[d] = r;
+            }
+    }
+    b.Minside = M;
+    double rhomin = rho[0];
+    for(d = 1; d < SUBHALO_NSO; d++)
+        rhomin = rho[d] < rhomin ? rho[d] : rhomin;
+    b.above = M > 4. / 3. * M_PI * rhomin * Rsearch * Rsearch * Rsearch;
+    free(rp);
+    return b;
+}
+
+/* ------------------------------------------------------------------ records */
+
+struct result {
+    double MSO[SUBHALO_NSO], RSO[SUBHALO_NSO], MT200c[6], MTVir[6];
+    double Flags, Rsearch;
+};
+
+static void
+make_records(struct SubTrack * G, const double voidpos[3])
+{
+    int k, d;
+    for(k = 0; k < NREC; k++) {
+        subhalo_track_clear(&G[k], k);
+        G[k].Rank = 0;
+        G[k].HostGroup = k;
+        G[k].Flags = SUBHALO_FLAG_ITERCAP | SUBHALO_FLAG_SOCUTOFF | SUBHALO_FLAG_SONOCROSS;
+        for(d = 0; d < SUBHALO_NSO; d++)
+            G[k].MSO[d] = G[k].RSO[d] = -7;
+        for(d = 0; d < 6; d++)
+            G[k].MTypeSO200c[d] = G[k].MTypeSOVir[d] = -7;
+    }
+    const double * cen[NREC] = {CenA, CenB, CenC, voidpos, CenA, CenB, CenC};
+    const int nb[NREC] = {NA, NB1, NC, 30, 100, 100, 0};
+    for(k = 0; k < NREC; k++) {
+        for(d = 0; d < 3; d++)
+            G[k].CorePos[d] = cen[k][d];
+        G[k].Nbound = nb[k];
+        G[k].Mbound = nb[k] * MPART;
+    }
+    G[4].Rank = 1;               /* satellite */
+    G[5].HostGroup = -1;         /* hostless */
+}
+
+static int
+is_central(int k)
+{
+    return k < 4;
+}
+
+/* Run one call with the records placed on ranks by owner(k) and gather the results. */
+static void
+run_case(DomainDecomp * ddecomp, const struct SubTrack * G, int (*owner)(int, int), const Cosmology * CP,
+         const struct SubhaloParams * par, const double * rho, struct result * res, struct SubhaloSOStats * stats)
+{
+    int NTask, ThisTask;
+    MPI_Comm_size(MPI_COMM_WORLD, &NTask);
+    MPI_Comm_rank(MPI_COMM_WORLD, &ThisTask);
+    struct SubTrack * loc = malloc(NREC * sizeof(struct SubTrack));
+    int idx[NREC];
+    int n = 0, k, d;
+    for(k = 0; k < NREC; k++)
+        if(owner(k, NTask) == ThisTask) {
+            idx[n] = k;
+            loc[n++] = G[k];
+        }
+    double Rs[NREC];
+    if(rho)
+        subhalo_field_so_full(loc, n, ddecomp, 1.0, CP, par, rho, Rs, stats, MPI_COMM_WORLD);
+    else {
+        subhalo_field_so(loc, n, ddecomp, 1.0, CP, par, MPI_COMM_WORLD);
+        for(k = 0; k < n; k++)
+            Rs[k] = 0;
+    }
+    struct result * mine = calloc(NREC, sizeof(struct result));
+    for(k = 0; k < n; k++) {
+        struct result * r = &mine[idx[k]];
+        const struct SubTrack * t = &loc[k];
+        for(d = 0; d < SUBHALO_NSO; d++) {
+            r->MSO[d] = t->MSO[d];
+            r->RSO[d] = t->RSO[d];
+        }
+        for(d = 0; d < 6; d++) {
+            r->MT200c[d] = t->MTypeSO200c[d];
+            r->MTVir[d] = t->MTypeSOVir[d];
+        }
+        r->Flags = t->Flags;
+        r->Rsearch = Rs[k];
+    }
+    MPI_Allreduce(mine, res, NREC * sizeof(struct result) / sizeof(double), MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    free(mine);
+    free(loc);
+}
+
+static int owner_spread(int k, int NTask) { return k % NTask; }
+static int owner_last(int k, int NTask) { return NTask - 1; }
+static int owner_first(int k, int NTask) { return 0; }
+
+static uint64_t
+checksum(const struct result * res)
+{
+    const unsigned char * b = (const unsigned char *) res;
+    uint64_t h = 1469598103934665603ULL;
+    size_t i;
+    for(i = 0; i < NREC * sizeof(struct result); i++)
+        h = (h ^ b[i]) * 1099511628211ULL;
+    return h;
+}
+
+static const char * DefName[SUBHALO_NSO] = {"vir", "200b", "200c", "500c", "2500c"};
+
+/* Compare a call's results with the brute force. Returns the number of failures. */
+static int
+compare_brute(const struct result * res, const struct gpart * g, int64_t ng, const double voidpos[3],
+              const struct SubhaloParams * par, const double rho[SUBHALO_NSO], const char * what)
+{
+    int bad = 0, k, d, t;
+    const double * cen[4] = {CenA, CenB, CenC, voidpos};
+    const double soft = FORCE_SOFTENING() / 2.8;
+    for(k = 0; k < NREC; k++) {
+        const struct result * r = &res[k];
+        if(!is_central(k)) {
+            /* not queried: untouched */
+            for(d = 0; d < SUBHALO_NSO; d++)
+                if(r->MSO[d] != -7 || r->RSO[d] != -7) bad++;
+            for(t = 0; t < 6; t++)
+                if(r->MT200c[t] != -7 || r->MTVir[t] != -7) bad++;
+            if((int) r->Flags != (SUBHALO_FLAG_ITERCAP | SUBHALO_FLAG_SOCUTOFF | SUBHALO_FLAG_SONOCROSS) || r->Rsearch != -1) {
+                message(0, "%s: record %d (not a central) was modified\n", what, k);
+                bad++;
+            }
+            continue;
+        }
+        const double R = r->Rsearch;
+        const double Rlo = fmin(soft, 0.25 * R);
+        const double dlog = log(R / Rlo) / par->SubhaloSOBins;
+        const int refined = (k == 0 ? NA : (k == 1 ? NB1 : (k == 2 ? NC : 30))) >= par->SubhaloSORefineMinPart;
+        struct brute b = brute_force(g, ng, cen[k], R, rho);
+        int64_t n;
+        struct rpair * rp = radial_order(g, ng, cen[k], R, &n);
+        const int flags = (int) r->Flags;
+        if(!(flags & SUBHALO_FLAG_ITERCAP)) {
+            message(0, "%s: record %d lost an unrelated flag\n", what, k);
+            bad++;
+        }
+        if(!!(flags & SUBHALO_FLAG_SOCUTOFF) != b.above) {
+            message(0, "%s: record %d cutoff flag %d, brute force above at R = %g: %d\n", what, k,
+                    !!(flags & SUBHALO_FLAG_SOCUTOFF), R, b.above);
+            bad++;
+        }
+        int nocross = 0;
+        for(d = 0; d < SUBHALO_NSO; d++) {
+            const double K = 4. / 3. * M_PI * rho[d];
+            if(r->MSO[d] < 0) {
+                nocross = 1;
+                if(r->MSO[d] != -1 || r->RSO[d] != -1) bad++;
+                if(b.M[d] >= 0) {
+                    message(0, "%s: record %d %s: no crossing found, brute force M = %g at r = %g\n", what, k, DefName[d], b.M[d], b.R[d]);
+                    bad++;
+                }
+                continue;
+            }
+            if(b.M[d] < 0) {
+                message(0, "%s: record %d %s: M = %g but the brute force has no crossing\n", what, k, DefName[d], r->MSO[d]);
+                bad++;
+                continue;
+            }
+            /* RSO consistent with MSO */
+            const double Rc = cbrt(r->MSO[d] / K);
+            if(fabs(r->RSO[d] - Rc) > 1e-5 * Rc) {
+                message(0, "%s: record %d %s: RSO %g != (3 M / 4 pi rho)^1/3 = %g\n", what, k, DefName[d], r->RSO[d], Rc);
+                bad++;
+            }
+            double tol, Mref = b.M[d];
+            if((flags & SUBHALO_FLAG_SOCUTOFF) && b.Minside > K * R * R * R) {
+                /* still above at R: the exact mass inside R */
+                Mref = b.Minside;
+                tol = 1e-6 * Mref;
+            }
+            else {
+                /* the mass of one pass-1 bin (two sub-bins) on either side of the crossing */
+                const double w = refined ? 2 * (exp(dlog) - 1) / SUBHALO_SO_NSUB : (exp(dlog) - 1);
+                tol = mass_within(rp, n, g, b.R[d] * (1 + w), -1) - mass_within(rp, n, g, b.R[d] / (1 + w), -1);
+                tol = fmax(tol, 1e-6 * Mref);
+            }
+            const double err = r->MSO[d] - Mref;
+            message(0, "%s: record %d %s: MSO %.6g brute %.6g (r %.4g) rel err %+.2e tol %.2e (%s)\n", what, k, DefName[d],
+                    r->MSO[d], Mref, b.R[d], err / Mref, tol / Mref, refined ? "pass 2" : "pass 1");
+            if(fabs(err) > tol) {
+                message(0, "%s: record %d %s: |MSO - brute| = %g above the tolerance %g\n", what, k, DefName[d], fabs(err), tol);
+                bad++;
+            }
+            /* per-type masses: sum to MSO and match the brute force per type */
+            if(d == 0 || d == 2) {
+                const double * mt = d == 0 ? r->MTVir : r->MT200c;
+                double sum = 0;
+                for(t = 0; t < 6; t++) {
+                    sum += mt[t];
+                    const double ref = mass_within(rp, n, g, Mref == b.Minside ? R : b.R[d], t);
+                    if(fabs(mt[t] - ref) > tol + 1e-6 * Mref) {
+                        message(0, "%s: record %d %s type %d: %g vs brute %g (tol %g)\n", what, k, DefName[d], t, mt[t], ref, tol);
+                        bad++;
+                    }
+                }
+                if(fabs(sum - r->MSO[d]) > 1e-5 * r->MSO[d]) {
+                    message(0, "%s: record %d %s: per-type sum %g != MSO %g\n", what, k, DefName[d], sum, r->MSO[d]);
+                    bad++;
+                }
+            }
+        }
+        if(!!(flags & SUBHALO_FLAG_SONOCROSS) != nocross) {
+            message(0, "%s: record %d no-crossing flag %d but %d definitions without a crossing\n", what, k,
+                    !!(flags & SUBHALO_FLAG_SONOCROSS), nocross);
+            bad++;
+        }
+        free(rp);
+    }
+    return bad;
+}
+
+static int
+same_results(const struct result * a, const struct result * b)
+{
+    return memcmp(a, b, NREC * sizeof(struct result)) == 0;
+}
+
+/* ------------------------------------------------------------------ the test */
+
+static void
+test_subhalo_field_so(void ** state)
+{
+    walltime_init(&CT);
+    struct DomainParams dp = {0};
+    dp.DomainOverDecompositionFactor = 1;
+    dp.DomainUseGlobalSorting = 0;
+    dp.TopNodeAllocFactor = 1.;
+    dp.SetAsideFactor = 1;
+    set_domain_par(dp);
+    init_forcetree_params(0.7);
+    struct gravshort_tree_params tp = get_gravshort_treepar();
+    tp.FractionalGravitySoftening = 1. / 50;
+    set_gravshort_treepar(tp);
+    gravshort_set_softenings(50.);       /* GravitySoftening = 1 kpc/h */
+
+    Cosmology CP = test_cosmology();
+    double rho[SUBHALO_NSO], rhoA3[SUBHALO_NSO];
+    test_thresholds(&CP, 1.0, rho);
+    subhalo_so_thresholds(&CP, 1.0, rhoA3);
+    int d, k;
+    for(d = 0; d < SUBHALO_NSO; d++)
+        message(0, "threshold %s: %g (subhalo_so_thresholds %g)\n", DefName[d], rho[d], rhoA3[d]);
+
+    setup_particles();
+    DomainDecomp ddecomp = {0};
+    domain_decompose_full(&ddecomp, MPI_COMM_WORLD);
+    /* the garbage particle: wherever it landed, at A's centre with mass 1024 */
+    int64_t i;
+    for(i = 0; i < PartManager->NumPart; i++)
+        if(P[i].ID == ID_GARBAGE) {
+            P[i].IsGarbage = 1;
+            P[i].Mass = 1024;
+            for(d = 0; d < 3; d++)
+                P[i].Pos[d] = wrap(CenA[d] + Offset[d]);
+        }
+
+    int64_t ng;
+    struct gpart * g = gather_particles(&ng);
+    CHECK(ng == NTOT, "gathered %ld particles, expected %d\n", ng, NTOT);
+
+    /* the emptiest point of a 20^3 grid away from the clumps */
+    double voidpos[3] = {0, 0, 0}, best = -1;
+    int ix, iy, iz;
+    for(ix = 0; ix < 20; ix++)
+    for(iy = 0; iy < 20; iy++)
+    for(iz = 0; iz < 20; iz++) {
+        const double c[3] = {25 + 50 * ix, 25 + 50 * iy, 25 + 50 * iz};
+        double dmin = 1e30;
+        for(i = 0; i < ng; i++) {
+            double r2 = 0;
+            for(d = 0; d < 3; d++) {
+                const double dx = nearest(g[i].x[d] - c[d]);
+                r2 += dx * dx;
+            }
+            if(r2 < dmin)
+                dmin = r2;
+        }
+        if(dmin > best) {
+            best = dmin;
+            memcpy(voidpos, c, sizeof(c));
+        }
+    }
+    message(0, "void central at %g %g %g, nearest particle %g\n", voidpos[0], voidpos[1], voidpos[2], sqrt(best));
+
+    struct SubTrack * G = malloc(NREC * sizeof(struct SubTrack));
+    make_records(G, voidpos);
+
+    struct SubhaloParams par;
+    memset(&par, 0, sizeof(par));
+    par.SubhaloSOBins = 64;
+    par.SubhaloSOSearchFactor = 2;
+    par.SubhaloSOMaxDoublings = 3;
+    par.SubhaloSORefineMinPart = 1000;
+
+    /* 1. defaults against the brute force */
+    struct result res1[NREC], res2[NREC], res3[NREC], res4[NREC];
+    struct SubhaloSOStats st;
+    run_case(&ddecomp, G, owner_spread, &CP, &par, rho, res1, &st);
+    CHECK(st.Ncentral == 4 && st.Nrefined == 2 && st.Ncutoff == 0 && st.Nnocross == 1,
+          "stats: %ld centrals %ld refined %ld cut off %ld without crossing\n", st.Ncentral, st.Nrefined, st.Ncutoff, st.Nnocross);
+    int bad = compare_brute(res1, g, ng, voidpos, &par, rho, "defaults");
+    CHECK(bad == 0, "defaults: %d failures against the brute force\n", bad);
+    /* the void central has no crossing at all; B's 200b crossing lies beyond its main clump */
+    for(d = 0; d < SUBHALO_NSO; d++)
+        CHECK(res1[3].MSO[d] == -1, "void central %s: %g\n", DefName[d], res1[3].MSO[d]);
+    CHECK(res1[1].RSO[1] > 100, "B: R200b = %g, not beyond the second concentration's centre\n", res1[1].RSO[1]);
+
+    /* 2. rank placement and batching do not change a bit */
+    run_case(&ddecomp, G, owner_last, &CP, &par, rho, res2, NULL);
+    CHECK(same_results(res1, res2), "results differ with all records on the last rank\n");
+    subhalo_so_set_max_batch(1);
+    run_case(&ddecomp, G, owner_spread, &CP, &par, rho, res3, &st);
+    CHECK(same_results(res1, res3), "results differ with batches of one query\n");
+    subhalo_so_set_max_batch(2);
+    run_case(&ddecomp, G, owner_first, &CP, &par, rho, res4, &st);
+    CHECK(same_results(res1, res4), "results differ with batches of two queries on rank 0\n");
+    CHECK(st.Npass1Walks >= 2, "batches of two on rank 0: %d pass-1 walks\n", st.Npass1Walks);
+    subhalo_so_set_max_batch(0);
+    message(0, "SO test checksum: %016lx\n", checksum(res1));
+
+    /* 3. the doubling cap, then doubling within the cap */
+    struct SubhaloParams cap = par;
+    cap.SubhaloSOSearchFactor = 0.02;
+    cap.SubhaloSOMaxDoublings = 0;
+    run_case(&ddecomp, G, owner_spread, &CP, &cap, rho, res2, &st);
+    CHECK((int) res2[0].Flags & SUBHALO_FLAG_SOCUTOFF, "A not cut off with a tiny search radius\n");
+    CHECK((int) res2[1].Flags & SUBHALO_FLAG_SOCUTOFF, "B not cut off with a tiny search radius\n");
+    CHECK(st.Ncutoff >= 2 && st.Ndoubled == 0, "cap: %ld cut off, %ld doubled\n", st.Ncutoff, st.Ndoubled);
+    bad = compare_brute(res2, g, ng, voidpos, &cap, rho, "cap");
+    CHECK(bad == 0, "cap: %d failures against the brute force\n", bad);
+    for(k = 0; k < 2; k++) {
+        /* every definition still above at R: the exact mass inside R, the radius beyond R */
+        const double * cen = k == 0 ? CenA : CenB;
+        struct brute b = brute_force(g, ng, cen, res2[k].Rsearch, rho);
+        for(d = 0; d < SUBHALO_NSO; d++)
+            CHECK(res2[k].MSO[d] == (float) b.Minside && res2[k].RSO[d] > res2[k].Rsearch,
+                  "cap: record %d %s: MSO %g inside-R mass %g RSO %g R %g\n", k, DefName[d], res2[k].MSO[d], b.Minside,
+                  res2[k].RSO[d], res2[k].Rsearch);
+    }
+
+    struct SubhaloParams dbl = par;
+    dbl.SubhaloSOSearchFactor = 0.3;
+    dbl.SubhaloSOMaxDoublings = 4;
+    run_case(&ddecomp, G, owner_spread, &CP, &dbl, rho, res3, &st);
+    CHECK(st.Ndoubled >= 3 && st.Ncutoff == 0, "doubling: %ld doubled, %ld cut off\n", st.Ndoubled, st.Ncutoff);
+    for(k = 0; k < 3; k++)
+        CHECK(res3[k].Rsearch > 0.3 * cbrt(3 * G[k].Mbound / (4 * M_PI * rho[1])) * 1.5,
+              "doubling: record %d final R %g not doubled\n", k, res3[k].Rsearch);
+    bad = compare_brute(res3, g, ng, voidpos, &dbl, rho, "doubling");
+    CHECK(bad == 0, "doubling: %d failures against the brute force\n", bad);
+
+    /* pass 1 only for every central */
+    struct SubhaloParams p1 = par;
+    p1.SubhaloSORefineMinPart = 1 << 30;
+    run_case(&ddecomp, G, owner_spread, &CP, &p1, rho, res4, &st);
+    CHECK(st.Nrefined == 0, "pass 1 only: %ld refined\n", st.Nrefined);
+    bad = compare_brute(res4, g, ng, voidpos, &p1, rho, "pass 1 only");
+    CHECK(bad == 0, "pass 1 only: %d failures against the brute force\n", bad);
+
+    /* 4. the plain entry point with subhalo_so_thresholds */
+    int same_rho = 1;
+    for(d = 0; d < SUBHALO_NSO; d++)
+        same_rho &= fabs(rhoA3[d] - rho[d]) <= 1e-12 * rho[d];
+    CHECK(same_rho, "subhalo_so_thresholds differs from the design 7.10 formulas\n");
+    run_case(&ddecomp, G, owner_spread, &CP, &par, NULL, res2, NULL);
+    for(k = 0; k < NREC; k++)
+        for(d = 0; d < SUBHALO_NSO; d++)
+            CHECK(fabs(res2[k].MSO[d] - res1[k].MSO[d]) <= 1e-5 * fabs(res1[k].MSO[d]),
+                  "plain call: record %d %s: %g vs %g\n", k, DefName[d], res2[k].MSO[d], res1[k].MSO[d]);
+
+    free(G);
+    free(g);
+    domain_free(&ddecomp);
+    slots_free(SlotsManager);
+    myfree(PartManager->Base);
+    PartManager->Base = NULL;
+    PartManager->NumPart = 0;
+}
+
+int main(void) {
+    const struct CMUnitTest tests[] = {
+        cmocka_unit_test(test_subhalo_field_so),
+    };
+    return cmocka_run_group_tests_mpi(tests, NULL, NULL);
+}

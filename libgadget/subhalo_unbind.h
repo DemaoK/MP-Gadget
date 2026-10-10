@@ -152,4 +152,37 @@ double subhalo_thermal_energy(int64_t i, double atime);
 void subhalo_props_hbt(struct SubTrack * rec, const struct SubCandidate * c, const struct SubhaloUnbindParams * up,
                        int CoreSize, const double Offset[3]);
 
+/* ------------------------------------------------------------------ Phase 3 properties (subhalo_props.c) */
+
+/* Comoving mass-density thresholds at a, in the order vir, 200b, 200c, 500c, 2500c (design 7.10,
+ * groupies.c:63-103): rho_crit_c(a) = 3 H(a)^2 a^3 / (8 pi G), rho_mean_c = Omega0 3 H0^2 /
+ * (8 pi G), x = Omega_m(a) - 1 with Omega_m(a) = Omega0 a^-3 (H0 / H(a))^2, Delta_vir = 18 pi^2 +
+ * 82 x - 39 x^2 relative to critical; H(a) = hubble_function, H0 = CP->Hubble, G = GravInternal. */
+void subhalo_so_thresholds(const Cosmology * CP, double atime, double rho[SUBHALO_NSO]);
+
+/* Arena bytes per bound particle that subhalo_props_rockstar takes (the radial order). */
+#define SUBHALO_PROPS_BYTES_PER_PART 16
+
+/* The Rockstar columns of rec (Phase 3 plan section 3) from a candidate after the final pass
+ * (Index[0, Nbound) bound in final-pass energy order, Energy the final-pass energies, RefPos/
+ * RefVel the final bound-CoM frame, as subhalo_props_hbt takes it): MBoundSO, RBoundSO, VmaxVir,
+ * RmaxVir, Rhalf, Renclose, J, JVir, SpinPeebles, SpinBullock, Xoff, Voff, RsKlypin, BtoA, CtoA,
+ * AxisA, BtoA500, CtoA500, AxisA500, InertiaTensor. Every one of these is set to -1 first and
+ * stays -1 when undefined (no crossing, too few particles, c->Energy NULL for SpinPeebles).
+ * rho from subhalo_so_thresholds at up->atime. The core is recomputed with subhalo_core (the
+ * same CorePos/CoreVel as subhalo_props_hbt), so rec's other columns are not read and the call
+ * may come before or after the caller's unit conversion of the HBT columns. Lengths comoving
+ * in the run's unit, velocities km/s (subhalo_vel_to_kms), J and JVir physical length unit x
+ * km/s. Scratch: SUBHALO_PROPS_BYTES_PER_PART * Nbound from the arena, rewound on return;
+ * endrun if the arena is short. Offset is unused (the core is in the translated frame). */
+void subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c,
+                            const struct SubhaloUnbindParams * up, const double rho[SUBHALO_NSO],
+                            int CoreSize, const double Offset[3], struct SubhaloArena * arena);
+
+/* Group C baryonic sums over the bound set, add_particle_to_group style (fof.c): SFR, HeIII mass
+ * (gas), BH subgrid mass and Mdot, MostMassiveBHID (largest BHP(i).Mass, ties to the smaller ID;
+ * (MyIDType) -1 without a bound BH); with MetalReturnOn the gas and stellar metal masses and
+ * element masses, else those stay -1. Nbound == 0: every column -1. No scratch. */
+void subhalo_props_baryons(struct SubTrack * rec, const struct SubCandidate * c, int MetalReturnOn);
+
 #endif
