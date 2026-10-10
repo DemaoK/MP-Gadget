@@ -42,6 +42,52 @@ arena_left(const struct SubhaloArena * a)
     return a->size > a->used + 32 ? a->size - a->used - 32 : 0;
 }
 
+/* ------------------------------------------------------------------ intra-key threading */
+
+/* Parallel mode (Phase 5 plan section 4 item 6, subhalo_unbind.h "Phase 5b"): an operation on
+ * more than SUBHALO_UNBIND_PAR_MIN elements, called outside a parallel region (a key processed
+ * alone) with more than one thread available, splits over the OpenMP threads. Every result is
+ * defined independently of the thread count: the algorithm of each step depends on the size
+ * only (sorts produce the unique order of a strict total order, the tree is the unique tree of
+ * its sorted keys, floating sums are taken in fixed chunks of chunk_len(n) combined in chunk
+ * order), the threads only share out the work. An operation on at most SUBHALO_UNBIND_PAR_MIN
+ * elements is one chunk, i.e. the serial loop of HEAD 9e60f168, bit for bit. */
+static inline int
+par_mode(int64_t n)
+{
+    return n > SUBHALO_UNBIND_PAR_MIN && !omp_in_parallel() && omp_get_max_threads() > 1;
+}
+
+/* The fixed chunks of the reductions and of the order-preserving gathers: max(PAR_MIN,
+ * ceil(n / CHUNK_MAX)) elements, so at most SUBHALO_CHUNK_MAX chunks (per-chunk partials on the
+ * stack) and a single chunk for n <= PAR_MIN. */
+#define SUBHALO_CHUNK_MAX 256
+static inline int64_t
+chunk_len(int64_t n)
+{
+    const int64_t c = (n + SUBHALO_CHUNK_MAX - 1) / SUBHALO_CHUNK_MAX;
+    return c > SUBHALO_UNBIND_PAR_MIN ? c : SUBHALO_UNBIND_PAR_MIN;
+}
+
+static inline int
+chunk_count(int64_t n, int64_t C)
+{
+    return n > 0 ? (int) ((n + C - 1) / C) : 0;
+}
+
+/* for(I = 0; I < N; I++) BODY, split statically over the threads when PAR. Written out as two
+ * loops rather than with an if() clause, so that the serial path (every small candidate, many
+ * per thread) opens no parallel region at all. */
+#define SUBHALO_PAR_FOR(PAR, I, N, ...)                                                 \
+    do {                                                                                \
+        if(PAR) {                                                                       \
+            _Pragma("omp parallel for schedule(static)")                               \
+            for(I = 0; I < (N); I++) { __VA_ARGS__ }                                    \
+        }                                                                               \
+        else                                                                            \
+            for(I = 0; I < (N); I++) { __VA_ARGS__ }                                    \
+    } while(0)
+
 /* splitmix64 (Steele, Lea & Flood 2014): the seeded generator of design D3 item 3, replacing
  * HBT's std::random_shuffle (subhalo_unbind.cpp:442), so results do not depend on the thread
  * or rank count. */
@@ -145,6 +191,76 @@ static void NAME(T * a, int64_t n) {                                            
     NAME##_intro(a, n, depth);                                                          \
 }
 
+/* Parallel merge sort with the same unique output as NAME (the order is a strict total order on
+ * distinct elements): one block per thread introsorted, then log2(threads) rounds of pairwise
+ * merges in which every thread writes an equal share of the output, located in each pair by a
+ * merge-path co-rank search. The merge buffer (n elements) comes from the arena and is released
+ * on return; without room for it, or outside parallel mode, NAME runs serially (same output). */
+#define SUBHALO_DEFINE_PSORT(NAME, T, LESS)                                             \
+static int64_t NAME##_corank(const T * A, int64_t m, const T * B, int64_t nb, int64_t k) { \
+    /* the number i of A elements among the first k outputs of the merge that takes A first \
+     * on ties: the smallest i with A[i] after B[k - i - 1] */                         \
+    int64_t lo = k > nb ? k - nb : 0, hi = k < m ? k : m;                               \
+    while(lo < hi) {                                                                    \
+        const int64_t i = lo + (hi - lo) / 2, j = k - i;                                \
+        if(j > 0 && !LESS((&B[j - 1]), (&A[i]))) lo = i + 1;                            \
+        else hi = i;                                                                    \
+    }                                                                                   \
+    return lo;                                                                          \
+}                                                                                       \
+static void NAME##_merge(const T * A, int64_t m, const T * B, int64_t nb, T * out,      \
+                         int64_t k0, int64_t k1) {                                      \
+    int64_t i = NAME##_corank(A, m, B, nb, k0), j = k0 - i, k = k0;                     \
+    const int64_t i1 = NAME##_corank(A, m, B, nb, k1), j1 = k1 - i1;                    \
+    while(i < i1 && j < j1) {                                                           \
+        if(LESS((&B[j]), (&A[i]))) out[k++] = B[j++];                                   \
+        else out[k++] = A[i++];                                                         \
+    }                                                                                   \
+    while(i < i1) out[k++] = A[i++];                                                    \
+    while(j < j1) out[k++] = B[j++];                                                    \
+}                                                                                       \
+static void NAME##_par(T * a, int64_t n, struct SubhaloArena * arena) {                 \
+    if(!par_mode(n) || arena_left(arena) < sizeof(T) * (size_t) n) {                    \
+        NAME(a, n);                                                                     \
+        return;                                                                         \
+    }                                                                                   \
+    const size_t mark = arena->used;                                                    \
+    T * buf = (T *) arena_need(arena, sizeof(T) * n, #NAME " merge buffer");            \
+    const int nblk = omp_get_max_threads();                                             \
+    int blk, w;                                                                         \
+    _Pragma("omp parallel for schedule(static, 1)")                                    \
+    for(blk = 0; blk < nblk; blk++) {                                                   \
+        const int64_t lo = (int64_t) blk * n / nblk, hi = (int64_t) (blk + 1) * n / nblk; \
+        NAME(a + lo, hi - lo);                                                          \
+    }                                                                                   \
+    T * from = a, * to = buf;                                                           \
+    for(w = 1; w < nblk; w *= 2) {                                                      \
+        _Pragma("omp parallel")                                                         \
+        {                                                                               \
+            const int tid = omp_get_thread_num(), nth = omp_get_num_threads();          \
+            const int64_t g0 = (int64_t) tid * n / nth, g1 = (int64_t) (tid + 1) * n / nth; \
+            int k;                                                                      \
+            for(k = 0; k < nblk; k += 2 * w) {                                          \
+                const int km = k + w < nblk ? k + w : nblk;                             \
+                const int ke = k + 2 * w < nblk ? k + 2 * w : nblk;                     \
+                const int64_t p0 = (int64_t) k * n / nblk, pm = (int64_t) km * n / nblk; \
+                const int64_t p1 = (int64_t) ke * n / nblk;                             \
+                const int64_t s0 = g0 > p0 ? g0 : p0, s1 = g1 < p1 ? g1 : p1;           \
+                if(s0 < s1)                                                             \
+                    NAME##_merge(from + p0, pm - p0, from + pm, p1 - pm, to + p0, s0 - p0, s1 - p0); \
+            }                                                                           \
+        }                                                                               \
+        T * tmp = from; from = to; to = tmp;                                            \
+    }                                                                                   \
+    if(from != a) {                                                                     \
+        int64_t i;                                                                      \
+        _Pragma("omp parallel for schedule(static)")                                   \
+        for(i = 0; i < n; i++)                                                          \
+            a[i] = from[i];                                                             \
+    }                                                                                   \
+    arena->used = mark;                                                                 \
+}
+
 /* (energy, P index) pairs: the energy order of design 7.10, ties by ID. */
 struct EPair {
     double E;
@@ -152,6 +268,7 @@ struct EPair {
 };
 #define EPAIR_LESS(x, y) ((x)->E < (y)->E || ((x)->E == (y)->E && id_less((x)->idx, (y)->idx)))
 SUBHALO_DEFINE_SORT(sort_epair, struct EPair, EPAIR_LESS)
+SUBHALO_DEFINE_PSORT(sort_epair, struct EPair, EPAIR_LESS)
 
 /* (energy, P index, list position) triples of the most-bound refinement: ordered as EPair, the
  * position carried along to permute the parallel arrays. */
@@ -161,6 +278,7 @@ struct EPairPos {
     int64_t pos;
 };
 SUBHALO_DEFINE_SORT(sort_epairpos, struct EPairPos, EPAIR_LESS)
+SUBHALO_DEFINE_PSORT(sort_epairpos, struct EPairPos, EPAIR_LESS)
 
 /* A gravity or neighbour source: Morton key, P index, position (comoving; relative to the
  * tree origin, NEAREST(Pos - origin), and absolute in a built neighbour tree), mass (upscaled
@@ -173,6 +291,7 @@ struct SubSrc {
 };
 #define SRC_LESS(x, y) ((x)->key < (y)->key || ((x)->key == (y)->key && id_less((x)->p, (y)->p)))
 SUBHALO_DEFINE_SORT(sort_src, struct SubSrc, SRC_LESS)
+SUBHALO_DEFINE_PSORT(sort_src, struct SubSrc, SRC_LESS)
 
 /* Sort the parallel arrays (Energy, Index)[0, n) by (Energy, Index), through a pair scratch. */
 static void
@@ -182,16 +301,11 @@ sort_energy_index(double * Energy, int64_t * Index, int64_t n, struct SubhaloAre
         return;
     const size_t mark = arena->used;
     struct EPair * pr = (struct EPair *) arena_need(arena, sizeof(struct EPair) * n, "energy sort pairs");
+    const int par = par_mode(n);
     int64_t i;
-    for(i = 0; i < n; i++) {
-        pr[i].E = Energy[i];
-        pr[i].idx = Index[i];
-    }
-    sort_epair(pr, n);
-    for(i = 0; i < n; i++) {
-        Energy[i] = pr[i].E;
-        Index[i] = pr[i].idx;
-    }
+    SUBHALO_PAR_FOR(par, i, n, pr[i].E = Energy[i]; pr[i].idx = Index[i];);
+    sort_epair_par(pr, n, arena);
+    SUBHALO_PAR_FOR(par, i, n, Energy[i] = pr[i].E; Index[i] = pr[i].idx;);
     arena->used = mark;
 }
 
@@ -279,23 +393,199 @@ tree_build_rec(const struct SubSrc * src, struct SubSkel * sk, int64_t * nn, int
         sk[node].skip = (int32_t) *nn;
 }
 
+/* Parallel build (parallel mode): the tree is split into "top" nodes, built serially, and
+ * subtree tasks, built by tree_build_rec in parallel. The serial recursion below mirrors
+ * tree_build_rec (same collapse, same children) down to the ranges of at most T sources (or the
+ * finest Morton level), which become tasks, and lists top nodes and tasks in pre-order. The
+ * node indices follow from the per-task node counts by a prefix sum, so every node lands at the
+ * index of the serial build with the same content: the tree is bit-identical, whatever T and
+ * the thread count. */
+struct TopItem {
+    int64_t lo, hi;          /* source range */
+    int64_t nodes;           /* nodes of a task's subtree; 1 for a top node */
+    int64_t off;             /* index of the item's first node */
+    int32_t level;           /* task: tree_build_rec's level argument; top node: its collapsed level */
+    int32_t end;             /* top node: index of the first item after its subtree; task: -1 */
+};
+#define SUBHALO_TOP_MAXITEMS 1024
+struct TopPlan {
+    int n;
+    struct TopItem it[SUBHALO_TOP_MAXITEMS];
+};
+
+/* First index in [s, hi) whose digit at level exceeds d (the keys of [s, hi) share their digits
+ * above level and are sorted, so the digits at level are non-decreasing). */
+static int64_t
+digit_run_end(const struct SubSrc * src, int64_t s, int64_t hi, int level, int d)
+{
+    int64_t lo = s + 1;
+    while(lo < hi) {
+        const int64_t m = lo + (hi - lo) / 2;
+        if(morton_digit(src[m].key, level) > d)
+            hi = m;
+        else
+            lo = m + 1;
+    }
+    return lo;
+}
+
+/* Returns 0 if the plan overflows SUBHALO_TOP_MAXITEMS. */
+static int
+plan_rec(const struct SubSrc * src, struct TopPlan * plan, int64_t lo, int64_t hi, int level, int64_t leafsize, int64_t T)
+{
+    if(plan->n >= SUBHALO_TOP_MAXITEMS)
+        return 0;
+    int lev = level;
+    if(hi - lo > T && hi - lo > leafsize)
+        while(lev < MORTON_LEVELS && morton_digit(src[lo].key, lev) == morton_digit(src[hi - 1].key, lev))
+            lev++;
+    struct TopItem * it = &plan->it[plan->n];
+    it->lo = lo;
+    it->hi = hi;
+    if(hi - lo <= T || hi - lo <= leafsize || lev >= MORTON_LEVELS) {
+        /* a task: tree_build_rec(lo, hi, level) builds this subtree exactly as the serial build */
+        it->level = level;
+        it->end = -1;
+        it->nodes = 0;
+        plan->n++;
+        return 1;
+    }
+    const int k = plan->n++;
+    it->level = lev;
+    it->nodes = 1;
+    int64_t s = lo;
+    while(s < hi) {
+        const int64_t e = digit_run_end(src, s, hi, lev, morton_digit(src[s].key, lev));
+        if(!plan_rec(src, plan, s, e, lev + 1, leafsize, T))
+            return 0;
+        s = e;
+    }
+    plan->it[k].end = plan->n;
+    return 1;
+}
+
+/* The plan for this leafsize (T doubled until it fits; T >= ns gives one task) and the node
+ * count of the tree, the task counts in parallel. */
+static int64_t
+plan_make(const struct SubSrc * src, int64_t ns, int64_t leafsize, struct TopPlan * plan)
+{
+    int64_t T = ns / (8 * (int64_t) omp_get_max_threads());
+    if(T < 1024)
+        T = 1024;
+    for(;;) {
+        plan->n = 0;
+        if(plan_rec(src, plan, 0, ns, 0, leafsize, T))
+            break;
+        T *= 2;
+    }
+    int k;
+    #pragma omp parallel for schedule(dynamic, 1)
+    for(k = 0; k < plan->n; k++) {
+        struct TopItem * it = &plan->it[k];
+        if(it->end < 0) {
+            int64_t c = 0;
+            tree_build_rec(src, NULL, &c, it->lo, it->hi, it->level, leafsize, 0);
+            it->nodes = c;
+        }
+    }
+    int64_t nn = 0;
+    for(k = 0; k < plan->n; k++) {
+        plan->it[k].off = nn;
+        nn += plan->it[k].nodes;
+    }
+    return nn;
+}
+
+static void
+plan_build(const struct SubSrc * src, struct SubSkel * sk, int64_t nn, int64_t leafsize, double rootlen, const struct TopPlan * plan)
+{
+    int k;
+    for(k = 0; k < plan->n; k++) {
+        const struct TopItem * it = &plan->it[k];
+        if(it->end < 0)
+            continue;
+        sk[it->off].first = (int32_t) it->lo;
+        sk[it->off].count = (int32_t) (it->hi - it->lo);
+        sk[it->off].len = (float) ldexp(rootlen, -it->level);
+        sk[it->off].skip = (int32_t) (it->end < plan->n ? plan->it[it->end].off : nn);
+    }
+    #pragma omp parallel for schedule(dynamic, 1)
+    for(k = 0; k < plan->n; k++) {
+        const struct TopItem * it = &plan->it[k];
+        if(it->end < 0) {
+            int64_t c = it->off;
+            tree_build_rec(src, sk, &c, it->lo, it->hi, it->level, leafsize, rootlen);
+            if(c != it->off + it->nodes)
+                endrun(1, "Subhalo kernel: parallel tree task built %ld nodes, counted %ld\n", (long) (c - it->off), (long) it->nodes);
+        }
+    }
+}
+
+/* Componentwise min and max of the source positions (exact in any order). */
+static void
+src_extent(const struct SubSrc * src, int64_t ns, int par, double lo[3], double hi[3])
+{
+    int d;
+    for(d = 0; d < 3; d++) {
+        lo[d] = DBL_MAX;
+        hi[d] = -DBL_MAX;
+    }
+    if(!par) {
+        int64_t i;
+        for(i = 0; i < ns; i++)
+            for(d = 0; d < 3; d++) {
+                if(src[i].x[d] < lo[d]) lo[d] = src[i].x[d];
+                if(src[i].x[d] > hi[d]) hi[d] = src[i].x[d];
+            }
+        return;
+    }
+    #pragma omp parallel
+    {
+        double l[3] = {DBL_MAX, DBL_MAX, DBL_MAX}, h[3] = {-DBL_MAX, -DBL_MAX, -DBL_MAX};
+        int64_t i;
+        int dd;
+        #pragma omp for schedule(static)
+        for(i = 0; i < ns; i++)
+            for(dd = 0; dd < 3; dd++) {
+                if(src[i].x[dd] < l[dd]) l[dd] = src[i].x[dd];
+                if(src[i].x[dd] > h[dd]) h[dd] = src[i].x[dd];
+            }
+        #pragma omp critical(subhalo_src_extent)
+        for(dd = 0; dd < 3; dd++) {
+            if(l[dd] < lo[dd]) lo[dd] = l[dd];
+            if(h[dd] > hi[dd]) hi[dd] = h[dd];
+        }
+    }
+}
+
 /* Build the skeleton over t->src[0, t->ns) (positions already relative to the origin):
  * Morton keys, sort, then as many nodes as fit in the arena (each needs node_bytes in all,
- * skeleton included), widening the leaves until the tree fits. */
+ * skeleton included), widening the leaves until the tree fits. plan != NULL (parallel mode
+ * only): build in parallel and leave the decomposition in plan for the moments; the tree is
+ * the same. */
 static void
-tree_build_skeleton(struct SubTree * t, size_t node_extra, struct SubhaloArena * arena)
+tree_build_skeleton(struct SubTree * t, size_t node_extra, struct SubhaloArena * arena, struct TopPlan * plan)
 {
     int64_t i;
     int d;
     const int64_t ns = t->ns;
+    const int par = plan != NULL;
     if(ns >= INT32_MAX)
         endrun(1, "Subhalo kernel: %ld sources exceed the int32 tree layout\n", (long) ns);
-    double lo[3] = {DBL_MAX, DBL_MAX, DBL_MAX}, hi[3] = {-DBL_MAX, -DBL_MAX, -DBL_MAX};
-    for(i = 0; i < ns; i++)
+    double lo[3], hi[3];
+    if(par)
+        src_extent(t->src, ns, 1, lo, hi);
+    else {
         for(d = 0; d < 3; d++) {
-            if(t->src[i].x[d] < lo[d]) lo[d] = t->src[i].x[d];
-            if(t->src[i].x[d] > hi[d]) hi[d] = t->src[i].x[d];
+            lo[d] = DBL_MAX;
+            hi[d] = -DBL_MAX;
         }
+        for(i = 0; i < ns; i++)
+            for(d = 0; d < 3; d++) {
+                if(t->src[i].x[d] < lo[d]) lo[d] = t->src[i].x[d];
+                if(t->src[i].x[d] > hi[d]) hi[d] = t->src[i].x[d];
+            }
+    }
     double ext = 0;
     for(d = 0; d < 3; d++)
         if(hi[d] - lo[d] > ext)
@@ -304,18 +594,21 @@ tree_build_skeleton(struct SubTree * t, size_t node_extra, struct SubhaloArena *
     if(rootlen <= 0)
         rootlen = 1e-10 * (fabs(lo[0]) + fabs(lo[1]) + fabs(lo[2]) + 1);
     const double scale = (double) (1 << MORTON_LEVELS) / rootlen;
-    for(i = 0; i < ns; i++) {
+    struct SubSrc * src = t->src;
+    SUBHALO_PAR_FOR(par, i, ns,
         uint64_t key = 0;
-        for(d = 0; d < 3; d++) {
-            double q = (t->src[i].x[d] - lo[d]) * scale;
+        int dd;
+        for(dd = 0; dd < 3; dd++) {
+            double q = (src[i].x[dd] - lo[dd]) * scale;
             int64_t iq = (int64_t) q;
             if(iq < 0) iq = 0;
             if(iq > (1 << MORTON_LEVELS) - 1) iq = (1 << MORTON_LEVELS) - 1;
-            key |= spread3((uint64_t) iq) << (2 - d);
+            key |= spread3((uint64_t) iq) << (2 - dd);
         }
-        t->src[i].key = key;
-    }
-    sort_src(t->src, ns);
+        src[i].key = key;
+    );
+    /* the merge buffer is released before the node budget is taken: the same cap either way */
+    sort_src_par(t->src, ns, arena);
 
     /* node budget from what is left; widen leaves until the tree fits */
     const size_t per_node = sizeof(struct SubSkel) + node_extra;
@@ -326,48 +619,99 @@ tree_build_skeleton(struct SubTree * t, size_t node_extra, struct SubhaloArena *
         endrun(1, "Subhalo kernel: no arena space left for tree nodes (%ld sources)\n", (long) ns);
     int64_t leafsize = 8, nn;
     for(;;) {
-        nn = 0;
-        tree_build_rec(t->src, NULL, &nn, 0, ns, 0, leafsize, rootlen);
+        if(par)
+            nn = plan_make(t->src, ns, leafsize, plan);
+        else {
+            nn = 0;
+            tree_build_rec(t->src, NULL, &nn, 0, ns, 0, leafsize, rootlen);
+        }
         if(nn <= cap)
             break;
         leafsize *= 2;
     }
     t->sk = (struct SubSkel *) arena_need(arena, sizeof(struct SubSkel) * nn, "tree skeleton");
-    t->nn = 0;
-    tree_build_rec(t->src, t->sk, &t->nn, 0, ns, 0, leafsize, rootlen);
+    if(par) {
+        plan_build(t->src, t->sk, nn, leafsize, rootlen, plan);
+        t->nn = nn;
+    }
+    else {
+        t->nn = 0;
+        tree_build_rec(t->src, t->sk, &t->nn, 0, ns, 0, leafsize, rootlen);
+    }
+}
+
+/* Children first over a tree built with a plan: node_fn on every node, each task's node range
+ * in reverse in parallel, then the top nodes serially in reverse plan order. Each node's
+ * computation reads only its children, so the results are those of the serial reverse
+ * pre-order pass. */
+#define SUBHALO_TREE_UPWARD_PAR(t, plan, node_fn)                                       \
+    do {                                                                                \
+        int k_;                                                                         \
+        _Pragma("omp parallel for schedule(dynamic, 1)")                               \
+        for(k_ = 0; k_ < (plan)->n; k_++) {                                             \
+            const struct TopItem * it_ = &(plan)->it[k_];                               \
+            int64_t m_;                                                                 \
+            if(it_->end < 0)                                                            \
+                for(m_ = it_->off + it_->nodes - 1; m_ >= it_->off; m_--)               \
+                    node_fn((t), m_);                                                   \
+        }                                                                               \
+        for(k_ = (plan)->n - 1; k_ >= 0; k_--)                                          \
+            if((plan)->it[k_].end >= 0)                                                 \
+                node_fn((t), (plan)->it[k_].off);                                       \
+    } while(0)
+
+/* Monopole of node n from its sources (leaf) or its children (HBT UpdateInternalNodes,
+ * gravity_tree.cpp:27-90). */
+static inline void
+grav_moment_node(struct SubTree * t, int64_t n)
+{
+    double m = 0, mx[3] = {0, 0, 0};
+    int d;
+    if(t->sk[n].skip == n + 1) {
+        int64_t j;
+        for(j = t->sk[n].first; j < t->sk[n].first + t->sk[n].count; j++) {
+            m += t->src[j].m;
+            for(d = 0; d < 3; d++)
+                mx[d] += t->src[j].m * t->src[j].x[d];
+        }
+    }
+    else {
+        int64_t ch;
+        for(ch = n + 1; ch < t->sk[n].skip; ch = t->sk[ch].skip) {
+            m += t->mom[ch].mass;
+            for(d = 0; d < 3; d++)
+                mx[d] += t->mom[ch].mass * t->mom[ch].com[d];
+        }
+    }
+    t->mom[n].mass = m;
+    for(d = 0; d < 3; d++)
+        t->mom[n].com[d] = m > 0 ? mx[d] / m : 0;
+}
+
+/* The parallel-mode build; its own frame holds the plan (outside any parallel region). */
+static void __attribute__((noinline))
+tree_build_gravity_par(struct SubTree * t, struct SubhaloArena * arena)
+{
+    struct TopPlan plan;
+    tree_build_skeleton(t, sizeof(struct SubMom), arena, &plan);
+    t->mom = (struct SubMom *) arena_need(arena, sizeof(struct SubMom) * t->nn, "tree moments");
+    SUBHALO_TREE_UPWARD_PAR(t, &plan, grav_moment_node);
 }
 
 /* Gravity tree: skeleton plus monopoles (mass, centre of mass), computed children first by a
- * reverse pre-order pass (HBT UpdateInternalNodes, gravity_tree.cpp:27-90). */
+ * reverse pre-order pass. */
 static void
 tree_build_gravity(struct SubTree * t, struct SubhaloArena * arena)
 {
-    tree_build_skeleton(t, sizeof(struct SubMom), arena);
+    if(par_mode(t->ns)) {
+        tree_build_gravity_par(t, arena);
+        return;
+    }
+    tree_build_skeleton(t, sizeof(struct SubMom), arena, NULL);
     t->mom = (struct SubMom *) arena_need(arena, sizeof(struct SubMom) * t->nn, "tree moments");
     int64_t n;
-    int d;
-    for(n = t->nn - 1; n >= 0; n--) {
-        double m = 0, mx[3] = {0, 0, 0};
-        if(t->sk[n].skip == n + 1) {
-            int64_t j;
-            for(j = t->sk[n].first; j < t->sk[n].first + t->sk[n].count; j++) {
-                m += t->src[j].m;
-                for(d = 0; d < 3; d++)
-                    mx[d] += t->src[j].m * t->src[j].x[d];
-            }
-        }
-        else {
-            int64_t ch;
-            for(ch = n + 1; ch < t->sk[n].skip; ch = t->sk[ch].skip) {
-                m += t->mom[ch].mass;
-                for(d = 0; d < 3; d++)
-                    mx[d] += t->mom[ch].mass * t->mom[ch].com[d];
-            }
-        }
-        t->mom[n].mass = m;
-        for(d = 0; d < 3; d++)
-            t->mom[n].com[d] = m > 0 ? mx[d] / m : 0;
-    }
+    for(n = t->nn - 1; n >= 0; n--)
+        grav_moment_node(t, n);
 }
 
 /* |NEAREST(x - y)|^2: the squared periodic separation of two points whose coordinates differ
@@ -472,6 +816,90 @@ subhalo_thermal_energy(int64_t i, double atime)
     return SPHP(i).Entropy / GAMMA_MINUS1 * pow(SPHP(i).Density * a3inv, GAMMA_MINUS1);
 }
 
+/* Widen [lo, hi] to the targets' frame coordinates NEAREST(Pos - RefPos). */
+static void
+tgt_extent(const int64_t * tgt, int64_t nt, const double RefPos[3], double BoxSize, int par, double lo[3], double hi[3])
+{
+    int d;
+    if(!par) {
+        int64_t i;
+        for(i = 0; i < nt; i++)
+            for(d = 0; d < 3; d++) {
+                const double y = NEAREST(P[tgt[i]].Pos[d] - RefPos[d], BoxSize);
+                if(y < lo[d]) lo[d] = y;
+                if(y > hi[d]) hi[d] = y;
+            }
+        return;
+    }
+    #pragma omp parallel
+    {
+        double l[3] = {DBL_MAX, DBL_MAX, DBL_MAX}, h[3] = {-DBL_MAX, -DBL_MAX, -DBL_MAX};
+        int64_t i;
+        int dd;
+        #pragma omp for schedule(static)
+        for(i = 0; i < nt; i++)
+            for(dd = 0; dd < 3; dd++) {
+                const double y = NEAREST(P[tgt[i]].Pos[dd] - RefPos[dd], BoxSize);
+                if(y < l[dd]) l[dd] = y;
+                if(y > h[dd]) h[dd] = y;
+            }
+        #pragma omp critical(subhalo_tgt_extent)
+        for(dd = 0; dd < 3; dd++) {
+            if(l[dd] < lo[dd]) lo[dd] = l[dd];
+            if(h[dd] > hi[dd]) hi[dd] = h[dd];
+        }
+    }
+}
+
+/* Pass 1 of potential_energies on srcidx[i0, i1): potential-type sources, the subsampleable
+ * ones among them and their mass per type (summed in list order). */
+static void
+source_count_chunk(const int64_t * srcidx, int64_t i0, int64_t i1, int PotentialTypes, int64_t * npot, int64_t * nsub, double M[6])
+{
+    int64_t i, np = 0, nsb = 0;
+    int t;
+    for(t = 0; t < 6; t++)
+        M[t] = 0;
+    for(i = i0; i < i1; i++) {
+        const int type = P[srcidx[i]].Type;
+        if(!type_in(PotentialTypes, type))
+            continue;
+        np++;
+        if(!type_in(SUBHALO_NOSUBSAMPLE_TYPES, type)) {
+            nsb++;
+            M[type] += P[srcidx[i]].Mass;
+        }
+    }
+    *npot = np;
+    *nsub = nsb;
+}
+
+/* The source records of srcidx[i0, i1) in list order from out[0]: every potential-type source,
+ * except, when sampled, the subsampleable ones of rank >= sample in the whole list (rank0: the
+ * rank of the chunk's first subsampleable source). */
+static void
+source_gather_chunk(const int64_t * srcidx, int64_t i0, int64_t i1, int PotentialTypes, int sampled, int64_t sample,
+                    const double fac[6], const double RefPos[3], double BoxSize, int64_t rank0, struct SubSrc * out)
+{
+    int64_t i, rank = rank0, k = 0;
+    int d;
+    for(i = i0; i < i1; i++) {
+        const int64_t p = srcidx[i];
+        const int type = P[p].Type;
+        if(!type_in(PotentialTypes, type))
+            continue;
+        if(sampled && !type_in(SUBHALO_NOSUBSAMPLE_TYPES, type)) {
+            if(rank++ >= sample)
+                continue;
+        }
+        out[k].p = p;
+        out[k].m = P[p].Mass * fac[type];
+        for(d = 0; d < 3; d++)
+            out[k].x[d] = NEAREST(P[p].Pos[d] - RefPos[d], BoxSize);
+        k++;
+    }
+}
+
 /* Energies of tgt[0, nt) in the frame (RefPos, RefVel). The potential is sourced by the
  * potential-type particles of srcidx[0, nsrc). If sample > 0 and more than sample of them can
  * be subsampled, only the never-subsampled ones plus the first `sample` subsampleable ones (in
@@ -489,23 +917,37 @@ potential_energies(const int64_t * tgt, int64_t nt, double * E, const int64_t * 
     const double BoxSize = up->BoxSize;
     int64_t i;
     int d, t;
-    /* pass 1: what can be subsampled */
+    /* pass 1: what can be subsampled, per fixed chunk of the list (the per-type masses summed
+     * within a chunk in list order, the chunk partials in chunk order) */
+    const int64_t C = chunk_len(nsrc);
+    const int nch = chunk_count(nsrc, C);
+    const int gpar = par_mode(nsrc);
+    int64_t cpot[SUBHALO_CHUNK_MAX], csub[SUBHALO_CHUNK_MAX], cout[SUBHALO_CHUNK_MAX], crank[SUBHALO_CHUNK_MAX];
+    double cM[SUBHALO_CHUNK_MAX][6];
+    int ch;
+    if(gpar) {
+        #pragma omp parallel for schedule(dynamic, 1)
+        for(ch = 0; ch < nch; ch++)
+            source_count_chunk(srcidx, ch * C, (ch + 1) * C < nsrc ? (ch + 1) * C : nsrc, up->PotentialTypes,
+                               &cpot[ch], &csub[ch], cM[ch]);
+    }
+    else
+        for(ch = 0; ch < nch; ch++)
+            source_count_chunk(srcidx, ch * C, (ch + 1) * C < nsrc ? (ch + 1) * C : nsrc, up->PotentialTypes,
+                               &cpot[ch], &csub[ch], cM[ch]);
     int64_t npot = 0, nsubable = 0;
     double Mtot[6] = {0};
-    for(i = 0; i < nsrc; i++) {
-        const int type = P[srcidx[i]].Type;
-        if(!type_in(up->PotentialTypes, type))
-            continue;
-        npot++;
-        if(!type_in(SUBHALO_NOSUBSAMPLE_TYPES, type)) {
-            nsubable++;
-            Mtot[type] += P[srcidx[i]].Mass;
-        }
+    for(ch = 0; ch < nch; ch++) {
+        npot += cpot[ch];
+        nsubable += csub[ch];
+        for(t = 0; t < 6; t++)
+            Mtot[t] += cM[ch][t];
     }
     const int sampled = sample > 0 && nsubable > sample;
     double fac[6] = {1, 1, 1, 1, 1, 1};
     int64_t ns = npot;
     if(sampled) {
+        /* serial: stops after the first `sample` subsampleable sources */
         double Msamp[6] = {0};
         int64_t taken = 0;
         for(i = 0; i < nsrc && taken < sample; i++) {
@@ -530,42 +972,45 @@ potential_energies(const int64_t * tgt, int64_t nt, double * E, const int64_t * 
         ns = npot - nsubable + sample;
     }
 
+    /* the gather keeps the list order: each chunk's output offset and its first subsampleable
+     * rank from the counts of the chunks before it */
+    {
+        int64_t off = 0, rank = 0;
+        for(ch = 0; ch < nch; ch++) {
+            cout[ch] = off;
+            crank[ch] = rank;
+            int64_t tsub = csub[ch];
+            if(sampled) {
+                tsub = sample - rank;
+                if(tsub < 0) tsub = 0;
+                if(tsub > csub[ch]) tsub = csub[ch];
+            }
+            off += cpot[ch] - csub[ch] + tsub;
+            rank += csub[ch];
+        }
+    }
     struct SubTree tree = {0};
     tree.BoxSize = BoxSize;
     tree.src = (struct SubSrc *) arena_need(arena, sizeof(struct SubSrc) * (ns > 0 ? ns : 1), "potential sources");
-    int64_t taken = 0, k = 0;
-    for(i = 0; i < nsrc; i++) {
-        const int64_t p = srcidx[i];
-        const int type = P[p].Type;
-        if(!type_in(up->PotentialTypes, type))
-            continue;
-        if(sampled && !type_in(SUBHALO_NOSUBSAMPLE_TYPES, type)) {
-            if(taken >= sample)
-                continue;
-            taken++;
-        }
-        tree.src[k].p = p;
-        tree.src[k].m = P[p].Mass * fac[type];
-        for(d = 0; d < 3; d++)
-            tree.src[k].x[d] = NEAREST(P[p].Pos[d] - RefPos[d], BoxSize);
-        k++;
+    struct SubSrc * src = tree.src;
+    if(gpar) {
+        #pragma omp parallel for schedule(dynamic, 1)
+        for(ch = 0; ch < nch; ch++)
+            source_gather_chunk(srcidx, ch * C, (ch + 1) * C < nsrc ? (ch + 1) * C : nsrc, up->PotentialTypes,
+                                sampled, sample, fac, RefPos, BoxSize, crank[ch], src + cout[ch]);
     }
-    tree.ns = k;
+    else
+        for(ch = 0; ch < nch; ch++)
+            source_gather_chunk(srcidx, ch * C, (ch + 1) * C < nsrc ? (ch + 1) * C : nsrc, up->PotentialTypes,
+                                sampled, sample, fac, RefPos, BoxSize, crank[ch], src + cout[ch]);
+    tree.ns = ns;
     /* the extent of sources and targets together in the frame coordinates: below BoxSize / 2
-     * (with a margin for rounding) along every axis, no displacement needs wrapping */
+     * (with a margin for rounding) along every axis, no displacement needs wrapping (min and
+     * max: exact in any order) */
     {
-        double lo[3] = {DBL_MAX, DBL_MAX, DBL_MAX}, hi[3] = {-DBL_MAX, -DBL_MAX, -DBL_MAX};
-        for(i = 0; i < tree.ns; i++)
-            for(d = 0; d < 3; d++) {
-                if(tree.src[i].x[d] < lo[d]) lo[d] = tree.src[i].x[d];
-                if(tree.src[i].x[d] > hi[d]) hi[d] = tree.src[i].x[d];
-            }
-        for(i = 0; i < nt; i++)
-            for(d = 0; d < 3; d++) {
-                const double y = NEAREST(P[tgt[i]].Pos[d] - RefPos[d], BoxSize);
-                if(y < lo[d]) lo[d] = y;
-                if(y > hi[d]) hi[d] = y;
-            }
+        double lo[3], hi[3];
+        src_extent(tree.src, tree.ns, par_mode(tree.ns), lo, hi);
+        tgt_extent(tgt, nt, RefPos, BoxSize, par_mode(nt), lo, hi);
         tree.wrap = 0;
         for(d = 0; d < 3; d++)
             if(!(hi[d] - lo[d] < 0.49 * BoxSize))
@@ -612,26 +1057,58 @@ subhalo_energies(const int64_t * idx, int64_t n, double * E, const int64_t * src
     potential_energies(idx, n, E, src, ns, 0, up->SampleSize, RefPos, RefVel, up, arena);
 }
 
-/* Mass-weighted centre and velocity of P[Index[0, n)] (HBT CentreOfMassReferenceFrame,
- * subhalo_unbind.cpp:150-195: positions relative to the first particle, NEAREST). Pos wrapped
- * into [0, BoxSize). Returns the mass; leaves Pos/Vel untouched if n == 0. */
-static double
-bound_frame(const int64_t * Index, int64_t n, double Pos[3], double Vel[3], double BoxSize)
+/* Partial sums of bound_frame over Index[i0, i1), in list order. */
+static void
+bound_frame_chunk(const int64_t * Index, int64_t i0, int64_t i1, const double ref[3], double BoxSize, double part[7])
 {
-    if(n <= 0)
-        return 0;
+    double M = 0, mx[3] = {0, 0, 0}, mv[3] = {0, 0, 0};
     int64_t i;
     int d;
-    double M = 0, mx[3] = {0, 0, 0}, mv[3] = {0, 0, 0}, ref[3];
-    for(d = 0; d < 3; d++)
-        ref[d] = P[Index[0]].Pos[d];
-    for(i = 0; i < n; i++) {
+    for(i = i0; i < i1; i++) {
         const struct particle_data * pp = &P[Index[i]];
         const double m = pp->Mass;
         M += m;
         for(d = 0; d < 3; d++) {
             mx[d] += m * NEAREST(pp->Pos[d] - ref[d], BoxSize);
             mv[d] += m * pp->Vel[d];
+        }
+    }
+    part[0] = M;
+    for(d = 0; d < 3; d++) {
+        part[1 + d] = mx[d];
+        part[4 + d] = mv[d];
+    }
+}
+
+/* Mass-weighted centre and velocity of P[Index[0, n)] (HBT CentreOfMassReferenceFrame,
+ * subhalo_unbind.cpp:150-195: positions relative to the first particle, NEAREST). Pos wrapped
+ * into [0, BoxSize). Returns the mass; leaves Pos/Vel untouched if n == 0. The sums run over
+ * the fixed chunks of chunk_len(n) (one chunk, HEAD's loop, for n <= PAR_MIN). */
+static double
+bound_frame(const int64_t * Index, int64_t n, double Pos[3], double Vel[3], double BoxSize)
+{
+    if(n <= 0)
+        return 0;
+    const int64_t C = chunk_len(n);
+    const int nch = chunk_count(n, C);
+    double part[SUBHALO_CHUNK_MAX][7];
+    int ch, d;
+    double M = 0, mx[3] = {0, 0, 0}, mv[3] = {0, 0, 0}, ref[3];
+    for(d = 0; d < 3; d++)
+        ref[d] = P[Index[0]].Pos[d];
+    if(par_mode(n)) {
+        #pragma omp parallel for schedule(dynamic, 1)
+        for(ch = 0; ch < nch; ch++)
+            bound_frame_chunk(Index, ch * C, (ch + 1) * C < n ? (ch + 1) * C : n, ref, BoxSize, part[ch]);
+    }
+    else
+        for(ch = 0; ch < nch; ch++)
+            bound_frame_chunk(Index, ch * C, (ch + 1) * C < n ? (ch + 1) * C : n, ref, BoxSize, part[ch]);
+    for(ch = 0; ch < nch; ch++) {
+        M += part[ch][0];
+        for(d = 0; d < 3; d++) {
+            mx[d] += part[ch][1 + d];
+            mv[d] += part[ch][4 + d];
         }
     }
     if(M <= 0)
@@ -643,6 +1120,7 @@ bound_frame(const int64_t * Index, int64_t n, double Pos[3], double Vel[3], doub
     return M;
 }
 
+/* Tracers among Index[0, n), counting stopped at stop (serial: the survival test stops early). */
 static int64_t
 count_tracers(const int64_t * Index, int64_t n, int TracerTypes, int64_t stop)
 {
@@ -651,6 +1129,84 @@ count_tracers(const int64_t * Index, int64_t n, int TracerTypes, int64_t stop)
         if(type_in(TracerTypes, P[Index[i]].Type))
             nt++;
     return nt;
+}
+
+/* All tracers among Index[0, n) (an integer sum: any order). */
+static int64_t
+count_tracers_all(const int64_t * Index, int64_t n, int TracerTypes)
+{
+    if(!par_mode(n))
+        return count_tracers(Index, n, TracerTypes, n);
+    int64_t i, nt = 0;
+    #pragma omp parallel for schedule(static) reduction(+: nt)
+    for(i = 0; i < n; i++)
+        if(type_in(TracerTypes, P[Index[i]].Type))
+            nt++;
+    return nt;
+}
+
+/* Bound (Energy < 0) to the front of (Index, Energy)[0, n), returning their number.
+ * n <= PAR_MIN: HEAD's swap loop (the bound keep their relative order, the unbound are left in
+ * the order of its swaps). n > PAR_MIN: the stable partition (bound and unbound both keep their
+ * relative order) by per-chunk counts and prefix offsets through a 16 byte per particle arena
+ * buffer (decision 34: the swap loop's unbound order cannot be parallelised; it is visible only
+ * in a candidate that dies, whose list seeds the parent's subsample). */
+static int64_t
+partition_bound(int64_t * Index, double * Energy, int64_t n, struct SubhaloArena * arena)
+{
+    int64_t i, j = 0;
+    if(n <= SUBHALO_UNBIND_PAR_MIN) {
+        for(i = 0; i < n; i++) {
+            if(Energy[i] < 0) {
+                if(i != j) {
+                    const int64_t ti = Index[i];
+                    const double te = Energy[i];
+                    Index[i] = Index[j];
+                    Energy[i] = Energy[j];
+                    Index[j] = ti;
+                    Energy[j] = te;
+                }
+                j++;
+            }
+        }
+        return j;
+    }
+    const size_t mark = arena->used;
+    int64_t * ti = (int64_t *) arena_need(arena, sizeof(int64_t) * n, "partition indices");
+    double * te = (double *) arena_need(arena, sizeof(double) * n, "partition energies");
+    const int64_t C = chunk_len(n);
+    const int nch = chunk_count(n, C);
+    const int par = par_mode(n);
+    int64_t cb[SUBHALO_CHUNK_MAX], boff[SUBHALO_CHUNK_MAX], uoff[SUBHALO_CHUNK_MAX];
+    int ch;
+    #pragma omp parallel for schedule(static) if(par)
+    for(ch = 0; ch < nch; ch++) {
+        const int64_t i1 = (ch + 1) * C < n ? (ch + 1) * C : n;
+        int64_t ii, nb = 0;
+        for(ii = ch * C; ii < i1; ii++)
+            nb += Energy[ii] < 0;
+        cb[ch] = nb;
+    }
+    int64_t nbound = 0;
+    for(ch = 0; ch < nch; ch++) {
+        boff[ch] = nbound;
+        nbound += cb[ch];
+    }
+    for(ch = 0; ch < nch; ch++)
+        uoff[ch] = nbound + ch * C - boff[ch];
+    #pragma omp parallel for schedule(static) if(par)
+    for(ch = 0; ch < nch; ch++) {
+        const int64_t i1 = (ch + 1) * C < n ? (ch + 1) * C : n;
+        int64_t ii, kb = boff[ch], ku = uoff[ch];
+        for(ii = ch * C; ii < i1; ii++) {
+            const int64_t k = Energy[ii] < 0 ? kb++ : ku++;
+            ti[k] = Index[ii];
+            te[k] = Energy[ii];
+        }
+    }
+    SUBHALO_PAR_FOR(par, i, n, Index[i] = ti[i]; Energy[i] = te[i];);
+    arena->used = mark;
+    return nbound;
 }
 
 /* ------------------------------------------------------------------ the unbinding loop */
@@ -667,17 +1223,13 @@ refine_most_bound(struct SubCandidate * c, int64_t nref, const struct SubhaloUnb
     potential_energies(c->Index, nref, Eref, c->Index, nref, 0, up->SampleSize, c->RefPos, c->RefVel, up, arena);
     struct EPairPos * pr = (struct EPairPos *) arena_need(arena, sizeof(struct EPairPos) * nref, "refinement order");
     double * oe = (double *) arena_need(arena, sizeof(double) * nref, "refinement energy copy");
-    for(i = 0; i < nref; i++) {
-        pr[i].E = Eref[i];
-        pr[i].idx = c->Index[i];   /* ties by the particle's ID, not its list position */
-        pr[i].pos = i;
-        oe[i] = c->Energy[i];
-    }
-    sort_epairpos(pr, nref);
-    for(i = 0; i < nref; i++) {
-        c->Index[i] = pr[i].idx;
-        c->Energy[i] = oe[pr[i].pos];
-    }
+    int64_t * Index = c->Index;
+    double * Energy = c->Energy;
+    const int par = par_mode(nref);
+    /* ties by the particle's ID, not its list position */
+    SUBHALO_PAR_FOR(par, i, nref, pr[i].E = Eref[i]; pr[i].idx = Index[i]; pr[i].pos = i; oe[i] = Energy[i];);
+    sort_epairpos_par(pr, nref, arena);
+    SUBHALO_PAR_FOR(par, i, nref, Index[i] = pr[i].idx; Energy[i] = oe[pr[i].pos];);
     arena->used = mark;
 }
 
@@ -733,21 +1285,7 @@ subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * up, s
 
         /* bound to the front, keeping their relative (shuffled) order (stable_partition,
          * subhalo_unbind.cpp:35-44); the unbound are sorted at the end */
-        int64_t j = 0;
-        for(i = 0; i < Nlast; i++) {
-            if(Energy[i] < 0) {
-                if(i != j) {
-                    const int64_t ti = Index[i];
-                    const double te = Energy[i];
-                    Index[i] = Index[j];
-                    Energy[i] = Energy[j];
-                    Index[j] = ti;
-                    Energy[j] = te;
-                }
-                j++;
-            }
-        }
-        Nbound = j;
+        Nbound = partition_bound(Index, Energy, Nlast, arena);
         c->ConvergenceRatio = (double) Nbound / (double) Nlast;
 
         /* survival thresholds (subhalo_unbind.cpp:629-674) */
@@ -794,7 +1332,7 @@ subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * up, s
             nref = Nbound;
         refine_most_bound(c, nref, up, arena);
     }
-    c->NboundTracer = count_tracers(Index, Nbound, up->TracerTypes, Nbound);
+    c->NboundTracer = count_tracers_all(Index, Nbound, up->TracerTypes);
     arena->used = mark;
     return 1;
 }
@@ -811,10 +1349,18 @@ subhalo_final_pass(struct SubCandidate * c, const struct SubhaloUnbindParams * u
     potential_energies(c->Index, n, c->Energy, c->Index, n, 0, up->SampleSize, c->RefPos, c->RefVel, up, arena);
     sort_energy_index(c->Energy, c->Index, n, arena);
     int64_t i, npos = 0;
-    for(i = 0; i < n; i++)
-        if(c->Energy[i] >= 0)
-            npos++;
-    c->NboundTracer = count_tracers(c->Index, n, up->TracerTypes, n);
+    const double * E = c->Energy;
+    if(par_mode(n)) {
+        #pragma omp parallel for schedule(static) reduction(+: npos)
+        for(i = 0; i < n; i++)
+            if(E[i] >= 0)
+                npos++;
+    }
+    else
+        for(i = 0; i < n; i++)
+            if(E[i] >= 0)
+                npos++;
+    c->NboundTracer = count_tracers_all(c->Index, n, up->TracerTypes);
     c->NboundPositive = npos;
     arena->used = mark;
     return npos;
@@ -1029,6 +1575,43 @@ knn_rec(const struct SubhaloKnnTree * kt, int64_t n, const double q[3], const do
         knn_rec(kt, ch[a], q, qa, L);
 }
 
+/* Bounding box of node n from its sources (leaf) or its children. */
+static inline void
+knn_box_node(struct SubTree * t, int64_t n)
+{
+    struct SubBox * b = &t->box[n];
+    int d;
+    for(d = 0; d < 3; d++) {
+        b->lo[d] = DBL_MAX;
+        b->hi[d] = -DBL_MAX;
+    }
+    if(t->sk[n].skip == n + 1) {
+        int64_t j;
+        for(j = t->sk[n].first; j < t->sk[n].first + t->sk[n].count; j++)
+            for(d = 0; d < 3; d++) {
+                if(t->src[j].x[d] < b->lo[d]) b->lo[d] = t->src[j].x[d];
+                if(t->src[j].x[d] > b->hi[d]) b->hi[d] = t->src[j].x[d];
+            }
+    }
+    else {
+        int64_t ch;
+        for(ch = n + 1; ch < t->sk[n].skip; ch = t->sk[ch].skip)
+            for(d = 0; d < 3; d++) {
+                if(t->box[ch].lo[d] < b->lo[d]) b->lo[d] = t->box[ch].lo[d];
+                if(t->box[ch].hi[d] > b->hi[d]) b->hi[d] = t->box[ch].hi[d];
+            }
+    }
+}
+
+static void __attribute__((noinline))
+knn_build_par(struct SubTree * t, struct SubhaloArena * arena)
+{
+    struct TopPlan plan;
+    tree_build_skeleton(t, sizeof(struct SubBox), arena, &plan);
+    t->box = (struct SubBox *) arena_need(arena, sizeof(struct SubBox) * t->nn, "neighbour boxes");
+    SUBHALO_TREE_UPWARD_PAR(t, &plan, knn_box_node);
+}
+
 struct SubhaloKnnTree *
 subhalo_knn_build(const int64_t * tr, int64_t nt, double BoxSize, struct SubhaloArena * arena)
 {
@@ -1049,43 +1632,32 @@ subhalo_knn_build(const int64_t * tr, int64_t nt, double BoxSize, struct Subhalo
         kt->origin[d] = P[tr[0]].Pos[d];
     struct SubTree * t = &kt->t;
     t->src = (struct SubSrc *) arena_need(arena, sizeof(struct SubSrc) * nt, "neighbour sources");
-    for(i = 0; i < nt; i++) {
-        t->src[i].p = tr[i];
-        t->src[i].m = 1;
-        for(d = 0; d < 3; d++)
-            t->src[i].x[d] = NEAREST(P[tr[i]].Pos[d] - kt->origin[d], BoxSize);
-    }
+    struct SubSrc * src = t->src;
+    const double * origin = kt->origin;
+    const int par = par_mode(nt);
+    SUBHALO_PAR_FOR(par, i, nt,
+        int dd;
+        src[i].p = tr[i];
+        src[i].m = 1;
+        for(dd = 0; dd < 3; dd++)
+            src[i].x[dd] = NEAREST(P[tr[i]].Pos[dd] - origin[dd], BoxSize);
+    );
     t->ns = nt;
-    tree_build_skeleton(t, sizeof(struct SubBox), arena);
-    t->box = (struct SubBox *) arena_need(arena, sizeof(struct SubBox) * t->nn, "neighbour boxes");
-    int64_t n;
-    for(n = t->nn - 1; n >= 0; n--) {
-        struct SubBox * b = &t->box[n];
-        for(d = 0; d < 3; d++) {
-            b->lo[d] = DBL_MAX;
-            b->hi[d] = -DBL_MAX;
-        }
-        if(t->sk[n].skip == n + 1) {
-            int64_t j;
-            for(j = t->sk[n].first; j < t->sk[n].first + t->sk[n].count; j++)
-                for(d = 0; d < 3; d++) {
-                    if(t->src[j].x[d] < b->lo[d]) b->lo[d] = t->src[j].x[d];
-                    if(t->src[j].x[d] > b->hi[d]) b->hi[d] = t->src[j].x[d];
-                }
-        }
-        else {
-            int64_t ch;
-            for(ch = n + 1; ch < t->sk[n].skip; ch = t->sk[ch].skip)
-                for(d = 0; d < 3; d++) {
-                    if(t->box[ch].lo[d] < b->lo[d]) b->lo[d] = t->box[ch].lo[d];
-                    if(t->box[ch].hi[d] > b->hi[d]) b->hi[d] = t->box[ch].hi[d];
-                }
-        }
+    if(par)
+        knn_build_par(t, arena);
+    else {
+        tree_build_skeleton(t, sizeof(struct SubBox), arena, NULL);
+        t->box = (struct SubBox *) arena_need(arena, sizeof(struct SubBox) * t->nn, "neighbour boxes");
+        int64_t n;
+        for(n = t->nn - 1; n >= 0; n--)
+            knn_box_node(t, n);
     }
     /* the point distances come from the absolute positions */
-    for(i = 0; i < nt; i++)
-        for(d = 0; d < 3; d++)
-            t->src[i].x[d] = P[t->src[i].p].Pos[d];
+    SUBHALO_PAR_FOR(par, i, nt,
+        int dd;
+        for(dd = 0; dd < 3; dd++)
+            src[i].x[dd] = P[src[i].p].Pos[dd];
+    );
     return kt;
 }
 

@@ -1,7 +1,7 @@
 #ifndef SUBHALO_UNBIND_H
 #define SUBHALO_UNBIND_H
 
-/* Serial unbinding kernel of the subhalo finder (design 7.4, Phase 2a plan section 3).
+/* Unbinding kernel of the subhalo finder (design 7.4, Phase 2a plan section 3).
  *
  * Port of HBT-HERONS: the monopole octree with geometric opening (src/gravity_tree.cpp), the
  * unbinding loop with subsampling, refinement, survival thresholds, frame update and count
@@ -9,11 +9,12 @@
  * criterion (src/subhalo_merge.cpp:13-26,93-181) and the k-nearest tracer search of
  * src/subhalo_reassign_gas.cpp. Deliberate deviations: design D3 items 3-6.
  *
- * Every function here is serial and thread-safe (it runs inside OpenMP threads, one key per
- * thread); scratch comes only from the caller's arena (subhalo_arena_get), which is rewound to
- * its entry state on return, so nothing a function allocates survives it. Energy evaluation
- * loops are split over OpenMP threads only when called outside a parallel region (a key that is
- * processed alone); results do not depend on the thread count.
+ * Every function here is thread-safe (it runs inside OpenMP threads, one key per thread);
+ * scratch comes only from the caller's arena (subhalo_arena_get), which is rewound to its entry
+ * state on return, so nothing a function allocates survives it. A step on more than
+ * SUBHALO_UNBIND_PAR_MIN entries that is called outside a parallel region (a key processed alone)
+ * splits its work over the OpenMP threads: see the "Phase 5b: intra-key threading" block at the
+ * end of this file. Results never depend on the thread count.
  *
  * Conventions (design 7.10): positions are P[i].Pos (translated comoving frame), relative vectors
  * NEAREST(dx, BoxSize); velocities are the internal P[i].Vel = a v_pec; energies per unit mass in
@@ -283,4 +284,29 @@ double subhalo_klypin_rs(double Rvir, double Mvir, double best, double rbest);
  * (MyIDType) -1 without a bound BH); with MetalReturnOn the gas and stellar metal masses and
  * element masses, else those stay -1. Nbound == 0: every column -1. No scratch. */
 void subhalo_props_baryons(struct SubTrack * rec, const struct SubCandidate * c, int MetalReturnOn);
+
+/* ------------------------------------------------------------------ Phase 5b: intra-key threading (subhalo_unbind.c) */
+
+/* Parallel mode of the kernel (Phase 5 plan section 4 item 6). A step on more than
+ * SUBHALO_UNBIND_PAR_MIN elements (sources, targets, list entries) called outside an OpenMP
+ * parallel region with more than one thread available (a key processed alone by
+ * subhalo_run_serial_keys) splits over the threads: the source gather, the extents, the Morton
+ * keys, the sorts (a parallel merge sort, its merge buffer from the arena; the serial introsort
+ * when the arena has no room for it), the octree (subtrees built and their moments or boxes
+ * computed in parallel, the top nodes serially), the energies, the bound/unbound partition, the
+ * frame and the counts. Every result (Index order, Energy, RefPos/RefVel, Mbound, the
+ * subsample, the neighbour lists) is defined independently of the thread count:
+ *  - the floating sums (the per-type masses of the subsampling, bound_frame) run over fixed
+ *    chunks of max(PAR_MIN, ceil(n / 256)) list entries, combined in chunk order;
+ *  - sorts and trees produce the unique result of their strict total order (ties by ID);
+ *  - the bound/unbound partition of a list of more than PAR_MIN entries is stable (both parts
+ *    keep their relative order; 16 bytes per entry of arena scratch, within
+ *    SUBHALO_UNBIND_SCRATCH_BYTES_PER_PART); at most PAR_MIN entries keep the swap loop of
+ *    HEAD 9e60f168, whose unbound order differs (decision 34; visible only in a dead
+ *    candidate's list).
+ * A candidate whose every step is at most PAR_MIN elements is bit-identical to HEAD 9e60f168.
+ * The seeded shuffle, the subsample mass sum and the early-stopping tracer count of the
+ * survival test stay serial. */
+#define SUBHALO_UNBIND_PAR_MIN 16384
+
 #endif
