@@ -180,8 +180,8 @@ double subhalo_thermal_energy(int64_t i, double atime);
 
 /* ------------------------------------------------------------------ properties (subhalo_props.c) */
 
-/* Arena bytes per bound particle that subhalo_props_hbt and subhalo_props_rockstar take (the
- * radial order: radius and P index). */
+/* Arena bytes per bound particle that subhalo_props_hbt, subhalo_props_rockstar and
+ * subhalo_props_deferred take (the radial order: radius and P index). */
 #define SUBHALO_PROPS_BYTES_PER_PART 16
 
 /* Fill the step 7g columns of rec from a candidate after the final pass (plan section 4):
@@ -225,10 +225,62 @@ void subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c
  * -1 if the Newton iteration fails (subhalo_props_rockstar and the in-place recipes). */
 double subhalo_klypin_f_to_c(double f);
 
+/* ------------------------------------------------------------------ Phase 5 properties (subhalo_props.c) */
+
+/* Rockstar's NFW shape fit (nfw.c:51-144) and the velocity trio (properties.c:199-244, 417-458)
+ * on the bound set (Phase 5 plan section 1 item 1): Rs, RockstarCoreVel, BulkVel, Vrms of rec.
+ * The aperture is the bound virial sphere: the radially sorted bound particles (radii from the
+ * core of subhalo_core, floored at GravitySoftening = h / 2.8, ties by ID) up to and including
+ * the outermost virial crossing (the rule of subhalo_props_rockstar, crossing particle included
+ * as D4), Nvir of them, of mass Mvir and radius Rvir = (3 Mvir / (4 pi rho[0]))^(1/3).
+ *  - BulkVel: the mass-weighted mean Vel of the aperture; Vrms: sqrt(sum_d sum m (v_d -
+ *    BulkVel_d)^2 / Mvir) over the aperture (no Hubble term, as Rockstar).
+ *  - RockstarCoreVel: the mass-weighted mean Vel of the aperture particles with r < 0.1 Rvir,
+ *    or of the innermost min(SUBHALO_ROCKSTAR_CORE_MINPART, Nvir) when fewer are inside.
+ *  - Rs: the fit of subhalo_nfw_fit on the equal-mass bins of the aperture
+ *    (subhalo_nfw_bin_plan, subhalo_nfw_threshold, subhalo_nfw_edge) from the Klypin start
+ *    (subhalo_klypin_rs); -1 when Nvir < SUBHALO_NFW_MINPART or the fit fails.
+ * All four stay -1 without a virial crossing (or Nbound == 0). Velocities physical peculiar
+ * km/s (subhalo_vel_to_kms(a) on Vel), Rs comoving in the run's length unit. The core is
+ * recomputed (as subhalo_props_rockstar does), so rec's other columns are not read. Scratch:
+ * SUBHALO_PROPS_BYTES_PER_PART * Nbound from the arena, rewound on return; endrun if short.
+ * subhalo_props_rockstar fills the same four columns with the same arithmetic on its own radial
+ * order (one sort per subhalo; the production path, subhalo_track.c); this standalone entry
+ * gives bit-identical values (the unit tests compare the two). */
+void subhalo_props_deferred(struct SubTrack * rec, const struct SubCandidate * c,
+                            const struct SubhaloUnbindParams * up, const double rho[SUBHALO_NSO],
+                            int CoreSize, struct SubhaloArena * arena);
+
+/* The pieces both modes share (subhalo_collective.c replicates the fit per label from reduced
+ * bin edges), so that the serial and the distributed Rs come from the same arithmetic. */
+#define SUBHALO_NFW_MAXBINS 50        /* MAX_SCALE_BINS */
+#define SUBHALO_NFW_MINPERBIN 15      /* MIN_PART_PER_BIN (also Rockstar's iteration cap) */
+#define SUBHALO_NFW_MINPART 100       /* MIN_SCALE_PART */
+#define SUBHALO_ROCKSTAR_CORE_MINPART 100
+/* The bin plan of calc_scale_radius for nfit particles of total mass Mfit and largest particle
+ * mass mmax: returns the number of bins (0 when nfit < SUBHALO_NFW_MINPART), *mpbin the mass per
+ * bin (at least mmax). */
+int subhalo_nfw_bin_plan(int64_t nfit, double Mfit, double mmax, double * mpbin);
+/* The cumulative mass at which bin b (1-based) closes: the first particle of the radial order
+ * with M(<= r) >= this closes it (Rockstar's running subtraction, with a 1e-9 relative margin so
+ * that rounding of the cumulative sums cannot move the edge between the two modes). */
+double subhalo_nfw_threshold(int b, double mpbin);
+/* The outer edge of bin b closed by the particle at r (mass m, cumulative mass Mc) between its
+ * neighbours rprev (ignored when has_prev == 0) and rnext (r when it is the last bound particle):
+ * 0.5 (r + rnext) - (Mc - b mpbin) / m (r - rprev) (nfw.c:126-132). */
+double subhalo_nfw_edge(int b, double mpbin, double rprev, int has_prev, double r, double rnext, double Mc, double m);
+/* calc_scale_from_bins (nfw.c:64-99) in double: Newton on the chi^2 of the bin masses from rs0
+ * (replaced by the middle edge when outside (edge[0], edge[nbins])), at most
+ * SUBHALO_NFW_MINPERBIN steps; bins whose inner edge is below wcut weigh 0.1. edge[0] = 0.
+ * Returns -1 when nbins < 3 or the result is not a finite positive radius. */
+double subhalo_nfw_fit(double rs0, const double * edge, int nbins, double wcut);
+/* Rockstar estimate_scale_radius (nfw.c:34-45) from the bound virial mass and radius and the
+ * VmaxVir pair (best = max M / r, rbest its radius, comoving): the RsKlypin column. */
+double subhalo_klypin_rs(double Rvir, double Mvir, double best, double rbest);
+
 /* Group C baryonic sums over the bound set, add_particle_to_group style (fof.c): SFR, HeIII mass
  * (gas), BH subgrid mass and Mdot, MostMassiveBHID (largest BHP(i).Mass, ties to the smaller ID;
  * (MyIDType) -1 without a bound BH); with MetalReturnOn the gas and stellar metal masses and
  * element masses, else those stay -1. Nbound == 0: every column -1. No scratch. */
 void subhalo_props_baryons(struct SubTrack * rec, const struct SubCandidate * c, int MetalReturnOn);
-
 #endif

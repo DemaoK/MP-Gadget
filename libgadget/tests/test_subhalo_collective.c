@@ -1010,6 +1010,23 @@ compare_outcomes(const struct Outcome * a, const struct Outcome * b, double nbto
             jy += y->J[d] * y->J[d];
         }
         CHECK(reldiff(sqrt(jx), sqrt(jy)) <= 2 * ptol, "%s: track %ld |J| %g / %g\n", what, t, sqrt(jx), sqrt(jy));
+        /* the Phase 5 columns: Rs fitted in both modes or -1 in both, Vrms within ptol, the two
+         * mean velocities within ptol Vrms (plus 0.01 km/s for a cold ball) */
+        message(0, "%s: track %ld Rs %g / %g (RsKlypin %g / %g), Vrms %g / %g, BulkVel (%g %g %g) / (%g %g %g), "
+                   "RockstarCoreVel (%g %g %g) / (%g %g %g)\n", what, t, x->Rs, y->Rs, x->RsKlypin, y->RsKlypin, x->Vrms, y->Vrms,
+                x->BulkVel[0], x->BulkVel[1], x->BulkVel[2], y->BulkVel[0], y->BulkVel[1], y->BulkVel[2],
+                x->RockstarCoreVel[0], x->RockstarCoreVel[1], x->RockstarCoreVel[2],
+                y->RockstarCoreVel[0], y->RockstarCoreVel[1], y->RockstarCoreVel[2]);
+        CHECK((x->Rs == -1 && y->Rs == -1) || (x->Rs > 0 && y->Rs > 0 && reldiff(x->Rs, y->Rs) <= ptol),
+              "%s: track %ld Rs %g serially, %g in place\n", what, t, x->Rs, y->Rs);
+        CHECK((x->Vrms == -1 && y->Vrms == -1) || reldiff(x->Vrms, y->Vrms) <= ptol, "%s: track %ld Vrms %g serially, %g in place\n",
+              what, t, x->Vrms, y->Vrms);
+        for(d = 0; d < 3; d++) {
+            const double vtol = ptol * fmax(x->Vrms, 0) + 0.01;
+            CHECK(fabs(x->BulkVel[d] - y->BulkVel[d]) <= vtol && fabs(x->RockstarCoreVel[d] - y->RockstarCoreVel[d]) <= vtol,
+                  "%s: track %ld BulkVel[%d] %g / %g RockstarCoreVel %g / %g\n", what, t, d, x->BulkVel[d], y->BulkVel[d],
+                  x->RockstarCoreVel[d], y->RockstarCoreVel[d]);
+        }
         CHECK(!(x->Flags & SUBHALO_FLAG_INPLACE), "%s: track %ld flagged in place in the serial run\n", what, t);
     }
     /* BoundTrackId and TrackId of every particle */

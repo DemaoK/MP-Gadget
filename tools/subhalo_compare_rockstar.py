@@ -38,9 +38,10 @@ Matching (--match):
 
 Per matched pair (ours / Rockstar, both converted to Rockstar's units): Mvir (--mass), M200b, M200c,
 M500c, M2500c (MBoundSO[1..4]), Rvir (RBoundSO[0]), Vmax (VmaxVir), Rs_Klypin (RsKlypin against
-rs_klypin, and against Rockstar's NFW fit Rs), Spin (SpinPeebles), Spin_Bullock, b_to_a, c_to_a,
-b_to_a(500c), c_to_a(500c), Xoff, Voff (VmaxVir and Voff are physical km/s in our catalogue as in
-Rockstar's, so they are not converted); p10/p50/p90 of each ratio over pairs where both sides are
+rs_klypin), Rs(fit) (our Phase 5 NFW fit Rs against Rockstar's fitted rs), Klypin/fit (our RsKlypin
+against Rockstar's fitted rs, for reference), Vrms, Spin (SpinPeebles), Spin_Bullock, b_to_a,
+c_to_a, b_to_a(500c), c_to_a(500c), Xoff, Voff (VmaxVir, Vrms and Voff are physical km/s in our
+catalogue as in Rockstar's, so they are not converted); p10/p50/p90 of each ratio over pairs where both sides are
 defined (> 0), with the counts of pairs where our value is undefined (-1 until Phase 3 fills the
 column), Rockstar's is (0), or our column is absent from the file. Rockstar's values are
 bound-only (BOUND_PROPS 1); its host's set includes its subhalos' particles while our central's
@@ -51,10 +52,16 @@ strict Mvir_all, MSO[1..4] against M200b..M2500c unless every halo has M200b = M
 = Mvir_all, the fork's io_bgc2.c:230-231 threshold bug (design 4.3), which is detected and reported;
 RSO[0] against (3 M / 4 pi rho_vir)^(1/3) of the strict mass when the Header has SOThresholds.
 
+Phase 5 summary (centrals <-> hosts within the tolerance, our Nbound >= --min-np): the median ratio
+and the fraction of pairs within 20 % (Rs(fit), Rs_Klypin, Klypin/fit) and 5 % (Vrms), and
+|RockstarCoreVel - Rockstar VX/VY/VZ| / Rockstar vrms (Rockstar's VX is its core velocity). Rockstar
+falls back to its Klypin rs below 100 bound particles while our Rs is -1 there ('ours und').
+
 Exit status: 0 when the fraction of our centrals with Nbound >= --min-np matched to a Rockstar host
 within the tolerance is at least --accept-frac and the median Mvir ratio (and with --field the median
-MSO[0] ratio) is within --median-tol of 1 (each skipped when fewer than 10 pairs define it or
---median-tol <= 0), or
+MSO[0] ratio) is within --median-tol of 1, the median Rs(fit) ratio within --rs-median-tol and the
+median Vrms ratio within --vrms-median-tol (each skipped when fewer than 10 pairs define it or its
+tolerance is <= 0), or
 --report-only is given; 1 otherwise; 2 when an input could not be read.
 
 Phase 1 catalogues (every FOF group one subhalo): pass --phase1 so that only section 0 of the
@@ -122,7 +129,7 @@ _ALIASES = {
     "rvir": ["rvir"], "vmax": ["vmax"], "rs": ["rs"], "rs_klypin": ["rs_klypin"],
     "spin": ["spin"], "spin_bullock": ["spin_bullock"],
     "b_to_a": ["b_to_a"], "c_to_a": ["c_to_a"], "b_to_a(500c)": ["b_to_a(500c)"], "c_to_a(500c)": ["c_to_a(500c)"],
-    "xoff": ["xoff"], "voff": ["voff"],
+    "xoff": ["xoff"], "voff": ["voff"], "vrms": ["vrms"], "vx": ["vx"], "vy": ["vy"], "vz": ["vz"],
     "x": ["x"], "y": ["y"], "z": ["z"], "np": ["np", "num_p"], "type": ["type"], "scale": ["scale"],
 }
 
@@ -342,7 +349,9 @@ QUANTITIES = [
     ("Rvir", "RBoundSO[0]", "rvir", "rad"),
     ("Vmax", "VmaxVir", "vmax", "kms"),
     ("Rs_Klypin", "RsKlypin", "rs_klypin", "rad"),
-    ("Rs(fit)", "RsKlypin", "rs", "rad"),
+    ("Rs(fit)", "Rs", "rs", "rad"),
+    ("Klypin/fit", "RsKlypin", "rs", "rad"),
+    ("Vrms", "Vrms", "vrms", "kms"),
     ("Spin", "SpinPeebles", "spin", "one"),
     ("Spin_Bullock", "SpinBullock", "spin_bullock", "one"),
     ("b_to_a", "BtoA", "b_to_a", "one"),
@@ -600,11 +609,14 @@ def report(side, ours, rs, M, args, box, out=sys.stdout, field=None):
           "value -1 (not computed) or <= 0; 'rs und': Rockstar's <= 0; 'absent': column not in the PIG):" % args.min_np, file=out)
     res = ratio_table(side, rs, M.o[sel_c], M.r[sel_c], qs, out, "centrals <-> hosts: %d pairs" % sel_c.size)
     ratio_table(side, rs, M.o[sel_s], M.r[sel_s], qs, out, "satellites <-> subhalos (secondary): %d pairs" % sel_s.size)
-    medians = [("Mvir", res.get("Mvir", np.zeros(0)))]
+    medians = [("Mvir", res.get("Mvir", np.zeros(0)), args.median_tol)]
+    phase5_summary(side, rs, M.o[sel_c], M.r[sel_c], res, out)
+    medians.append(("Rs(fit)", res.get("Rs(fit)", np.zeros(0)), args.rs_median_tol))
+    medians.append(("Vrms", res.get("Vrms", np.zeros(0)), args.vrms_median_tol))
     if field is not None:
         res_f = field_report(side, field, args, box, out)
         if res_f is not None:
-            medians.append(("MSO[0]", res_f.get("MSO[0]", np.zeros(0))))
+            medians.append(("MSO[0]", res_f.get("MSO[0]", np.zeros(0)), args.median_tol))
 
     if cen_big.size:
         ok = frac >= args.accept_frac
@@ -613,16 +625,16 @@ def report(side, ours, rs, M, args, box, out=sys.stdout, field=None):
     else:
         ok = True
         print("Acceptance: no centrals with Nbound >= %d, not tested" % args.min_np, file=out)
-    for label, rat in medians:
-        if args.median_tol > 0 and rat.size >= 10:
+    for label, rat, tol in medians:
+        if tol > 0 and rat.size >= 10:
             med = float(np.median(rat))
-            mok = abs(med - 1) <= args.median_tol
-            print("  median %s ratio %.3f (target within %.2f of 1): %s" % (label, med, args.median_tol, "ok" if mok else "FAILED"),
+            mok = abs(med - 1) <= tol
+            print("  median %s ratio %.3f (target within %.2f of 1): %s" % (label, med, tol, "ok" if mok else "FAILED"),
                   file=out)
             ok = ok and mok
         else:
             print("  median %s ratio not tested (%d pairs define it%s)" % (
-                label, rat.size, ", --median-tol <= 0" if args.median_tol <= 0 else ""), file=out)
+                label, rat.size, ", tolerance <= 0" if tol <= 0 else ""), file=out)
 
     if args.pairs_out:
         with open(args.pairs_out, "w") as f:
@@ -641,6 +653,36 @@ def report(side, ours, rs, M, args, box, out=sys.stdout, field=None):
                     " ".join(vals)))
         print("  pairs written to %s" % args.pairs_out, file=out)
     return ok
+
+
+def phase5_summary(side, rs, o, r, res, out):
+    """The Phase 5 columns over the central-host pairs (o, r): median ratio and the fraction within
+    20 % (radii) or 5 % (Vrms) of the pairs where both sides define the value; the core velocity
+    offset against Rockstar's VX/VY/VZ (its core velocity) in units of Rockstar's vrms."""
+    print("Phase 5 (centrals <-> hosts, %d pairs):" % o.size, file=out)
+    for label, tol in (("Rs(fit)", 0.2), ("Rs_Klypin", 0.2), ("Klypin/fit", 0.2), ("Vrms", 0.05)):
+        rat = res.get(label)
+        if rat is None or rat.size == 0:
+            print("    %-11s no pairs define it" % label, file=out)
+            continue
+        print("    %-11s %4d pairs: median ratio %.3f, within %2.0f%%: %.1f%%" % (
+            label, rat.size, float(np.median(rat)), 100 * tol, 100.0 * np.count_nonzero(np.abs(rat - 1) <= tol) / rat.size),
+            file=out)
+    if all(k in rs.columns for k in ("vx", "vy", "vz", "vrms")) and "RockstarCoreVel" in side.S and o.size:
+        ov = side.S["RockstarCoreVel"][o].astype(np.float64)
+        rv = np.stack([rs.columns[k][r] for k in ("vx", "vy", "vz")], axis=1)
+        sig = rs.columns["vrms"][r]
+        d = np.all(ov != -1, axis=1) & (sig > 0)
+        if np.any(d):
+            x = np.sqrt(((ov[d] - rv[d]) ** 2).sum(axis=1)) / sig[d]
+            print("    |RockstarCoreVel - Rockstar VX| / vrms: %d pairs, p10/p50/p90 %s" % (np.count_nonzero(d), _q(x)), file=out)
+    if "BulkVel" in side.S and "CoreVel" in side.S and o.size:
+        bv, cv = side.S["BulkVel"][o].astype(np.float64), side.S["CoreVel"][o].astype(np.float64)
+        sig = side.S["Vrms"][o].astype(np.float64) if "Vrms" in side.S else np.full(o.size, -1.0)
+        d = np.all(bv != -1, axis=1) & (sig > 0)
+        if np.any(d):
+            x = np.sqrt(((bv[d] - cv[d]) ** 2).sum(axis=1)) / sig[d]
+            print("    ours |BulkVel - CoreVel| / Vrms: p10/p50/p90 %s" % _q(x), file=out)
 
 
 def field_report(side, field, args, box, out):
@@ -722,6 +764,10 @@ def main(argv=None):
     p.add_argument("--accept-frac", type=float, default=0.9, help="target matched fraction of centrals (default 0.9)")
     p.add_argument("--median-tol", type=float, default=0.1,
                    help="target |median ratio - 1| for Mvir and, with --field, MSO[0]; <= 0 disables (default 0.1)")
+    p.add_argument("--rs-median-tol", type=float, default=0.2,
+                   help="target |median Rs(fit) ratio - 1| (Phase 5; default 0.2; <= 0 disables)")
+    p.add_argument("--vrms-median-tol", type=float, default=0.05,
+                   help="target |median Vrms ratio - 1| (Phase 5; default 0.05; <= 0 disables)")
     p.add_argument("--rs-snap", type=int, default=None, help="Rockstar snapshot number (default: SnapshotIndex + offset)")
     p.add_argument("--rs-snap-offset", type=int, default=0, help="Rockstar snapshot minus our SnapshotIndex (default 0)")
     p.add_argument("--phase1", action="store_true", help="Phase 1 catalogue: read section 0 of the particle blocks only")

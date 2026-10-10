@@ -1052,6 +1052,7 @@ struct RoundProps {
     double * prof;           /* [nc][8]: hbt best M/r, Rmax, vir best M/r, RmaxVir, rhalf, Renclose, (unused) x2 */
     double * jv;             /* [nc][9]: JVir sums 3, x sums 3, v sums 3 */
     float * shape;           /* [nc][2][5]: BtoA, CtoA, AxisA[3] (vir, 500c), -1 */
+    double * dfr;            /* [nc][8]: Rs, RockstarCoreVel 3, BulkVel 3, Vrms (km/s), -1 (Phase 5) */
 };
 
 struct RadRec {
@@ -1188,6 +1189,187 @@ shapes_distributed(const struct Coll * C, const struct RadRec * rr, int64_t nr, 
     myfree(orth);
 }
 
+/* The Phase 5 recipes of subhalo_props_deferred on the radial ordered set of the round (rr[0, nr)
+ * sorted by (label, r, ID), pos the global positions within each label, Mc the cumulative masses
+ * M(<= r)), after the profile (rp->kc, Mso, prof, hs) is known: the aperture is pos <= kc[vir].
+ * Four reductions over the labels: (1) the aperture velocity sums about the core velocity and the
+ * count inside 0.1 Rvir, (2) the largest particle mass, (3) the position closing each equal-mass
+ * bin (the first with Mc >= subhalo_nfw_threshold), (4) the radii around each closing position
+ * and the core velocity sums; the fit itself (subhalo_nfw_fit) is replicated per label. Results
+ * in rp->dfr (km/s, the run's length unit), -1 where undefined. Collective. */
+static void
+deferred_distributed(const struct Coll * C, const struct CoreOut * core, const struct RadRec * rr, int64_t nr,
+                     const int64_t * pos, const double * Mc, struct RoundProps * rp)
+{
+    const int64_t nc = C->c1 - C->c0;
+    const double * rho = C->ctx->rho;
+    const double rfloor = C->up->h / 2.8;
+    const double vkms = subhalo_vel_to_kms(C->up->atime);
+    const int NB = SUBHALO_NFW_MAXBINS;
+    const int NA = 8, NV = 4 + 5 * NB;      /* (1): ncore, M, Sb 3, S2 3; (4): Mcore, Sc 3, per bin 5 */
+    int64_t c, k;
+    int d, b;
+    if(nc <= 0)
+        return;
+    double * A = (double *) mymalloc("SubCollDfA", sizeof(double) * NA * nc);
+    double * AG = (double *) mymalloc("SubCollDfAG", sizeof(double) * NA * nc);
+    double * X = (double *) mymalloc("SubCollDfX", sizeof(double) * (NB + 1) * nc);
+    double * XG = (double *) mymalloc("SubCollDfXG", sizeof(double) * (NB + 1) * nc);
+    double * V = (double *) mymalloc("SubCollDfV", sizeof(double) * NV * nc);
+    double * VG = (double *) mymalloc("SubCollDfVG", sizeof(double) * NV * nc);
+    int64_t * kc = (int64_t *) mymalloc("SubCollDfKc", sizeof(int64_t) * 3 * nc);   /* kc, ncore, nb */
+    double * Rv = (double *) mymalloc("SubCollDfRv", sizeof(double) * 2 * nc);       /* Rvir, mpbin */
+    for(c = 0; c < nc; c++) {
+        kc[3 * c] = rp->kc[SUBHALO_NSO * c];
+        Rv[2 * c] = kc[3 * c] >= 0 ? cbrt(3 * rp->Mso[SUBHALO_NSO * c] / (4 * M_PI * rho[0])) : -1;
+    }
+
+    /* (1) the aperture: velocity sums about the core velocity, the count inside 0.1 Rvir; (2) the
+     * largest particle mass (X[c * (NB + 1)]) */
+    memset(A, 0, sizeof(double) * NA * nc);
+    for(c = 0; c < nc; c++)
+        X[(NB + 1) * c] = 0;
+    for(k = 0; k < nr; k++) {
+        c = (int64_t) rr[k].key[2];
+        if(pos[k] > kc[3 * c])
+            continue;
+        const double * cp = core->d + CORE_ND * c;
+        const double m = rr[k].m;
+        double * a = A + NA * c;
+        if(rr[k].r < 0.1 * Rv[2 * c])
+            a[0] += 1;
+        a[1] += m;
+        for(d = 0; d < 3; d++) {
+            const double dv = rr[k].vel[d] - cp[3 + d];
+            a[2 + d] += m * dv;
+            a[5 + d] += m * dv * dv;
+        }
+        if(m > X[(NB + 1) * c])
+            X[(NB + 1) * c] = m;
+    }
+    MPI_Allreduce(A, AG, NA * nc, MPI_DOUBLE, MPI_SUM, C->Comm);
+    for(c = 0; c < nc; c++)
+        XG[c] = X[(NB + 1) * c];
+    MPI_Allreduce(XG, V, nc, MPI_DOUBLE, MPI_MAX, C->Comm);
+    for(c = 0; c < nc; c++) {
+        double * o = rp->dfr + 8 * c;
+        kc[3 * c + 1] = 0;
+        kc[3 * c + 2] = 0;
+        Rv[2 * c + 1] = 0;
+        if(kc[3 * c] < 0)
+            continue;
+        const int64_t nvir = kc[3 * c] + 1;
+        const double * a = AG + NA * c;
+        const double * cp = core->d + CORE_ND * c;
+        int64_t ncore = (int64_t) a[0];
+        if(ncore < SUBHALO_ROCKSTAR_CORE_MINPART)
+            ncore = nvir < SUBHALO_ROCKSTAR_CORE_MINPART ? nvir : SUBHALO_ROCKSTAR_CORE_MINPART;
+        kc[3 * c + 1] = ncore;
+        double var = 0;
+        for(d = 0; d < 3; d++) {
+            const double mb = a[2 + d] / a[1];
+            var += a[5 + d] / a[1] - mb * mb;
+            o[4 + d] = (cp[3 + d] + mb) * vkms;
+        }
+        o[7] = sqrt(var > 0 ? var : 0) * vkms;
+        kc[3 * c + 2] = subhalo_nfw_bin_plan(nvir, rp->Mso[SUBHALO_NSO * c], V[c], &Rv[2 * c + 1]);
+    }
+
+    /* (3) the closing positions: the first local record of each label reaching each threshold,
+     * the global minimum by a MAX of the negated positions */
+    for(k = 0; k < (NB + 1) * nc; k++)
+        X[k] = -1e300;
+    {
+        int64_t lab = -1;
+        int nextb = 1;
+        for(k = 0; k < nr; k++) {
+            c = (int64_t) rr[k].key[2];
+            if(c != lab) {
+                lab = c;
+                nextb = 1;
+            }
+            if(pos[k] > kc[3 * c])
+                continue;
+            while(nextb <= kc[3 * c + 2] && Mc[k] >= subhalo_nfw_threshold(nextb, Rv[2 * c + 1])) {
+                X[(NB + 1) * c + nextb] = -(double) pos[k];
+                nextb++;
+            }
+        }
+    }
+    MPI_Allreduce(X, XG, (NB + 1) * nc, MPI_DOUBLE, MPI_MAX, C->Comm);
+
+    /* (4) the radii at and around each closing position, the mass and cumulative mass there, and
+     * the core velocity sums */
+    memset(V, 0, sizeof(double) * NV * nc);
+    for(k = 0; k < nr; k++) {
+        c = (int64_t) rr[k].key[2];
+        double * v = V + NV * c;
+        const int64_t pk = pos[k];
+        if(pk < kc[3 * c + 1]) {
+            const double * cp = core->d + CORE_ND * c;
+            v[0] += rr[k].m;
+            for(d = 0; d < 3; d++)
+                v[1 + d] += rr[k].m * (rr[k].vel[d] - cp[3 + d]);
+        }
+        for(b = 1; b <= kc[3 * c + 2]; b++) {
+            const double xb = XG[(NB + 1) * c + b];
+            if(xb < -1e299)
+                break;
+            const int64_t pb = (int64_t) -xb;
+            double * e = v + 4 + 5 * (b - 1);
+            if(pk == pb - 1)
+                e[0] += rr[k].r;
+            if(pk == pb) {
+                e[1] += rr[k].r;
+                e[3] += rr[k].m;
+                e[4] += Mc[k];
+            }
+            if(pk == pb + 1)
+                e[2] += rr[k].r;
+        }
+    }
+    MPI_Allreduce(V, VG, NV * nc, MPI_DOUBLE, MPI_SUM, C->Comm);
+    for(c = 0; c < nc; c++) {
+        if(kc[3 * c] < 0)
+            continue;
+        const double * v = VG + NV * c;
+        const double * cp = core->d + CORE_ND * c;
+        double * o = rp->dfr + 8 * c;
+        for(d = 0; d < 3; d++)
+            o[1 + d] = (cp[3 + d] + v[1 + d] / v[0]) * vkms;
+        const int nb = (int) kc[3 * c + 2];
+        if(nb <= 0)
+            continue;
+        const double mpbin = Rv[2 * c + 1];
+        const int64_t nbound = (int64_t) rp->hs[NHS * c + HS_N];
+        double edge[SUBHALO_NFW_MAXBINS + 1];
+        edge[0] = 0;
+        int nf = 0;
+        for(b = 1; b <= nb; b++) {
+            const double xb = XG[(NB + 1) * c + b];
+            if(xb < -1e299)
+                break;
+            const int64_t pb = (int64_t) -xb;
+            const double * e = v + 4 + 5 * (b - 1);
+            const double rnext = pb + 1 < nbound ? e[2] : e[1];
+            edge[b] = subhalo_nfw_edge(b, mpbin, e[0], pb > 0, e[1], rnext, e[4], e[3]);
+            nf = b;
+        }
+        const double * prf = rp->prof + 8 * c;
+        const double rs0 = subhalo_klypin_rs(Rv[2 * c], rp->Mso[SUBHALO_NSO * c], prf[2], prf[3]);
+        const double rs = subhalo_nfw_fit(rs0, edge, nf, 3 * rfloor);
+        o[0] = rs > 0 ? rs : -1;
+    }
+    myfree(Rv);
+    myfree(kc);
+    myfree(VG);
+    myfree(V);
+    myfree(XG);
+    myfree(X);
+    myfree(AG);
+    myfree(A);
+}
+
 /* The properties of the alive candidates of the round (subhalo_props_hbt, subhalo_props_rockstar
  * and subhalo_props_baryons with the same formulas), from the final-pass energies, the final
  * frames and the final cores. Collective; rp is allocated here (bottom) and freed by the caller
@@ -1213,6 +1395,9 @@ round_props(const struct Coll * C, const struct CoreOut * core, struct RoundProp
     rp->shape = (float *) mymalloc("SubCollShape", sizeof(float) * 10 * (nc + 1));
     for(k = 0; k < 10 * nc; k++)
         rp->shape[k] = -1;
+    rp->dfr = (double *) mymalloc("SubCollDfr", sizeof(double) * 8 * (nc + 1));
+    for(k = 0; k < 8 * nc; k++)
+        rp->dfr[k] = -1;
 
     /* ---- holder-side sums: counts, masses, energies, J, inertia, baryons ---- */
     double * hs = (double *) mymalloc("SubCollHsLoc", sizeof(double) * NHS * (nc + 1));
@@ -1493,6 +1678,8 @@ round_props(const struct Coll * C, const struct CoreOut * core, struct RoundProp
         MPI_Allreduce(jl, rp->jv, 9 * nc, MPI_DOUBLE, MPI_SUM, C->Comm);
         myfree(jl);
     }
+    /* the Phase 5 recipes: Rs fit, RockstarCoreVel, BulkVel, Vrms */
+    deferred_distributed(C, core, rr, nb, pos, Mc, rp);
     /* shapes at Rvir and R500c over the particles up to each crossing */
     {
         int64_t * np = (int64_t *) mymalloc("SubCollShNp", sizeof(int64_t) * (nc + 1));
@@ -1522,6 +1709,7 @@ round_props(const struct Coll * C, const struct CoreOut * core, struct RoundProp
 static void
 free_round_props(struct RoundProps * rp)
 {
+    myfree(rp->dfr);
     myfree(rp->shape);
     myfree(rp->jv);
     myfree(rp->prof);
@@ -1945,6 +2133,16 @@ fill_alive_record(const struct Coll * C, int64_t c, const struct CoreOut * fin, 
             }
             rec->RsKlypin = (float) rs;
         }
+    }
+    /* Phase 5 (subhalo_props_deferred) */
+    {
+        const double * df = rp->dfr + 8 * q;
+        rec->Rs = (float) df[0];
+        for(d = 0; d < 3; d++) {
+            rec->RockstarCoreVel[d] = (float) df[1 + d];
+            rec->BulkVel[d] = (float) df[4 + d];
+        }
+        rec->Vrms = (float) df[7];
     }
     const float * sh = rp->shape + 10 * q;
     rec->BtoA = sh[0];

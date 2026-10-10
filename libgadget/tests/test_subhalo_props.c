@@ -21,8 +21,15 @@
  *     its maximum), a flat profile of equal-radius pairs (Rmax is the smallest radius attaining
  *     the maximum, as HBT's max_element), and random masses on a few shared radii.
  *
+ *  8. The Phase 5 deferred columns (subhalo_props_deferred): the fitted NFW Rs of the sampled
+ *     sphere of test 1 within 15 % of its scale radius; on the disc of test 3 BulkVel against the
+ *     sample mean and Bulk, Vrms against the sample dispersion and sqrt(frac / 2) DISC_VEDGE,
+ *     RockstarCoreVel against the mean inside 0.1 Rvir about CorePos (centred and displaced
+ *     clump); -1 without a crossing (test_absent); unit invariance (test_units).
+ *
  * Every candidate goes through subhalo_final_pass first (energies and order as in production),
- * then subhalo_props_hbt and subhalo_props_rockstar, both with an arena of exactly
+ * then subhalo_props_hbt, subhalo_props_rockstar (which also fills the Phase 5 columns) and
+ * subhalo_props_deferred (the standalone entry, bit-identical), all with an arena of exactly
  * SUBHALO_PROPS_BYTES_PER_PART per particle, which checks their scratch budget. Internal units
  * kpc/h, 1e10 Msun/h, km/s, a = 1, H = 0 (the Hubble term does not enter these properties
  * beyond the energies). Haloes are placed across a periodic boundary. Serial: mpirun -np 1. */
@@ -175,6 +182,15 @@ run_props_up(int64_t n, const double ref[3], const double rho[SUBHALO_NSO], stru
     assert_int_equal(arena.used, 0);
     subhalo_props_rockstar(rec, &c, &up, rho, CORESIZE, Offset, &arena);
     assert_int_equal(arena.used, 0);
+    /* subhalo_props_rockstar fills the Phase 5 columns on its radial order; the standalone
+     * subhalo_props_deferred must give the same bits */
+    struct SubTrack r2 = *rec;
+    r2.Rs = r2.Vrms = -7;
+    subhalo_props_deferred(&r2, &c, &up, rho, CORESIZE, &arena);
+    assert_int_equal(arena.used, 0);
+    assert_true(r2.Rs == rec->Rs && r2.Vrms == rec->Vrms);
+    for(d = 0; d < 3; d++)
+        assert_true(r2.BulkVel[d] == rec->BulkVel[d] && r2.RockstarCoreVel[d] == rec->RockstarCoreVel[d]);
     myfree(arena.base);
 }
 
@@ -360,9 +376,88 @@ test_nfw(void ** state)
     assert_true(rec.SpinPeebles >= 0 && rec.SpinPeebles < 0.02);
     assert_true(rec.SpinBullock >= 0 && rec.SpinBullock < 0.02);
     assert_true(rec.Xoff < 0.02 * rec.RBoundSO[0]);
+    /* Phase 5: the fitted Rs; BulkVel equal to Bulk within the sampling noise (sigma ~ 150 km/s
+     * over ~ 4e4 particles: 0.75 km/s per component), Vrms finite and positive */
+    message(0, "NFW Rs (fit) %.3f rs %.3f (%+.2f%%), RsKlypin %.3f; BulkVel (%.2f %.2f %.2f) Bulk (%g %g %g); "
+               "RockstarCoreVel (%.2f %.2f %.2f); Vrms %.2f\n", rec.Rs, h.rs, 100 * (rec.Rs / h.rs - 1), rec.RsKlypin,
+            rec.BulkVel[0], rec.BulkVel[1], rec.BulkVel[2], Bulk[0], Bulk[1], Bulk[2],
+            rec.RockstarCoreVel[0], rec.RockstarCoreVel[1], rec.RockstarCoreVel[2], rec.Vrms);
+    assert_true(rec.Rs > 0 && fabs(rec.Rs / h.rs - 1) < 0.15);
+    for(d = 0; d < 3; d++) {
+        assert_true(fabs(rec.BulkVel[d] - Bulk[d]) < 3.);
+        assert_true(fabs(rec.RockstarCoreVel[d] - Bulk[d]) < 10.);
+    }
+    assert_true(rec.Vrms > 0 && subhalo_isfinite(rec.Vrms));
     myfree(Energy);
     myfree(Index);
     teardown_pman();
+}
+
+/* subhalo_nfw_fit alone on exact equal-mass NFW bin edges (no sampling noise) out to c rs, with
+ * and without down-weighted inner bins. Rockstar's iteration (nfw.c:64-99, kept verbatim) is a
+ * local refinement of the Klypin start, not a global fit: chi^2 is sharply peaked at rs, the
+ * Newton step overshoots, the accepted probe step shrinks the next probe tenfold, and a step
+ * that improves nothing ends the loop. So: from starts below rs (0.3, 0.6 rs) it lands within
+ * 2 % of rs; from starts above rs (1.6, 2.5 rs) it only moves towards rs (by at most 1.11 times
+ * the first probe, rs0 / 10); a start outside the edges falls back to the middle edge and
+ * returns a radius inside them. On the sampled sphere of test_nfw the Klypin start is already
+ * at the chi^2 minimum and the fit keeps it. */
+static void
+test_nfw_fit(void ** state)
+{
+    const double rs = 7.5;
+    const double conc[3] = {4., 10., 25.};
+    const int nbins[3] = {50, 20, 6};
+    const double start[6] = {0.3, 0.6, 1.6, 2.5, 0, 1e6};
+    int ic, ib, is, b;
+    for(ic = 0; ic < 3; ic++)
+        for(ib = 0; ib < 3; ib++) {
+            const int nb = nbins[ib];
+            double edge[SUBHALO_NFW_MAXBINS + 1];
+            const double Mt = nfw_m(conc[ic]);
+            edge[0] = 0;
+            for(b = 1; b <= nb; b++) {
+                double lo = 0, hi = conc[ic];
+                int it;
+                for(it = 0; it < 100; it++) {
+                    const double mid = 0.5 * (lo + hi);
+                    if(nfw_m(mid) < Mt * b / nb) lo = mid;
+                    else hi = mid;
+                }
+                edge[b] = 0.5 * (lo + hi) * rs;
+            }
+            for(is = 0; is < 6; is++) {
+                const double f0 = subhalo_nfw_fit(start[is] * rs, edge, nb, 0);
+                const double f1 = subhalo_nfw_fit(start[is] * rs, edge, nb, edge[nb / 4]);
+                message(0, "NFW fit c %g, %d bins, start %g rs: %.4f rs (inner bins down-weighted %.4f rs)\n",
+                        conc[ic], nb, start[is], f0 / rs, f1 / rs);
+                const double st = start[is] * rs;
+                if(!(st > edge[0]) || !(st < edge[nb])) {
+                    assert_true(f0 > edge[0] && f0 < edge[nb] && f1 > edge[0] && f1 < edge[nb]);
+                }
+                else if(start[is] < 1) {
+                    assert_true(fabs(f0 / rs - 1) < 0.02);
+                    assert_true(fabs(f1 / rs - 1) < 0.02);
+                }
+                else {
+                    assert_true(fabs(f0 - rs) < fabs(st - rs) && f0 >= rs * (1 - 1e-6));
+                    assert_true(fabs(f1 - rs) < fabs(st - rs) && f1 >= rs * (1 - 1e-6));
+                }
+            }
+        }
+    /* too few bins */
+    double e3[3] = {0, 1, 2};
+    assert_true(subhalo_nfw_fit(1, e3, 2, 0) == -1);
+    /* the bin plan of calc_scale_radius */
+    double mp;
+    assert_int_equal(subhalo_nfw_bin_plan(99, 99, 1, &mp), 0);
+    assert_int_equal(subhalo_nfw_bin_plan(100, 100, 1, &mp), 6);    /* 100 / 15 */
+    assert_true(fabs(mp - 100. / 6) < 1e-12);
+    assert_int_equal(subhalo_nfw_bin_plan(1000, 1000, 1, &mp), 50); /* ppbin 20 */
+    assert_int_equal(subhalo_nfw_bin_plan(5000, 5000, 1, &mp), 50); /* ppbin 100 */
+    assert_int_equal(subhalo_nfw_bin_plan(5001, 5001, 1, &mp), 49); /* ppbin 101 */
+    assert_int_equal(subhalo_nfw_bin_plan(200, 200, 50, &mp), 13);
+    assert_true(mp == 50);                                           /* at least the largest mass */
 }
 
 /* ------------------------------------------------------------------ 2. triaxial Gaussian */
@@ -496,6 +591,54 @@ make_clump(gsl_rng * rng, int64_t first, int64_t n, double M, double dX, double 
     }
 }
 
+/* The Phase 5 velocity trio of the disc tests against oracles over P[0, n) (every particle
+ * bound and inside the virial aperture there): the mass-weighted mean and dispersion of all
+ * particles, and the mean over r < 0.1 RBoundSO[0] about CorePos (radii floored at EPS). */
+static void
+disc_trio_check(int64_t n, const struct SubTrack * rec, const char * label)
+{
+    double Mt = 0, Mc = 0, mv[3] = {0, 0, 0}, cv[3] = {0, 0, 0};
+    const double rcore = 0.1 * rec->RBoundSO[0];
+    int64_t i, ncore = 0;
+    int d;
+    for(i = 0; i < n; i++) {
+        double r2 = 0;
+        for(d = 0; d < 3; d++) {
+            const double dx = NEAREST(P[i].Pos[d] - rec->CorePos[d], BOXSIZE);
+            r2 += dx * dx;
+        }
+        const double r = fmax(sqrt(r2), EPS);
+        Mt += P[i].Mass;
+        for(d = 0; d < 3; d++)
+            mv[d] += P[i].Mass * P[i].Vel[d];
+        if(r < rcore) {
+            ncore++;
+            Mc += P[i].Mass;
+            for(d = 0; d < 3; d++)
+                cv[d] += P[i].Mass * P[i].Vel[d];
+        }
+    }
+    double var = 0;
+    for(d = 0; d < 3; d++) {
+        mv[d] /= Mt;
+        cv[d] /= Mc;
+    }
+    for(i = 0; i < n; i++)
+        for(d = 0; d < 3; d++)
+            var += P[i].Mass * (P[i].Vel[d] - mv[d]) * (P[i].Vel[d] - mv[d]);
+    const double vrms = sqrt(var / Mt);
+    message(0, "%s: BulkVel (%.3f %.3f %.3f) sample (%.3f %.3f %.3f); RockstarCoreVel (%.3f %.3f %.3f) oracle "
+               "(%.3f %.3f %.3f) over %ld inside 0.1 Rvir; Vrms %.3f sample %.3f\n", label,
+            rec->BulkVel[0], rec->BulkVel[1], rec->BulkVel[2], mv[0], mv[1], mv[2], rec->RockstarCoreVel[0],
+            rec->RockstarCoreVel[1], rec->RockstarCoreVel[2], cv[0], cv[1], cv[2], (long) ncore, rec->Vrms, vrms);
+    assert_true(ncore >= SUBHALO_ROCKSTAR_CORE_MINPART);
+    assert_true(fabs(rec->Vrms / vrms - 1) < 1e-4);
+    for(d = 0; d < 3; d++) {
+        assert_true(fabs(rec->BulkVel[d] - mv[d]) < 1e-4 * vrms);
+        assert_true(fabs(rec->RockstarCoreVel[d] - cv[d]) < 1e-4 * vrms);
+    }
+}
+
 static void
 test_disc(void ** state)
 {
@@ -559,6 +702,18 @@ test_disc(void ** state)
     assert_true(fabs(rec.MBoundSO[0] / rec.Mbound - 1) < 1e-6);
     assert_true(rec.Xoff >= 0 && rec.Xoff < 0.01 * DISC_R);
     assert_true(rec.Voff >= 0 && rec.Voff < 0.01 * DISC_VEDGE);
+    /* Phase 5: the trio against the sample; the rigid rotation of a uniform disc has <v^2> =
+     * VEDGE^2 / 2 about the centre, carried by the fraction frac of the mass, the clump at rest:
+     * Vrms = sqrt(frac / 2) VEDGE, BulkVel = Bulk, RockstarCoreVel = Bulk (symmetric core) */
+    disc_trio_check(n, &rec, "Disc trio");
+    const double vrms_an = sqrt(frac / 2) * DISC_VEDGE;
+    message(0, "Disc: Vrms %.3f analytic sqrt(frac/2) VEDGE %.3f (%+.2f%%), Rs %.3f\n", rec.Vrms, vrms_an,
+            100 * (rec.Vrms / vrms_an - 1), rec.Rs);
+    assert_true(fabs(rec.Vrms / vrms_an - 1) < 0.05);
+    for(d = 0; d < 3; d++) {
+        assert_true(fabs(rec.BulkVel[d] - Bulk[d]) < 0.01 * DISC_VEDGE);
+        assert_true(fabs(rec.RockstarCoreVel[d] - Bulk[d]) < 0.02 * DISC_VEDGE);
+    }
 
     /* the clump displaced by dX along U1 and moving with dV along U2 relative to the disc: the
      * core follows the clump, so Xoff = dX M_disc / M_total and Voff = dV M_disc / M_total */
@@ -576,6 +731,10 @@ test_disc(void ** state)
     assert_true(fabs(dot3(coff, U1) - dX) < 0.1);
     assert_true(fabs(rec.Xoff / (dX * frac) - 1) < 0.03);
     assert_true(fabs(rec.Voff / (dV * frac) - 1) < 0.03);
+    /* the core moves with the clump: RockstarCoreVel follows it, BulkVel = Bulk + dV U2 (1 - frac) */
+    disc_trio_check(n, &rec, "Displaced trio");
+    for(d = 0; d < 3; d++)
+        assert_true(fabs(rec.BulkVel[d] - (Bulk[d] + dV * U2[d] * (1 - frac))) < 0.01 * DISC_VEDGE);
     myfree(Energy);
     myfree(Index);
     teardown_pman();
@@ -660,6 +819,15 @@ test_units(void ** state)
     assert_true(fabs(a.VmaxVir / b.VmaxVir - 1) < 1e-4);
     assert_true(fabs(a.MBoundSO[0] / b.MBoundSO[0] - 1) < 1e-4);
     assert_true(fabs(a.RBoundSO[0] / (1000 * b.RBoundSO[0]) - 1) < 1e-4);
+    /* Phase 5: physical km/s and the run's length unit */
+    message(0, "Units: Vrms %g / %g km/s, BulkVel.x %g / %g, RockstarCoreVel.x %g / %g, Rs %g kpc/h / %g Mpc/h\n",
+            a.Vrms, b.Vrms, a.BulkVel[0], b.BulkVel[0], a.RockstarCoreVel[0], b.RockstarCoreVel[0], a.Rs, b.Rs);
+    assert_true(a.Vrms > 0 && fabs(a.Vrms / b.Vrms - 1) < 1e-4);
+    for(d = 0; d < 3; d++) {
+        assert_true(fabs(a.BulkVel[d] - b.BulkVel[d]) < 1e-4 * a.Vrms);
+        assert_true(fabs(a.RockstarCoreVel[d] - b.RockstarCoreVel[d]) < 1e-4 * a.Vrms);
+    }
+    assert_true((a.Rs == -1 && b.Rs == -1) || fabs(a.Rs / (1000 * b.Rs) - 1) < 1e-3);
 }
 
 /* ------------------------------------------------------------------ 4. thresholds */
@@ -835,6 +1003,10 @@ test_absent(void ** state)
         assert_true(rec.MBoundSO[s] == -1 && rec.RBoundSO[s] == -1);
     assert_true(rec.VmaxVir == -1 && rec.RmaxVir == -1 && rec.JVir[0] == -1 && rec.SpinBullock == -1);
     assert_true(rec.Xoff == -1 && rec.Voff == -1 && rec.RsKlypin == -1 && rec.BtoA == -1 && rec.AxisA500[2] == -1);
+    /* the Phase 5 columns need the crossing too */
+    assert_true(rec.Rs == -1 && rec.Vrms == -1);
+    for(d = 0; d < 3; d++)
+        assert_true(rec.RockstarCoreVel[d] == -1 && rec.BulkVel[d] == -1);
     /* defined without a crossing */
     assert_true(rec.Rhalf > 0 && rec.Renclose >= rec.Rhalf && rec.InertiaTensor[0] > 0 && rec.SpinPeebles >= 0);
     /* nothing bound */
@@ -846,6 +1018,10 @@ test_absent(void ** state)
     rec.Rhalf = 5;
     subhalo_props_rockstar(&rec, &c, &up, rho, CORESIZE, Offset, &arena);
     assert_true(rec.Rhalf == -1 && rec.J[1] == -1 && rec.InertiaTensor[5] == -1);
+    assert_true(rec.Rs == -1 && rec.Vrms == -1 && rec.BulkVel[0] == -1 && rec.RockstarCoreVel[2] == -1);
+    rec.Rs = rec.Vrms = rec.BulkVel[0] = rec.RockstarCoreVel[2] = 5;
+    subhalo_props_deferred(&rec, &c, &up, rho, CORESIZE, &arena);
+    assert_true(rec.Rs == -1 && rec.Vrms == -1 && rec.BulkVel[0] == -1 && rec.RockstarCoreVel[2] == -1);
     teardown_pman();
 }
 
@@ -1010,6 +1186,7 @@ int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_thresholds),
         cmocka_unit_test(test_nfw),
+        cmocka_unit_test(test_nfw_fit),
         cmocka_unit_test(test_triaxial),
         cmocka_unit_test(test_disc),
         cmocka_unit_test(test_baryons),

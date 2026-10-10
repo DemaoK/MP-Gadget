@@ -56,7 +56,10 @@ input could not be read.
                               MostMassiveBHID (UINT64_MAX the only 'none'; 0 is a real ID) set exactly
                               when a black hole is bound; no NaN. Only defined values (!= -1) are
                               tested, so a catalogue written before Phase 3 passes. MSO below MBoundSO
-                              is a warning.
+                              is a warning. Phase 5: Vrms, BulkVel, RockstarCoreVel defined exactly
+                              with RBoundSO[vir] (Vrms >= 0); Rs -1 below 100 bound particles, else
+                              > 0 and below 1.5 RBoundSO[vir] (-1 there is a warning);
+                              |RockstarCoreVel - CoreVel| > Vrms a warning; skipped when all -1.
   tree OUTPUTDIR|PIG...       Phase 4: the track history over a PIG sequence. Tracks present at every
                               output after birth; resolved nodes their own descendant; deaths with
                               SnapDeath = the first orphan output, DescendantTrackId resolved there,
@@ -1427,10 +1430,10 @@ def cmd_orphans(args):
 GCGS = 6.674e-8
 SO_NAMES = ("vir", "200b", "200c", "500c", "2500c")
 # Phase 3 float columns whose defined values are positive (> 0) or, second set, non-negative
-_PROPS_POSITIVE = ("MBoundSO", "RBoundSO", "VmaxVir", "RmaxVir", "Rhalf", "Renclose", "RsKlypin", "MSO", "RSO")
-_PROPS_NONNEG = ("SpinPeebles", "SpinBullock", "Xoff", "Voff")
+_PROPS_POSITIVE = ("MBoundSO", "RBoundSO", "VmaxVir", "RmaxVir", "Rhalf", "Renclose", "RsKlypin", "MSO", "RSO", "Rs")
+_PROPS_NONNEG = ("SpinPeebles", "SpinBullock", "Xoff", "Voff", "Vrms")
 _PROPS_FINITE = _PROPS_POSITIVE + _PROPS_NONNEG + (
-    "J", "JVir", "BtoA", "CtoA", "BtoA500", "CtoA500", "AxisA", "AxisA500", "InertiaTensor",
+    "RockstarCoreVel", "BulkVel", "J", "JVir", "BtoA", "CtoA", "BtoA500", "CtoA500", "AxisA", "AxisA500", "InertiaTensor",
     "MTypeSO200c", "MTypeSOVir", "StarFormationRate", "GasMetalMass", "StellarMetalMass", "BlackholeMass",
     "BlackholeAccretionRate", "MassHeIonized", "GasMetalElemMass", "StellarMetalElemMass")
 FLAG_SOCUTOFF = 1 << 3
@@ -1621,12 +1624,85 @@ def check_props(pigdir, ck, vmax_rtol=1e-3, field_warn=0.02):
     bad = none & (nbt[:, 5] > 0) & _defined(S["BlackholeMass"])
     ck.check(not np.any(bad), "%s: %d subhalos with bound black holes and group C filled but no MostMassiveBHID (e.g. TrackId %s)"
              % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    _check_props_deferred(ck, tag, S, tid)
     cnt = lambda c: int(np.count_nonzero(np.any(_defined(_rows2d(S[c])), axis=1)))  # noqa: E731
     print("  %s: %d subhalos (%d centrals); thresholds %s; defined: MBoundSO %d, VmaxVir %d, Rhalf %d, SpinPeebles %d, "
           "SpinBullock %d, RsKlypin %d, BtoA %d, BtoA500 %d, InertiaTensor %d, MSO %d (centrals), Flags bit 3 %d, bit 4 %d"
           % (tag, n, np.count_nonzero(central), src, cnt("MBoundSO"), cnt("VmaxVir"), cnt("Rhalf"), cnt("SpinPeebles"),
              cnt("SpinBullock"), cnt("RsKlypin"), cnt("BtoA"), cnt("BtoA500"), int(np.count_nonzero(dit)), cnt("MSO"),
              np.count_nonzero(flags & FLAG_SOCUTOFF), np.count_nonzero(flags & FLAG_SONOCROSS)))
+
+
+# Rockstar's MIN_SCALE_PART (nfw.c): the NFW fit needs this many particles in the virial aperture
+NFW_MINPART = 100
+
+
+def _check_props_deferred(ck, tag, S, tid, corevel_warn=1.0):
+    """Phase 5 (halofinder_phase5_plan.md section 1 item 1, subhalo_props_deferred): Rs, Vrms, BulkVel,
+    RockstarCoreVel. Skipped (a note) when every value is -1, i.e. a catalogue written before Phase 5.
+     - all four defined exactly when RBoundSO[vir] is (the aperture is the bound virial sphere), except
+       Rs, which is -1 below NFW_MINPART bound particles (the aperture is a subset of the bound set) and
+       otherwise > 0, or -1 (a warning: fewer than NFW_MINPART particles inside Rvir, or a failed fit);
+     - Vrms >= 0 when RBoundSO[vir] > 0; Rs inside the aperture (below 1.5 RBoundSO[vir]: the outer bin
+       edge may lie half a particle spacing beyond the crossing);
+     - |RockstarCoreVel - CoreVel| above corevel_warn Vrms: a warning only (two different core definitions:
+       r < 0.1 Rvir or the innermost 100 against the CoreSize most-bound particles)."""
+    names = ("Rs", "Vrms", "BulkVel", "RockstarCoreVel")
+    if any(c not in S for c in names):
+        ck.note("%s: no Phase 5 columns (%s); the deferred-property rules are skipped" % (tag, ", ".join(c for c in names if c not in S)))
+        return
+    rs, vrms = S["Rs"].astype(np.float64), S["Vrms"].astype(np.float64)
+    bv, rcv = S["BulkVel"].astype(np.float64), S["RockstarCoreVel"].astype(np.float64)
+    if not (np.any(_defined(rs)) or np.any(_defined(vrms)) or np.any(_defined(bv)) or np.any(_defined(rcv))):
+        ck.note("%s: Rs, Vrms, BulkVel, RockstarCoreVel all -1 (a catalogue before Phase 5); rules skipped" % tag)
+        return
+    rv = S["RBoundSO"][:, 0].astype(np.float64)
+    hasr = _defined(rv) & (rv > 0)
+    nb = S["Nbound"].astype(np.int64)
+    for name, d in (("Vrms", _defined(vrms)), ("BulkVel", np.all(_defined(bv), axis=1)),
+                    ("RockstarCoreVel", np.all(_defined(rcv), axis=1))):
+        bad = d != hasr
+        ck.check(not np.any(bad), "%s: %d subhalos with %s defined %s RBoundSO[vir] (e.g. TrackId %s)"
+                 % (tag, np.count_nonzero(bad), name, "without" if np.any(d & ~hasr) else "-1 with", tid[bad][:5].tolist()))
+    for name, v in (("BulkVel", bv), ("RockstarCoreVel", rcv)):
+        bad = np.any(_defined(v), axis=1) & ~np.all(_defined(v), axis=1)
+        ck.check(not np.any(bad), "%s: %d subhalos with %s partly -1 (e.g. TrackId %s)"
+                 % (tag, np.count_nonzero(bad), name, tid[bad][:5].tolist()))
+    bad = hasr & ~(vrms >= 0)
+    ck.check(not np.any(bad), "%s: %d subhalos with RBoundSO[vir] > 0 but Vrms < 0 (e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    drs = _defined(rs)
+    bad = drs & (nb < NFW_MINPART)
+    ck.check(not np.any(bad), "%s: %d subhalos with Rs defined below %d bound particles (e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), NFW_MINPART, tid[bad][:5].tolist()))
+    bad = drs & ~hasr
+    ck.check(not np.any(bad), "%s: %d subhalos with Rs but no RBoundSO[vir] (e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    bad = drs & hasr & ~(rs < 1.5 * rv)
+    ck.check(not np.any(bad), "%s: %d subhalos with Rs beyond 1.5 RBoundSO[vir] (e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    big = nb >= NFW_MINPART
+    miss = big & ~drs
+    if np.any(miss):
+        ck.warn("%s: %d of %d subhalos with Nbound >= %d have Rs = -1 (%d of them without RBoundSO[vir]; the others "
+                "with fewer than %d particles inside Rvir or a failed fit; e.g. TrackId %s)"
+                % (tag, np.count_nonzero(miss), np.count_nonzero(big), NFW_MINPART, np.count_nonzero(miss & ~hasr),
+                   NFW_MINPART, tid[miss][:5].tolist()))
+    if "CoreVel" in S:
+        cv = S["CoreVel"].astype(np.float64)
+        both = np.all(_defined(rcv), axis=1) & np.all(_defined(cv), axis=1) & _defined(vrms)
+        dv = np.sqrt(((rcv - cv) ** 2).sum(axis=1))
+        far = both & (dv > corevel_warn * vrms)
+        if np.any(both):
+            print("  %s: |RockstarCoreVel - CoreVel| / Vrms median %.3f, 90th percentile %.3f over %d subhalos"
+                  % (tag, np.median(dv[both] / np.maximum(vrms[both], 1e-30)),
+                     np.percentile(dv[both] / np.maximum(vrms[both], 1e-30), 90), np.count_nonzero(both)))
+        if np.any(far):
+            ck.warn("%s: %d subhalos with |RockstarCoreVel - CoreVel| > %g Vrms (different core definitions; e.g. TrackId %s)"
+                    % (tag, np.count_nonzero(far), corevel_warn, tid[far][:5].tolist()))
+    print("  %s: Phase 5 defined: Rs %d (of %d with Nbound >= %d), Vrms %d, BulkVel %d, RockstarCoreVel %d"
+          % (tag, np.count_nonzero(drs), np.count_nonzero(big), NFW_MINPART, np.count_nonzero(_defined(vrms)),
+             np.count_nonzero(np.all(_defined(bv), axis=1)), np.count_nonzero(np.all(_defined(rcv), axis=1))))
 
 
 def cmd_props(args):
