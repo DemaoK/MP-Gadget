@@ -75,10 +75,19 @@ wrap_box(double x, double BoxSize)
     return x;
 }
 
+/* The tie order of design 7.10: particle ID, then (defensively, IDs being unique in a valid
+ * snapshot) the P index. Comparators call it only on exact ties of their primary key, so the
+ * P access is rare. */
+static inline int
+id_less(int64_t a, int64_t b)
+{
+    return P[a].ID < P[b].ID || (P[a].ID == P[b].ID && a < b);
+}
+
 /* In-place introsort (quicksort, median of three, heapsort fallback, insertion sort below 16),
  * allocation-free and thread-safe, unlike qsort. Every comparator below is a strict total order
- * on distinct elements (ties broken by a P index or a position), so the result is unique and
- * does not depend on the algorithm. */
+ * on distinct elements (ties broken by particle ID and P index), so the result is unique and
+ * does not depend on the algorithm or on the order of P. */
 #define SUBHALO_DEFINE_SORT(NAME, T, LESS)                                              \
 static void NAME##_isort(T * a, int64_t n) {                                            \
     int64_t i, j;                                                                       \
@@ -136,23 +145,33 @@ static void NAME(T * a, int64_t n) {                                            
     NAME##_intro(a, n, depth);                                                          \
 }
 
-/* (energy, P index) pairs: the energy order of design 7.10, ties by P index. */
+/* (energy, P index) pairs: the energy order of design 7.10, ties by ID. */
 struct EPair {
     double E;
     int64_t idx;
 };
-#define EPAIR_LESS(x, y) ((x)->E < (y)->E || ((x)->E == (y)->E && (x)->idx < (y)->idx))
+#define EPAIR_LESS(x, y) ((x)->E < (y)->E || ((x)->E == (y)->E && id_less((x)->idx, (y)->idx)))
 SUBHALO_DEFINE_SORT(sort_epair, struct EPair, EPAIR_LESS)
 
-/* A gravity or neighbour source: Morton key, P index, position relative to the tree origin
- * (comoving), mass (upscaled when subsampled). 48 bytes. */
+/* (energy, P index, list position) triples of the most-bound refinement: ordered as EPair, the
+ * position carried along to permute the parallel arrays. */
+struct EPairPos {
+    double E;
+    int64_t idx;
+    int64_t pos;
+};
+SUBHALO_DEFINE_SORT(sort_epairpos, struct EPairPos, EPAIR_LESS)
+
+/* A gravity or neighbour source: Morton key, P index, position (comoving; relative to the
+ * tree origin, NEAREST(Pos - origin), and absolute in a built neighbour tree), mass (upscaled
+ * when subsampled). 48 bytes. Equal keys are ordered by ID. */
 struct SubSrc {
     uint64_t key;
     int64_t p;
     double x[3];
     double m;
 };
-#define SRC_LESS(x, y) ((x)->key < (y)->key || ((x)->key == (y)->key && (x)->p < (y)->p))
+#define SRC_LESS(x, y) ((x)->key < (y)->key || ((x)->key == (y)->key && id_less((x)->p, (y)->p)))
 SUBHALO_DEFINE_SORT(sort_src, struct SubSrc, SRC_LESS)
 
 /* Sort the parallel arrays (Energy, Index)[0, n) by (Energy, Index), through a pair scratch. */
@@ -206,6 +225,9 @@ struct SubTree {
     int64_t nn;
     struct SubMom * mom;     /* gravity trees */
     struct SubBox * box;     /* neighbour trees */
+    double BoxSize;          /* every displacement is NEAREST(dx, BoxSize) ... */
+    int wrap;                /* ... unless 0: no pair can be farther apart than BoxSize / 2 along
+                                an axis, so NEAREST is the identity and is skipped */
 };
 
 static inline uint64_t
@@ -348,21 +370,47 @@ tree_build_gravity(struct SubTree * t, struct SubhaloArena * arena)
     }
 }
 
+/* |NEAREST(x - y)|^2: the squared periodic separation of two points whose coordinates differ
+ * by less than 1.5 BoxSize per axis (tree coordinates are within BoxSize / 2 of their origin,
+ * absolute ones in [0, BoxSize)). wrap == 0 when the caller knows every |x - y| per axis is
+ * below BoxSize / 2, where NEAREST is the identity: the same value, faster. */
+static inline __attribute__((always_inline)) double
+pair_r2(const double x[3], const double y[3], double BoxSize, const int wrap)
+{
+    double ex = x[0] - y[0], ey = x[1] - y[1], ez = x[2] - y[2];
+    if(wrap) {
+        ex = NEAREST(ex, BoxSize);
+        ey = NEAREST(ey, BoxSize);
+        ez = NEAREST(ez, BoxSize);
+    }
+    return ex * ex + ey * ey + ez * ez;
+}
+
+static inline double
+periodic_r2(const double x[3], const double y[3], double BoxSize)
+{
+    return pair_r2(x, y, BoxSize, 1);
+}
+
 /* sum_j m_j W(|x_j - y|, h) over the tree, excluding the source with P index self
  * (EvaluatePotential, gravity_tree.cpp:92-171: geometric opening len^2 > r^2 theta^2 against
- * the node centre of mass, monopole otherwise). theta2 is capped below 1/3 so that a node
- * containing the target is always opened (true for HBT's 0.45). */
-static double
-tree_potential(const struct SubTree * t, const double y[3], int64_t self, double theta2, double h)
+ * the node centre of mass, monopole otherwise), every displacement a nearest image as in
+ * gravity_tree.cpp:110-135. theta2 is capped below 1/3 so that a node containing the target is
+ * always opened (true for HBT's 0.45): the node's sources and its centre of mass lie in its
+ * Morton cell of side len, which then holds the target too, so their Euclidean separation in
+ * the tree coordinates is at most sqrt(3) len and the periodic one, never larger, gives
+ * r^2 theta2 < len^2. A monopole is used only for a node with len < theta r; its sources lie in
+ * its cell and |NEAREST(a)| is 1-Lipschitz, so each source's periodic distance differs from the
+ * centre's by at most its offset from the centre, as without periodicity. */
+static inline __attribute__((always_inline)) double
+tree_potential_impl(const struct SubTree * t, const double y[3], int64_t self, double theta2, double h, const int wrap)
 {
+    const double BoxSize = t->BoxSize;
     double sum = 0;
     int64_t n = 0;
     while(n < t->nn) {
         const struct SubSkel * s = &t->sk[n];
-        const double dx = t->mom[n].com[0] - y[0];
-        const double dy = t->mom[n].com[1] - y[1];
-        const double dz = t->mom[n].com[2] - y[2];
-        const double r2 = dx * dx + dy * dy + dz * dz;
+        const double r2 = pair_r2(t->mom[n].com, y, BoxSize, wrap);
         const double len = s->len;
         if(len * len > r2 * theta2) {
             /* open */
@@ -371,10 +419,7 @@ tree_potential(const struct SubTree * t, const double y[3], int64_t self, double
                 for(j = s->first; j < s->first + s->count; j++) {
                     if(t->src[j].p == self)
                         continue;
-                    const double ex = t->src[j].x[0] - y[0];
-                    const double ey = t->src[j].x[1] - y[1];
-                    const double ez = t->src[j].x[2] - y[2];
-                    sum += t->src[j].m * grav_spline_potential(sqrt(ex * ex + ey * ey + ez * ez), h);
+                    sum += t->src[j].m * grav_spline_potential(sqrt(pair_r2(t->src[j].x, y, BoxSize, wrap)), h);
                 }
                 n = s->skip;
             }
@@ -389,21 +434,30 @@ tree_potential(const struct SubTree * t, const double y[3], int64_t self, double
     return sum;
 }
 
-/* The same sum by direct summation. */
 static double
-direct_potential(const struct SubSrc * src, int64_t ns, const double y[3], int64_t self, double h)
+tree_potential(const struct SubTree * t, const double y[3], int64_t self, double theta2, double h)
+{
+    return t->wrap ? tree_potential_impl(t, y, self, theta2, h, 1) : tree_potential_impl(t, y, self, theta2, h, 0);
+}
+
+/* The same sum by direct summation. */
+static inline __attribute__((always_inline)) double
+direct_potential_impl(const struct SubTree * t, const double y[3], int64_t self, double h, const int wrap)
 {
     double sum = 0;
     int64_t j;
-    for(j = 0; j < ns; j++) {
-        if(src[j].p == self)
+    for(j = 0; j < t->ns; j++) {
+        if(t->src[j].p == self)
             continue;
-        const double ex = src[j].x[0] - y[0];
-        const double ey = src[j].x[1] - y[1];
-        const double ez = src[j].x[2] - y[2];
-        sum += src[j].m * grav_spline_potential(sqrt(ex * ex + ey * ey + ez * ez), h);
+        sum += t->src[j].m * grav_spline_potential(sqrt(pair_r2(t->src[j].x, y, t->BoxSize, wrap)), h);
     }
     return sum;
+}
+
+static double
+direct_potential(const struct SubTree * t, const double y[3], int64_t self, double h)
+{
+    return t->wrap ? direct_potential_impl(t, y, self, h, 1) : direct_potential_impl(t, y, self, h, 0);
 }
 
 /* ------------------------------------------------------------------ energies */
@@ -477,6 +531,7 @@ potential_energies(const int64_t * tgt, int64_t nt, double * E, const int64_t * 
     }
 
     struct SubTree tree = {0};
+    tree.BoxSize = BoxSize;
     tree.src = (struct SubSrc *) arena_need(arena, sizeof(struct SubSrc) * (ns > 0 ? ns : 1), "potential sources");
     int64_t taken = 0, k = 0;
     for(i = 0; i < nsrc; i++) {
@@ -496,6 +551,26 @@ potential_energies(const int64_t * tgt, int64_t nt, double * E, const int64_t * 
         k++;
     }
     tree.ns = k;
+    /* the extent of sources and targets together in the frame coordinates: below BoxSize / 2
+     * (with a margin for rounding) along every axis, no displacement needs wrapping */
+    {
+        double lo[3] = {DBL_MAX, DBL_MAX, DBL_MAX}, hi[3] = {-DBL_MAX, -DBL_MAX, -DBL_MAX};
+        for(i = 0; i < tree.ns; i++)
+            for(d = 0; d < 3; d++) {
+                if(tree.src[i].x[d] < lo[d]) lo[d] = tree.src[i].x[d];
+                if(tree.src[i].x[d] > hi[d]) hi[d] = tree.src[i].x[d];
+            }
+        for(i = 0; i < nt; i++)
+            for(d = 0; d < 3; d++) {
+                const double y = NEAREST(P[tgt[i]].Pos[d] - RefPos[d], BoxSize);
+                if(y < lo[d]) lo[d] = y;
+                if(y > hi[d]) hi[d] = y;
+            }
+        tree.wrap = 0;
+        for(d = 0; d < 3; d++)
+            if(!(hi[d] - lo[d] < 0.49 * BoxSize))
+                tree.wrap = 1;
+    }
     const int use_tree = sampled || tree.ns > direct_max;
     if(use_tree && tree.ns > 0)
         tree_build_gravity(&tree, arena);
@@ -519,7 +594,7 @@ potential_energies(const int64_t * tgt, int64_t nt, double * E, const int64_t * 
         }
         double sum = 0;
         if(tree.ns > 0)
-            sum = use_tree ? tree_potential(&tree, y, p, theta2, up->h) : direct_potential(tree.src, tree.ns, y, p, up->h);
+            sum = use_tree ? tree_potential(&tree, y, p, theta2, up->h) : direct_potential(&tree, y, p, up->h);
         double e = 0.5 * K - Ga * sum;
         if(up->WithThermal)
             e += subhalo_thermal_energy(p, a);
@@ -590,19 +665,18 @@ refine_most_bound(struct SubCandidate * c, int64_t nref, const struct SubhaloUnb
     int64_t i;
     double * Eref = (double *) arena_need(arena, sizeof(double) * nref, "refinement energies");
     potential_energies(c->Index, nref, Eref, c->Index, nref, 0, up->SampleSize, c->RefPos, c->RefVel, up, arena);
-    struct EPair * pr = (struct EPair *) arena_need(arena, sizeof(struct EPair) * nref, "refinement order");
-    int64_t * oi = (int64_t *) arena_need(arena, sizeof(int64_t) * nref, "refinement index copy");
+    struct EPairPos * pr = (struct EPairPos *) arena_need(arena, sizeof(struct EPairPos) * nref, "refinement order");
     double * oe = (double *) arena_need(arena, sizeof(double) * nref, "refinement energy copy");
     for(i = 0; i < nref; i++) {
         pr[i].E = Eref[i];
-        pr[i].idx = i;      /* ties by position, itself in (E, P index) order */
-        oi[i] = c->Index[i];
+        pr[i].idx = c->Index[i];   /* ties by the particle's ID, not its list position */
+        pr[i].pos = i;
         oe[i] = c->Energy[i];
     }
-    sort_epair(pr, nref);
+    sort_epairpos(pr, nref);
     for(i = 0; i < nref; i++) {
-        c->Index[i] = oi[pr[i].idx];
-        c->Energy[i] = oe[pr[i].idx];
+        c->Index[i] = pr[i].idx;
+        c->Energy[i] = oe[pr[i].pos];
     }
     arena->used = mark;
 }
@@ -620,6 +694,8 @@ subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * up, s
     c->Nbound = 0;
     c->NboundTracer = 0;
     c->Mbound = 0;
+    c->ConvergenceRatio = 0;
+    c->NboundPositive = -1;
 
     /* A source below the thresholds cannot survive: the first iteration would kill it. */
     if(N < up->MinNumPart || N <= 0 || count_tracers(Index, N, up->TracerTypes, up->MinNumTracerPart) < up->MinNumTracerPart)
@@ -672,6 +748,7 @@ subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * up, s
             }
         }
         Nbound = j;
+        c->ConvergenceRatio = (double) Nbound / (double) Nlast;
 
         /* survival thresholds (subhalo_unbind.cpp:629-674) */
         const int64_t ntr = count_tracers(Index, Nbound, up->TracerTypes, up->MinNumTracerPart);
@@ -727,6 +804,7 @@ subhalo_final_pass(struct SubCandidate * c, const struct SubhaloUnbindParams * u
 {
     const size_t mark = arena->used;
     const int64_t n = c->Nbound;
+    c->NboundPositive = 0;
     if(n <= 0)
         return 0;
     c->Mbound = bound_frame(c->Index, n, c->RefPos, c->RefVel, up->BoxSize);
@@ -737,6 +815,7 @@ subhalo_final_pass(struct SubCandidate * c, const struct SubhaloUnbindParams * u
         if(c->Energy[i] >= 0)
             npos++;
     c->NboundTracer = count_tracers(c->Index, n, up->TracerTypes, n);
+    c->NboundPositive = npos;
     arena->used = mark;
     return npos;
 }
@@ -831,7 +910,29 @@ subhalo_sink_test(const double sPos[3], const double sVel[3], const double aPos[
 
 /* ------------------------------------------------------------------ k nearest tracers */
 
-/* Neighbour list of one query: sorted ascending by (d2, P index), at most k entries. */
+/* The read-only neighbour tree of subhalo_knn_build. The skeleton and the boxes are laid out in
+ * the coordinates NEAREST(Pos - origin); after the build the sources hold their absolute
+ * positions, from which every point distance is taken as a nearest image. The boxes give
+ * periodic lower bounds (knn_axis_gap), reduced by slack so that the rounding of the layout
+ * coordinates can never prune a node holding an exact tie. */
+struct SubhaloKnnTree {
+    struct SubTree t;
+    double origin[3];
+    double slack;
+};
+
+static int64_t knn_builds = 0;
+
+int64_t
+subhalo_knn_build_count(void)
+{
+    int64_t n;
+    #pragma omp atomic read
+    n = knn_builds;
+    return n;
+}
+
+/* Neighbour list of one query: sorted ascending by (d2, ID, P index), at most k entries. */
 struct KnnList {
     double d2[SUBHALO_KNN_MAXK];
     int64_t p[SUBHALO_KNN_MAXK];
@@ -841,7 +942,7 @@ struct KnnList {
 static inline int
 knn_better(double d2, int64_t p, double d2w, int64_t pw)
 {
-    return d2 < d2w || (d2 == d2w && p < pw);
+    return d2 < d2w || (d2 == d2w && id_less(p, pw));
 }
 
 static inline void
@@ -859,35 +960,55 @@ knn_insert(struct KnnList * L, double d2, int64_t p)
     L->p[j] = p;
 }
 
+/* Lower bound along one axis of the periodic distance from q to any point of [lo, hi], all
+ * three in layout coordinates, i.e. within BoxSize / 2 of the origin: the gap to the nearer of
+ * the images q and q -+ BoxSize (the third image is farther), less the slack. */
 static inline double
-box_dist2(const struct SubBox * b, const double q[3])
+knn_axis_gap(double q, double lo, double hi, double BoxSize, double slack)
 {
+    double g, g2;
+    if(q < lo) {
+        g = lo - q;
+        g2 = q + BoxSize - hi;
+    }
+    else if(q > hi) {
+        g = q - hi;
+        g2 = lo + BoxSize - q;
+    }
+    else
+        return 0;
+    if(g2 < g)
+        g = g2;
+    g -= slack;
+    return g > 0 ? g : 0;
+}
+
+static inline double
+knn_box_dist2(const struct SubhaloKnnTree * kt, int64_t n, const double q[3])
+{
+    const struct SubBox * b = &kt->t.box[n];
     double r2 = 0;
     int d;
     for(d = 0; d < 3; d++) {
-        double e = 0;
-        if(q[d] < b->lo[d]) e = b->lo[d] - q[d];
-        else if(q[d] > b->hi[d]) e = q[d] - b->hi[d];
+        const double e = knn_axis_gap(q[d], b->lo[d], b->hi[d], kt->t.BoxSize, kt->slack);
         r2 += e * e;
     }
     return r2;
 }
 
 /* Depth-first, nearest child first, pruned by the current k-th distance (the search of
- * HBT's GeoTree_t::NearestNeighbours used by subhalo_reassign_gas.cpp:140-150). */
+ * HBT's GeoTree_t::NearestNeighbours used by subhalo_reassign_gas.cpp:140-150). q is the query
+ * in layout coordinates (for the boxes), qa its absolute position (for the point distances). */
 static void
-knn_rec(const struct SubTree * t, int64_t n, const double q[3], struct KnnList * L)
+knn_rec(const struct SubhaloKnnTree * kt, int64_t n, const double q[3], const double qa[3], struct KnnList * L)
 {
-    if(L->n > 0 && L->n == L->k && box_dist2(&t->box[n], q) > L->d2[L->n - 1])
+    const struct SubTree * t = &kt->t;
+    if(L->n > 0 && L->n == L->k && knn_box_dist2(kt, n, q) > L->d2[L->n - 1])
         return;
     if(t->sk[n].skip == n + 1) {
         int64_t j;
-        for(j = t->sk[n].first; j < t->sk[n].first + t->sk[n].count; j++) {
-            const double ex = t->src[j].x[0] - q[0];
-            const double ey = t->src[j].x[1] - q[1];
-            const double ez = t->src[j].x[2] - q[2];
-            knn_insert(L, ex * ex + ey * ey + ez * ez, t->src[j].p);
-        }
+        for(j = t->sk[n].first; j < t->sk[n].first + t->sk[n].count; j++)
+            knn_insert(L, periodic_r2(t->src[j].x, qa, t->BoxSize), t->src[j].p);
         return;
     }
     int64_t ch[8];
@@ -896,7 +1017,7 @@ knn_rec(const struct SubTree * t, int64_t n, const double q[3], struct KnnList *
     int64_t c;
     for(c = n + 1; c < t->sk[n].skip && nc < 8; c = t->sk[c].skip) {
         ch[nc] = c;
-        cd[nc] = box_dist2(&t->box[c], q);
+        cd[nc] = knn_box_dist2(kt, c, q);
         nc++;
     }
     for(a = 1; a < nc; a++)
@@ -905,76 +1026,111 @@ knn_rec(const struct SubTree * t, int64_t n, const double q[3], struct KnnList *
             const int64_t tc = ch[b]; ch[b] = ch[b - 1]; ch[b - 1] = tc;
         }
     for(a = 0; a < nc; a++)
-        knn_rec(t, ch[a], q, L);
+        knn_rec(kt, ch[a], q, qa, L);
+}
+
+struct SubhaloKnnTree *
+subhalo_knn_build(const int64_t * tr, int64_t nt, double BoxSize, struct SubhaloArena * arena)
+{
+    struct SubhaloKnnTree * kt = (struct SubhaloKnnTree *) arena_need(arena, sizeof(struct SubhaloKnnTree), "neighbour tree");
+    int64_t i;
+    int d;
+    memset(kt, 0, sizeof(*kt));
+    kt->t.BoxSize = BoxSize;
+    kt->t.wrap = 1;
+    /* far above the rounding of NEAREST(Pos - origin) (a few ulp of BoxSize), far below any
+     * physical separation */
+    kt->slack = 1e-12 * BoxSize;
+    #pragma omp atomic
+    knn_builds++;
+    if(nt <= 0)
+        return kt;
+    for(d = 0; d < 3; d++)
+        kt->origin[d] = P[tr[0]].Pos[d];
+    struct SubTree * t = &kt->t;
+    t->src = (struct SubSrc *) arena_need(arena, sizeof(struct SubSrc) * nt, "neighbour sources");
+    for(i = 0; i < nt; i++) {
+        t->src[i].p = tr[i];
+        t->src[i].m = 1;
+        for(d = 0; d < 3; d++)
+            t->src[i].x[d] = NEAREST(P[tr[i]].Pos[d] - kt->origin[d], BoxSize);
+    }
+    t->ns = nt;
+    tree_build_skeleton(t, sizeof(struct SubBox), arena);
+    t->box = (struct SubBox *) arena_need(arena, sizeof(struct SubBox) * t->nn, "neighbour boxes");
+    int64_t n;
+    for(n = t->nn - 1; n >= 0; n--) {
+        struct SubBox * b = &t->box[n];
+        for(d = 0; d < 3; d++) {
+            b->lo[d] = DBL_MAX;
+            b->hi[d] = -DBL_MAX;
+        }
+        if(t->sk[n].skip == n + 1) {
+            int64_t j;
+            for(j = t->sk[n].first; j < t->sk[n].first + t->sk[n].count; j++)
+                for(d = 0; d < 3; d++) {
+                    if(t->src[j].x[d] < b->lo[d]) b->lo[d] = t->src[j].x[d];
+                    if(t->src[j].x[d] > b->hi[d]) b->hi[d] = t->src[j].x[d];
+                }
+        }
+        else {
+            int64_t ch;
+            for(ch = n + 1; ch < t->sk[n].skip; ch = t->sk[ch].skip)
+                for(d = 0; d < 3; d++) {
+                    if(t->box[ch].lo[d] < b->lo[d]) b->lo[d] = t->box[ch].lo[d];
+                    if(t->box[ch].hi[d] > b->hi[d]) b->hi[d] = t->box[ch].hi[d];
+                }
+        }
+    }
+    /* the point distances come from the absolute positions */
+    for(i = 0; i < nt; i++)
+        for(d = 0; d < 3; d++)
+            t->src[i].x[d] = P[t->src[i].p].Pos[d];
+    return kt;
+}
+
+void
+subhalo_knn_query(const struct SubhaloKnnTree * kt, const int64_t * query, int64_t nq, int k, int64_t * out)
+{
+    int64_t i;
+    if(k > SUBHALO_KNN_MAXK)
+        endrun(1, "Subhalo kernel: k = %d nearest neighbours exceeds SUBHALO_KNN_MAXK = %d\n", k, SUBHALO_KNN_MAXK);
+    if(k <= 0)
+        return;
+    if(kt->t.ns <= 0) {
+        for(i = 0; i < nq * k; i++)
+            out[i] = -1;
+        return;
+    }
+    const double BoxSize = kt->t.BoxSize;
+    const int par = nq > 4096 && !omp_in_parallel();
+    #pragma omp parallel for schedule(dynamic, 256) if(par)
+    for(i = 0; i < nq; i++) {
+        struct KnnList L;
+        double q[3], qa[3];
+        int dd, j;
+        L.n = 0;
+        L.k = k;
+        for(dd = 0; dd < 3; dd++) {
+            qa[dd] = P[query[i]].Pos[dd];
+            q[dd] = NEAREST(qa[dd] - kt->origin[dd], BoxSize);
+        }
+        knn_rec(kt, 0, q, qa, &L);
+        for(j = 0; j < k; j++)
+            out[i * k + j] = j < L.n ? L.p[j] : -1;
+    }
 }
 
 void
 subhalo_knn_tracers(const int64_t * query, int64_t nq, const int64_t * tr, int64_t nt, int k,
                     int64_t * out, double BoxSize, struct SubhaloArena * arena)
 {
-    const size_t mark = arena->used;
-    int64_t i;
-    int d;
     if(k > SUBHALO_KNN_MAXK)
         endrun(1, "Subhalo kernel: k = %d nearest neighbours exceeds SUBHALO_KNN_MAXK = %d\n", k, SUBHALO_KNN_MAXK);
     if(k <= 0)
         return;
-    if(nt <= 0) {
-        for(i = 0; i < nq * k; i++)
-            out[i] = -1;
-        return;
-    }
-    double origin[3];
-    for(d = 0; d < 3; d++)
-        origin[d] = P[tr[0]].Pos[d];
-    struct SubTree tree = {0};
-    tree.src = (struct SubSrc *) arena_need(arena, sizeof(struct SubSrc) * nt, "neighbour sources");
-    for(i = 0; i < nt; i++) {
-        tree.src[i].p = tr[i];
-        tree.src[i].m = 1;
-        for(d = 0; d < 3; d++)
-            tree.src[i].x[d] = NEAREST(P[tr[i]].Pos[d] - origin[d], BoxSize);
-    }
-    tree.ns = nt;
-    tree_build_skeleton(&tree, sizeof(struct SubBox), arena);
-    tree.box = (struct SubBox *) arena_need(arena, sizeof(struct SubBox) * tree.nn, "neighbour boxes");
-    int64_t n;
-    for(n = tree.nn - 1; n >= 0; n--) {
-        struct SubBox * b = &tree.box[n];
-        for(d = 0; d < 3; d++) {
-            b->lo[d] = DBL_MAX;
-            b->hi[d] = -DBL_MAX;
-        }
-        if(tree.sk[n].skip == n + 1) {
-            int64_t j;
-            for(j = tree.sk[n].first; j < tree.sk[n].first + tree.sk[n].count; j++)
-                for(d = 0; d < 3; d++) {
-                    if(tree.src[j].x[d] < b->lo[d]) b->lo[d] = tree.src[j].x[d];
-                    if(tree.src[j].x[d] > b->hi[d]) b->hi[d] = tree.src[j].x[d];
-                }
-        }
-        else {
-            int64_t ch;
-            for(ch = n + 1; ch < tree.sk[n].skip; ch = tree.sk[ch].skip)
-                for(d = 0; d < 3; d++) {
-                    if(tree.box[ch].lo[d] < b->lo[d]) b->lo[d] = tree.box[ch].lo[d];
-                    if(tree.box[ch].hi[d] > b->hi[d]) b->hi[d] = tree.box[ch].hi[d];
-                }
-        }
-    }
-    const int par = nq > 4096 && !omp_in_parallel();
-    #pragma omp parallel for schedule(dynamic, 256) if(par)
-    for(i = 0; i < nq; i++) {
-        struct KnnList L;
-        double q[3];
-        int dd, j;
-        L.n = 0;
-        L.k = k;
-        for(dd = 0; dd < 3; dd++)
-            q[dd] = NEAREST(P[query[i]].Pos[dd] - origin[dd], BoxSize);
-        knn_rec(&tree, 0, q, &L);
-        for(j = 0; j < k; j++)
-            out[i * k + j] = j < L.n ? L.p[j] : -1;
-    }
+    const size_t mark = arena->used;
+    const struct SubhaloKnnTree * kt = subhalo_knn_build(tr, nt, BoxSize, arena);
+    subhalo_knn_query(kt, query, nq, k, out);
     arena->used = mark;
 }

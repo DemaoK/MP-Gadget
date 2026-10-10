@@ -21,9 +21,16 @@
  *   E_i   = 1/2 |Vel_i / a - RefVel / a + H a dx_i|^2 + phi_i (+ u_i for type 0 with WithThermal)
  *   dx_i  = NEAREST(Pos_i - RefPos)
  *   phi_i = -(G / a) sum_{j != i, Type_j in PotentialTypes} m_j W(|dx_ij|, h)
- * with W = grav_spline_potential (gravshort.h). The octree works in coordinates relative to the
- * frame (one NEAREST per particle), so pair distances are periodic minimum images for any
- * candidate smaller than half the box. */
+ * with W = grav_spline_potential (gravshort.h). Every pair displacement is a nearest image,
+ * NEAREST(x_j - x_i), taken at each interaction as HBT does (gravity_tree.cpp:110-135): direct
+ * sums, tree leaves, node monopoles and the opening test, and the k-nearest search (point
+ * distances and periodic box bounds). The trees are built in coordinates relative to one origin
+ * (NEAREST(Pos - origin)) only as a layout convenience; no distance is taken from those
+ * coordinates without re-wrapping, so the results hold for sources of any extent.
+ *
+ * Ties (design 7.10): every ordering is broken by the particle ID (P[i].ID) and only then by the
+ * P index, so results do not depend on the order of P: energy sorts, the most-bound refinement,
+ * equal Morton keys in the trees, the radial order of the properties and neighbour distances. */
 
 #include <stdint.h>
 #include "subhalo.h"
@@ -45,6 +52,14 @@ struct SubCandidate {
     int Iterations;
     int Flags;               /* SUBHALO_FLAG_ITERCAP */
     uint64_t Seed;           /* subsampling RNG seed, set by the caller from (TrackId, SnapNum) */
+    /* Diagnostics (design 7.4, logged by the driver; written by the kernel, never read by it):
+     * ConvergenceRatio is Nbound / Nlast of the last iteration subhalo_unbind ran (>=
+     * BoundMassPrecision when it converged, below it when the cap was hit with ITERCAP set; the
+     * ratio at the kill for a candidate that died; 0 if no iteration ran). NboundPositive is the
+     * number of bound-prefix particles with E >= 0 after subhalo_final_pass (its return value),
+     * -1 until a final pass ran. */
+    double ConvergenceRatio;
+    int64_t NboundPositive;
 };
 
 struct SubhaloUnbindParams {
@@ -66,7 +81,7 @@ struct SubhaloUnbindParams {
 /* Fraction of the bound set whose order is refined with exact masses after a subsampled loop
  * (HBT BoundFractionCenterRefinement, config_parser.h:140). */
 #define SUBHALO_REFINE_FRACTION 0.1
-/* Largest k accepted by subhalo_knn_tracers (the per-query heap lives on the thread stack). */
+/* Largest k accepted by subhalo_knn_query (the per-query list lives on the thread stack). */
 #define SUBHALO_KNN_MAXK 64
 
 /* Arena bytes per particle of a candidate. The caller's Index (8) and Energy (8) arrays, plus
@@ -87,14 +102,15 @@ struct SubhaloUnbindParams {
  * are reordered by their exact-mass self-energy as HBT's RefineMostBoundParticle does, keeping
  * the loop energies: subhalo_final_pass supersedes both), Index[Nbound, N) the unbound in
  * ascending Energy (each with the energy of the iteration that removed it); RefPos/RefVel the
- * bound CoM frame; Mbound, NboundTracer, Iterations set; Flags |= SUBHALO_FLAG_ITERCAP when
- * MaxIter iterations did not converge. */
+ * bound CoM frame; Mbound, NboundTracer, Iterations, ConvergenceRatio set; NboundPositive = -1;
+ * Flags |= SUBHALO_FLAG_ITERCAP when MaxIter iterations did not converge (ConvergenceRatio is
+ * then the Nbound / Nlast at the cap). */
 int subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * up, struct SubhaloArena * arena);
 
 /* Recompute the energies of the bound prefix with exact masses and no subsampling (direct sum
  * for Nbound <= SampleSize, the candidate's own tree otherwise), in the final bound-CoM frame,
  * and sort the prefix by energy. Membership unchanged. Returns the number of prefix particles
- * with E >= 0 after the pass (logged by the caller).
+ * with E >= 0 after the pass (logged by the caller), also stored in c->NboundPositive.
  * The frame (RefPos, RefVel, Mbound) is recomputed from the prefix first, so the pass is also
  * valid after the caller edited the prefix; NboundTracer is recounted. */
 int64_t subhalo_final_pass(struct SubCandidate * c, const struct SubhaloUnbindParams * up, struct SubhaloArena * arena);
@@ -111,11 +127,34 @@ void subhalo_core(const struct SubCandidate * c, const struct SubhaloUnbindParam
 int subhalo_sink_test(const double sPos[3], const double sVel[3], const double aPos[3], const double aVel[3],
                       double aSigmaX, double aSigmaV, double sSigmaX, double sSigmaV, int symmetric, double BoxSize);
 
-/* For every particle in query[0..nq) find the k nearest among the tracer list tr[0..nt)
- * (indices into P), writing k indices per query into out (row-major). Octree-based.
- * Each row is sorted by distance, nearest first (ties by P index); if nt < k the row is padded
- * with -1. A query that is itself in tr finds itself at distance 0 (no self exclusion).
- * k <= SUBHALO_KNN_MAXK. Arena: 48 bytes per tracer plus the nodes in the space left. */
+/* k nearest tracers (ReassignParticles, subhalo_reassign_gas.cpp:131-150): one read-only
+ * octree over the tracer list, built once per key and queried in as many batches as the caller
+ * likes (HBT builds one tree per group).
+ *
+ * subhalo_knn_build: the tree over tr[0..nt) (indices into P; nt may be 0), allocated in the
+ * arena where it lives until the caller rewinds the arena below it. The tree holds its own copy
+ * of the tracer indices and positions, so tr may be reused after the build. Arena: 48 bytes per
+ * tracer plus the nodes (64 bytes each, about 0.3 to 0.6 per tracer) in the space left, the
+ * leaves widened until they fit; endrun if even one node does not fit. A caller that needs
+ * more arena after the build (query and output buffers) should take it before the build, which
+ * may use the whole remainder for the nodes when the arena is tight. Like every kernel function,
+ * one arena per thread.
+ *
+ * subhalo_knn_query: for every particle in query[0..nq) the k nearest tracers of t, k indices
+ * per query into out (row-major). Each row is sorted by periodic distance, nearest first, ties
+ * by P[].ID and then P index; if the tree has fewer than k tracers the row is padded with -1.
+ * A query that is itself a tracer finds itself at distance 0 (no self exclusion).
+ * 1 <= k <= SUBHALO_KNN_MAXK. Read-only on t, no scratch: concurrent queries on one tree are
+ * safe; split over OpenMP threads when nq > 4096 and not already in a parallel region.
+ *
+ * subhalo_knn_build_count: number of trees built by this process since start (all threads),
+ * for the tests' one-build-per-key check.
+ *
+ * subhalo_knn_tracers: build + query + rewind, for one-shot use. */
+struct SubhaloKnnTree;
+struct SubhaloKnnTree * subhalo_knn_build(const int64_t * tr, int64_t nt, double BoxSize, struct SubhaloArena * arena);
+void subhalo_knn_query(const struct SubhaloKnnTree * t, const int64_t * query, int64_t nq, int k, int64_t * out);
+int64_t subhalo_knn_build_count(void);
 void subhalo_knn_tracers(const int64_t * query, int64_t nq, const int64_t * tr, int64_t nt, int k,
                          int64_t * out, double BoxSize, struct SubhaloArena * arena);
 
@@ -141,16 +180,22 @@ double subhalo_thermal_energy(int64_t i, double atime);
 
 /* ------------------------------------------------------------------ properties (subhalo_props.c) */
 
+/* Arena bytes per bound particle that subhalo_props_hbt and subhalo_props_rockstar take (the
+ * radial order: radius and P index). */
+#define SUBHALO_PROPS_BYTES_PER_PART 16
+
 /* Fill the step 7g columns of rec from a candidate after the final pass (plan section 4):
  * Nbound, NboundTracer, NboundType, Mbound, MboundType, Flags |= c->Flags, CorePos/CoreVel/
  * CoreSigmaX/CoreSigmaV, MostBoundID/Pos/Vel (the most-bound tracer, else the most bound),
- * CoMPos/CoMVel (the final frame), Vmax/Rmax (HBT: all bound particles, radii from CorePos
- * floored at h / 2.8, Vmax = max sqrt(G M(<=r) / (a r))), Ekin, Epot, KinToPot. NboundExclusive,
- * NboundExclusiveType and NtailType are step 8's and untouched, as is every other column.
- * Positions in the physical frame (Offset removed, wrapped into [0, BoxSize)), comoving;
- * velocities physical peculiar km/s. Needs no scratch. */
+ * CoMPos/CoMVel (the final frame), Vmax/Rmax (HBT CalculateProfileProperties: all bound
+ * particles sorted by radius from CorePos floored at h / 2.8; Vmax = max over radii r of
+ * sqrt(G M(<=r) / (a r)), exact, Rmax the smallest radius attaining it), Ekin, Epot, KinToPot.
+ * NboundExclusive, NboundExclusiveType and NtailType are step 8's and untouched, as is every
+ * other column. Positions in the physical frame (Offset removed, wrapped into [0, BoxSize)),
+ * comoving; velocities physical peculiar km/s. Scratch: SUBHALO_PROPS_BYTES_PER_PART * Nbound
+ * from the arena, rewound on return; endrun if the arena is short. */
 void subhalo_props_hbt(struct SubTrack * rec, const struct SubCandidate * c, const struct SubhaloUnbindParams * up,
-                       int CoreSize, const double Offset[3]);
+                       int CoreSize, const double Offset[3], struct SubhaloArena * arena);
 
 /* ------------------------------------------------------------------ Phase 3 properties (subhalo_props.c) */
 
@@ -159,9 +204,6 @@ void subhalo_props_hbt(struct SubTrack * rec, const struct SubCandidate * c, con
  * (8 pi G), x = Omega_m(a) - 1 with Omega_m(a) = Omega0 a^-3 (H0 / H(a))^2, Delta_vir = 18 pi^2 +
  * 82 x - 39 x^2 relative to critical; H(a) = hubble_function, H0 = CP->Hubble, G = GravInternal. */
 void subhalo_so_thresholds(const Cosmology * CP, double atime, double rho[SUBHALO_NSO]);
-
-/* Arena bytes per bound particle that subhalo_props_rockstar takes (the radial order). */
-#define SUBHALO_PROPS_BYTES_PER_PART 16
 
 /* The Rockstar columns of rec (Phase 3 plan section 3) from a candidate after the final pass
  * (Index[0, Nbound) bound in final-pass energy order, Energy the final-pass energies, RefPos/

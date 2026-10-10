@@ -13,10 +13,14 @@
  *     and velocity: Xoff and Voff equal to the known shift times M_disc / M_total.
  *  4. subhalo_so_thresholds at a = 1 and a = 0.1 against the formulas of design 7.10.
  *  5. subhalo_props_baryons on a handful of gas, star and BH particles.
+ *  6. The HBT Vmax / Rmax of subhalo_props_hbt against a sorted cumulative-mass oracle: the
+ *     multi-peak profile of the Phase 2a audit (J9; the former bounded histogram search lost
+ *     its maximum), a flat profile of equal-radius pairs (Rmax is the smallest radius attaining
+ *     the maximum, as HBT's max_element), and random masses on a few shared radii.
  *
  * Every candidate goes through subhalo_final_pass first (energies and order as in production),
- * then subhalo_props_hbt and subhalo_props_rockstar; the latter gets an arena of exactly
- * SUBHALO_PROPS_BYTES_PER_PART per particle, which checks its scratch budget. Internal units
+ * then subhalo_props_hbt and subhalo_props_rockstar, both with an arena of exactly
+ * SUBHALO_PROPS_BYTES_PER_PART per particle, which checks their scratch budget. Internal units
  * kpc/h, 1e10 Msun/h, km/s, a = 1, H = 0 (the Hubble term does not enter these properties
  * beyond the energies). Haloes are placed across a periodic boundary. Serial: mpirun -np 1. */
 
@@ -150,10 +154,11 @@ run_props(int64_t n, const double ref[3], const double rho[SUBHALO_NSO], struct 
 
     subhalo_track_clear(rec, 0);
     const double Offset[3] = {0, 0, 0};
-    subhalo_props_hbt(rec, &c, &up, CORESIZE, Offset);
     arena.size = SUBHALO_PROPS_BYTES_PER_PART * n;
     arena.used = 0;
     arena.base = (char *) mymalloc("TestArena", arena.size);
+    subhalo_props_hbt(rec, &c, &up, CORESIZE, Offset, &arena);
+    assert_int_equal(arena.used, 0);
     subhalo_props_rockstar(rec, &c, &up, rho, CORESIZE, Offset, &arena);
     assert_int_equal(arena.used, 0);
     myfree(arena.base);
@@ -749,6 +754,163 @@ test_absent(void ** state)
     teardown_pman();
 }
 
+/* ------------------------------------------------------------------ 6. HBT Vmax */
+
+/* max over the bound particles i of M(<= r_i) / r_i by brute force, radii from cen floored at
+ * rfloor, the smallest radius on ties. */
+static double
+vmax_brute(int64_t n, const double cen[3], double rfloor, double * rbest)
+{
+    double best = -1;
+    int64_t i, j;
+    int d;
+    double * r = (double *) mymalloc("TestR", sizeof(double) * n);
+    for(i = 0; i < n; i++) {
+        double r2 = 0;
+        for(d = 0; d < 3; d++) {
+            const double dx = NEAREST(P[i].Pos[d] - cen[d], BOXSIZE);
+            r2 += dx * dx;
+        }
+        r[i] = sqrt(r2) > rfloor ? sqrt(r2) : rfloor;
+    }
+    for(i = 0; i < n; i++) {
+        double M = 0;
+        for(j = 0; j < n; j++)
+            if(r[j] <= r[i])
+                M += P[j].Mass;
+        if(M / r[i] > best * (1 + 1e-13) || (fabs(M / r[i] - best) <= 1e-13 * best && r[i] < *rbest)) {
+            best = M / r[i];
+            *rbest = r[i];
+        }
+    }
+    myfree(r);
+    return best;
+}
+
+/* subhalo_props_hbt on P[0, n) in Index order with CoreSize core particles, an arena of exactly
+ * the documented budget. */
+static void
+hbt_props(int64_t n, int coresize, struct SubTrack * rec)
+{
+    struct SubhaloUnbindParams up = default_params();
+    struct SubCandidate c;
+    memset(&c, 0, sizeof(c));
+    int64_t * Index = (int64_t *) mymalloc("TestIndex", sizeof(int64_t) * n);
+    double * Energy = (double *) mymalloc("TestEnergy", sizeof(double) * n);
+    int64_t i;
+    for(i = 0; i < n; i++) {
+        Index[i] = i;
+        Energy[i] = -1;
+    }
+    c.Index = Index;
+    c.Energy = Energy;
+    c.N = c.Nbound = n;
+    struct SubhaloArena arena;
+    arena.size = SUBHALO_PROPS_BYTES_PER_PART * n;
+    arena.used = 0;
+    arena.base = (char *) mymalloc("TestArena", arena.size);
+    subhalo_track_clear(rec, 0);
+    const double Offset[3] = {0, 0, 0};
+    subhalo_props_hbt(rec, &c, &up, coresize, Offset, &arena);
+    assert_int_equal(arena.used, 0);
+    myfree(arena.base);
+    myfree(Energy);
+    myfree(Index);
+}
+
+/* P[i] at Centre + r along axis (k / 2) % 3, sign by k % 2 */
+static void
+place(int64_t i, double r, int64_t k, double m, MyIDType id)
+{
+    int d;
+    memset(&P[i], 0, sizeof(P[i]));
+    P[i].Type = 1;
+    P[i].Mass = m;
+    P[i].ID = id;
+    for(d = 0; d < 3; d++)
+        P[i].Pos[d] = wrapb(Centre[d] + (d == (k / 2) % 3 ? (k % 2 ? -r : r) : 0));
+}
+
+static void
+test_vmax(void ** state)
+{
+    const double rfloor = 2.8 * EPS / 2.8;
+    struct SubTrack rec;
+    double rb = 0, best;
+    int64_t i, b;
+    setup_pman(600);
+
+    /* (a) the audit's multi-peak profile: rlo(b) = exp((b + 0.2) / 64), rhi(b) = exp((b + 0.8)
+     * / 64), M(rhi) = rhi, M(rlo) = 1.00001 rlo except 1.005 rlo at b = 220, endpoints at 1 and
+     * exp(4) with 1e-9 each; a central core particle of mass 1e-12 */
+    {
+        int64_t n = 0;
+        place(n, 0, 0, 1e-12, 1 + n);
+        n++;
+        double Mprev = 1e-12;
+        place(n, 1, n, 1e-9, 1 + n);
+        Mprev += 1e-9;
+        n++;
+        for(b = 0; b < 256; b++) {
+            const double rlo = exp((b + 0.2) / 64), rhi = exp((b + 0.8) / 64);
+            const double Mlo = rlo * (b == 220 ? 1.005 : 1.00001);
+            place(n, rlo, n, Mlo - Mprev, 1 + n);
+            n++;
+            place(n, rhi, n, rhi - Mlo, 1 + n);
+            n++;
+            Mprev = rhi;
+        }
+        place(n, exp(4.), n, 1e-9, 1 + n);
+        n++;
+        for(i = 0; i < n; i++)
+            assert_true(P[i].Mass > 0);
+        hbt_props(n, 1, &rec);
+        best = vmax_brute(n, rec.CorePos, rfloor, &rb);
+        message(0, "Vmax multi-peak profile (%ld particles): Rmax %.8g (oracle %.8g, audit 31.20645611), Vmax^2 / G %.8g (oracle %.8g, audit 1.005)\n",
+                (long) n, rec.Rmax, rb, rec.Vmax * rec.Vmax / TEST_G, best);
+        assert_true(fabs(rb / 31.20645611 - 1) < 1e-8);
+        assert_true(fabs(best / 1.005 - 1) < 1e-8);
+        assert_true(fabs(rec.Rmax / rb - 1) < 1e-6);
+        assert_true(fabs(rec.Vmax / sqrt(TEST_G * best) - 1) < 1e-6);
+    }
+    /* (b) flat: pairs at radii 1..100 (integers, exact), mass 0.5 each, the radius-1 pair the
+     * core (CoreSize 2, centred exactly): M(<= r) / r = 1 at every radius, Rmax the smallest */
+    {
+        int64_t n = 0, k;
+        for(k = 1; k <= 100; k++) {
+            place(n, (double) k, 2 * (k % 3), 0.5, 1000 - n);
+            n++;
+            place(n, (double) k, 2 * (k % 3) + 1, 0.5, 1000 - n);
+            n++;
+        }
+        hbt_props(n, 2, &rec);
+        best = vmax_brute(n, rec.CorePos, rfloor, &rb);
+        message(0, "Vmax flat profile: Rmax %g (oracle %g), Vmax^2 / G %.12g (oracle %.12g)\n", rec.Rmax, rb, rec.Vmax * rec.Vmax / TEST_G, best);
+        assert_true(rec.Rmax == 1 && rb == 1 && best == 1);
+        assert_true(fabs(rec.Vmax / sqrt(TEST_G) - 1) < 1e-6);
+    }
+    /* (c) random masses on 12 shared radii (many equal radii), and particles inside the floor */
+    {
+        gsl_rng * rng = gsl_rng_alloc(gsl_rng_mt19937);
+        gsl_rng_set(rng, 3);
+        const int64_t n = 500;
+        place(0, 0, 0, 0.01, 1);
+        for(i = 1; i < n; i++) {
+            const int inner = i % 25 == 0;   /* a few light particles inside the floor */
+            const double r = inner ? 0.1 * gsl_rng_uniform(rng) : (double) (1 + gsl_rng_uniform_int(rng, 12));
+            place(i, r, gsl_rng_uniform_int(rng, 6), (inner ? 0.01 : 1) * (0.1 + gsl_rng_uniform(rng)), 1 + (i * 37) % n);
+        }
+        gsl_rng_free(rng);
+        hbt_props(n, 1, &rec);
+        best = vmax_brute(n, rec.CorePos, rfloor, &rb);
+        message(0, "Vmax shared radii: Rmax %g (oracle %g), Vmax^2 / G %.10g (oracle %.10g)\n", rec.Rmax, rb, rec.Vmax * rec.Vmax / TEST_G, best);
+        assert_true(rb > 1);   /* the maximum lies on a shared radius, not at the floor */
+        assert_true(fabs(rec.Rmax / rb - 1) < 1e-6);
+        assert_true(fabs(rec.Vmax / sqrt(TEST_G * best) - 1) < 1e-6);
+    }
+    teardown_pman();
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_thresholds),
@@ -757,6 +919,7 @@ int main(void) {
         cmocka_unit_test(test_disc),
         cmocka_unit_test(test_baryons),
         cmocka_unit_test(test_absent),
+        cmocka_unit_test(test_vmax),
     };
     return cmocka_run_group_tests_mpi(tests, NULL, NULL);
 }

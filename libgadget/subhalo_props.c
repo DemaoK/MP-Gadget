@@ -24,128 +24,59 @@ wrap_box(double x, double BoxSize)
     return x;
 }
 
-/* Radius of P[p] from cen, comoving, floored at rfloor. */
-static inline double
-floored_radius(int64_t p, const double cen[3], double rfloor, double BoxSize)
+/* (radius, P index) pairs of the radial order, ties by particle ID then P index. 16 bytes per
+ * bound particle: the only per-particle scratch of the property functions. */
+struct RPair {
+    double r;
+    int64_t p;
+};
+
+static inline int
+rpair_less(const struct RPair * x, const struct RPair * y)
 {
-    double r2 = 0;
-    int d;
-    for(d = 0; d < 3; d++) {
-        const double dx = NEAREST(P[p].Pos[d] - cen[d], BoxSize);
-        r2 += dx * dx;
-    }
-    const double r = sqrt(r2);
-    return r > rfloor ? r : rfloor;
+    if(x->r != y->r)
+        return x->r < y->r;
+    return P[x->p].ID < P[y->p].ID || (P[x->p].ID == P[y->p].ID && x->p < y->p);
 }
+#define RPAIR_LESS(x, y) rpair_less((x), (y))
 
-/* Exact max over the bound particles i of M(<= r_i) / r_i, radii from cen floored at rfloor
- * (HBT CalculateProfileProperties, subhalo.cpp:200-231, which sorts the radii). The function
- * has no scratch memory, so instead of a sort it brackets the maximum with mass histograms:
- * a pass over [lo, hi] bins the particles in log r and keeps per bin the mass and the smallest
- * and largest radius; with M_b the mass at r <= the largest radius of bin b, M_b / rmax_b is a
- * value the profile attains and M_b / rmin_b bounds every particle of the bin, so only bins
- * whose bound beats the best attained value are refined by further passes over their own
- * [rmin_b, rmax_b]. A bin holding a single radius is exact. Returns M / r at the maximum and its
- * radius in *Rmax. */
-#define VMAX_NBINS 256
-#define VMAX_WORK 128
-#define VMAX_MAXPASS 64
+static void rpair_sort(struct RPair * a, int64_t n);
 
-static double
-mass_within(const struct SubCandidate * c, const double cen[3], double rfloor, double BoxSize, double r)
-{
-    double M = 0;
-    int64_t i;
-    for(i = 0; i < c->Nbound; i++)
-        if(floored_radius(c->Index[i], cen, rfloor, BoxSize) <= r)
-            M += P[c->Index[i]].Mass;
-    return M;
-}
-
-static double
-vmax_profile(const struct SubCandidate * c, const double cen[3], double rfloor, double BoxSize, double * Rmax)
+/* The radial order of the bound set Index[0, Nbound) about cen (translated comoving), radii
+ * NEAREST-periodic and floored at rfloor, in SUBHALO_PROPS_BYTES_PER_PART * Nbound of arena
+ * scratch that the caller rewinds; endrun if the arena is short. *Mtot: the bound mass. */
+static struct RPair *
+radial_order(const struct SubCandidate * c, const double cen[3], double rfloor, double BoxSize,
+             struct SubhaloArena * arena, double * Mtot)
 {
     const int64_t n = c->Nbound;
+    struct RPair * pr = (struct RPair *) (arena ? subhalo_arena_get(arena, sizeof(struct RPair) * n) : NULL);
+    if(!pr)
+        endrun(1, "Subhalo properties: arena exhausted for the radial order of %ld particles (%lu of %lu bytes used)\n",
+               (long) n, (unsigned long) (arena ? arena->used : 0), (unsigned long) (arena ? arena->size : 0));
+    double M = 0;
     int64_t i;
-    double rmin = 1e300, rmax = 0;
+    int d;
     for(i = 0; i < n; i++) {
-        const double r = floored_radius(c->Index[i], cen, rfloor, BoxSize);
-        if(r < rmin) rmin = r;
-        if(r > rmax) rmax = r;
+        const int64_t p = c->Index[i];
+        double r2 = 0;
+        for(d = 0; d < 3; d++) {
+            const double dx = NEAREST(P[p].Pos[d] - cen[d], BoxSize);
+            r2 += dx * dx;
+        }
+        const double r = sqrt(r2);
+        pr[i].r = r > rfloor ? r : rfloor;
+        pr[i].p = p;
+        M += P[p].Mass;
     }
-    double wlo[VMAX_WORK], whi[VMAX_WORK], wub[VMAX_WORK];
-    int nw = 0, npass = 0;
-    double best = 0, bestr = rmin;
-    wlo[nw] = rmin;
-    whi[nw] = rmax;
-    wub[nw] = 1e300;
-    nw++;
-    while(nw > 0 && npass < VMAX_MAXPASS) {
-        nw--;
-        const double lo = wlo[nw], hi = whi[nw];
-        /* the bound of a pushed range may have been beaten since */
-        if(wub[nw] <= best * (1 + 1e-12))
-            continue;
-        npass++;
-        if(!(hi > lo)) {
-            const double v = mass_within(c, cen, rfloor, BoxSize, lo) / lo;
-            if(v > best) {
-                best = v;
-                bestr = lo;
-            }
-            continue;
-        }
-        double bm[VMAX_NBINS], bmin[VMAX_NBINS], bmax[VMAX_NBINS];
-        int b;
-        for(b = 0; b < VMAX_NBINS; b++) {
-            bm[b] = 0;
-            bmin[b] = 1e300;
-            bmax[b] = 0;
-        }
-        const double llo = log(lo);
-        const double lscale = VMAX_NBINS / (log(hi) - llo);
-        double Mbelow = 0;
-        for(i = 0; i < n; i++) {
-            const double r = floored_radius(c->Index[i], cen, rfloor, BoxSize);
-            const double m = P[c->Index[i]].Mass;
-            if(r < lo) {
-                Mbelow += m;
-                continue;
-            }
-            if(r > hi)
-                continue;
-            b = (int) ((log(r) - llo) * lscale);
-            if(b < 0) b = 0;
-            if(b >= VMAX_NBINS) b = VMAX_NBINS - 1;
-            bm[b] += m;
-            if(r < bmin[b]) bmin[b] = r;
-            if(r > bmax[b]) bmax[b] = r;
-        }
-        double M = Mbelow, Mle[VMAX_NBINS];
-        for(b = 0; b < VMAX_NBINS; b++) {
-            M += bm[b];
-            Mle[b] = M;
-            if(bm[b] > 0 && M / bmax[b] > best) {
-                best = M / bmax[b];
-                bestr = bmax[b];
-            }
-        }
-        for(b = 0; b < VMAX_NBINS; b++)
-            if(bm[b] > 0 && bmin[b] < bmax[b] && Mle[b] / bmin[b] > best * (1 + 1e-12) && nw < VMAX_WORK) {
-                wlo[nw] = bmin[b];
-                whi[nw] = bmax[b];
-                wub[nw] = Mle[b] / bmin[b];
-                nw++;
-            }
-    }
-    /* the maximum, recomputed exactly at its radius */
-    *Rmax = bestr;
-    return mass_within(c, cen, rfloor, BoxSize, bestr) / bestr;
+    rpair_sort(pr, n);
+    *Mtot = M;
+    return pr;
 }
 
 void
 subhalo_props_hbt(struct SubTrack * rec, const struct SubCandidate * c, const struct SubhaloUnbindParams * up,
-                  int CoreSize, const double Offset[3])
+                  int CoreSize, const double Offset[3], struct SubhaloArena * arena)
 {
     const int64_t n = c->Nbound;
     const double a = up->atime;
@@ -200,12 +131,29 @@ subhalo_props_hbt(struct SubTrack * rec, const struct SubCandidate * c, const st
         rec->MostBoundVel[d] = (float) (P[mb].Vel[d] / a);
     }
 
-    /* Vmax, Rmax: whole bound profile from CorePos, radii floored at GravitySoftening = h / 2.8
-     * (subhalo.cpp:221-231; physical radius a r) */
-    double Rmax;
-    const double v2 = vmax_profile(c, CorePos, up->h / 2.8, BoxSize, &Rmax);
-    rec->Vmax = (float) sqrt(up->G * v2 / a);
-    rec->Rmax = (float) Rmax;
+    /* Vmax, Rmax: the whole bound profile from CorePos, radii floored at GravitySoftening =
+     * h / 2.8 (CalculateProfileProperties, subhalo.cpp:200-231: sort, cumulative mass, max of
+     * M / r; physical radius a r). M / r is evaluated at the last particle of each run of equal
+     * radii, i.e. M(<= r); the first (smallest) radius attaining the maximum is Rmax, as HBT's
+     * max_element. */
+    {
+        const size_t mark = arena ? arena->used : 0;
+        double Mtot, Mc = 0, best = -1, Rmax = 0;
+        const struct RPair * pr = radial_order(c, CorePos, up->h / 2.8, BoxSize, arena, &Mtot);
+        for(i = 0; i < n; i++) {
+            Mc += P[pr[i].p].Mass;
+            if(i + 1 < n && pr[i + 1].r == pr[i].r)
+                continue;
+            const double v = Mc / pr[i].r;
+            if(v > best) {
+                best = v;
+                Rmax = pr[i].r;
+            }
+        }
+        arena->used = mark;
+        rec->Vmax = (float) sqrt(up->G * best / a);
+        rec->Rmax = (float) Rmax;
+    }
 
     /* Ekin, Epot per unit mass in the final frame; phi = E - K (- u) of the final pass;
      * Epot counts each pair once */
@@ -258,14 +206,6 @@ subhalo_so_thresholds(const Cosmology * CP, double atime, double rho[SUBHALO_NSO
     rho[3] = 500 * rhocrit;
     rho[4] = 2500 * rhocrit;
 }
-
-/* (radius, P index) pairs of the radial order, ties by P index. 16 bytes per bound particle:
- * the only per-particle scratch of subhalo_props_rockstar. */
-struct RPair {
-    double r;
-    int64_t p;
-};
-#define RPAIR_LESS(x, y) ((x)->r < (y)->r || ((x)->r == (y)->r && (x)->p < (y)->p))
 
 /* Allocation-free introsort (the algorithm of subhalo_unbind.c's SUBHALO_DEFINE_SORT, which is
  * private to that file): quicksort with median of three, heapsort below the depth limit,
@@ -520,26 +460,11 @@ subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c, con
     double cpos[3], cvel[3], sx, sv;
     subhalo_core(c, up, CoreSize, cpos, cvel, &sx, &sv);
 
-    /* radial order from the core, radii floored at the softening */
+    /* radial order from the core, radii floored at the softening (the order subhalo_props_hbt
+     * builds for Vmax; rebuilt here, an O(N log N) sort, so the two calls stay independent) */
     const size_t mark = arena->used;
-    struct RPair * pr = (struct RPair *) subhalo_arena_get(arena, sizeof(struct RPair) * n);
-    if(!pr)
-        endrun(1, "Subhalo properties: arena exhausted for the radial order of %ld particles (%lu of %lu bytes used)\n",
-               (long) n, (unsigned long) arena->used, (unsigned long) arena->size);
-    double Mtot = 0;
-    for(i = 0; i < n; i++) {
-        const int64_t p = c->Index[i];
-        double r2 = 0;
-        for(d = 0; d < 3; d++) {
-            const double dx = NEAREST(P[p].Pos[d] - cpos[d], BoxSize);
-            r2 += dx * dx;
-        }
-        const double r = sqrt(r2);
-        pr[i].r = r > rfloor ? r : rfloor;
-        pr[i].p = p;
-        Mtot += P[p].Mass;
-    }
-    rpair_sort(pr, n);
+    double Mtot;
+    struct RPair * pr = radial_order(c, cpos, rfloor, BoxSize, arena, &Mtot);
 
     /* cumulative profile (properties.c:383-415): outermost crossing per definition, VmaxVir over
      * the particles whose enclosed density exceeds the virial threshold, the half-mass radius */
