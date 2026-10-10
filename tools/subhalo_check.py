@@ -1637,14 +1637,32 @@ def check_props(pigdir, ck, vmax_rtol=1e-3, field_warn=0.02):
 NFW_MINPART = 100
 
 
+def deferred_velocity_aperture(vrms):
+    """Rows whose Phase 5 velocities were computed: the virial aperture exists, i.e. Vrms is a finite
+    value >= 0 (-1 otherwise). Velocity components are signed, so -1 km/s is a legitimate value and
+    never marks a missing vector by itself (Phase 5 audit R8)."""
+    vrms = np.asarray(vrms, dtype=np.float64)
+    return np.isfinite(vrms) & (vrms >= 0)
+
+
+def deferred_velocity_valid(vrms, vel):
+    """Rows of the velocity vector vel (n x 3: BulkVel or RockstarCoreVel) to use: the aperture exists
+    and every component is finite. subhalo_compare_rockstar.py uses the same mask."""
+    vel = np.asarray(vel, dtype=np.float64)
+    return deferred_velocity_aperture(vrms) & np.all(np.isfinite(vel), axis=1)
+
+
 def _check_props_deferred(ck, tag, S, tid, corevel_warn=1.0):
     """Phase 5 (halofinder_phase5_plan.md section 1 item 1, subhalo_props_deferred): Rs, Vrms, BulkVel,
     RockstarCoreVel. Skipped (a note) when every value is -1, i.e. a catalogue written before Phase 5.
-     - all four defined exactly when RBoundSO[vir] is (the aperture is the bound virial sphere), except
-       Rs, which is -1 below NFW_MINPART bound particles (the aperture is a subset of the bound set) and
+     - Vrms defined (>= 0) exactly when RBoundSO[vir] is (the aperture is the bound virial sphere);
+     - the velocities are signed, so -1 is a legitimate component value: BulkVel and RockstarCoreVel are
+       valid where the aperture exists (Vrms >= 0) and then every component must be finite; where the
+       aperture is absent they must be the all -1 sentinel (Phase 5 audit R8);
+     - Rs is -1 below NFW_MINPART bound particles (the aperture is a subset of the bound set) and
        otherwise > 0, or -1 (a warning: fewer than NFW_MINPART particles inside Rvir, or a failed fit);
-     - Vrms >= 0 when RBoundSO[vir] > 0; Rs inside the aperture (below 1.5 RBoundSO[vir]: the outer bin
-       edge may lie half a particle spacing beyond the crossing);
+       Rs inside the aperture (below 1.5 RBoundSO[vir]: the outer bin edge may lie half a particle
+       spacing beyond the crossing);
      - |RockstarCoreVel - CoreVel| above corevel_warn Vrms: a warning only (two different core definitions:
        r < 0.1 Rvir or the innermost 100 against the CoreSize most-bound particles)."""
     names = ("Rs", "Vrms", "BulkVel", "RockstarCoreVel")
@@ -1659,14 +1677,17 @@ def _check_props_deferred(ck, tag, S, tid, corevel_warn=1.0):
     rv = S["RBoundSO"][:, 0].astype(np.float64)
     hasr = _defined(rv) & (rv > 0)
     nb = S["Nbound"].astype(np.int64)
-    for name, d in (("Vrms", _defined(vrms)), ("BulkVel", np.all(_defined(bv), axis=1)),
-                    ("RockstarCoreVel", np.all(_defined(rcv), axis=1))):
-        bad = d != hasr
-        ck.check(not np.any(bad), "%s: %d subhalos with %s defined %s RBoundSO[vir] (e.g. TrackId %s)"
-                 % (tag, np.count_nonzero(bad), name, "without" if np.any(d & ~hasr) else "-1 with", tid[bad][:5].tolist()))
+    bad = _defined(vrms) != hasr
+    ck.check(not np.any(bad), "%s: %d subhalos with Vrms defined %s RBoundSO[vir] (e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), "without" if np.any(_defined(vrms) & ~hasr) else "-1 with", tid[bad][:5].tolist()))
+    aper = deferred_velocity_aperture(vrms)
     for name, v in (("BulkVel", bv), ("RockstarCoreVel", rcv)):
-        bad = np.any(_defined(v), axis=1) & ~np.all(_defined(v), axis=1)
-        ck.check(not np.any(bad), "%s: %d subhalos with %s partly -1 (e.g. TrackId %s)"
+        fin = np.all(np.isfinite(v), axis=1)
+        bad = aper & ~fin
+        ck.check(not np.any(bad), "%s: %d subhalos with a virial aperture but a non-finite %s component (e.g. TrackId %s)"
+                 % (tag, np.count_nonzero(bad), name, tid[bad][:5].tolist()))
+        bad = ~aper & ~np.all(v == -1, axis=1)
+        ck.check(not np.any(bad), "%s: %d subhalos without a virial aperture (Vrms -1) but %s not the all -1 sentinel (e.g. TrackId %s)"
                  % (tag, np.count_nonzero(bad), name, tid[bad][:5].tolist()))
     bad = hasr & ~(vrms >= 0)
     ck.check(not np.any(bad), "%s: %d subhalos with RBoundSO[vir] > 0 but Vrms < 0 (e.g. TrackId %s)"
@@ -1690,7 +1711,8 @@ def _check_props_deferred(ck, tag, S, tid, corevel_warn=1.0):
                    NFW_MINPART, tid[miss][:5].tolist()))
     if "CoreVel" in S:
         cv = S["CoreVel"].astype(np.float64)
-        both = np.all(_defined(rcv), axis=1) & np.all(_defined(cv), axis=1) & _defined(vrms)
+        # CoreVel (the HBT core, signed) exists for every subhalo with a bound set
+        both = deferred_velocity_valid(vrms, rcv) & (nb > 0) & np.all(np.isfinite(cv), axis=1)
         dv = np.sqrt(((rcv - cv) ** 2).sum(axis=1))
         far = both & (dv > corevel_warn * vrms)
         if np.any(both):
@@ -1702,7 +1724,7 @@ def _check_props_deferred(ck, tag, S, tid, corevel_warn=1.0):
                     % (tag, np.count_nonzero(far), corevel_warn, tid[far][:5].tolist()))
     print("  %s: Phase 5 defined: Rs %d (of %d with Nbound >= %d), Vrms %d, BulkVel %d, RockstarCoreVel %d"
           % (tag, np.count_nonzero(drs), np.count_nonzero(big), NFW_MINPART, np.count_nonzero(_defined(vrms)),
-             np.count_nonzero(np.all(_defined(bv), axis=1)), np.count_nonzero(np.all(_defined(rcv), axis=1))))
+             np.count_nonzero(deferred_velocity_valid(vrms, bv)), np.count_nonzero(deferred_velocity_valid(vrms, rcv))))
 
 
 def cmd_props(args):

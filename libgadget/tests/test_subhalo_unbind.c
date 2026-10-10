@@ -4,7 +4,9 @@
  * adversarial oracles of the Phase 2a audit (J5 periodic gravity and neighbours across the
  * frame's unwrap cut, J6 one neighbour tree per key, J10 exact ties with scrambled IDs, J11 the
  * cap diagnostics; item 6: core fill, sinking forms, an absent type in a subsample, the always
- * included BH type, mixed masses).
+ * included BH type, mixed masses). Phase 5b: bit-identical results at 1, 3 and 8 threads
+ * (test_threads_bitwise) and, Phase 5 audit R7, inside the scheduler's worker region at sizes
+ * around SUBHALO_UNBIND_PAR_MIN (test_threads_worker_region).
  *
  * Haloes are Hernquist (1990) spheres sampled from the exact isotropic distribution function
  * (eq. 17), positions from the inverse cumulative mass profile truncated at 100 scale radii, so
@@ -1738,6 +1740,150 @@ test_threads_bitwise(void ** state)
     teardown_pman();
 }
 
+/* Phase 5 audit R7: the kernel inside the scheduler's worker region. A key that is not run alone
+ * is processed by one worker of subhalo_run_serial_keys' parallel region, where the kernel must
+ * stay serial (omp_in_parallel) and give the same result as alone. The host + satellite candidate
+ * of test_threads_bitwise (the satellite a tenth, unbound in the host frame: several iterations,
+ * a non-trivial partition) with 16383, 16384, 16385 and 16500 particles (around
+ * SUBHALO_UNBIND_PAR_MIN: the whole-list steps switch to the parallel mode above it), with and
+ * without subsampling, from a start frame 150 km/s off (several iterations): unbind + final pass at 1 thread,
+ * alone at 4 threads (dynamic adjustment off, the team size checked), and inside an active
+ * 4-thread region where two workers run two copies of the candidate concurrently, each compared
+ * bitwise with the 1-thread result (Index and Energy over the whole list, frame, counts). */
+static void
+cand_result_take(struct CandResult * r, const struct TestCand * t, int alive, int64_t npos)
+{
+    const int64_t n = t->c.N;
+    r->alive = alive;
+    r->NboundPositive = npos;
+    r->N = n;
+    r->Nbound = t->c.Nbound;
+    r->NboundTracer = t->c.NboundTracer;
+    r->Iterations = t->c.Iterations;
+    r->Flags = t->c.Flags;
+    r->Mbound = t->c.Mbound;
+    r->ConvergenceRatio = t->c.ConvergenceRatio;
+    memcpy(r->RefPos, t->c.RefPos, sizeof(r->RefPos));
+    memcpy(r->RefVel, t->c.RefVel, sizeof(r->RefVel));
+    r->Index = (int64_t *) malloc(sizeof(int64_t) * n);
+    r->Energy = (double *) malloc(sizeof(double) * n);
+    memcpy(r->Index, t->c.Index, sizeof(int64_t) * n);
+    memcpy(r->Energy, t->c.Energy, sizeof(double) * n);
+}
+
+/* unbind + final pass of an initialised candidate, no allocation outside the arena (safe in a
+ * worker); returns alive, *npos the final pass's count */
+static int
+cand_unbind_final(struct TestCand * t, const struct SubhaloUnbindParams * up, struct SubhaloArena * arena, int64_t * npos)
+{
+    const int alive = subhalo_unbind(&t->c, up, arena);
+    *npos = alive ? subhalo_final_pass(&t->c, up, arena) : -1;
+    return alive;
+}
+
+static void
+test_threads_worker_region(void ** state)
+{
+    const int nmax0 = omp_get_max_threads();
+    const int dyn0 = omp_get_dynamic();
+    const int T = 4;
+    const int64_t sizes[4] = {SUBHALO_UNBIND_PAR_MIN - 1, SUBHALO_UNBIND_PAR_MIN, SUBHALO_UNBIND_PAR_MIN + 1, 16500};
+    const int samples[2] = {1000, 0};
+    /* a start frame 150 km/s off: several iterations, particles unbound on the way */
+    const double vel0[3] = {Bulk[0] + 150., Bulk[1], Bulk[2]};
+    int is, ip;
+    omp_set_dynamic(0);
+    for(is = 0; is < 4; is++)
+        for(ip = 0; ip < 2; ip++) {
+            const int64_t n = sizes[is];
+            setup_pman(n);
+            make_host_satellite(n - n / 11, n / 11);
+            struct SubhaloUnbindParams up = default_params();
+            up.SampleSize = samples[ip];
+            struct CandResult ref, alone, wk[2];
+            int64_t npos;
+            int alive;
+            /* the reference: 1 thread */
+            {
+                omp_set_num_threads(1);
+                struct TestCand t;
+                cand_init(&t, 0, n, Centre, vel0, 11);
+                struct SubhaloArena a = arena_alloc(n);
+                alive = cand_unbind_final(&t, &up, &a, &npos);
+                assert_int_equal(a.used, 0);
+                cand_result_take(&ref, &t, alive, npos);
+                myfree(a.base);
+                cand_free(&t);
+            }
+            /* alone with T threads: the runtime gives T (dynamic adjustment off) */
+            {
+                omp_set_num_threads(T);
+                int got = 0;
+                #pragma omp parallel
+                {
+                    #pragma omp master
+                    got = omp_get_num_threads();
+                }
+                assert_int_equal(got, T);
+                assert_false(omp_in_parallel());
+                struct TestCand t;
+                cand_init(&t, 0, n, Centre, vel0, 11);
+                struct SubhaloArena a = arena_alloc(n);
+                alive = cand_unbind_final(&t, &up, &a, &npos);
+                assert_int_equal(a.used, 0);
+                cand_result_take(&alone, &t, alive, npos);
+                myfree(a.base);
+                cand_free(&t);
+            }
+            /* inside an active T-thread region: workers 1 and 2 each run a copy concurrently */
+            {
+                omp_set_num_threads(T);
+                struct TestCand t[2];
+                struct SubhaloArena a[2];
+                int k, team = 0, inpar[2] = {0, 0}, wal[2] = {0, 0};
+                int64_t wpos[2] = {0, 0};
+                for(k = 0; k < 2; k++) {
+                    cand_init(&t[k], 0, n, Centre, vel0, 11);
+                    a[k] = arena_alloc(n);
+                }
+                #pragma omp parallel num_threads(T)
+                {
+                    const int tid = omp_get_thread_num();
+                    if(tid == 0)
+                        team = omp_get_num_threads();
+                    if(tid == 1 || tid == 2) {
+                        inpar[tid - 1] = omp_in_parallel();
+                        wal[tid - 1] = cand_unbind_final(&t[tid - 1], &up, &a[tid - 1], &wpos[tid - 1]);
+                    }
+                }
+                assert_int_equal(team, T);
+                for(k = 0; k < 2; k++) {
+                    assert_true(inpar[k]);
+                    assert_int_equal(a[k].used, 0);
+                    cand_result_take(&wk[k], &t[k], wal[k], wpos[k]);
+                }
+                for(k = 1; k >= 0; k--) {
+                    myfree(a[k].base);
+                    cand_free(&t[k]);
+                }
+            }
+            message(0, "Worker region, N %ld, SampleSize %d: Nbound %ld after %d iterations; alone at %d threads and in two workers of a "
+                       "%d-thread region: %s\n", (long) n, samples[ip], (long) ref.Nbound, ref.Iterations, T, T,
+                    "compared bitwise");
+            assert_true(ref.alive && ref.Nbound > 0.5 * n && ref.Iterations > 1);
+            assert_same_result(&ref, &alone);
+            assert_same_result(&ref, &wk[0]);
+            assert_same_result(&ref, &wk[1]);
+            cand_result_free(&wk[1]);
+            cand_result_free(&wk[0]);
+            cand_result_free(&alone);
+            cand_result_free(&ref);
+            teardown_pman();
+        }
+    omp_set_dynamic(dyn0);
+    omp_set_num_threads(nmax0);
+}
+
 /* Timing table of the parallel mode (Phase 5 plan section 4 item 6), run only when
  * SUBHALO_UNBIND_TIMING is set to a repeat count (it takes minutes): unbind + final pass of a
  * Hernquist sphere of 2e4, 2e5 and 1e6 particles with the production SampleSize 1000, at 1, 2,
@@ -1821,6 +1967,7 @@ int main(void) {
         cmocka_unit_test(test_sample_types),
         cmocka_unit_test(test_death),
         cmocka_unit_test(test_threads_bitwise),
+        cmocka_unit_test(test_threads_worker_region),
         cmocka_unit_test(test_timing),
     };
     return cmocka_run_group_tests_mpi(tests, NULL, NULL);

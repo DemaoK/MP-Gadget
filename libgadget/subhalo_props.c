@@ -484,10 +484,13 @@ subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c, con
         kc[s] = -1;
         Mso[s] = 0;
     }
-    double M = 0, best = 0, rbest = -1, rhalf = -1;
+    /* M(<= r) as a compensated sum (Phase 5 audit R4): the same value as the distributed profile
+     * of subhalo_collective.c for the same radial order, exactly so for equal masses */
+    double Mk[2] = {0, 0}, best = 0, rbest = -1, rhalf = -1;
     for(k = 0; k < n; k++) {
         const double r = pr[k].r;
-        M += P[pr[k].p].Mass;
+        subhalo_ksum_add(Mk, P[pr[k].p].Mass);
+        const double M = subhalo_ksum_value(Mk);
         const double dens = M / (4.0 / 3.0 * M_PI * r * r * r);
         for(s = 0; s < SUBHALO_NSO; s++)
             if(dens > rho[s]) {
@@ -673,6 +676,13 @@ subhalo_nfw_threshold(int b, double mpbin)
     return b * mpbin * (1 - 1e-9);
 }
 
+/* nfw.c:126-132 computes the midpoint in kpc/h (1e3 x the Mpc/h radii) but subtracts the
+ * interpolation diff (r1 - r0) with the radii still in Mpc/h, so its correction is a thousand times
+ * too small and the edge is effectively the midpoint (for radii 0.01, 0.02, 0.03 Mpc/h and an
+ * excess of half the closing particle's mass: 24.995 kpc/h instead of 20 kpc/h). This is an
+ * upstream unit bug; here both terms are in the run's length unit, so the intended linear
+ * interpolation of the bin edge is applied (Phase 5 audit R5; the deviation list of
+ * subhalo_unbind.h). */
 double
 subhalo_nfw_edge(int b, double mpbin, double rprev, int has_prev, double r, double rnext, double Mc, double m)
 {
@@ -713,6 +723,10 @@ subhalo_nfw_fit(double rs0, const double * edge, int nb, double wcut)
     int i;
     if(nb < 3 || nb > SUBHALO_NFW_MAXBINS)
         return -1;
+    /* degenerate input (Phase 5 audit R6): every edge finite, a positive extent */
+    for(i = 0; i <= nb; i++)
+        if(!subhalo_isfinite(edge[i]))
+            return -1;
     for(i = 0; i < nb; i++)
         w[i] = edge[i] < wcut ? 0.1 : 1;
     const double rmin = edge[0], rmax = edge[nb];
@@ -720,28 +734,39 @@ subhalo_nfw_fit(double rs0, const double * edge, int nb, double wcut)
         return -1;
     /* calc_scale_from_bins (nfw.c:64-99) */
     double rs = rs0;
-    if(!(rs > rmin) || !(rs < rmax))
+    if(!subhalo_isfinite(rs) || !(rs > rmin) || !(rs < rmax))
         rs = edge[(nb + 1) / 2];
     if(!(rs > 0))
         return -1;
     double chi2 = nfw_chi2(rs, edge, w, nb);
+    if(!subhalo_isfinite(chi2))
+        return -1;
     double drs = rs / 10.0, last = 1e30;
     int iter = 0;
+    /* Rockstar's finite stopping rule; a nonfinite objective, a zero or nonfinite probe step or a
+     * nonfinite derivative is a failed fit (-1) rather than the radius reached so far (audit R6:
+     * repeated edges at the start radius give drs = 0 and 0 / 0 derivatives) */
     while(fabs(chi2 - last) > 0.005 * chi2 && iter < SUBHALO_NFW_MINPERBIN) {
         last = chi2;
         if(rs + drs > rmax)
             drs = 0.1 * (rmax - rs);
         if(rs - drs < rmin)
             drs = 0.1 * (rs - rmin);
+        if(!(drs > 0) || !subhalo_isfinite(drs))
+            return -1;
         const double cr = nfw_chi2(rs + drs, edge, w, nb);
         const double cl = nfw_chi2(rs - drs, edge, w, nb);
         const double dx = 0.5 * (cr - cl) / drs;
         const double dx2 = (cr + cl - 2.0 * chi2) / (drs * drs);
+        if(!subhalo_isfinite(cr) || !subhalo_isfinite(cl) || !subhalo_isfinite(dx) || !subhalo_isfinite(dx2))
+            return -1;
         double move = 0;
         if(dx2 != 0)
             move = -dx / dx2;
-        if(!move || !subhalo_isfinite(move))
-            break;
+        if(!subhalo_isfinite(move))
+            return -1;
+        if(!move)
+            break;              /* nfw.c: return rs */
         if(rs + move > 4 * rs)
             move = 3.0 * rs;
         if(rs + move < 0.25 * rs)
@@ -752,6 +777,8 @@ subhalo_nfw_fit(double rs0, const double * edge, int nb, double wcut)
         else if(nrs < rmin)
             nrs = rs + 0.8 * (rmin - rs);
         double nchi2 = nfw_chi2(nrs, edge, w, nb);
+        if(!subhalo_isfinite(nchi2))
+            return -1;
         if(cr < nchi2) {
             nchi2 = cr;
             nrs = rs + drs;
@@ -772,6 +799,21 @@ subhalo_nfw_fit(double rs0, const double * edge, int nb, double wcut)
     return (subhalo_isfinite(rs) && rs > 0) ? rs : -1;
 }
 
+void
+subhalo_deferred_velocities(float BulkVel[3], float CoreVel[3], float * Vrms, const double cvel[3], double Mb, double Mc,
+                            double Sb[3][2], double S2[3][2], double Sc[3][2], double vkms)
+{
+    double var = 0;
+    int d;
+    for(d = 0; d < 3; d++) {
+        const double mb = subhalo_ksum_value(Sb[d]) / Mb;
+        var += subhalo_ksum_value(S2[d]) / Mb - mb * mb;
+        BulkVel[d] = (float) ((cvel[d] + mb) * vkms);
+        CoreVel[d] = (float) ((cvel[d] + subhalo_ksum_value(Sc[d]) / Mc) * vkms);
+    }
+    *Vrms = (float) (sqrt(var > 0 ? var : 0) * vkms);
+}
+
 /* The recipe of subhalo_props_deferred on a radial order pr[0, n) of the bound set (radii from the
  * core, floored at rfloor, ties by ID) with the core velocity cvel: shared by subhalo_props_deferred
  * and subhalo_props_rockstar, which already holds this order (one radial sort per subhalo). The
@@ -789,12 +831,14 @@ deferred_on_order(struct SubTrack * rec, const struct RPair * pr, int64_t n, con
     if(n <= 0)
         return;
 
-    /* the virial aperture and the VmaxVir pair (the profile rule of subhalo_props_rockstar) */
+    /* the virial aperture and the VmaxVir pair (the profile rule of subhalo_props_rockstar, its
+     * compensated cumulative mass) */
     int64_t kc = -1;
-    double M = 0, Mvir = 0, best = 0, rbest = -1;
+    double Mk[2] = {0, 0}, Mvir = 0, best = 0, rbest = -1;
     for(k = 0; k < n; k++) {
         const double r = pr[k].r;
-        M += P[pr[k].p].Mass;
+        subhalo_ksum_add(Mk, P[pr[k].p].Mass);
+        const double M = subhalo_ksum_value(Mk);
         const double dens = M / (4.0 / 3.0 * M_PI * r * r * r);
         if(dens > rho[0]) {
             kc = k;
@@ -812,7 +856,8 @@ deferred_on_order(struct SubTrack * rec, const struct RPair * pr, int64_t n, con
     const double rcore = 0.1 * Rvir;
 
     /* velocities about the core velocity (the shift keeps the one-pass variance accurate); the
-     * core: r < 0.1 Rvir, at least the innermost SUBHALO_ROCKSTAR_CORE_MINPART of the aperture */
+     * core: r < 0.1 Rvir, at least the innermost SUBHALO_ROCKSTAR_CORE_MINPART of the aperture.
+     * Every sum is compensated (audit R4), as the distributed recipe's per-rank pairs. */
     int64_t ncore = 0;
     double mmax = 0;
     for(k = 0; k < nvir; k++) {
@@ -823,41 +868,40 @@ deferred_on_order(struct SubTrack * rec, const struct RPair * pr, int64_t n, con
     }
     if(ncore < SUBHALO_ROCKSTAR_CORE_MINPART)
         ncore = nvir < SUBHALO_ROCKSTAR_CORE_MINPART ? nvir : SUBHALO_ROCKSTAR_CORE_MINPART;
-    double Sc[3] = {0, 0, 0}, Sb[3] = {0, 0, 0}, S2[3] = {0, 0, 0}, Mc = 0, Mb = 0;
+    double Sc[3][2], Sb[3][2], S2[3][2], Mc[2] = {0, 0}, Mb[2] = {0, 0};
+    for(d = 0; d < 3; d++)
+        Sc[d][0] = Sc[d][1] = Sb[d][0] = Sb[d][1] = S2[d][0] = S2[d][1] = 0;
     for(k = 0; k < nvir; k++) {
         const int64_t p = pr[k].p;
         const double m = P[p].Mass;
-        Mb += m;
+        subhalo_ksum_add(Mb, m);
         if(k < ncore)
-            Mc += m;
+            subhalo_ksum_add(Mc, m);
         for(d = 0; d < 3; d++) {
             const double dv = P[p].Vel[d] - cvel[d];
-            Sb[d] += m * dv;
-            S2[d] += m * dv * dv;
+            subhalo_ksum_add(Sb[d], m * dv);
+            subhalo_ksum_add(S2[d], m * dv * dv);
             if(k < ncore)
-                Sc[d] += m * dv;
+                subhalo_ksum_add(Sc[d], m * dv);
         }
     }
-    double var = 0;
-    for(d = 0; d < 3; d++) {
-        const double mb = Sb[d] / Mb;
-        var += S2[d] / Mb - mb * mb;
-        rec->BulkVel[d] = (float) ((cvel[d] + mb) * vkms);
-        rec->RockstarCoreVel[d] = (float) ((cvel[d] + Sc[d] / Mc) * vkms);
-    }
-    rec->Vrms = (float) (sqrt(var > 0 ? var : 0) * vkms);
+    subhalo_deferred_velocities(rec->BulkVel, rec->RockstarCoreVel, &rec->Vrms, cvel, subhalo_ksum_value(Mb), subhalo_ksum_value(Mc),
+                        Sb, S2, Sc, vkms);
 
-    /* Rs: the equal-mass bins of the aperture (calc_scale_radius, nfw.c:101-144) */
+    /* Rs: the equal-mass bins of the aperture (calc_scale_radius, nfw.c:101-144), the bins closed
+     * by the compensated cumulative mass against the thresholds of the aperture's mass Mvir (the
+     * quantities the distributed recipe reduces) */
     double mpbin;
     const int nb = subhalo_nfw_bin_plan(nvir, Mvir, mmax, &mpbin);
     if(nb > 0) {
         double edge[SUBHALO_NFW_MAXBINS + 1];
         int b = 1;
         edge[0] = 0;
-        M = 0;
+        Mk[0] = Mk[1] = 0;
         for(k = 0; k < nvir && b <= nb; k++) {
             const double m = P[pr[k].p].Mass;
-            M += m;
+            subhalo_ksum_add(Mk, m);
+            const double M = subhalo_ksum_value(Mk);
             /* while, as the distributed scan: one particle may close several bins only when
              * mpbin is the largest particle mass, and then both modes close them alike */
             while(b <= nb && M >= subhalo_nfw_threshold(b, mpbin)) {

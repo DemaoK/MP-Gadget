@@ -1988,9 +1988,14 @@ stats_reduce(const struct SubhaloCallStats * loc, struct SubhaloCallStats * tot,
 const char * const SubhaloStageName[SUBHALO_NSTAGE] = {
     "setup", "vote", "frames", "lookup", "plan", "exchange", "sort", "fetch", "serial", "restore",
     "rounds", "number", "descendants", "history", "store", "unhosted", "orphansync", "fieldso"};
+/* The rounds stage is split by subhalo_collective_run into /Subhalo/Rounds/{Setup,Rounds,Walk,
+ * Tags} (Walk: the potential-only walks); the driver's end of the stage measures the rest as
+ * /Subhalo/Rounds/Cleanup (all of the stage when there is no in-place candidate), so that the
+ * parent /Subhalo/Rounds, the sum of its children, is the summary's rounds time (Phase 5 audit R3)
+ * less the tree builds of the walks, which forcetree.c books as /Tree/Build/{Nodes,Moments}. */
 static const char * const SubhaloStageClock[SUBHALO_NSTAGE] = {
     "/Subhalo/Setup", "/Subhalo/Vote", "/Subhalo/Frames", "/Subhalo/Lookup", "/Subhalo/Plan", "/Subhalo/Exchange",
-    "/Subhalo/Sort", "/Subhalo/Fetch", "/Subhalo/Serial", "/Subhalo/Restore", "/Subhalo/Rounds", "/Subhalo/Number",
+    "/Subhalo/Sort", "/Subhalo/Fetch", "/Subhalo/Serial", "/Subhalo/Restore", "/Subhalo/Rounds/Cleanup", "/Subhalo/Number",
     "/Subhalo/Descendants", "/Subhalo/History", "/Subhalo/Store", "/Subhalo/Unhosted", "/Subhalo/OrphanSync",
     "/Subhalo/FieldSO"};
 
@@ -2113,7 +2118,7 @@ subhalo_finish_call(int SnapNum, int complete, const struct SubhaloCallStats * l
         MPI_Bcast(&kn, 1, MPI_INT64, kout.r, Comm);
         st->KeyTimeMax = kout.v;
         st->KeyTimeMaxN = kn;
-        const double timb = (ss->ThreadSum > 0 && ss->NThreads > 0) ? ss->ThreadMax / (ss->ThreadSum / ss->NThreads) : 0;
+        const double timb = ss->ThreadMeanSum > 0 ? ss->ThreadMax / ss->ThreadMeanSum : 0;
         const double rload = ss->AloneWall + ss->ThreadMax;
         double bl[8] = {timb, timb > 0 ? 1 : 0, rload, ss->FitN, ss->FitX, ss->FitXX, ss->FitY, ss->FitXY}, bs[8], bm = 0, rm = 0;
         MPI_Allreduce(bl, bs, 8, MPI_DOUBLE, MPI_SUM, Comm);

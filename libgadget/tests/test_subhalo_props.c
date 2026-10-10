@@ -26,6 +26,10 @@
  *     sample mean and Bulk, Vrms against the sample dispersion and sqrt(frac / 2) DISC_VEDGE,
  *     RockstarCoreVel against the mean inside 0.1 Rvir about CorePos (centred and displaced
  *     clump); -1 without a crossing (test_absent); unit invariance (test_units).
+ *  9. Phase 5 audit fixes: R6, subhalo_nfw_fit returns -1 on repeated edges at the start radius
+ *     (zero probe step), nonfinite edges (test_nfw_fit); R5, the bin edge's interpolation in the
+ *     run's length unit (the audit's 0.01/0.02/0.03 Mpc/h example: 20 kpc/h, not Rockstar's
+ *     literal 24.995) and an overshooting-bin oracle for Rs (test_nfw_bin_edges).
  *
  * Every candidate goes through subhalo_final_pass first (energies and order as in production),
  * then subhalo_props_hbt, subhalo_props_rockstar (which also fills the Phase 5 columns) and
@@ -448,6 +452,27 @@ test_nfw_fit(void ** state)
     /* too few bins */
     double e3[3] = {0, 1, 2};
     assert_true(subhalo_nfw_fit(1, e3, 2, 0) == -1);
+    /* Phase 5 audit R6: degenerate or nonfinite input is a failed fit, not a radius. Repeated
+     * edges at the fallback start (edge[(6 + 1) / 2] = 1 = the outer edge): the probe step is 0
+     * and the derivatives 0 / 0; before the fix the loop broke and returned 1. */
+    {
+        double rep[7] = {0, 1, 1, 1, 1, 1, 1};
+        const double bad_start[3] = {-1, 5, NAN};
+        int k;
+        for(k = 0; k < 3; k++) {
+            const double f = subhalo_nfw_fit(bad_start[k], rep, 6, 0);
+            message(0, "NFW fit on repeated edges [0,1,1,1,1,1,1], start %g: %g\n", bad_start[k], f);
+            assert_true(f == -1);
+        }
+        double en[7] = {0, 1, 2, NAN, 4, 5, 6};
+        assert_true(subhalo_nfw_fit(2, en, 6, 0) == -1);
+        double ei[7] = {0, 1, 2, 3, 4, 5, INFINITY};
+        assert_true(subhalo_nfw_fit(2, ei, 6, 0) == -1);
+        /* a nonfinite start on valid edges falls back to the middle edge as before */
+        double eg[7] = {0, 1, 2, 3, 4, 5, 6};
+        const double f = subhalo_nfw_fit(NAN, eg, 6, 0);
+        assert_true(f > 0 && f < 6);
+    }
     /* the bin plan of calc_scale_radius */
     double mp;
     assert_int_equal(subhalo_nfw_bin_plan(99, 99, 1, &mp), 0);
@@ -1182,6 +1207,116 @@ test_vmax(void ** state)
     teardown_pman();
 }
 
+/* ------------------------------------------------------------------ 9. NFW bin edges (Phase 5 audit R5) */
+
+/* Rockstar's bin edge (nfw.c:126-132) converts the midpoint to kpc/h and subtracts the
+ * interpolation in Mpc/h (an upstream unit bug that effectively drops the correction); the recipe
+ * applies the correction in the run's length unit. (a) The audit's example, radii 0.01, 0.02, 0.03
+ * Mpc/h and an excess of half the closing mass: 0.020 Mpc/h = 20 kpc/h (Rockstar literally 24.995
+ * kpc/h), the same edge in kpc/h units. (b) An overshooting-bin oracle: 130 equal masses at
+ * distinct radii 0.5 + 0.1 k from a one-particle core, every particle inside the aperture, 8 bins
+ * of 16.25 masses (every bin closes with an excess); Rs of subhalo_props_deferred against the fit
+ * on the edges computed here with the intended interpolation. */
+static void
+test_nfw_bin_edges(void ** state)
+{
+    /* (a) */
+    const double e_mpc = subhalo_nfw_edge(1, 1.0, 0.01, 1, 0.02, 0.03, 1.5, 1.0);
+    const double e_kpc = subhalo_nfw_edge(1, 1.0, 10., 1, 20., 30., 1.5, 1.0);
+    const double rockstar_literal_kpc = 1e3 * 0.5 * (0.02 + 0.03) - 0.5 * (0.02 - 0.01);
+    message(0, "NFW bin edge, radii 0.01/0.02/0.03 Mpc/h, excess/mass 0.5: %.6g Mpc/h = %.6g kpc/h (kpc/h units: %.6g; Rockstar's "
+               "literal nfw.c arithmetic %.6g kpc/h)\n", e_mpc, 1e3 * e_mpc, e_kpc, rockstar_literal_kpc);
+    assert_true(fabs(e_mpc - 0.02) < 1e-15);
+    assert_true(fabs(e_kpc - 20.) < 1e-12);
+    assert_true(fabs(rockstar_literal_kpc - 24.995) < 1e-9);
+    /* no excess, or the first particle: the midpoint */
+    assert_true(fabs(subhalo_nfw_edge(1, 1.0, 10., 1, 20., 30., 1.0, 1.0) - 25.) < 1e-12);
+    assert_true(fabs(subhalo_nfw_edge(1, 1.0, 0., 0, 20., 30., 1.5, 1.0) - 25.) < 1e-12);
+
+    /* (b) */
+    const int64_t n = 130;
+    const double m = 0.01;
+    int64_t k;
+    int b;
+    setup_pman(n);
+    place(0, 0, 0, m, 1);
+    for(k = 1; k < n; k++)
+        place(k, 0.5 + 0.1 * k, k, m, 1 + k);
+    struct SubhaloUnbindParams up = default_params();
+    struct SubCandidate c;
+    memset(&c, 0, sizeof(c));
+    int64_t * Index = (int64_t *) mymalloc("TestIndex", sizeof(int64_t) * n);
+    for(k = 0; k < n; k++)
+        Index[k] = k;
+    c.Index = Index;
+    c.N = c.Nbound = n;
+    double rho[SUBHALO_NSO];
+    for(k = 0; k < SUBHALO_NSO; k++)
+        rho[k] = 1e-12;               /* every particle inside every aperture */
+    struct SubhaloArena arena;
+    arena.size = SUBHALO_PROPS_BYTES_PER_PART * n;
+    arena.used = 0;
+    arena.base = (char *) mymalloc("TestArena", arena.size);
+    struct SubTrack rec;
+    subhalo_track_clear(&rec, 0);
+    subhalo_props_deferred(&rec, &c, &up, rho, 1, &arena);
+    assert_int_equal(arena.used, 0);
+    myfree(arena.base);
+    /* the oracle: radii from the same core, sorted (distinct by construction) */
+    double cpos[3], cvel[3], sx, sv;
+    subhalo_core(&c, &up, 1, cpos, cvel, &sx, &sv);
+    const double rfloor = up.h / 2.8;
+    double r[130];
+    for(k = 0; k < n; k++) {
+        double r2 = 0;
+        int d;
+        for(d = 0; d < 3; d++) {
+            const double dx = NEAREST(P[k].Pos[d] - cpos[d], BOXSIZE);
+            r2 += dx * dx;
+        }
+        r[k] = sqrt(r2) > rfloor ? sqrt(r2) : rfloor;
+        assert_true(k == 0 || r[k] > r[k - 1]);
+    }
+    double mpbin;
+    const double Mvir = n * m;
+    const int nb = subhalo_nfw_bin_plan(n, Mvir, m, &mpbin);
+    assert_int_equal(nb, 8);                       /* ppbin 130 / (130 / 15) = 16 */
+    assert_true(fabs(mpbin / m - 16.25) < 1e-12);
+    double edge[SUBHALO_NFW_MAXBINS + 1], lit[SUBHALO_NFW_MAXBINS + 1];
+    edge[0] = lit[0] = 0;
+    int novershoot = 0;
+    for(b = 1, k = 0; b <= nb && k < n; k++) {
+        const double M = (double) (k + 1) * m;
+        if(!(M >= b * mpbin * (1 - 1e-9)))
+            continue;
+        const double excess = (M - b * mpbin) / m;
+        const double rnext = k + 1 < n ? r[k + 1] : r[k];
+        edge[b] = 0.5 * (r[k] + rnext) - excess * (r[k] - r[k - 1]);
+        lit[b] = 0.5 * (r[k] + rnext);               /* Rockstar's effective edge: the correction dropped */
+        if(excess > 0.1)
+            novershoot++;
+        b++;
+    }
+    assert_int_equal(b - 1, nb);
+    assert_true(novershoot >= nb / 2);
+    double best = 0, rbest = -1;
+    for(k = 0; k < n; k++)
+        if((double) (k + 1) * m / r[k] > best) {
+            best = (double) (k + 1) * m / r[k];
+            rbest = r[k];
+        }
+    const double Rvir = cbrt(3 * Mvir / (4 * M_PI * rho[0]));
+    const double rs0 = subhalo_klypin_rs(Rvir, Mvir, best, rbest);
+    const double rs = subhalo_nfw_fit(rs0, edge, nb, 3 * rfloor);
+    const double rs_lit = subhalo_nfw_fit(rs0, lit, nb, 3 * rfloor);
+    message(0, "NFW bin oracle: %d bins of %.4g masses, %d with an excess > 0.1; Rs %.8g, oracle %.8g (Rockstar's effective midpoint "
+               "edges: %.8g); edge 1 %.6g (midpoint %.6g)\n", nb, mpbin / m, novershoot, rec.Rs, rs, rs_lit, edge[1], lit[1]);
+    assert_true(rs > 0 && fabs(rec.Rs / rs - 1) < 1e-6);
+    assert_true(edge[1] < lit[1]);
+    myfree(Index);
+    teardown_pman();
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_thresholds),
@@ -1193,6 +1328,7 @@ int main(void) {
         cmocka_unit_test(test_absent),
         cmocka_unit_test(test_vmax),
         cmocka_unit_test(test_units),
+        cmocka_unit_test(test_nfw_bin_edges),
     };
     return cmocka_run_group_tests_mpi(tests, NULL, NULL);
 }

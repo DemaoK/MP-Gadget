@@ -566,7 +566,7 @@ subhalo_plan_default_cfg(struct SubhaloPlanCfg * cfg, int64_t TotNgroups, int NT
      * pass knows (cfg->NCandsKnown, NMembersKnown, set by the caller) and, for a key that turns
      * oversized during the packing, one candidate and its census tags */
     cfg->InplaceKeyBytes = SUBHALO_INPLACE_KEY_BYTES;
-    cfg->InplaceCandBytes = SUBHALO_INPLACE_CAND_BYTES;
+    cfg->InplaceCandBytes = SUBHALO_INPLACE_CAND_BYTES + SUBHALO_INPLACE_CAND_PROPS_BYTES;
     cfg->InplaceMemberBytes = SUBHALO_INPLACE_MEMBER_BYTES;
     cfg->NCandsKnown = cfg->NMembersKnown = 0;
     /* a sub-tree key's particles also hold a binder-ordinal slot from the serial key to the final
@@ -2989,7 +2989,7 @@ subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t
     qsort(ord, ns, sizeof(struct KeyOrder), cmp_keyorder);
 #define KEY_ARENA_BYTES(kk) ((size_t) bytes_per_part * (size_t) segs[kk].n + (size_t) (extra ? extra[kk] : 0) + 64)
     double peakfrac = 0;
-    SerialStats.NThreads = nthreads;
+    SerialStats.NQueues = nthreads;
 
     /* keys above one thread's share of the cost run alone, with every thread inside the key */
     const double share = totalcost / nthreads;
@@ -3024,7 +3024,7 @@ subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t
     int64_t * maxb = (int64_t *) mymalloc("SubThreadMaxB", sizeof(int64_t) * nthreads);
     int64_t * count = (int64_t *) mymalloc("SubThreadCount", sizeof(int64_t) * nthreads);
     double * tpeak = (double *) mymalloc("SubThreadPeak", sizeof(double) * nthreads);
-    double * tbusy = (double *) mymalloc("SubThreadBusy", sizeof(double) * nthreads);
+    double * tbusy = (double *) mymalloc("SubThreadBusy", sizeof(double) * nthreads);   /* per actual worker (audit R2) */
     double * kt = (double *) mymalloc("SubKeyTime", sizeof(double) * (ns + 1));
     int * owner = (int *) mymalloc("SubKeyOwner", sizeof(int) * (ns + 1));
     for(t = 0; t < nthreads; t++) {
@@ -3051,12 +3051,16 @@ subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t
         arenas[t].base = (char *) mymalloc2("SubArena", arenas[t].size);
     }
     const double tthr = MPI_Wtime();
+    int team = 1;
     #pragma omp parallel num_threads(nthreads)
     {
         const int tid = omp_get_thread_num();
         const int nt = omp_get_num_threads();
         int tt;
-        /* if the runtime gives fewer threads, each covers several queues */
+        if(tid == 0)
+            team = nt;
+        /* if the runtime gives fewer threads (dynamic adjustment, a thread limit, an enclosing
+         * parallel region), each covers several queues; the busy time is the worker's (audit R2) */
         for(tt = tid; tt < nthreads; tt += nt) {
             int64_t kk;
             for(kk = nalone; kk < ns; kk++) {
@@ -3066,7 +3070,7 @@ subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t
                 const double t0 = omp_get_wtime();
                 fn(&segs[ord[kk].k], ord[kk].k, &arenas[tt], 1, userdata);
                 kt[kk] = omp_get_wtime() - t0;
-                tbusy[tt] += kt[kk];
+                tbusy[tid] += kt[kk];
                 /* relative to what the key itself was allowed, not the thread's larger arena */
                 const double f = (double) arenas[tt].peak / (double) KEY_ARENA_BYTES(ord[kk].k);
                 if(f > tpeak[tt])
@@ -3075,16 +3079,18 @@ subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t
         }
     }
 #undef KEY_ARENA_BYTES
+    SerialStats.NThreads = team;
     if(ns > nalone) {
         SerialStats.ThreadedWall += MPI_Wtime() - tthr;
         double bmax = 0, bsum = 0;
-        for(t = 0; t < nthreads; t++) {
+        for(t = 0; t < team; t++) {
             bsum += tbusy[t];
             if(tbusy[t] > bmax)
                 bmax = tbusy[t];
         }
         SerialStats.ThreadMax += bmax;
         SerialStats.ThreadSum += bsum;
+        SerialStats.ThreadMeanSum += bsum / team;
     }
     for(k = nalone; k < ns; k++)
         serial_stats_key(kt[k], ord[k].n, 0);

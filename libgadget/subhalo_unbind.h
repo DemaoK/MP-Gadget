@@ -247,7 +247,34 @@ double subhalo_klypin_f_to_c(double f);
  * SUBHALO_PROPS_BYTES_PER_PART * Nbound from the arena, rewound on return; endrun if short.
  * subhalo_props_rockstar fills the same four columns with the same arithmetic on its own radial
  * order (one sort per subhalo; the production path, subhalo_track.c); this standalone entry
- * gives bit-identical values (the unit tests compare the two). */
+ * gives bit-identical values (the unit tests compare the two).
+ *
+ * Serial and distributed (Phase 5 audit R4): subhalo_collective.c computes the same four columns
+ * for an in-place candidate from its distributed radial ordered set. Every accumulation of the
+ * recipe is a compensated (Neumaier) double sum in both modes (subhalo_ksum_*): the cumulative
+ * mass M(<= r) that sets the aperture, Mvir and the bin closing (the distributed one merges
+ * per-rank pairs in rank order through the prefix scan), the aperture's mass and velocity
+ * moments and the core's; the bin plan uses the same reduced quantities in both (Mvir, the
+ * largest mass), the bin edges, the fit and the velocity trio the same functions
+ * (subhalo_nfw_edge, subhalo_nfw_fit, subhalo_deferred_velocities). Guarantee: for an identical
+ * bound set, core and radial order, the two modes give identical columns whenever the
+ * compensated sums are exact, in particular for equal particle masses (DM-only runs), where
+ * every cumulative mass is the correctly rounded k m in both modes whatever the rank
+ * decomposition, and for any masses that are small multiples of a common quantum; for other
+ * masses they agree to about one rounding of the final sums, and the 1e-9 margin of
+ * subhalo_nfw_threshold keeps the bin edges where they are unless a cumulative mass lies within
+ * 1e-9 of a threshold (test_collective_props_identity checks both cases across three layouts).
+ * The bound set and core themselves come from different trees in the two modes and may differ.
+ *
+ * Deviations from Rockstar's recipe (beyond the aperture, the bound set of HBT membership):
+ *  - the bin edge interpolation (subhalo_nfw_edge) is applied in the run's length unit; nfw.c
+ *    subtracts the excess-mass interpolation computed from the radii in Mpc/h from a midpoint it
+ *    has converted to kpc/h, an upstream unit bug that effectively drops the correction (for radii
+ *    0.01, 0.02, 0.03 Mpc/h and an excess of half the closing mass: Rockstar 24.995 kpc/h, here
+ *    20 kpc/h; audit R5), so part of any remaining Rs difference against Rockstar comes from the
+ *    edges, not from membership alone;
+ *  - the fit (subhalo_nfw_fit) is in double and returns -1 for degenerate or nonfinite input
+ *    instead of Rockstar's start radius or a NaN (audit R6). */
 void subhalo_props_deferred(struct SubTrack * rec, const struct SubCandidate * c,
                             const struct SubhaloUnbindParams * up, const double rho[SUBHALO_NSO],
                             int CoreSize, struct SubhaloArena * arena);
@@ -263,17 +290,23 @@ void subhalo_props_deferred(struct SubTrack * rec, const struct SubCandidate * c
  * bin (at least mmax). */
 int subhalo_nfw_bin_plan(int64_t nfit, double Mfit, double mmax, double * mpbin);
 /* The cumulative mass at which bin b (1-based) closes: the first particle of the radial order
- * with M(<= r) >= this closes it (Rockstar's running subtraction, with a 1e-9 relative margin so
- * that rounding of the cumulative sums cannot move the edge between the two modes). */
+ * with M(<= r) >= this closes it (Rockstar's running subtraction, with a 1e-9 relative margin
+ * against the rounding of the cumulative sums; with the compensated sums of both modes the
+ * decision is identical whenever the sums are exact, see above). */
 double subhalo_nfw_threshold(int b, double mpbin);
 /* The outer edge of bin b closed by the particle at r (mass m, cumulative mass Mc) between its
  * neighbours rprev (ignored when has_prev == 0) and rnext (r when it is the last bound particle):
- * 0.5 (r + rnext) - (Mc - b mpbin) / m (r - rprev) (nfw.c:126-132). */
+ * 0.5 (r + rnext) - (Mc - b mpbin) / m (r - rprev) (nfw.c:126-132, both terms in the run's
+ * length unit: the intended interpolation, not nfw.c's mixed units; see the deviations above). */
 double subhalo_nfw_edge(int b, double mpbin, double rprev, int has_prev, double r, double rnext, double Mc, double m);
 /* calc_scale_from_bins (nfw.c:64-99) in double: Newton on the chi^2 of the bin masses from rs0
  * (replaced by the middle edge when outside (edge[0], edge[nbins])), at most
  * SUBHALO_NFW_MINPERBIN steps; bins whose inner edge is below wcut weigh 0.1. edge[0] = 0.
- * Returns -1 when nbins < 3 or the result is not a finite positive radius. */
+ * Returns -1 when nbins < 3, an edge is not finite, edge[nbins] <= edge[0], the start or a step
+ * gives a nonfinite chi^2, a zero or nonfinite probe step or a nonfinite derivative (repeated
+ * edges at the start radius), or the result is not a finite positive radius (audit R6);
+ * Rockstar's finite stopping rule (a zero Newton move, the 0.5 % chi^2 change, the step cap) is
+ * kept. */
 double subhalo_nfw_fit(double rs0, const double * edge, int nbins, double wcut);
 /* Rockstar estimate_scale_radius (nfw.c:34-45) from the bound virial mass and radius and the
  * VmaxVir pair (best = max M / r, rbest its radius, comoving): the RsKlypin column. */

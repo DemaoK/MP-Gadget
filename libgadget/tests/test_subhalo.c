@@ -41,7 +41,8 @@
  * (subhalo_last_call_stats) are checked after the calls of tests 11 and the mixed call, the PIG
  * header's SubhaloWallTime and SubhaloPeakBytes in test 9, a cost-balance case (c) in test 7;
  * test_subhalo_serial_keys runs subhalo_run_serial_keys directly at 1 to 4 threads (cost order per
- * thread, the alone keys, LPT balance, the same outcome at every thread count) and
+ * thread, the alone keys, LPT balance, the same outcome at every thread count; Phase 5 audit R2:
+ * a team reduced to one worker for four queues reports that worker's busy time) and
  * test_subhalo_reserve_admission squeezes the free memory 2 MB below the plan's reserve (the
  * collective stage alone still fits): the call fails before the exchange with the tags unchanged.
  * 11. test_subhalo_twohalo        plan test 5: two Hernquist clumps over three calls: persistent
@@ -2171,6 +2172,26 @@ sk_fn(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloArena * arena, 
     u->result[k] = h;
 }
 
+/* The reduced-team case (Phase 5 audit R2): each key spins for a fixed time and records the
+ * worker that ran it. */
+struct sk_timed {
+    int * worker;
+    double * dt;
+};
+
+static void
+sk_fn_timed(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloArena * arena, int nthreads, void * userdata)
+{
+    struct sk_timed * u = (struct sk_timed *) userdata;
+    const double t0 = omp_get_wtime();
+    (void) arena;
+    (void) nthreads;
+    while(omp_get_wtime() - t0 < 2e-4 + 1e-8 * seg->n)
+        ;
+    u->worker[k] = omp_get_thread_num();
+    u->dt[k] = omp_get_wtime() - t0;
+}
+
 static void
 test_subhalo_serial_keys(void ** state)
 {
@@ -2276,6 +2297,63 @@ test_subhalo_serial_keys(void ** state)
         free(u.result);
         free(u.done);
         free(u.log);
+    }
+    /* a deliberately reduced team (audit R2): 4 queues, but the scheduler called from inside an
+     * active parallel region with one active level, so its own region runs on 1 worker, which
+     * covers every queue. The reported workers, maximum and mean are the worker's: its maximum
+     * busy time is the sum of every threaded key (not a quarter of it, as by queue). */
+    {
+        const int T = 4;
+        const int savedlev = omp_get_max_active_levels();
+        const int saveddyn = omp_get_dynamic();
+        omp_set_dynamic(0);
+        omp_set_num_threads(T);
+        omp_set_max_active_levels(1);
+        struct sk_timed u;
+        u.worker = calloc(nsegs, sizeof(int));
+        u.dt = calloc(nsegs, sizeof(double));
+        for(k = 0; k < nsegs; k++)
+            u.worker[k] = -1;
+        int outer = 0, inner_max = 0;
+        subhalo_serial_reset_stats();
+        #pragma omp parallel num_threads(2)
+        {
+            #pragma omp master
+            {
+                outer = omp_get_num_threads();
+                inner_max = omp_get_max_threads();
+                subhalo_run_serial_keys(segs, nsegs, sizeof(uint64_t), NULL, sk_fn_timed, &u);
+            }
+        }
+        omp_set_max_active_levels(savedlev);
+        omp_set_dynamic(saveddyn);
+        const struct SubhaloSerialStats * ss = subhalo_serial_last_stats();
+        /* the keys of the threaded part: the alone keys are above the share of 4 queues */
+        double total = 0, wsum = 0;
+        for(k = 0; k < nsegs; k++)
+            if(!segs[k].inplace)
+                total += subhalo_key_cost(segs[k].n);
+        int64_t bad = 0, nthr = 0;
+        for(k = 0; k < nsegs; k++) {
+            if(segs[k].inplace || subhalo_key_cost(segs[k].n) > total / T)
+                continue;
+            nthr++;
+            wsum += u.dt[k];
+            LOCAL_CHECK(bad, u.worker[k] == 0, "serial keys, reduced team: key %ld ran on worker %d\n", k, u.worker[k]);
+        }
+        message(0, "serial keys, reduced team: outer team %d, %d queues requested, %d worker(s); %ld threaded keys, their summed time %g s; "
+                   "reported max %g s, sum %g s, mean %g s, threaded wall %g s\n", outer, inner_max, ss->NThreads, nthr, wsum,
+                ss->ThreadMax, ss->ThreadSum, ss->ThreadMeanSum, ss->ThreadedWall);
+        LOCAL_CHECK(bad, outer == 2 && inner_max == T && ss->NQueues == T && ss->NThreads == 1,
+                    "serial keys, reduced team: outer %d, queues %d / %d, workers %d\n", outer, inner_max, ss->NQueues, ss->NThreads);
+        /* one worker: its maximum is the sum and the mean; it covers every threaded key's time */
+        LOCAL_CHECK(bad, nthr > 10 && ss->ThreadMax == ss->ThreadSum && ss->ThreadMeanSum == ss->ThreadSum && ss->ThreadMax >= wsum
+                    && ss->ThreadMax <= ss->ThreadedWall * (1 + 1e-9) + 1e-6,
+                    "serial keys, reduced team: max %g sum %g mean %g, keys %g s, wall %g s\n", ss->ThreadMax, ss->ThreadSum,
+                    ss->ThreadMeanSum, wsum, ss->ThreadedWall);
+        assert_all_true(bad == 0);
+        free(u.dt);
+        free(u.worker);
     }
     omp_set_num_threads(saved);
     free(ref);

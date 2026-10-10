@@ -86,6 +86,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from subhalo_reader import SubhaloFormatError  # noqa: E402
+from subhalo_check import deferred_velocity_valid  # noqa: E402  (the Phase 5 velocity mask, audit R8)
 from subhalo_compare_hbt import Ours, _weighted_vote, _lookup, _q  # noqa: E402
 
 MSUN_G = 1.989e33          # MP-Gadget's solar mass (UnitMass_in_g = 1.989e43 for 1e10 Msun/h)
@@ -668,18 +669,21 @@ def phase5_summary(side, rs, o, r, res, out):
         print("    %-11s %4d pairs: median ratio %.3f, within %2.0f%%: %.1f%%" % (
             label, rat.size, float(np.median(rat)), 100 * tol, 100.0 * np.count_nonzero(np.abs(rat - 1) <= tol) / rat.size),
             file=out)
+    # the velocities are signed: valid where our virial aperture exists (Vrms >= 0) and every component
+    # is finite, never "no component equal to -1" (Phase 5 audit R8; subhalo_check.py's mask)
+    ovrms = side.S["Vrms"][o].astype(np.float64) if "Vrms" in side.S else np.full(o.size, -1.0)
     if all(k in rs.columns for k in ("vx", "vy", "vz", "vrms")) and "RockstarCoreVel" in side.S and o.size:
         ov = side.S["RockstarCoreVel"][o].astype(np.float64)
         rv = np.stack([rs.columns[k][r] for k in ("vx", "vy", "vz")], axis=1)
         sig = rs.columns["vrms"][r]
-        d = np.all(ov != -1, axis=1) & (sig > 0)
+        d = deferred_velocity_valid(ovrms, ov) & (sig > 0)
         if np.any(d):
             x = np.sqrt(((ov[d] - rv[d]) ** 2).sum(axis=1)) / sig[d]
             print("    |RockstarCoreVel - Rockstar VX| / vrms: %d pairs, p10/p50/p90 %s" % (np.count_nonzero(d), _q(x)), file=out)
     if "BulkVel" in side.S and "CoreVel" in side.S and o.size:
         bv, cv = side.S["BulkVel"][o].astype(np.float64), side.S["CoreVel"][o].astype(np.float64)
-        sig = side.S["Vrms"][o].astype(np.float64) if "Vrms" in side.S else np.full(o.size, -1.0)
-        d = np.all(bv != -1, axis=1) & (sig > 0)
+        sig = ovrms
+        d = deferred_velocity_valid(sig, bv) & np.all(np.isfinite(cv), axis=1) & (sig > 0)
         if np.any(d):
             x = np.sqrt(((bv[d] - cv[d]) ** 2).sum(axis=1)) / sig[d]
             print("    ours |BulkVel - CoreVel| / Vrms: p10/p50/p90 %s" % _q(x), file=out)

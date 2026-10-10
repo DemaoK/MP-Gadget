@@ -11,7 +11,9 @@
  * lists, force_tree_active_moments' TreeAllocFactor x NumPart nodes before the shrink, the
  * treewalk's export buffers); the cores (bounded heaps of K tracers and K non-tracers per
  * candidate, the owner's receive buffer); the radial ordered set (88-byte records and mpsort's
- * record-sized copy); the relaxed-source positions (40 + 40 bytes); the final tags (40 + 40
+ * record-sized copy); the properties (the records with their positions and cumulative masses, per
+ * candidate of the round SUBHALO_INPLACE_CAND_PROPS_BYTES of profile vectors and deferred-recipe
+ * reductions, Phase 5 audit R1); the relaxed-source positions (40 + 40 bytes); the final tags (40 + 40
  * bytes per in-place own-tag particle, the change list); the serial repair (the changes, the
  * rank queries and replies, routed to the tracks' result ranks: nothing per particle is
  * replicated). The serial arenas have been freed before the first round (subhalo_run_serial_keys).
@@ -458,6 +460,9 @@ coll_walk(struct Coll * C, double * Sum)
         if(PartManager->NumPart < need)
             PartManager->NumPart = need;
     }
+    /* the walltime clocks (audit R3): close the interval before the tree build, whose own clocks
+     * would otherwise book it as /Misc */
+    walltime_measure("/Subhalo/Rounds/Rounds");
     force_tree_active_moments(&tree, C->ddecomp, &act, 0, 0, NULL);
     PartManager->NumPart = NumPartSave;
     label_tree(&tree, C->ddecomp, C->Cand, C->c0);
@@ -488,6 +493,7 @@ coll_walk(struct Coll * C, double * Sum)
      * charges the walk with the reserve the admission guarantees (subhalo_collective_walk_bytes) */
     const size_t lowbefore = allocator_get_min_free(A_MAIN), freebefore = mymalloc_freebytes();
     treewalk_run(tw, ql, nq);
+    walltime_measure("/Subhalo/Rounds/Walk");
     {
         const size_t lowwalk = allocator_get_min_free(A_MAIN);
         const double took = (double) freebefore - (double) lowwalk;
@@ -1189,6 +1195,63 @@ shapes_distributed(const struct Coll * C, const struct RadRec * rr, int64_t nr, 
     myfree(orth);
 }
 
+/* The compensated sums (subhalo_ksum_*, audit R4) as an MPI operation on pairs of doubles,
+ * non-commutative: MPI applies it in rank order, the order of the radial ordered set. */
+static MPI_Datatype KsumType = MPI_DATATYPE_NULL;
+static MPI_Op KsumOp = MPI_OP_NULL;
+
+static void
+ksum_mpi_op(void * in, void * inout, int * len, MPI_Datatype * dt)
+{
+    const double * a = (const double *) in;
+    double * b = (double *) inout;
+    int i;
+    (void) dt;
+    for(i = 0; i < *len; i++) {
+        double r[2] = {a[2 * i], a[2 * i + 1]};
+        subhalo_ksum_merge(r, b + 2 * i);
+        b[2 * i] = r[0];
+        b[2 * i + 1] = r[1];
+    }
+}
+
+static void
+ksum_mpi_init(void)
+{
+    if(KsumOp != MPI_OP_NULL)
+        return;
+    MPI_Type_contiguous(2, MPI_DOUBLE, &KsumType);
+    MPI_Type_commit(&KsumType);
+    MPI_Op_create(ksum_mpi_op, 0, &KsumOp);
+}
+
+/* Per-candidate transient scratch of round_props (bytes per candidate of the round, on every rank;
+ * subhalo_coll_estimate charges it, audit R1): the holder-side sums (NHS + 2), then, kept to the
+ * end, the radial positions and compensated prefix masses (2 int64 + 2 pairs) and the profile's
+ * local and reduced candidates (2 NL), with at most two more NL vectors (the maxima, the second
+ * reduction) or JVir's local sums (9), the deferred recipes (COLL_DFR_DOUBLES doubles and 3
+ * int64) or the shape fit (9 + 3 + 2 + 8 + 8 doubles, an int, the aperture counts and radii). */
+#define COLL_NL (8 + 2 * SUBHALO_NSO)
+#define COLL_DFR_NA 8                          /* (1) ncore, M, Sb 3, S2 3: pairs */
+#define COLL_DFR_NW 4                          /* (4) the core: Mcore, Sc 3: pairs */
+#define COLL_DFR_NB (5 * SUBHALO_NFW_MAXBINS)  /* (4) per bin: r at pb - 1, pb, pb + 1, m, Mc */
+#define COLL_DFR_DOUBLES (2 * (2 * COLL_DFR_NA) + 2 * (SUBHALO_NFW_MAXBINS + 1) + 2 * COLL_DFR_NB + 2 * (2 * COLL_DFR_NW) + 2)
+#define COLL_PROPS_KEPT_BYTES (2 * 8 + 4 * 8 + 2 * COLL_NL * 8)
+#define COLL_PROPS_DFR_BYTES (COLL_DFR_DOUBLES * 8 + 3 * 8)
+#define COLL_PROPS_SHAPE_BYTES ((9 + 3 + 2 + 8 + 8) * 8 + 4 + 8 + 8)
+#define COLL_PROPS_CAND_BYTES (COLL_PROPS_KEPT_BYTES + COLL_PROPS_DFR_BYTES)
+_Static_assert((NHS + 2) * 8 <= COLL_PROPS_CAND_BYTES && COLL_PROPS_KEPT_BYTES + 2 * COLL_NL * 8 <= COLL_PROPS_CAND_BYTES
+               && COLL_PROPS_KEPT_BYTES + 9 * 8 <= COLL_PROPS_CAND_BYTES && COLL_PROPS_SHAPE_BYTES <= COLL_PROPS_DFR_BYTES,
+               "COLL_PROPS_CAND_BYTES is not the largest per-candidate stage of round_props");
+_Static_assert(COLL_PROPS_CAND_BYTES <= SUBHALO_INPLACE_CAND_PROPS_BYTES,
+               "SUBHALO_INPLACE_CAND_PROPS_BYTES does not cover the per-candidate scratch of round_props");
+/* Bytes per radial record kept through the properties (the record, its position, M(<= r)) and the
+ * most allocations round_props holds at once (the round's vectors, the radial set, the deferred
+ * recipe's), each costing the allocator up to two alignment blocks (utils/memory.c). */
+#define COLL_PROPS_REC_BYTES (sizeof(struct RadRec) + 8 + 8)
+#define COLL_PROPS_NALLOC 32
+#define COLL_ALLOC_OVERHEAD (2. * 4096.)
+
 /* The Phase 5 recipes of subhalo_props_deferred on the radial ordered set of the round (rr[0, nr)
  * sorted by (label, r, ID), pos the global positions within each label, Mc the cumulative masses
  * M(<= r)), after the profile (rp->kc, Mso, prof, hs) is known: the aperture is pos <= kc[vir].
@@ -1206,17 +1269,21 @@ deferred_distributed(const struct Coll * C, const struct CoreOut * core, const s
     const double rfloor = C->up->h / 2.8;
     const double vkms = subhalo_vel_to_kms(C->up->atime);
     const int NB = SUBHALO_NFW_MAXBINS;
-    const int NA = 8, NV = 4 + 5 * NB;      /* (1): ncore, M, Sb 3, S2 3; (4): Mcore, Sc 3, per bin 5 */
+    const int NA = 2 * COLL_DFR_NA, NW = 2 * COLL_DFR_NW, NV = COLL_DFR_NB;
     int64_t c, k;
     int d, b;
     if(nc <= 0)
         return;
+    ksum_mpi_init();
+    /* the allocations COLL_PROPS_DFR_BYTES counts */
     double * A = (double *) mymalloc("SubCollDfA", sizeof(double) * NA * nc);
     double * AG = (double *) mymalloc("SubCollDfAG", sizeof(double) * NA * nc);
     double * X = (double *) mymalloc("SubCollDfX", sizeof(double) * (NB + 1) * nc);
     double * XG = (double *) mymalloc("SubCollDfXG", sizeof(double) * (NB + 1) * nc);
     double * V = (double *) mymalloc("SubCollDfV", sizeof(double) * NV * nc);
     double * VG = (double *) mymalloc("SubCollDfVG", sizeof(double) * NV * nc);
+    double * W = (double *) mymalloc("SubCollDfW", sizeof(double) * NW * nc);
+    double * WG = (double *) mymalloc("SubCollDfWG", sizeof(double) * NW * nc);
     int64_t * kc = (int64_t *) mymalloc("SubCollDfKc", sizeof(int64_t) * 3 * nc);   /* kc, ncore, nb */
     double * Rv = (double *) mymalloc("SubCollDfRv", sizeof(double) * 2 * nc);       /* Rvir, mpbin */
     for(c = 0; c < nc; c++) {
@@ -1224,8 +1291,9 @@ deferred_distributed(const struct Coll * C, const struct CoreOut * core, const s
         Rv[2 * c] = kc[3 * c] >= 0 ? cbrt(3 * rp->Mso[SUBHALO_NSO * c] / (4 * M_PI * rho[0])) : -1;
     }
 
-    /* (1) the aperture: velocity sums about the core velocity, the count inside 0.1 Rvir; (2) the
-     * largest particle mass (X[c * (NB + 1)]) */
+    /* (1) the aperture: velocity sums about the core velocity, the count inside 0.1 Rvir, as
+     * compensated pairs merged in rank order (audit R4); (2) the largest particle mass
+     * (X[c * (NB + 1)]) */
     memset(A, 0, sizeof(double) * NA * nc);
     for(c = 0; c < nc; c++)
         X[(NB + 1) * c] = 0;
@@ -1238,21 +1306,20 @@ deferred_distributed(const struct Coll * C, const struct CoreOut * core, const s
         double * a = A + NA * c;
         if(rr[k].r < 0.1 * Rv[2 * c])
             a[0] += 1;
-        a[1] += m;
+        subhalo_ksum_add(a + 2, m);
         for(d = 0; d < 3; d++) {
             const double dv = rr[k].vel[d] - cp[3 + d];
-            a[2 + d] += m * dv;
-            a[5 + d] += m * dv * dv;
+            subhalo_ksum_add(a + 4 + 2 * d, m * dv);
+            subhalo_ksum_add(a + 10 + 2 * d, m * dv * dv);
         }
         if(m > X[(NB + 1) * c])
             X[(NB + 1) * c] = m;
     }
-    MPI_Allreduce(A, AG, NA * nc, MPI_DOUBLE, MPI_SUM, C->Comm);
+    MPI_Allreduce(A, AG, COLL_DFR_NA * nc, KsumType, KsumOp, C->Comm);
     for(c = 0; c < nc; c++)
         XG[c] = X[(NB + 1) * c];
     MPI_Allreduce(XG, V, nc, MPI_DOUBLE, MPI_MAX, C->Comm);
     for(c = 0; c < nc; c++) {
-        double * o = rp->dfr + 8 * c;
         kc[3 * c + 1] = 0;
         kc[3 * c + 2] = 0;
         Rv[2 * c + 1] = 0;
@@ -1260,23 +1327,17 @@ deferred_distributed(const struct Coll * C, const struct CoreOut * core, const s
             continue;
         const int64_t nvir = kc[3 * c] + 1;
         const double * a = AG + NA * c;
-        const double * cp = core->d + CORE_ND * c;
-        int64_t ncore = (int64_t) a[0];
+        int64_t ncore = (int64_t) subhalo_ksum_value(a);
         if(ncore < SUBHALO_ROCKSTAR_CORE_MINPART)
             ncore = nvir < SUBHALO_ROCKSTAR_CORE_MINPART ? nvir : SUBHALO_ROCKSTAR_CORE_MINPART;
         kc[3 * c + 1] = ncore;
-        double var = 0;
-        for(d = 0; d < 3; d++) {
-            const double mb = a[2 + d] / a[1];
-            var += a[5 + d] / a[1] - mb * mb;
-            o[4 + d] = (cp[3 + d] + mb) * vkms;
-        }
-        o[7] = sqrt(var > 0 ? var : 0) * vkms;
+        /* the bin plan from the aperture's mass Mvir and the largest mass, as the serial recipe */
         kc[3 * c + 2] = subhalo_nfw_bin_plan(nvir, rp->Mso[SUBHALO_NSO * c], V[c], &Rv[2 * c + 1]);
     }
 
     /* (3) the closing positions: the first local record of each label reaching each threshold,
-     * the global minimum by a MAX of the negated positions */
+     * the global minimum by a MAX of the negated positions; Mc is the profile's compensated
+     * M(<= r), the value the serial recipe compares */
     for(k = 0; k < (NB + 1) * nc; k++)
         X[k] = -1e300;
     {
@@ -1298,25 +1359,27 @@ deferred_distributed(const struct Coll * C, const struct CoreOut * core, const s
     }
     MPI_Allreduce(X, XG, (NB + 1) * nc, MPI_DOUBLE, MPI_MAX, C->Comm);
 
-    /* (4) the radii at and around each closing position, the mass and cumulative mass there, and
-     * the core velocity sums */
+    /* (4) the radii at and around each closing position, the mass and cumulative mass there (one
+     * record each: exact sums), and the core velocity sums (compensated pairs) */
     memset(V, 0, sizeof(double) * NV * nc);
+    memset(W, 0, sizeof(double) * NW * nc);
     for(k = 0; k < nr; k++) {
         c = (int64_t) rr[k].key[2];
         double * v = V + NV * c;
         const int64_t pk = pos[k];
         if(pk < kc[3 * c + 1]) {
             const double * cp = core->d + CORE_ND * c;
-            v[0] += rr[k].m;
+            double * w = W + NW * c;
+            subhalo_ksum_add(w, rr[k].m);
             for(d = 0; d < 3; d++)
-                v[1 + d] += rr[k].m * (rr[k].vel[d] - cp[3 + d]);
+                subhalo_ksum_add(w + 2 + 2 * d, rr[k].m * (rr[k].vel[d] - cp[3 + d]));
         }
         for(b = 1; b <= kc[3 * c + 2]; b++) {
             const double xb = XG[(NB + 1) * c + b];
             if(xb < -1e299)
                 break;
             const int64_t pb = (int64_t) -xb;
-            double * e = v + 4 + 5 * (b - 1);
+            double * e = v + 5 * (b - 1);
             if(pk == pb - 1)
                 e[0] += rr[k].r;
             if(pk == pb) {
@@ -1329,14 +1392,31 @@ deferred_distributed(const struct Coll * C, const struct CoreOut * core, const s
         }
     }
     MPI_Allreduce(V, VG, NV * nc, MPI_DOUBLE, MPI_SUM, C->Comm);
+    MPI_Allreduce(W, WG, COLL_DFR_NW * nc, KsumType, KsumOp, C->Comm);
     for(c = 0; c < nc; c++) {
         if(kc[3 * c] < 0)
             continue;
         const double * v = VG + NV * c;
+        const double * a = AG + NA * c, * w = WG + NW * c;
         const double * cp = core->d + CORE_ND * c;
         double * o = rp->dfr + 8 * c;
-        for(d = 0; d < 3; d++)
-            o[1 + d] = (cp[3 + d] + v[1 + d] / v[0]) * vkms;
+        /* the velocity trio: the serial recipe's function on the same sums */
+        double Sb[3][2], S2[3][2], Sc[3][2];
+        float bv[3], cv[3], vrms;
+        for(d = 0; d < 3; d++) {
+            Sb[d][0] = a[4 + 2 * d];
+            Sb[d][1] = a[5 + 2 * d];
+            S2[d][0] = a[10 + 2 * d];
+            S2[d][1] = a[11 + 2 * d];
+            Sc[d][0] = w[2 + 2 * d];
+            Sc[d][1] = w[3 + 2 * d];
+        }
+        subhalo_deferred_velocities(bv, cv, &vrms, cp + 3, subhalo_ksum_value(a + 2), subhalo_ksum_value(w), Sb, S2, Sc, vkms);
+        for(d = 0; d < 3; d++) {
+            o[1 + d] = cv[d];
+            o[4 + d] = bv[d];
+        }
+        o[7] = vrms;
         const int nb = (int) kc[3 * c + 2];
         if(nb <= 0)
             continue;
@@ -1350,7 +1430,7 @@ deferred_distributed(const struct Coll * C, const struct CoreOut * core, const s
             if(xb < -1e299)
                 break;
             const int64_t pb = (int64_t) -xb;
-            const double * e = v + 4 + 5 * (b - 1);
+            const double * e = v + 5 * (b - 1);
             const double rnext = pb + 1 < nbound ? e[2] : e[1];
             edge[b] = subhalo_nfw_edge(b, mpbin, e[0], pb > 0, e[1], rnext, e[4], e[3]);
             nf = b;
@@ -1362,6 +1442,8 @@ deferred_distributed(const struct Coll * C, const struct CoreOut * core, const s
     }
     myfree(Rv);
     myfree(kc);
+    myfree(WG);
+    myfree(W);
     myfree(VG);
     myfree(V);
     myfree(XG);
@@ -1520,24 +1602,27 @@ round_props(const struct Coll * C, const struct CoreOut * core, struct RoundProp
     }
     mpsort_mpi(rr, nb, sizeof(struct RadRec), radrec_radix, 24, NULL, C->Comm);
     /* positions and cumulative masses: local prefix per label + vector Exscan */
+    /* the masses as compensated pairs, merged in rank order by the Exscan (audit R4): M(<= r) is
+     * the serial recipe's compensated sum over the same radial order */
+    ksum_mpi_init();
     int64_t * cnt = (int64_t *) mymalloc("SubCollRadCnt", sizeof(int64_t) * 2 * (nc + 1));
-    double * msum = (double *) mymalloc("SubCollRadM", sizeof(double) * 2 * (nc + 1));
+    double * msum = (double *) mymalloc("SubCollRadM", sizeof(double) * 4 * (nc + 1));
     memset(cnt, 0, sizeof(int64_t) * 2 * (nc + 1));
-    memset(msum, 0, sizeof(double) * 2 * (nc + 1));
+    memset(msum, 0, sizeof(double) * 4 * (nc + 1));
     for(k = 0; k < nb; k++) {
         cnt[rr[k].key[2]]++;
-        msum[rr[k].key[2]] += rr[k].m;
+        subhalo_ksum_add(msum + 2 * rr[k].key[2], rr[k].m);
     }
     MPI_Exscan(cnt, cnt + nc, nc, MPI_INT64, MPI_SUM, C->Comm);
-    MPI_Exscan(msum, msum + nc, nc, MPI_DOUBLE, MPI_SUM, C->Comm);
+    MPI_Exscan(msum, msum + 2 * nc, nc, KsumType, KsumOp, C->Comm);
     if(C->ThisTask == 0)
         for(c = 0; c < nc; c++) {
             cnt[nc + c] = 0;
-            msum[nc + c] = 0;
+            msum[2 * nc + 2 * c] = msum[2 * nc + 2 * c + 1] = 0;
         }
     int64_t * pos = (int64_t *) mymalloc("SubCollRadPos", sizeof(int64_t) * (nb + 1));
     /* local candidates of each per-label quantity (the global one is reduced below) */
-    const int NL = 8 + 2 * SUBHALO_NSO;
+    const int NL = COLL_NL;
     double * L = (double *) mymalloc("SubCollRadL", sizeof(double) * NL * (nc + 1));
     double * G = (double *) mymalloc("SubCollRadG", sizeof(double) * NL * (nc + 1));
     /* L: 0 hbt best, 1 vir best, 2 rhalf position (min), 3 Renclose (max r), 4.. kc[s] (max), (4 + NSO).. unused */
@@ -1553,16 +1638,18 @@ round_props(const struct Coll * C, const struct CoreOut * core, struct RoundProp
     double * Mc = (double *) mymalloc("SubCollRadMc", sizeof(double) * (nb + 1));
     {
         int64_t lab = -1, j = 0;
-        double M = 0;
+        double Mk[2] = {0, 0};
         for(k = 0; k < nb; k++) {
             c = (int64_t) rr[k].key[2];
             if(c != lab) {
                 lab = c;
                 j = 0;
-                M = msum[nc + c];
+                Mk[0] = msum[2 * nc + 2 * c];
+                Mk[1] = msum[2 * nc + 2 * c + 1];
             }
             pos[k] = cnt[nc + c] + j++;
-            M += rr[k].m;
+            subhalo_ksum_add(Mk, rr[k].m);
+            const double M = subhalo_ksum_value(Mk);
             Mc[k] = M;
             const double r = rr[k].r;
             const double Mtot = rp->hs[NHS * c + HS_M];
@@ -3121,14 +3208,14 @@ struct SerialInfo {
 _Static_assert(sizeof(struct SubhaloInplaceKey) + 8 + 4 * 16 <= SUBHALO_INPLACE_KEY_BYTES,
                "SUBHALO_INPLACE_KEY_BYTES does not cover the per-key vectors");
 _Static_assert(sizeof(struct SubhaloInplaceCand) + sizeof(struct CandState)
-               + 8 * (NHS + 2 + CORE_ND + 1 + 2 * SUBHALO_MAXTRACERS + 2 * SUBHALO_NSO + 8 + 9 + 2 * NSUM + 12 + 4 + 4 + 3 * 12 + 2 + 1)
+               + 8 * (NHS + 2 + CORE_ND + 1 + 2 * SUBHALO_MAXTRACERS + 2 * SUBHALO_NSO + 8 + 9 + 8 + 2 * NSUM + 12 + 4 + 4 + 3 * 12 + 2 + 1)
                + 4 * 10 <= SUBHALO_INPLACE_CAND_BYTES, "SUBHALO_INPLACE_CAND_BYTES does not cover the per-candidate vectors");
 _Static_assert(sizeof(struct SubhaloMember) + sizeof(struct SerialInfo) + 32 <= SUBHALO_INPLACE_MEMBER_BYTES,
                "SUBHALO_INPLACE_MEMBER_BYTES does not cover the member table");
 
 const char * const SubhaloCollStageName[SUBHALO_COLL_NSTAGE] = {
     "setup (serial results, previous records)", "tree build and walk", "core selection", "radial sort",
-    "relaxed-source sort", "final tags", "serial-tag repair"};
+    "properties (profile, deferred recipes, shapes)", "relaxed-source sort", "final tags", "serial-tag repair"};
 
 /* Fixed slack per stage for the allocator's block headers and alignment and the small NTask- and
  * leaf-sized vectors of the sorts. */
@@ -3185,9 +3272,14 @@ subhalo_coll_estimate(struct SubhaloCollAdmit * a, int64_t NumPart, int64_t MaxP
             heap = U;
         a->stage[SUBHALO_COLL_CORE] = sizeof(struct CoreRec) * (heap + (double) OwnedRecv + 1);
     }
-    /* the radial ordered set: the records and mpsort's record-sized exchange copy, then the
-     * positions and cumulative masses */
+    /* the radial ordered set: the records and mpsort's record-sized exchange copy */
     a->stage[SUBHALO_COLL_RADIAL] = 2. * sizeof(struct RadRec) * U;
+    /* the properties (round_props, Phase 5 audit R1): the sorted records with their positions and
+     * cumulative masses, every candidate's transient scratch (the profile's vectors and the
+     * deferred recipes' reductions; the round holds at most every candidate) and the allocator's
+     * alignment blocks of the arrays held at once */
+    a->stage[SUBHALO_COLL_PROPS] = COLL_PROPS_REC_BYTES * U + nc * SUBHALO_INPLACE_CAND_PROPS_BYTES
+        + COLL_PROPS_NALLOC * COLL_ALLOC_OVERHEAD;
     /* the relaxed-source positions: records and mpsort's copy */
     a->stage[SUBHALO_COLL_SOURCE] = 2. * sizeof(struct UPosRec) * U;
     /* the final tags: records and mpsort's copy, then records, answers and their receive buffer;
@@ -3595,13 +3687,13 @@ subhalo_collective_run(struct SubhaloPlan * plan, struct SubhaloCallCtx * ctx, D
 
     /* 2. the sources */
     init_sources(&C);
-    walltime_measure("/Subhalo/InPlace/Setup");
+    walltime_measure("/Subhalo/Rounds/Setup");
 
     /* 3. the rounds, deepest first */
     int r;
     for(r = 0; r < plan->NRounds; r++)
         run_round(&C, r, slotof, oldrec);
-    walltime_measure("/Subhalo/InPlace/Rounds");
+    walltime_measure("/Subhalo/Rounds/Rounds");
 
     /* 4. the hierarchy, the records */
     double * maxmerge = (double *) mymalloc("SubCollMaxMerge", sizeof(double) * (plan->NInplace + 1));
@@ -3613,7 +3705,7 @@ subhalo_collective_run(struct SubhaloPlan * plan, struct SubhaloCallCtx * ctx, D
     if(PretagHook)
         PretagHook(ctx, plan);
     coll_final_tags(&C, slotof);
-    walltime_measure("/Subhalo/InPlace/Tags");
+    walltime_measure("/Subhalo/Rounds/Tags");
 
     myfree(C.ClaimE);
     myfree(C.En);
@@ -3669,4 +3761,62 @@ subhalo_collective_run(struct SubhaloPlan * plan, struct SubhaloCallCtx * ctx, D
                "binding owner (J2); final tags %g s (serial repair of %ld tracks, %ld rank queries: %g s); %g s.\n",
             ncand, plan->NRounds, iters, CollStats.NAlive, CollStats.NDied, CollStats.NSunk, CollStats.NStolen, CollStats.NAdded,
             CollStats.NJ2, CollStats.TagSeconds, CollStats.NRepairTracks, CollStats.NRepairQueries, CollStats.RepairSeconds, MPI_Wtime() - t0);
+}
+
+/* ------------------------------------------------------------------ test hook: the round's properties */
+
+void
+subhalo_collective_test_props(const int32_t * label, int64_t nlabels, const double * core, const struct SubhaloUnbindParams * up,
+                              const double rho[SUBHALO_NSO], double * dfr, double * mvir)
+{
+    struct Coll C;
+    struct SubhaloCallCtx ctx;
+    struct CoreOut co;
+    struct RoundProps rp;
+    int64_t i, c;
+    int d;
+    memset(&C, 0, sizeof(C));
+    memset(&ctx, 0, sizeof(ctx));
+    memset(&co, 0, sizeof(co));
+    for(d = 0; d < SUBHALO_NSO; d++)
+        ctx.rho[d] = rho[d];
+    C.ctx = &ctx;
+    C.up = up;
+    C.Comm = MPI_COMM_WORLD;
+    MPI_Comm_size(MPI_COMM_WORLD, &C.NTask);
+    MPI_Comm_rank(MPI_COMM_WORLD, &C.ThisTask);
+    C.NumPart = PartManager->NumPart;
+    C.c0 = 0;
+    C.c1 = nlabels;
+    C.cs = (struct CandState *) mymalloc("SubTestPropsCs", sizeof(struct CandState) * (nlabels + 1));
+    memset(C.cs, 0, sizeof(struct CandState) * (nlabels + 1));
+    co.d = (double *) mymalloc("SubTestPropsCore", sizeof(double) * CORE_ND * (nlabels + 1));
+    memset(co.d, 0, sizeof(double) * CORE_ND * (nlabels + 1));
+    for(c = 0; c < nlabels; c++) {
+        C.cs[c].state = SUBHALO_ST_ALIVE;
+        for(d = 0; d < 3; d++) {
+            C.cs[c].RefPos[d] = co.d[CORE_ND * c + d] = core[6 * c + d];
+            C.cs[c].RefVel[d] = co.d[CORE_ND * c + 3 + d] = core[6 * c + 3 + d];
+        }
+    }
+    C.Cand = (int32_t *) mymalloc("SubTestPropsCand", sizeof(int32_t) * (C.NumPart + 1));
+    C.Flag = (uint8_t *) mymalloc("SubTestPropsFlag", C.NumPart + 1);
+    C.En = (double *) mymalloc("SubTestPropsEn", sizeof(double) * (C.NumPart + 1));
+    for(i = 0; i < C.NumPart; i++) {
+        C.Cand[i] = label[i] >= 0 && label[i] < nlabels ? label[i] : -1;
+        C.Flag[i] = C.Cand[i] >= 0 ? CF_BOUND : 0;
+        C.En[i] = 0;
+    }
+    round_props(&C, &co, &rp);
+    for(c = 0; c < 8 * nlabels; c++)
+        dfr[c] = rp.dfr[c];
+    if(mvir)
+        for(c = 0; c < nlabels; c++)
+            mvir[c] = rp.kc[SUBHALO_NSO * c] >= 0 ? rp.Mso[SUBHALO_NSO * c] : -1;
+    free_round_props(&rp);
+    myfree(C.En);
+    myfree(C.Flag);
+    myfree(C.Cand);
+    myfree(co.d);
+    myfree(C.cs);
 }

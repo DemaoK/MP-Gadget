@@ -44,6 +44,12 @@ size_t subhalo_arena_bytes_per_part(void);
 #define SUBHALO_INPLACE_KEY_BYTES 512
 #define SUBHALO_INPLACE_CAND_BYTES 4096
 #define SUBHALO_INPLACE_MEMBER_BYTES 768
+/* Phase 5 audit R1: the transient per-candidate scratch of the round's properties (the holder-side
+ * sums, the radial profile's per-label vectors, the deferred recipes' reductions, the shape fit;
+ * checked by static assertions in subhalo_collective.c), on every rank for every candidate of the
+ * round. The admission charges it in its properties stage; the packing allowance per in-place
+ * candidate is SUBHALO_INPLACE_CAND_BYTES + SUBHALO_INPLACE_CAND_PROPS_BYTES. */
+#define SUBHALO_INPLACE_CAND_PROPS_BYTES 6144
 
 /* Phase 5c: the estimated processing cost of a serial key of N particles, in arbitrary units,
  * cost(N) = SUBHALO_COST_ITER * N log2 max(N, 2) + SUBHALO_COST_KEY: the tree builds and walks of
@@ -76,6 +82,53 @@ static inline int subhalo_mpi_bytes_fit(int64_t n, size_t elsize) {
 /* Finite test that survives -ffast-math (which lets the compiler assume isfinite() is true):
  * the exponent bits of an IEEE double. */
 int subhalo_isfinite(double x);
+
+/* Compensated (Neumaier) summation, Phase 5 audit R4: s[0] is the rounded running sum, s[1] the
+ * accumulated rounding errors, the value s[0] + s[1]. The serial and the distributed recipes of
+ * the Rockstar profile and the deferred properties accumulate their cumulative masses and
+ * velocity sums this way, the distributed one merging per-rank pairs in rank order
+ * (subhalo_ksum_merge as an MPI operation). For n equal masses m every partial sum and error is
+ * an exact multiple of the last bit of m, so both modes give the correctly rounded n m whatever
+ * the grouping; for other inputs they agree to about one rounding. The volatile temporaries keep
+ * -ffast-math (the build's default) from reassociating the error terms away. */
+static inline void
+subhalo_ksum_add(double s[2], double x)
+{
+    volatile double t = s[0] + x;
+    volatile double d, e, c;
+    if(fabs(s[0]) >= fabs(x)) {
+        d = s[0] - t;
+        e = d + x;
+    }
+    else {
+        d = x - t;
+        e = d + s[0];
+    }
+    c = s[1] + e;
+    s[0] = t;
+    s[1] = c;
+}
+/* a += b (b to the right of a in the summation order) */
+static inline void
+subhalo_ksum_merge(double a[2], const double b[2])
+{
+    subhalo_ksum_add(a, b[0]);
+    volatile double c = a[1] + b[1];
+    a[1] = c;
+}
+static inline double
+subhalo_ksum_value(const double s[2])
+{
+    volatile double v = s[0] + s[1];
+    return v;
+}
+
+/* The velocity trio of the Phase 5 recipe (subhalo_props.c) from the compensated aperture sums
+ * about the core velocity cvel (Vel units): Mb the aperture mass, Sb and S2 its first and second
+ * moments, Mc and Sc those of the Rockstar core; vkms converts Vel to km/s. One function for the
+ * serial and the distributed recipe, so that equal sums give equal columns. */
+void subhalo_deferred_velocities(float BulkVel[3], float CoreVel[3], float * Vrms, const double cvel[3], double Mb, double Mc,
+                                 double Sb[3][2], double S2[3][2], double Sc[3][2], double vkms);
 
 /* Velocity conversion of the catalogue (design 7.10): internal Vel -> physical peculiar km/s,
  * Vel * UnitVelocity_in_cm_per_s / (1e5 * atime). The units come from subhalo_set_units. */
@@ -260,8 +313,8 @@ struct SubhaloPlanStats {
     int Fallback;           /* 1 if the pass cap was reached (the census then settles the plan) */
 };
 
-enum { SUBHALO_COLL_SETUP = 0, SUBHALO_COLL_TREE, SUBHALO_COLL_CORE, SUBHALO_COLL_RADIAL, SUBHALO_COLL_SOURCE,
-       SUBHALO_COLL_TAGS, SUBHALO_COLL_REPAIR, SUBHALO_COLL_NSTAGE };
+enum { SUBHALO_COLL_SETUP = 0, SUBHALO_COLL_TREE, SUBHALO_COLL_CORE, SUBHALO_COLL_RADIAL, SUBHALO_COLL_PROPS,
+       SUBHALO_COLL_SOURCE, SUBHALO_COLL_TAGS, SUBHALO_COLL_REPAIR, SUBHALO_COLL_NSTAGE };
 extern const char * const SubhaloCollStageName[SUBHALO_COLL_NSTAGE];
 struct SubhaloCollAdmit {
     int checked;             /* 1: the plan has in-place candidates and was checked */
@@ -554,9 +607,14 @@ struct SubhaloSerialStats {
     int64_t KeyTimeMaxN;      /* its particles */
     double AloneWall;         /* wall time of the keys processed alone (s) */
     double ThreadedWall;      /* wall time of the threaded part (s) */
-    double ThreadMax;         /* sum over calls of the largest per-thread summed key time of the threaded part */
-    double ThreadSum;         /* sum over calls and threads of the per-thread summed key times */
-    int NThreads;             /* threads of the last call */
+    /* the threaded part, per actual worker of the OpenMP team (Phase 5 audit R2: a team smaller
+     * than the queues, from dynamic adjustment, a thread limit or an enclosing parallel region,
+     * runs several queues per worker) */
+    double ThreadMax;         /* sum over calls of the largest per-worker summed key time */
+    double ThreadSum;         /* sum over calls and workers of the per-worker summed key times */
+    double ThreadMeanSum;     /* sum over calls of the mean per-worker summed key time */
+    int NThreads;             /* workers of the team of the last call */
+    int NQueues;              /* queues of the last call (omp_get_max_threads()) */
     double KeyTimeSum;        /* summed key times (alone keys counted once, at their wall time) */
     /* least-squares sums of the single-threaded key times t against x = N log2 max(N, 2) (the fit
      * t = a x + b calibrates SUBHALO_COST_KEY / SUBHALO_COST_ITER = b / a) */

@@ -36,6 +36,11 @@
  * 14. test_collective_guards             Q4: int32 and MPI byte-count guards, the estimate.
  * 15. test_collective_walk_theta         the potential-only walk at 0.45 and 0.15 against a direct
  *     sum across the periodic boundary.
+ * The Phase 5 audit fixes (halofinder_phase5_audit_codex.md):
+ * 16. test_collective_props_identity     R4: the serial and the distributed deferred recipes on
+ *     identical bound sets, cores and radial orders, three rank layouts; bitwise for equal masses.
+ * 17. test_collective_admission_props    R1: 2304 candidates in one round; the properties stage is
+ *     the largest, a squeeze between the old and the new need fails the admission there.
  * SUBHALO_TEST_ONLY=<substring> runs only the matching tests. */
 
 #define _GNU_SOURCE
@@ -60,6 +65,7 @@
 #include <libgadget/subhalo.h>
 #include <libgadget/subhalo_internal.h>
 #include <libgadget/subhalo_collective.h>
+#include <libgadget/subhalo_unbind.h>
 #include <libgadget/petaio.h>
 #include <libgadget/fof.h>
 #include <libgadget/walltime.h>
@@ -2408,10 +2414,10 @@ test_collective_admission(void ** state)
     const struct SubhaloPlanSummary * ps = subhalo_plan_last_summary();
     const struct SubhaloCollAdmit * ad = subhalo_plan_last_admission();
     message(0, "admission: ret %d; plan %ld serial, %ld in place, %ld candidates; admitted %d, failed %d on rank %d at the %s, "
-               "this rank needs %g MB (%g held + stages %g %g %g %g %g %g %g), %g MB available\n", ret, ps->NSerial, ps->NOversized, ps->NCands,
+               "this rank needs %g MB (%g held + stages %g %g %g %g %g %g %g %g), %g MB available\n", ret, ps->NSerial, ps->NOversized, ps->NCands,
             ps->Admitted, ad->failed, ad->failrank, ad->failstage >= 0 ? SubhaloCollStageName[ad->failstage] : "-", ad->need / 1048576.,
             ad->persist / 1048576., ad->stage[0] / 1048576., ad->stage[1] / 1048576., ad->stage[2] / 1048576., ad->stage[3] / 1048576.,
-            ad->stage[4] / 1048576., ad->stage[5] / 1048576., ad->stage[6] / 1048576., ad->avail / 1048576.);
+            ad->stage[4] / 1048576., ad->stage[5] / 1048576., ad->stage[6] / 1048576., ad->stage[7] / 1048576., ad->avail / 1048576.);
     CHECK(ret == 0 && !subhalo_last_call_complete(), "admission: the squeezed call returned %d\n", ret);
     CHECK(ps->NSerial == 0 && ps->NOversized >= 2 && ps->NCands == 6 && !ps->Admitted && ad->failed
           && ps->NEncFof == 0 && ps->NEncField == 0, "admission: every key promoted and the admission failed\n");
@@ -2458,7 +2464,9 @@ test_collective_guards(void ** state)
             mx = a.stage[s];
     const double persist = 25. * 1000001 + 11. * SUBHALO_INPLACE_CAND_BYTES + 3. * (sizeof(struct SubTrack) + 8.);
     CHECK(fabs(a.persist - persist) < 1 && a.need == a.persist + mx
-          && a.stage[SUBHALO_COLL_RADIAL] >= 176. * 100000 && a.stage[SUBHALO_COLL_TREE] >= 0.7 * 1000000 * sizeof(struct NODE),
+          && a.stage[SUBHALO_COLL_RADIAL] >= 176. * 100000 && a.stage[SUBHALO_COLL_TREE] >= 0.7 * 1000000 * sizeof(struct NODE)
+          /* Phase 5 audit R1: the properties keep 104 bytes per record and every candidate's scratch */
+          && a.stage[SUBHALO_COLL_PROPS] >= 104. * 100000 + 11. * SUBHALO_INPLACE_CAND_PROPS_BYTES,
           "guards: estimate persist %g need %g\n", a.persist, a.need);
 }
 
@@ -2613,6 +2621,449 @@ test_collective_walk_theta(void ** state)
     syn_teardown();
 }
 
+/* ---- test 16: the deferred recipes of the two modes on identical inputs (Phase 5 audit R4) ----
+ * Six power-law balls (density ~ r^-2, every particle bound, one across the periodic boundary,
+ * one below the NFW fit's 100 particles), large bulk velocities, prescribed cores (subhalo_core of
+ * the ID order) and thresholds with crossings inside every ball. The serial recipes
+ * (subhalo_props_rockstar and subhalo_props_deferred on rank 0, which holds every particle) against
+ * the distributed ones (round_props through subhalo_collective_test_props) with the particles on
+ * rank 0 only, round-robin over the 4 ranks, and unevenly split (1:2:4:6): with equal masses
+ * the four Phase 5 columns and the virial mass are bitwise identical in every layout (the
+ * compensated cumulative masses are the correctly rounded k m in both modes); with random unequal
+ * masses they agree to 1e-6; with masses 1 and 2^-50 (one in 50 heavy, inside the light ones:
+ * exact multiples of 2^-50, whose plain sums lose the light masses in an order-dependent way, so
+ * that the plain prefix sums of the uneven layout differ from the others) bitwise again, the
+ * virial masses included. Also the compensated sum itself survives -ffast-math. */
+#define PI_NL 6
+static const int64_t PiN[PI_NL] = {3000, 1200, 450, 260, 99, 2500};
+#define PI_CORESIZE 20
+
+static int64_t
+pi_total(void)
+{
+    int64_t t = 0;
+    int l;
+    for(l = 0; l < PI_NL; l++)
+        t += PiN[l];
+    return t;
+}
+
+static int
+pi_label(MyIDType id, int64_t * j)
+{
+    int64_t s = 0;
+    int l;
+    *j = -1;
+    for(l = 0; l < PI_NL; l++) {
+        if((int64_t) id < s + PiN[l]) {
+            *j = (int64_t) id - s;
+            return l;
+        }
+        s += PiN[l];
+    }
+    return -1;
+}
+
+/* Particle id of ball l: r = R u (M(< r) ~ r), R = 20 (N / 3000)^(1/3), mean density inside R the
+ * same for every ball; velocities bulk + 200 x uniform in a ball. */
+enum { PI_EQUAL = 0, PI_UNEQUAL, PI_WIDE };
+static const char * const PiMode[3] = {"equal", "unequal", "wide"};
+
+static void
+pi_particle(MyIDType id, int mode, double pos[3], double vel[3], double * mass)
+{
+    int64_t j;
+    const int l = pi_label(id, &j);
+    const double cen[PI_NL][3] = {{500, 500, 500}, {0.5, 300, 700}, {800, 150, 220}, {250, 820, 400}, {650, 650, 90}, {120, 480, 930}};
+    const double bulk[3] = {3000. - 1000 * l, -2000. + 700 * l, 50. * l};
+    const double R = 20. * cbrt((double) PiN[l] / 3000.);
+    double u[3];
+    const double zero[3] = {0, 0, 0};
+    rand_in_ball(id, 161, 1.0, zero, u);
+    const double un = sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+    /* wide masses: the heavy particles (j % 50 == 0) in the inner 5 % of the radius, so that a
+     * plain running sum drops the light masses beyond them, but not a later rank's partial sum */
+    const double r = (mode == PI_WIDE && j % 50 == 0 ? 0.05 : 1.0) * R * urand(id, 162, 0);
+    int d;
+    for(d = 0; d < 3; d++) {
+        double x = cen[l][d] + (un > 0 ? r * u[d] / un : 0);
+        while(x >= BOXSIZE) x -= BOXSIZE;
+        while(x < 0) x += BOXSIZE;
+        pos[d] = x;
+    }
+    double v[3];
+    rand_in_ball(id, 163, 200., zero, v);
+    for(d = 0; d < 3; d++)
+        vel[d] = bulk[d] + v[d];
+    if(mode == PI_EQUAL)
+        *mass = SYN_M;
+    else if(mode == PI_UNEQUAL)
+        *mass = SYN_M * (0.5 + urand(id, 164, 0));
+    else
+        *mass = j % 50 == 0 ? 1.0 : ldexp(1.0, -50);
+}
+
+/* layout 0: every particle on rank 0; 1: round robin; 2: 1/13, 2/13, 4/13 and 6/13 on ranks 0-3
+ * (the sorted records then change rank inside the inner part of the first balls) */
+static int
+pi_rank(MyIDType id, int layout, int NTask)
+{
+    if(layout == 0)
+        return 0;
+    if(layout == 1)
+        return (int) (id % NTask);
+    const int k = (int) (splitmix64(id ^ 0x5151) % 13);
+    return (k < 1 ? 0 : (k < 3 ? 1 : (k < 7 ? 2 : 3))) % NTask;
+}
+
+static void
+pi_place(int layout, int mode)
+{
+    const int NTask = get_ntask(), ThisTask = get_thistask();
+    const int64_t n = pi_total();
+    setup_pman(n + 1, BOXSIZE);
+    MyIDType id;
+    for(id = 0; id < (MyIDType) n; id++) {
+        if(pi_rank(id, layout, NTask) != ThisTask)
+            continue;
+        double pos[3], vel[3], m;
+        pi_particle(id, mode, pos, vel, &m);
+        add_dm_particle(id, pos);
+        struct particle_data * p = &P[PartManager->NumPart - 1];
+        int d;
+        for(d = 0; d < 3; d++)
+            p->Vel[d] = vel[d];
+        p->Mass = m;
+    }
+}
+
+static void
+pi_distributed(const double * core, const struct SubhaloUnbindParams * up, const double rho[SUBHALO_NSO], double * dfr, double * mvir)
+{
+    int32_t * label = (int32_t *) malloc(sizeof(int32_t) * (PartManager->NumPart + 1));
+    int64_t i, j;
+    for(i = 0; i < PartManager->NumPart; i++)
+        label[i] = pi_label(P[i].ID, &j);
+    subhalo_collective_test_props(label, PI_NL, core, up, rho, dfr, mvir);
+    free(label);
+}
+
+static void
+pi_run(int mode)
+{
+    const int exact = mode != PI_UNEQUAL;
+    const int ThisTask = get_thistask();
+    struct SubhaloUnbindParams up;
+    memset(&up, 0, sizeof(up));
+    up.atime = 0.7;
+    up.h = 2.8 * 0.3;
+    up.BoxSize = BOXSIZE;
+    up.TracerTypes = 2;
+    up.PotentialTypes = 2;
+    up.G = 43007.1;
+    /* the thresholds: the mean density inside R of ball 0 times 1.5, 2.5, 6, 15, 60 (crossings at
+     * R / 1.2, R / 1.6, R / 2.4, R / 3.9, R / 7.7 for equal masses) */
+    double Mball = 0;
+    {
+        MyIDType id;
+        for(id = 0; id < (MyIDType) PiN[0]; id++) {
+            double pos[3], vel[3], m;
+            pi_particle(id, mode, pos, vel, &m);
+            Mball += m;
+        }
+    }
+    const double rhoR = 3 * Mball / (4 * M_PI * 20. * 20. * 20.);
+    const double f[SUBHALO_NSO] = {1.5, 2.5, 6, 15, 60};
+    double rho[SUBHALO_NSO];
+    int s, l, d, k;
+    for(s = 0; s < SUBHALO_NSO; s++)
+        rho[s] = f[s] * rhoR;
+    /* the serial recipes on rank 0, which holds everything (layout 0) */
+    double core[6 * PI_NL];
+    struct SubTrack ser[PI_NL];
+    memset(core, 0, sizeof(core));
+    memset(ser, 0, sizeof(ser));
+    pi_place(0, mode);
+    if(ThisTask == 0) {
+        int64_t * Index = (int64_t *) mymalloc("PiIndex", sizeof(int64_t) * (PartManager->NumPart + 1));
+        int64_t start = 0, i;
+        for(l = 0; l < PI_NL; l++) {
+            int64_t n = 0;
+            for(i = 0; i < PartManager->NumPart; i++) {
+                int64_t j;
+                if(pi_label(P[i].ID, &j) == l)
+                    Index[start + n++] = i;
+            }
+            struct SubCandidate c;
+            memset(&c, 0, sizeof(c));
+            c.Index = Index + start;
+            c.N = c.Nbound = n;
+            double sx, sv;
+            subhalo_core(&c, &up, PI_CORESIZE, core + 6 * l, core + 6 * l + 3, &sx, &sv);
+            for(d = 0; d < 3; d++)
+                c.RefPos[d] = core[6 * l + d];
+            struct SubhaloArena arena;
+            arena.size = SUBHALO_PROPS_BYTES_PER_PART * n + 64;
+            arena.used = 0;
+            arena.base = (char *) mymalloc("PiArena", arena.size);
+            const double Offset[3] = {0, 0, 0};
+            subhalo_track_clear(&ser[l], l);
+            subhalo_props_rockstar(&ser[l], &c, &up, rho, PI_CORESIZE, Offset, &arena);
+            struct SubTrack r2 = ser[l];
+            subhalo_props_deferred(&r2, &c, &up, rho, PI_CORESIZE, &arena);
+            assert_true(r2.Rs == ser[l].Rs && r2.Vrms == ser[l].Vrms);
+            for(d = 0; d < 3; d++)
+                assert_true(r2.BulkVel[d] == ser[l].BulkVel[d] && r2.RockstarCoreVel[d] == ser[l].RockstarCoreVel[d]);
+            myfree(arena.base);
+            start += n;
+        }
+        myfree(Index);
+    }
+    MPI_Bcast(core, 6 * PI_NL, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Bcast(ser, sizeof(ser), MPI_BYTE, 0, MPI_COMM_WORLD);
+    /* the distributed recipes in three layouts */
+    double dfr[3][8 * PI_NL], mvir[3][PI_NL];
+    int lay;
+    for(lay = 0; lay < 3; lay++) {
+        if(lay > 0)
+            pi_place(lay, mode);
+        message(0, "props identity (%s masses), layout %d: rank 0 holds %ld particles\n", PiMode[mode], lay,
+                (long) PartManager->NumPart);
+        pi_distributed(core, &up, rho, dfr[lay], mvir[lay]);
+        teardown_pman();
+    }
+    int64_t bad = 0;
+    double worst = 0;
+    for(l = 0; l < PI_NL; l++) {
+        const struct SubTrack * x = &ser[l];
+        const float sv[8] = {x->Rs, x->RockstarCoreVel[0], x->RockstarCoreVel[1], x->RockstarCoreVel[2],
+                             x->BulkVel[0], x->BulkVel[1], x->BulkVel[2], x->Vrms};
+        message(0, "props identity (%s masses), ball %d (%ld particles): serial Rs %.9g Vrms %.9g BulkVel (%.9g %.9g %.9g) "
+                   "RockstarCoreVel (%.9g %.9g %.9g) MBoundSO[vir] %.9g\n", PiMode[mode], l, (long) PiN[l],
+                sv[0], sv[7], sv[4], sv[5], sv[6], sv[1], sv[2], sv[3], x->MBoundSO[0]);
+        /* every ball crosses; the fit runs with at least 100 particles in the aperture (about half of each ball) */
+        LOCAL_CHECK(bad, mode == PI_WIDE || (x->Vrms > 0 && x->MBoundSO[0] > 0 && ((PiN[l] >= 200) == (x->Rs > 0))),
+                    "props identity: ball %d Vrms %g MBoundSO %g Rs %g\n", l, x->Vrms, x->MBoundSO[0], x->Rs);
+        for(lay = 0; lay < 3; lay++) {
+            const double * o = dfr[lay] + 8 * l;
+            for(k = 0; k < 8; k++) {
+                const float v = (float) o[k];
+                if(exact)
+                    LOCAL_CHECK(bad, v == sv[k], "props identity (%s masses): ball %d layout %d column %d serial %.9g distributed %.9g\n",
+                                PiMode[mode], l, lay, k, sv[k], v);
+                else {
+                    const double scale = k == 0 ? fabs(sv[0]) : (k == 7 ? sv[7] : fabs(sv[k]) + sv[7]);
+                    const double dd = fabs(v - sv[k]) / (scale > 0 ? scale : 1);
+                    if(dd > worst)
+                        worst = dd;
+                    LOCAL_CHECK(bad, dd <= 1e-6, "props identity (unequal masses): ball %d layout %d column %d serial %.9g distributed %.9g\n",
+                                l, lay, k, sv[k], v);
+                }
+            }
+            if(exact)
+                LOCAL_CHECK(bad, (float) mvir[lay][l] == x->MBoundSO[0] && mvir[lay][l] == mvir[0][l],
+                            "props identity: ball %d layout %d Mvir %.17g / %.17g, serial %.9g\n", l, lay, mvir[lay][l], mvir[0][l],
+                            x->MBoundSO[0]);
+        }
+    }
+    if(!exact)
+        message(0, "props identity (unequal masses): largest relative difference %.3g\n", worst);
+    assert_all_true(bad == 0);
+}
+
+static void
+test_collective_props_identity(void ** state)
+{
+    /* the compensated sum under the build's -ffast-math: 1 + 10 x 1e-16 - 1 */
+    double ks[2] = {0, 0};
+    int i;
+    subhalo_ksum_add(ks, 1.0);
+    for(i = 0; i < 10; i++)
+        subhalo_ksum_add(ks, 1e-16);
+    subhalo_ksum_add(ks, -1.0);
+    CHECK(fabs(subhalo_ksum_value(ks) - 1e-15) < 1e-30, "compensated sum: %.17g\n", subhalo_ksum_value(ks));
+    common_physics_setup();
+    subhalo_set_units(3.085678e21, 1.989e43, 1e5);
+    pi_run(PI_EQUAL);
+    pi_run(PI_UNEQUAL);
+    pi_run(PI_WIDE);
+}
+
+/* ---- test 17: many in-place candidates in one round: the properties stage (Phase 5 audit R1) ----
+ * 2304 isolated 12-particle groups, each with one resolved track (SubhaloMinNumPart 10), all
+ * forced in place (SubhaloCollectiveMinPart 10): one round of 2304 candidates, whose per-candidate property
+ * scratch (the deferred recipes' reductions, the profile vectors: SUBHALO_INPLACE_CAND_PROPS_BYTES
+ * each on every rank) is the largest stage. (a) Unsqueezed: admitted with the properties as the
+ * largest stage, the call completes and the measured high water stays within the estimate. (b) The
+ * same call with the free memory squeezed on every rank to halfway between the need without the
+ * properties stage (the admission before the fix) and the need with it: the admission fails at
+ * the properties stage, before the exchange, where the old estimate would have admitted it. Also
+ * (audit R3) the walltime children /Subhalo/Rounds/{Setup,Rounds,Tags,Cleanup} add up to the
+ * summary's rounds time. */
+#define ML_NX 16
+#define ML_NYZ 12
+#define ML_NG (ML_NX * ML_NYZ * ML_NYZ)
+#define ML_NP 12
+
+static void
+ml_particle(MyIDType id, double atime, struct SynPart * s, void * ud)
+{
+    (void) ud;
+    if((int64_t) id >= ML_NG * ML_NP)
+        return;
+    const int64_t g = (int64_t) id / ML_NP;
+    /* x on multiples of 62.5 (31.25 from every lattice coordinate: no field particle links) */
+    const double cen[3] = {62.5 * (g % ML_NX), 40. + 80. * ((g / ML_NX) % ML_NYZ), 40. + 80. * (g / (ML_NX * ML_NYZ))};
+    const double zero[3] = {0, 0, 0};
+    syn_ball(id, 171, cen, 0.5, zero, 2., atime, s);
+    s->tag = s->bound = g;
+    s->rank = (int32_t) ((int64_t) id - g * ML_NP);
+}
+
+static void
+ml_setup(Cosmology * CP)
+{
+    struct SubhaloParams sp = default_subhalo_params();
+    sp.SubhaloFieldSO = 0;
+    sp.SubhaloPotentialSampleSize = 0;
+    sp.SubhaloCollectiveMinPart = 10;
+    sp.SubhaloMinNumPart = 10;
+    sp.SubhaloLookupBatchBytes = 1024 * 1024;
+    syn_setup(CP, ML_NG * ML_NP + SYN_NFIELD, sp);
+    struct SubTrack * recs = (struct SubTrack *) malloc(sizeof(struct SubTrack) * ML_NG);
+    int64_t g;
+    for(g = 0; g < ML_NG; g++) {
+        recs[g] = syn_rec(g, ML_NP, ML_NP * SYN_M, -1, g, 0, 0);
+        recs[g].HostGroup = g + 1;
+    }
+    syn_records(recs, ML_NG);
+    free(recs);
+    syn_place(ml_particle, NULL, 0.55, 1);
+}
+
+struct MlCtx {
+    double freepre;          /* free bytes at the pre hook */
+    double target;           /* > 0: squeeze the free bytes to this */
+    void * block;
+};
+
+static void
+ml_pre(void * ud)
+{
+    struct MlCtx * c = (struct MlCtx *) ud;
+    c->freepre = (double) mymalloc_freebytes();
+    c->block = c->target > 0 && c->freepre > c->target ? mymalloc2("TestSqueeze", (size_t) (c->freepre - c->target)) : NULL;
+}
+
+static void
+ml_post(void * ud)
+{
+    struct MlCtx * c = (struct MlCtx *) ud;
+    if(c->block)
+        myfree(c->block);
+    c->block = NULL;
+}
+
+/* persist + the largest stage other than the properties: the admission's need before the fix */
+static double
+ml_need_without_props(const struct SubhaloCollAdmit * ad)
+{
+    double mx = 0;
+    int s;
+    for(s = 0; s < SUBHALO_COLL_NSTAGE; s++)
+        if(s != SUBHALO_COLL_PROPS && ad->stage[s] > mx)
+            mx = ad->stage[s];
+    return ad->persist + mx;
+}
+
+/* The summed time of this rank's walltime clocks whose names start with prefix. */
+static double
+ml_clock_sum(const char * prefix)
+{
+    double t = 0;
+    int i;
+    for(i = 0; i < CT.N; i++)
+        if(strncmp(CT.C[i].name, prefix, strlen(prefix)) == 0)
+            t += CT.C[i].time;
+    return t;
+}
+
+static void
+test_collective_admission_props(void ** state)
+{
+    Cosmology CP;
+    int64_t ng;
+    struct MlCtx c = {0, 0, NULL};
+    /* (a) */
+    ml_setup(&CP);
+    /* Phase 5 audit R3: the rounds stage's walltime children (this rank; the clock names carry
+     * "@file:line"). walltime_init (in ml_setup) resets the table but not the times of its slots,
+     * which new clocks would inherit from the earlier tests: cleared here */
+    {
+        int i;
+        for(i = 0; i < CT.Nmax; i++)
+            CT.C[i].time = CT.AC[i].time = 0;
+    }
+    double wt0 = ml_clock_sum("/Subhalo/Rounds/"), wcl = ml_clock_sum("/Subhalo/Rounds/Cleanup");
+    double t0 = MPI_Wtime();
+    int ret = run_finder_call_ex(1, &CP, &ng, ml_pre, ml_post, &c);
+    const double wt1 = ml_clock_sum("/Subhalo/Rounds/");
+    wcl = ml_clock_sum("/Subhalo/Rounds/Cleanup") - wcl;
+    {
+        const struct SubhaloCallStats * st = subhalo_last_call_stats();
+        message(0, "many labels (a): walltime /Subhalo/Rounds children %.4f s (cleanup %.4f s), the summary's rounds %.4f s (max), %.4f s (mean)\n",
+                wt1 - wt0, wcl, st->StageMax[SUBHALO_STAGE_ROUNDS], st->StageMean[SUBHALO_STAGE_ROUNDS]);
+        /* the children cover the stage (less the tree builds' own clocks), the cleanup a small part */
+        CHECK(wt1 - wt0 <= st->StageMax[SUBHALO_STAGE_ROUNDS] * (1 + 1e-6) + 1e-4 && wt1 - wt0 >= 0.8 * st->StageMean[SUBHALO_STAGE_ROUNDS]
+              && wcl < 0.5 * (wt1 - wt0), "many labels (a): walltime rounds %g s (cleanup %g s), summary %g / %g s\n", wt1 - wt0, wcl,
+              st->StageMax[SUBHALO_STAGE_ROUNDS], st->StageMean[SUBHALO_STAGE_ROUNDS]);
+    }
+    const struct SubhaloPlanSummary * ps = subhalo_plan_last_summary();
+    const struct SubhaloCollAdmit * ad = subhalo_plan_last_admission();
+    const struct SubhaloCollectiveStats * cs = subhalo_collective_last_stats();
+    const double need = ad->need, noprops = ml_need_without_props(ad), delta = c.freepre - ad->avail;
+    message(0, "many labels (a): ret %d in %.2f s, %ld groups, %ld candidates in %d round(s), %ld alive; this rank needs %g MB (%g held, "
+               "properties %g MB, tree %g MB; %g MB without the properties stage), measured high water %g MB of the estimate %g MB "
+               "(largest measured/estimated %.3f)\n", ret, MPI_Wtime() - t0, ng, ps->NCands, ps->NRounds, cs->NAlive, need / 1048576.,
+            ad->persist / 1048576., ad->stage[SUBHALO_COLL_PROPS] / 1048576., ad->stage[SUBHALO_COLL_TREE] / 1048576.,
+            noprops / 1048576., cs->MeasPeakBytes / 1048576., cs->EstPeakBytes / 1048576., cs->MaxMeasOverEst);
+    CHECK(ret == 1 && ng == ML_NG && subhalo_last_call_complete() && ps->Admitted && ps->NCands == ML_NG && ps->NRounds == 1
+          && cs->NAlive == ML_NG, "many labels (a): ret %d, %ld groups, %ld candidates, %ld alive\n", ret, ng, ps->NCands, cs->NAlive);
+    CHECK(ad->checked && !ad->failed && ad->failstage == SUBHALO_COLL_PROPS, "many labels (a): the largest stage is the %s\n",
+          ad->failstage >= 0 ? SubhaloCollStageName[ad->failstage] : "-");
+    CHECK(cs->MaxMeasOverEst > 0 && cs->MaxMeasOverEst <= 1, "many labels (a): measured / estimated %g\n", cs->MaxMeasOverEst);
+    CHECK(need - noprops > 2 * 1048576., "many labels (a): the properties stage adds %g MB\n", (need - noprops) / 1048576.);
+    syn_teardown();
+    /* (b) */
+    ml_setup(&CP);
+    c.target = delta + 0.5 * (need + noprops);
+    struct tagrec * pre = NULL;
+    int64_t npre = 0, n, i, bad = 0;
+    pre = gather_tags(&npre);
+    ret = run_finder_call_ex(1, &CP, &ng, ml_pre, ml_post, &c);
+    ps = subhalo_plan_last_summary();
+    ad = subhalo_plan_last_admission();
+    message(0, "many labels (b): free %g MB at the call squeezed to %g MB; ret %d, admitted %d, failed %d on rank %d at the %s; this rank needs "
+               "%g MB (%g MB without the properties stage), %g MB available\n", c.freepre / 1048576., c.target / 1048576., ret, ps->Admitted,
+            ad->failed, ad->failrank, ad->failstage >= 0 ? SubhaloCollStageName[ad->failstage] : "-", ad->need / 1048576.,
+            ml_need_without_props(ad) / 1048576., ad->avail / 1048576.);
+    CHECK(ret == 0 && !subhalo_last_call_complete() && !ps->Admitted && ad->failed && ad->failstage == SUBHALO_COLL_PROPS,
+          "many labels (b): ret %d, admitted %d, failed %d at stage %d\n", ret, ps->Admitted, ad->failed, ad->failstage);
+    /* on every rank the need without the properties stage fits: the old estimate admitted the call */
+    LOCAL_CHECK(bad, ml_need_without_props(ad) < ad->avail && ad->need > ad->avail, "many labels (b): need %g / %g MB without the "
+                "properties, %g MB available\n", ad->need / 1048576., ml_need_without_props(ad) / 1048576., ad->avail / 1048576.);
+    struct tagrec * post = gather_tags(&n);
+    for(i = 0; i < n && n == npre; i++)
+        if(post[i].ID != pre[i].ID || post[i].TrackId != pre[i].TrackId || post[i].BoundTrackId != pre[i].BoundTrackId
+           || post[i].BindRank != pre[i].BindRank)
+            bad++;
+    CHECK(n == npre, "many labels (b): %ld / %ld particles\n", n, npre);
+    free(post);
+    free(pre);
+    assert_all_true(bad == 0);
+    syn_teardown();
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_collective_serial_vs_inplace),
@@ -2628,8 +3079,10 @@ int main(void) {
         cmocka_unit_test(test_collective_voided_claim),
         cmocka_unit_test(test_collective_long_chain),
         cmocka_unit_test(test_collective_admission),
+        cmocka_unit_test(test_collective_admission_props),
         cmocka_unit_test(test_collective_guards),
         cmocka_unit_test(test_collective_walk_theta),
+        cmocka_unit_test(test_collective_props_identity),
     };
     const char * only = getenv("SUBHALO_TEST_ONLY");
     if(only && only[0]) {

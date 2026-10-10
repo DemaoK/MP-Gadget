@@ -111,6 +111,16 @@ void subhalo_collective_run(struct SubhaloPlan * plan, struct SubhaloCallCtx * c
  * domain. Collective. */
 void subhalo_collective_test_walk(DomainDecomp * ddecomp, const int32_t * label, int64_t nlabels, double theta, double h,
                                   int PotentialTypes, double * out);
+/* The properties of one round (round_props: the radial profile and the Phase 5 recipes) for the
+ * local particles with label[i] in [0, nlabels) taken as the bound sets of nlabels alive
+ * candidates with the prescribed cores core[6 c .. 6 c + 5] (CorePos, CoreVel in Vel units) and
+ * the thresholds rho: dfr[8 c ..] receives Rs, RockstarCoreVel 3, BulkVel 3, Vrms (km/s; -1 where
+ * undefined), mvir[c] (if not NULL) the bound virial mass (-1 without a crossing). up needs atime,
+ * h, BoxSize and TracerTypes. Collective (Phase 5 audit R4: the serial and the distributed recipes
+ * on identical inputs). */
+struct SubhaloUnbindParams;
+void subhalo_collective_test_props(const int32_t * label, int64_t nlabels, const double * core, const struct SubhaloUnbindParams * up,
+                                   const double rho[SUBHALO_NSO], double * dfr, double * mvir);
 /* A function called on every rank right before the final tag pass of the next calls (NULL: none),
  * with the call context (ctx->BindOrd: the binder ordinals of this rank) and the plan; P then holds
  * the serial keys' (provisional) tags. */
