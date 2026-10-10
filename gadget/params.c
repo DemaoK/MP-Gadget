@@ -229,6 +229,7 @@ create_gadget_parameter_set()
     param_declare_double(ps, "SubhaloBoundMassPrecision", OPTIONAL, 0.995, "Unbinding convergence criterion.");
     param_declare_double(ps, "SubhaloSourceRelaxFactor", OPTIONAL, 3, "Source size as a multiple of Nbound, in [1, 10]; the per-thread arena reserves 8 bytes per particle per unit.");
     param_declare_int(ps, "SubhaloPotentialSampleSize", OPTIONAL, 1000, "Potential subsampling size; 0 disables subsampling.");
+    param_declare_int(ps, "SubhaloFinalPass", OPTIONAL, 0, "0 = sampled final pass (default; HBT-HERONS's rule: the last unbinding iteration's subsampled order, the head of the most bound re-ranked by exact energies over all bound particles; subhalos above SubhaloPotentialSampleSize only); 1 = exact final pass (energies of the bound set over all its particles set the whole binding order).");
     param_declare_double(ps, "SubhaloTreeOpenAngle", OPTIONAL, 0.45, "Geometric opening angle of the serial octree and of the in-place walk.");
     param_declare_int(ps, "SubhaloMergeTrapped", OPTIONAL, 1, "Enable sinking of trapped satellites.");
     param_declare_int(ps, "SubhaloSinkSymmetric", OPTIONAL, 0, "0 = HBT code behaviour, 1 = documented symmetric sinking test.");

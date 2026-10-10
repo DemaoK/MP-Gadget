@@ -99,6 +99,8 @@ subhalo_validate_params(const struct SubhaloParams * sp)
     if(sp->SubhaloCoreSize < 1 || sp->SubhaloPotentialSampleSize < 0 || sp->SubhaloMaxUnbindIterations < 1)
         endrun(1, "SubhaloCoreSize = %d and SubhaloMaxUnbindIterations = %d must be at least 1, SubhaloPotentialSampleSize = %d not negative.\n",
                sp->SubhaloCoreSize, sp->SubhaloMaxUnbindIterations, sp->SubhaloPotentialSampleSize);
+    if(sp->SubhaloFinalPass != 0 && sp->SubhaloFinalPass != 1)
+        endrun(1, "SubhaloFinalPass = %d must be 1 (exact final pass) or 0 (sampled final pass).\n", sp->SubhaloFinalPass);
     if(!(sp->SubhaloSourceRelaxFactor >= 1 && sp->SubhaloSourceRelaxFactor <= SUBHALO_MAX_RELAX_FACTOR))
         endrun(1, "SubhaloSourceRelaxFactor = %g must be in [1, %g]: the per-thread arena reserves 8 R bytes per particle "
                   "for the relaxed sources (J7; HBT finds no change above 3).\n", sp->SubhaloSourceRelaxFactor, SUBHALO_MAX_RELAX_FACTOR);
@@ -175,6 +177,7 @@ set_subhalo_params(ParameterSet * ps)
         SubParams.SubhaloBoundMassPrecision = param_get_double(ps, "SubhaloBoundMassPrecision");
         SubParams.SubhaloSourceRelaxFactor = param_get_double(ps, "SubhaloSourceRelaxFactor");
         SubParams.SubhaloPotentialSampleSize = param_get_int(ps, "SubhaloPotentialSampleSize");
+        SubParams.SubhaloFinalPass = param_get_int(ps, "SubhaloFinalPass");
         SubParams.SubhaloTreeOpenAngle = param_get_double(ps, "SubhaloTreeOpenAngle");
         SubParams.SubhaloMergeTrapped = param_get_int(ps, "SubhaloMergeTrapped");
         SubParams.SubhaloSinkSymmetric = param_get_int(ps, "SubhaloSinkSymmetric");
@@ -2492,6 +2495,9 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     up.MinNumPart = sp->SubhaloMinNumPart;
     up.MinNumTracerPart = sp->SubhaloMinNumTracerPart;
     up.SampleSize = sp->SubhaloPotentialSampleSize;
+    up.SampledFinalPass = !sp->SubhaloFinalPass;
+    /* the core and the reserved tracers (SubhaloMinNumTracerPart >= SubhaloNumTracerHostFinding) */
+    up.FinalRefineTracers = sp->SubhaloCoreSize > sp->SubhaloMinNumTracerPart ? sp->SubhaloCoreSize : sp->SubhaloMinNumTracerPart;
     up.MaxIter = sp->SubhaloMaxUnbindIterations;
     up.OpenAngle = sp->SubhaloTreeOpenAngle;
     up.BoundMassPrecision = sp->SubhaloBoundMassPrecision;

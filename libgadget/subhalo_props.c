@@ -1,7 +1,10 @@
 /* HBT-level subhalo properties (design 7.5, Phase 2a plan section 4 and step 7g).
  *
  * Input: a candidate after subhalo_final_pass, i.e. Index[0, Nbound) in ascending final-pass
- * energy, Energy the final-pass energies in the frame (RefPos, RefVel). The HBT set (Phase 2a)
+ * energy, Energy the final-pass energies in the frame (RefPos, RefVel); with the sampled final
+ * pass (SubhaloFinalPass = 0, Nbound > SampleSize) Index is in the loop's refined order and
+ * Energy holds subsampled estimates, unsorted: only the energy sums (Epot, SpinPeebles) read
+ * them, which do not depend on the order. The HBT set (Phase 2a)
  * first, then the Rockstar set and the baryonic sums of Phase 3 (below). Declared in
  * subhalo_unbind.h. */
 

@@ -1337,6 +1337,34 @@ subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * up, s
     return 1;
 }
 
+/* The head of the sampled final pass: the shortest prefix Index[0, K) that holds the first
+ * T = SUBHALO_FINAL_REFINE_MARGIN * Kt tracers of the prefix (all of them if fewer), Kt =
+ * max(SUBHALO_FINAL_REFINE_MIN, up->FinalRefineTracers), and, when there are fewer than T
+ * tracers, the first T - (tracer count) non-tracers (subhalo_core's fill), and at least T
+ * particles; at most n. The margin lets the first Kt tracers after the exact sort be the exact
+ * pass's even when the loop's order misplaces some of them by a few ranks. Serial scan. */
+static int64_t
+final_refine_count(const int64_t * Index, int64_t n, const struct SubhaloUnbindParams * up)
+{
+    const int64_t Kt = up->FinalRefineTracers > SUBHALO_FINAL_REFINE_MIN ? up->FinalRefineTracers : SUBHALO_FINAL_REFINE_MIN;
+    int64_t T = SUBHALO_FINAL_REFINE_MARGIN * Kt;
+    if(T > n)
+        T = n;
+    const int64_t NT = count_tracers_all(Index, n, up->TracerTypes);
+    const int64_t need_tr = NT < T ? NT : T;
+    const int64_t need_nt = T - need_tr;
+    int64_t i, nt = 0, nn = 0;
+    for(i = 0; i < n; i++) {
+        if(i >= T && nt >= need_tr && nn >= need_nt)
+            break;
+        if(type_in(up->TracerTypes, P[Index[i]].Type))
+            nt++;
+        else
+            nn++;
+    }
+    return i;
+}
+
 int64_t
 subhalo_final_pass(struct SubCandidate * c, const struct SubhaloUnbindParams * up, struct SubhaloArena * arena)
 {
@@ -1346,9 +1374,36 @@ subhalo_final_pass(struct SubCandidate * c, const struct SubhaloUnbindParams * u
     if(n <= 0)
         return 0;
     c->Mbound = bound_frame(c->Index, n, c->RefPos, c->RefVel, up->BoxSize);
-    potential_energies(c->Index, n, c->Energy, c->Index, n, 0, up->SampleSize, c->RefPos, c->RefVel, up, arena);
-    sort_energy_index(c->Energy, c->Index, n, arena);
     int64_t i, npos = 0;
+    if(up->SampledFinalPass && up->SampleSize > 0 && n > up->SampleSize) {
+        /* the sampled pass: the order of subhalo_unbind kept, except its head. */
+        const int64_t K = final_refine_count(c->Index, n, up);
+        /* 1. the head: exact energies over the whole prefix (the exact pass's call, made with
+         *    the arena in the same state, hence the same tree and bitwise the same energies)
+         *    for Index[0, K), which is then sorted by them */
+        potential_energies(c->Index, K, c->Energy, c->Index, n, 0, up->SampleSize, c->RefPos, c->RefVel, up, arena);
+        sort_energy_index(c->Energy, c->Index, K, arena);
+        /* 2. energies in the final frame from the SampleSize-particle subsample of a seeded
+         *    shuffle of the prefix (the loop's estimator, subhalo_unbind.cpp:599-617), for the
+         *    energy sums of the properties; the head's exact energies are replaced by them too,
+         *    so the sums use one estimator */
+        int64_t * sh = (int64_t *) arena_need(arena, sizeof(int64_t) * n, "final-pass subsample");
+        const int64_t * Index = c->Index;
+        SUBHALO_PAR_FOR(par_mode(n), i, n, sh[i] = Index[i];);
+        uint64_t s = c->Seed ^ 0x5851f42d4c957f2dULL;
+        for(i = n - 1; i > 0; i--) {
+            const int64_t j = (int64_t) rng_below(&s, (uint64_t) (i + 1));
+            const int64_t t = sh[i];
+            sh[i] = sh[j];
+            sh[j] = t;
+        }
+        potential_energies(c->Index, n, c->Energy, sh, n, up->SampleSize, up->SampleSize, c->RefPos, c->RefVel, up, arena);
+        arena->used = mark;
+    }
+    else {
+        potential_energies(c->Index, n, c->Energy, c->Index, n, 0, up->SampleSize, c->RefPos, c->RefVel, up, arena);
+        sort_energy_index(c->Energy, c->Index, n, arena);
+    }
     const double * E = c->Energy;
     if(par_mode(n)) {
         #pragma omp parallel for schedule(static) reduction(+: npos)

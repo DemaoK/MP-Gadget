@@ -53,6 +53,7 @@ struct SubhaloParams {
     double SubhaloBoundMassPrecision;    /* 0.995 */
     double SubhaloSourceRelaxFactor;     /* 3 */
     int    SubhaloPotentialSampleSize;   /* 1000 */
+    int    SubhaloFinalPass;             /* 0 = sampled final pass with an exact head (HBT's rule, the default, decision 42.4); 1 = exact */
     double SubhaloTreeOpenAngle;         /* 0.45 */
     int    SubhaloMergeTrapped;          /* 1 */
     int    SubhaloSinkSymmetric;         /* 0 */

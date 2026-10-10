@@ -644,6 +644,7 @@ subhalo_format_params(char * buf, size_t size)
         "SubhaloBoundMassPrecision = %g\n"
         "SubhaloSourceRelaxFactor = %g\n"
         "SubhaloPotentialSampleSize = %d\n"
+        "SubhaloFinalPass = %d\n"
         "SubhaloTreeOpenAngle = %g\n"
         "SubhaloMergeTrapped = %d\n"
         "SubhaloSinkSymmetric = %d\n"
@@ -663,7 +664,7 @@ subhalo_format_params(char * buf, size_t size)
         sp->SubhaloPotentialTypes, sp->SubhaloMinNumPart, sp->SubhaloMinNumTracerPart,
         sp->SubhaloNumTracerHostFinding, sp->SubhaloLookupBatchBytes,
         sp->SubhaloMajorProgenitorMassRatio, sp->SubhaloBoundMassPrecision,
-        sp->SubhaloSourceRelaxFactor, sp->SubhaloPotentialSampleSize, sp->SubhaloTreeOpenAngle,
+        sp->SubhaloSourceRelaxFactor, sp->SubhaloPotentialSampleSize, sp->SubhaloFinalPass, sp->SubhaloTreeOpenAngle,
         sp->SubhaloMergeTrapped, sp->SubhaloSinkSymmetric, sp->SubhaloCoreSize,
         sp->SubhaloReassignGas, sp->SubhaloUnbindWithThermal, sp->SubhaloFieldSO,
         sp->SubhaloSOBins, sp->SubhaloSOSearchFactor, sp->SubhaloSOMaxDoublings,

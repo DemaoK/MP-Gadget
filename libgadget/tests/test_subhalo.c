@@ -153,6 +153,7 @@ default_subhalo_params(void)
     sp.SubhaloBoundMassPrecision = 0.995;
     sp.SubhaloSourceRelaxFactor = 3;
     sp.SubhaloPotentialSampleSize = 1000;
+    sp.SubhaloFinalPass = 1;
     sp.SubhaloTreeOpenAngle = 0.45;
     sp.SubhaloMergeTrapped = 1;
     sp.SubhaloSinkSymmetric = 0;

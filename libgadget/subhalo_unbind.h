@@ -74,6 +74,14 @@ struct SubhaloUnbindParams {
     int MaxIter;
     double OpenAngle, BoundMassPrecision;
     int WithThermal;
+    /* 1 - SubhaloFinalPass: 0 (zero-initialised) = the exact final pass, 1 = the sampled one
+     * (see subhalo_final_pass). Inverted so that a parameter struct built with memset gets the
+     * default. */
+    int SampledFinalPass;
+    /* Tracers whose order the sampled pass takes from exact energies (the caller's
+     * max(SubhaloCoreSize, SubhaloMinNumTracerPart): the core and the reserved tracers, which
+     * include the host-finding ones); SUBHALO_FINAL_REFINE_MIN if smaller. */
+    int FinalRefineTracers;
 };
 
 /* Types never subsampled when the potential is subsampled (HBT DoNotSubsampleParticleTypes,
@@ -82,6 +90,11 @@ struct SubhaloUnbindParams {
 /* Fraction of the bound set whose order is refined with exact masses after a subsampled loop
  * (HBT BoundFractionCenterRefinement, config_parser.h:140). */
 #define SUBHALO_REFINE_FRACTION 0.1
+/* The exact head of the sampled final pass (subhalo_final_pass): Kt = max(SUBHALO_FINAL_REFINE_MIN,
+ * FinalRefineTracers) tracers must come from exact energies; the head holds
+ * SUBHALO_FINAL_REFINE_MARGIN * Kt tracers so that they do. */
+#define SUBHALO_FINAL_REFINE_MIN 20
+#define SUBHALO_FINAL_REFINE_MARGIN 5
 /* Largest k accepted by subhalo_knn_query (the per-query list lives on the thread stack). */
 #define SUBHALO_KNN_MAXK 64
 
@@ -113,7 +126,31 @@ int subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * u
  * and sort the prefix by energy. Membership unchanged. Returns the number of prefix particles
  * with E >= 0 after the pass (logged by the caller), also stored in c->NboundPositive.
  * The frame (RefPos, RefVel, Mbound) is recomputed from the prefix first, so the pass is also
- * valid after the caller edited the prefix; NboundTracer is recounted. */
+ * valid after the caller edited the prefix; NboundTracer is recounted.
+ *
+ * Sampled final pass (up->SampledFinalPass, SubhaloFinalPass = 0; decision 42.4): HBT-HERONS's
+ * own rule, which has no exact pass, plus an exact head. When up->SampleSize > 0 and
+ * Nbound > SampleSize, the prefix keeps the order subhalo_unbind left it in (the last
+ * iteration's subsampled energies, the max(SampleSize, 0.1 Nbound) most bound reordered by their
+ * exact self-binding energy: RefineMostBoundParticle, subhalo_unbind.cpp:709-733), except its
+ * head Index[0, K): with Kt = max(SUBHALO_FINAL_REFINE_MIN, up->FinalRefineTracers), K is the
+ * shortest prefix holding the first T = SUBHALO_FINAL_REFINE_MARGIN * Kt tracers (and, with
+ * fewer than T tracers bound, the first non-tracers subhalo_core fills with), at least T
+ * particles. The head gets the exact pass's energies (the tree over the whole prefix in the
+ * final frame, built exactly as the exact pass builds it, K walks: bitwise the exact pass's
+ * values for those particles) and is sorted by them. So the most-bound tracer (MostBoundID),
+ * the reserved tracers and the core (the first Kt tracers) are the exact pass's whenever the
+ * true ones are among the loop order's first T tracers; the rest of the order (BindRank beyond
+ * K) is the loop's. Energy[0, Nbound) is then recomputed in the final frame with
+ * the loop's estimator (the SampleSize-particle subsample of a seeded shuffle of the prefix,
+ * masses upscaled per type), for the energy sums of the properties (Epot, SpinPeebles) and
+ * NboundPositive only: it is not sorted and not used for the order. The caller must not have
+ * edited the prefix since subhalo_unbind (subhalo_track.c does not). Otherwise (SampleSize == 0
+ * or Nbound <= SampleSize) the exact pass runs, so a candidate below the sample size gets
+ * bit-identical results under both options. Thread-count independent like the exact pass (the
+ * scan and the shuffle are serial, the energies those of potential_energies, the sorts total
+ * orders). Arena: the exact pass's tree, then 8 bytes per prefix particle for the shuffled copy
+ * plus the subsample's sources and tree, within SUBHALO_UNBIND_SCRATCH_BYTES_PER_PART. */
 int64_t subhalo_final_pass(struct SubCandidate * c, const struct SubhaloUnbindParams * up, struct SubhaloArena * arena);
 
 /* Core of the SubhaloCoreSize most-bound tracers, filled with non-tracers when fewer are bound
