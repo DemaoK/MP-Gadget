@@ -51,21 +51,34 @@ size_t subhalo_arena_bytes_per_part(void);
  * candidate is SUBHALO_INPLACE_CAND_BYTES + SUBHALO_INPLACE_CAND_PROPS_BYTES. */
 #define SUBHALO_INPLACE_CAND_PROPS_BYTES 6144
 
-/* Phase 5c: the estimated processing cost of a serial key of N particles, in arbitrary units,
- * cost(N) = SUBHALO_COST_ITER * N log2 max(N, 2) + SUBHALO_COST_KEY: the tree builds and walks of
- * the unbinding iterations scale as N log N, the per-key constant covers the record fetch, the
- * hierarchy and the per-key setup. Only the ratio SUBHALO_COST_KEY / SUBHALO_COST_ITER matters
- * (the planner and subhalo_run_serial_keys compare costs with each other). The values are
- * placeholders to calibrate on dm-128 from the fit of the measured key times that the per-call
- * summary logs ("key time fit"). On dm-small (64^3, keys of 20 to 4058 particles, one thread per
- * rank) the fit gave 1.1e-6 to 1.25e-6 s per N log2 N and an intercept that is not resolved
- * (slightly negative: the times curve upward in N log N), so only the slope is calibrated there:
- * one cost unit is about 1.2e-7 s and the placeholder per-key constant about 0.25 ms. */
+/* Phase 5c/5d: the estimated processing cost of a serial key of N particles tagged by M member
+ * tracks, in arbitrary units,
+ *   cost(N, M) = SUBHALO_COST_ITER * N log2 max(N, 2) + SUBHALO_COST_MEMBER * M + SUBHALO_COST_KEY:
+ * the tree builds and walks of the unbinding iterations scale as N log N, every member adds its
+ * own candidate (unbinding, final pass, properties, hierarchy), the per-key constant covers the
+ * per-key setup. Only the ratios matter (the planner and subhalo_run_serial_keys compare costs
+ * with each other). Calibration (Phase 5d, dm-128 outputs 4-6 at 4 x 1 on r30, 10,411 keys with
+ * their measured times, member counts and diagnostics): 1.0e-6 s per N log2 N (one cost unit is
+ * about 1.0e-7 s on one EPYC 7713 core). Over all keys the least-squares member and per-key
+ * terms are not positive (the times curve upward in N log N; small keys dominate the count); on
+ * the keys that set the thread balance (N >= 1000, 142 keys, relative non-negative least squares)
+ * the fit is 1.01e-6 s per N log2 N + 1.5e-4 s per member + 2.0e-3 s per key, which gives
+ * SUBHALO_COST_MEMBER = 1500. The per-key constant stays 2000: the large-key fit's 20000 is the
+ * curvature, not a per-key cost (it would weigh the many small keys of a rank's tail tenfold in
+ * the packing). The outliers (e.g. a 2,206-particle key with 12 members taking as long as an
+ * 8,000-particle one) come from the unbinding iteration count (50 iterations over 11
+ * candidates), which no input of the plan predicts. M is the segment's distinct tags in
+ * subhalo_run_serial_keys; the planner's packing uses M = 0, because its only member count, the
+ * directory's Tags, counts a track once per rank holding it: with it the rank imbalance at a = 1
+ * rose from 1.36 to 1.85 at 16 x 8 and from 1.23 to 1.42 at 8 x 16 (serial stage +0.03-0.05 s),
+ * while the exact count in the thread schedule lowered the serial stage at 4 x 32 from 0.23 to
+ * 0.20 s (dm-128, epyc, OpenMP threads bound; Phase 5d diag2_p5d.sh). */
 #define SUBHALO_COST_ITER 10.
+#define SUBHALO_COST_MEMBER 1500.
 #define SUBHALO_COST_KEY 2000.
-static inline double subhalo_key_cost(int64_t N) {
+static inline double subhalo_key_cost(int64_t N, int64_t M) {
     const double n = N > 2 ? (double) N : 2.;
-    return SUBHALO_COST_ITER * (double) (N > 0 ? N : 0) * log2(n) + SUBHALO_COST_KEY;
+    return SUBHALO_COST_ITER * (double) (N > 0 ? N : 0) * log2(n) + SUBHALO_COST_MEMBER * (double) (M > 0 ? M : 0) + SUBHALO_COST_KEY;
 }
 
 /* Catalogue int32 guards (audit Q4; the schema columns are i4): a count of n particles fits if
@@ -468,6 +481,7 @@ struct SubhaloKeySeg {
     int decider;            /* in place: lowest holding rank */
     int64_t ipindex;        /* in place: index into plan->Inplace, else -1 */
     double ref[3];          /* in place: common reference position */
+    int64_t Tracks;         /* serial: the distinct tracks tagging its particles (Phase 5d cost model) */
 };
 
 /* Steps 0 and 2: tracer snapshot and HBT's weighted host vote. Every rank sends, per track T,
@@ -555,6 +569,37 @@ int subhalo_plan_exchange(struct SubhaloPlan * plan, MPI_Comm Comm);
 void subhalo_plan_free(struct SubhaloPlan * plan);
 /* Local sort of P by (garbage last, processing key, TrackId, BindRank, ID). */
 void subhalo_local_sort(void);
+/* Phase 5d: an order-preserving threaded selection over P[0 .. N): COUNT_CHUNKS fills off[c + 1]
+ * with the number of selected particles of chunk c and turns off into offsets, FILL_CHUNKS runs
+ * BODY(i, m) for the m-th selected particle i in P order. The result does not depend on the
+ * thread count. */
+#define SUBHALO_COUNT_CHUNKS(N, nc, off, PRED) do { \
+        int c_; \
+        (off)[0] = 0; \
+        _Pragma("omp parallel for") \
+        for(c_ = 0; c_ < (nc); c_++) { \
+            int64_t cnt_ = 0, i; \
+            for(i = c_ * (int64_t) (N) / (nc); i < (c_ + 1) * (int64_t) (N) / (nc); i++) \
+                if(PRED) cnt_++; \
+            (off)[c_ + 1] = cnt_; \
+        } \
+        for(c_ = 0; c_ < (nc); c_++) \
+            (off)[c_ + 1] += (off)[c_]; \
+    } while(0)
+#define SUBHALO_FILL_CHUNKS(N, nc, off, PRED, BODY) do { \
+        int c_; \
+        _Pragma("omp parallel for") \
+        for(c_ = 0; c_ < (nc); c_++) { \
+            int64_t m = (off)[c_], i; \
+            for(i = c_ * (int64_t) (N) / (nc); i < (c_ + 1) * (int64_t) (N) / (nc); i++) \
+                if(PRED) { BODY; m++; } \
+        } \
+    } while(0)
+/* Phase 5d test knob: 0 the record sort when it fits (default), 1 always the indirect sort of P. */
+void subhalo_local_sort_set_mode(int mode);
+/* Chunks of an order-preserving threaded pass over n items (about four per thread, at least 4096
+ * items each); the results of such passes do not depend on it. */
+int subhalo_par_nchunks(int64_t n);
 /* The key runs on this rank after the sort: serial keys assigned here and the local part of
  * oversized keys. Allocates *segs on the top of the stack. endrun on a broken plan. */
 int64_t subhalo_build_segments(const struct SubhaloPlan * plan, struct SubhaloKeySeg ** segs);
@@ -588,7 +633,7 @@ static inline void * subhalo_arena_get(struct SubhaloArena * a, size_t bytes) {
 /* Callback processing serial key k with one arena; nthreads > 1 only for a key processed alone. */
 typedef void (*subhalo_key_fn)(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloArena * arena, int nthreads, void * userdata);
 /* Static cost-ordered schedule of the serial segments over the OpenMP threads (Phase 5c): the
- * keys sorted by decreasing subhalo_key_cost(n) (ties by g; the same order as by n), those whose
+ * keys sorted by decreasing subhalo_key_cost(n, Tracks) (ties by g), those whose
  * cost exceeds the total cost / nthreads processed alone first with every thread inside the key,
  * the rest assigned longest-processing-time first on cost to the least loaded thread and processed
  * by each thread in that order; one arena per thread (mymalloc2 in thread order, freed in
@@ -649,6 +694,9 @@ double subhalo_lookup_index_bytes(int64_t NumPart);
 double subhalo_lookup_last_peak_bytes(void);
 /* Test knob: at most maxbatch ids per rank and batch (0 restores the byte cap alone). */
 void subhalo_lookup_set_max_batch(int64_t maxbatch);
+/* Phase 5d test knob: 0 auto (scan when all queries of the call are at most 1/16 of the rank's
+ * live particles, else the sorted index), 1 always the index, 2 always the scan. */
+void subhalo_lookup_set_mode(int mode);
 /* Step 1: every orphan record homed here (Nbound == 0, SnapTracerLost < 0) looks up its
  * MostBoundID: a hit sets Host to the particle's GrNr (-1 outside groups) and TracerPos
  * (physical frame) / TracerVel (km/s), a miss sets SnapTracerLost = SnapNum. Returns the
@@ -710,6 +758,14 @@ struct SubhaloCallStats {
     double StageMax[SUBHALO_NSTAGE];        /* wall time per stage (s), max over the ranks */
     double StageMean[SUBHALO_NSTAGE];       /* mean over the ranks */
     double StagePeakBytes[SUBHALO_NSTAGE];  /* used high water within the stage, max over the ranks */
+    /* Phase 5d: the finder's own increment: per stage the used high water within the stage
+     * without the field SO walks' elastic export tables, minus the usage at the call's entry
+     * (max over the ranks); the call's increment is the largest over the stages and ranks */
+    double StageIncrBytes[SUBHALO_NSTAGE];
+    int64_t PeakIncrementBytes;
+    int PeakIncrementRank, PeakIncrementStage;
+    double EntryBytes;                      /* main-allocator usage at the call's entry, max over the ranks */
+    double FieldSOElasticBytes;             /* the largest export tables of a field SO walk, max over the ranks (excluded above) */
     double ExchOutMax, ExchOutMean;         /* particles sent by the exchange, max and mean over the ranks */
     double ExchInMax, ExchInMean;           /* received */
     int64_t NSerial, LargestSerial;         /* serial keys of the plan, the largest's particles */

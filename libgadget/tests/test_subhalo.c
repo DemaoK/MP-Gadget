@@ -1,7 +1,12 @@
 /* Unit tests for the runtime subhalo finder: Phase 1 (halofinder_phase1_plan.md section 5) and
  * Phase 2a (halofinder_phase2a_plan.md section 5, tests 5-7 as tests 11-13 here).
  *
- * Run as: mpirun -np 4 .objs/test_subhalo
+ * Run as: mpirun -np 4 .objs/test_subhalo, with OMP_NUM_THREADS 1 or 2. Above 2 threads MP-Gadget's
+ * tree build fails on these fixtures (125 particles on a rank; force_tree_create_nodes reserves
+ * NODECACHE_SIZE = 96 nodes per thread and TreeAllocFactor is capped at 3.0), before any finder
+ * code runs. Higher thread counts are covered by test_subhalo_local_sort and
+ * test_subhalo_serial_keys (which set their own thread counts), by test_subhalo_unbind and
+ * test_subhalo_collective, and by the exact catalogue compares on the test boxes.
  *
  *  1. test_subhalo_table          track table: append past the initial allocation, home-rank and
  *                                 local-index arithmetic, redistribution when Chunk changes,
@@ -39,12 +44,15 @@
  * test_subhalo_nocentral: Phase 3 audit P2 (no surviving central: CentralTrackId -1).
  * Phase 5c (instrumentation, cost-aware packing, reserve admission): the per-call statistics
  * (subhalo_last_call_stats) are checked after the calls of tests 11 and the mixed call, the PIG
- * header's SubhaloWallTime and SubhaloPeakBytes in test 9, a cost-balance case (c) in test 7;
+ * header's SubhaloWallTime and SubhaloPeakBytes in test 9 (Phase 5d: also SubhaloPeakIncrementBytes, and
+ * the per-stage increments in the call statistics), a cost-balance case (c) in test 7;
  * test_subhalo_serial_keys runs subhalo_run_serial_keys directly at 1 to 4 threads (cost order per
  * thread, the alone keys, LPT balance, the same outcome at every thread count; Phase 5 audit R2:
  * a team reduced to one worker for four queues reports that worker's busy time) and
  * test_subhalo_reserve_admission squeezes the free memory 2 MB below the plan's reserve (the
  * collective stage alone still fits): the call fails before the exchange with the tags unchanged.
+ * Phase 5d: test_subhalo_local_sort checks that the local sort's particle table does not depend
+ * on the thread count or the sort path; test_subhalo_lookup runs the three lookup modes.
  * 11. test_subhalo_twohalo        plan test 5: two Hernquist clumps over three calls: persistent
  *                                 tracks, HBT properties, unbound tails, the D10 tag invariants.
  * 12. test_subhalo_overlap        plan test 6: B falls into A: satellite (Rank 1, Depth 1, parent
@@ -387,6 +395,24 @@ check_call_stats(const char * what, int complete)
     CHECK(st->PeakBytes > 0 && st->PeakStage >= 0 && st->PeakStage < SUBHALO_NSTAGE && st->PeakRank >= 0 && st->PeakRank < NTask
           && (int64_t) st->StagePeakBytes[st->PeakStage] == st->PeakBytes,
           "%s: peak %ld bytes on rank %d in stage %d\n", what, st->PeakBytes, st->PeakRank, st->PeakStage);
+    /* Phase 5d: the finder's own increment: per stage at most the stage's high water less the
+     * entry usage of some rank, the call's the largest of them */
+    double imax = 0;
+    for(s = 0; s < SUBHALO_NSTAGE; s++) {
+        CHECK(st->StageIncrBytes[s] >= 0 && st->StageIncrBytes[s] <= st->StagePeakBytes[s] + 1,
+              "%s: stage %s: increment %g bytes, high water %g\n", what, SubhaloStageName[s], st->StageIncrBytes[s], st->StagePeakBytes[s]);
+        if(st->StageIncrBytes[s] > imax)
+            imax = st->StageIncrBytes[s];
+    }
+    CHECK(st->PeakIncrementBytes == (int64_t) imax && st->PeakIncrementBytes > 0 && st->PeakIncrementBytes < st->PeakBytes
+          && st->PeakIncrementStage >= 0 && st->PeakIncrementStage < SUBHALO_NSTAGE && st->PeakIncrementRank >= 0
+          && st->PeakIncrementRank < NTask && st->EntryBytes > 0 && st->EntryBytes < st->PeakBytes,
+          "%s: own increment %ld bytes (largest stage %g) on rank %d in stage %d; entry %g, high water %ld\n", what,
+          st->PeakIncrementBytes, imax, st->PeakIncrementRank, st->PeakIncrementStage, st->EntryBytes, st->PeakBytes);
+    if(complete && st->FieldSOPass1Walks > 0)
+        CHECK(st->FieldSOElasticBytes > 0 && st->StageIncrBytes[SUBHALO_STAGE_FIELDSO] < st->StagePeakBytes[SUBHALO_STAGE_FIELDSO],
+              "%s: field SO elastic export tables %g bytes, stage increment %g, high water %g\n", what, st->FieldSOElasticBytes,
+              st->StageIncrBytes[SUBHALO_STAGE_FIELDSO], st->StagePeakBytes[SUBHALO_STAGE_FIELDSO]);
     if(complete) {
         CHECK(fabs(st->ExchOutMean - st->ExchInMean) < 1e-6 && st->ExchOutMax >= st->ExchOutMean && st->ExchInMax >= st->ExchInMean,
               "%s: exchange out %g/%g in %g/%g\n", what, st->ExchOutMax, st->ExchOutMean, st->ExchInMax, st->ExchInMean);
@@ -412,7 +438,7 @@ static void
 check_header_cost(const char * dir, int snap, const char * what)
 {
     double w = -1;
-    uint64_t pb = 0;
+    uint64_t pb = 0, pi = 0;
     int ok = 1;
     if(get_thistask() == 0) {
         char * f = fastpm_strdup_printf("%s/PIG_%03d", dir, snap);
@@ -420,7 +446,8 @@ check_header_cost(const char * dir, int snap, const char * what)
         BigBlock bh;
         if(0 != big_file_open(&bf, f) || 0 != big_file_open_block(&bf, &bh, "Header"))
             endrun(1, "test: cannot open %s/Header\n", f);
-        if(0 != big_block_get_attr(&bh, "SubhaloWallTime", &w, "f8", 1) || 0 != big_block_get_attr(&bh, "SubhaloPeakBytes", &pb, "u8", 1))
+        if(0 != big_block_get_attr(&bh, "SubhaloWallTime", &w, "f8", 1) || 0 != big_block_get_attr(&bh, "SubhaloPeakBytes", &pb, "u8", 1)
+           || 0 != big_block_get_attr(&bh, "SubhaloPeakIncrementBytes", &pi, "u8", 1))
             ok = 0;
         big_block_close(&bh);
         big_file_close(&bf);
@@ -429,10 +456,15 @@ check_header_cost(const char * dir, int snap, const char * what)
     MPI_Bcast(&ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&w, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Bcast(&pb, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&pi, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
     const struct SubhaloCallStats * st = subhalo_last_call_stats();
     CHECK(ok && w == st->WallTime && w > 0 && pb == (uint64_t) st->PeakBytes && pb > 0,
           "%s: header SubhaloWallTime %g SubhaloPeakBytes %lu (read %d), the call's %g s and %ld bytes\n", what, w, (unsigned long) pb, ok,
           st->WallTime, st->PeakBytes);
+    /* Phase 5d: the finder's own increment round-trips too */
+    CHECK(ok && pi == (uint64_t) st->PeakIncrementBytes && pi > 0 && pi < pb,
+          "%s: header SubhaloPeakIncrementBytes %lu, the call's %ld bytes (high water %lu)\n", what, (unsigned long) pi,
+          st->PeakIncrementBytes, (unsigned long) pb);
 }
 
 static void
@@ -2104,12 +2136,12 @@ test_subhalo_plan_pack(void ** state)
             if(oversized[k] || target[k] < 0)
                 continue;
             const int64_t len = keys[k].cnt[k % 4][1];
-            cost[target[k]] += subhalo_key_cost(len);
+            cost[target[k]] += subhalo_key_cost(len, 0);
             if(k < nbig + nmid) {
-                headcost[target[k]] += subhalo_key_cost(len);
+                headcost[target[k]] += subhalo_key_cost(len, 0);
                 nhead[target[k]]++;
             }
-            tot += subhalo_key_cost(len);
+            tot += subhalo_key_cost(len, 0);
         }
         for(r = 0; r < 4; r++)
             if(cost[r] > mx)
@@ -2126,6 +2158,87 @@ test_subhalo_plan_pack(void ** state)
         free(target);
         free(keys);
     }
+}
+
+/* ------------------------------------------------------------------ Phase 5d: the local sort */
+
+/* subhalo_local_sort (the record sort with the threaded permutation, and the indirect sort of P
+ * it falls back to) leaves the same particle table at 1 to 4 threads: garbage last, then by key
+ * (group, encoded travelling key, -1 first), TrackId, BindRank, ID, and the input order for full
+ * ties (duplicated records). The reference is the indirect sort at one thread (glibc's merge sort,
+ * the pre-5d code path). */
+static void
+test_subhalo_local_sort(void ** state)
+{
+    const int64_t N = 60000;
+    setup_pman(N + 10, BOXSIZE);
+    int64_t i;
+    for(i = 0; i < N; i++) {
+        double pos[3] = {urand(i, 91, 0) * BOXSIZE, urand(i, 91, 1) * BOXSIZE, urand(i, 91, 2) * BOXSIZE};
+        add_dm_particle((MyIDType) (1000000 + splitmix64(i) % 5000000), pos);
+        struct particle_data * p = &P[i];
+        const double u = urand(i, 92, 0);
+        if(u < 0.3)
+            p->GrNr = -1;
+        else if(u < 0.8)
+            p->GrNr = 1 + (int64_t) (urand(i, 92, 1) * 300);
+        else if(u < 0.95)
+            p->GrNr = -(2 + (1 + (int64_t) (urand(i, 92, 2) * 300)));
+        else
+            p->GrNr = -(2 + ((1 + (int64_t) (urand(i, 92, 3) * 300)) | SUBHALO_KEY_FOFBIT));
+        p->TrackId = urand(i, 93, 0) < 0.3 ? -1 : (int64_t) (urand(i, 93, 1) * 50);
+        p->BindRank = urand(i, 94, 0) < 0.3 ? -1 : (int32_t) (urand(i, 94, 1) * 20);
+        p->IsGarbage = urand(i, 95, 0) < 0.15;
+        p->Hsml = (MyFloat) i;      /* the input position, to check the stability */
+        /* full duplicates of an earlier record (same keys and ID): their order is the input order */
+        if(i > 10 && urand(i, 96, 0) < 0.02) {
+            const int64_t j = (int64_t) (urand(i, 96, 1) * (i - 1));
+            const MyFloat h = p->Hsml;
+            *p = P[j];
+            p->Hsml = h;
+        }
+    }
+    struct particle_data * in = malloc(sizeof(struct particle_data) * N);
+    struct particle_data * ref = malloc(sizeof(struct particle_data) * N);
+    memcpy(in, P, sizeof(struct particle_data) * N);
+    const int saved = omp_get_max_threads();
+    omp_set_num_threads(1);
+    subhalo_local_sort_set_mode(1);
+    subhalo_local_sort();
+    memcpy(ref, P, sizeof(struct particle_data) * N);
+    int64_t bad = 0;
+    /* the reference is sorted and stable */
+    for(i = 1; i < N; i++) {
+        const struct particle_data * a = &ref[i - 1], * b = &ref[i];
+        const int64_t ka = subhalo_particle_key(a), kb = subhalo_particle_key(b);
+        int c = (a->IsGarbage > b->IsGarbage) - (a->IsGarbage < b->IsGarbage);
+        if(!c) c = (ka > kb) - (ka < kb);
+        if(!c) c = (a->TrackId > b->TrackId) - (a->TrackId < b->TrackId);
+        if(!c) c = (a->BindRank > b->BindRank) - (a->BindRank < b->BindRank);
+        if(!c) c = (a->ID > b->ID) - (a->ID < b->ID);
+        if(!c) c = (a->Hsml > b->Hsml) - (a->Hsml < b->Hsml);
+        LOCAL_CHECK(bad, c < 0, "local sort reference: entries %ld and %ld out of order\n", i - 1, i);
+    }
+    int mode, T;
+    for(mode = 0; mode < 2; mode++)
+        for(T = 1; T <= 4; T++) {
+            omp_set_num_threads(T);
+            subhalo_local_sort_set_mode(mode);
+            memcpy(P, in, sizeof(struct particle_data) * N);
+            subhalo_local_sort();
+            int64_t first = -1;
+            for(i = 0; i < N && first < 0; i++)
+                if(memcmp(&P[i], &ref[i], sizeof(struct particle_data)))
+                    first = i;
+            LOCAL_CHECK(bad, first < 0, "local sort, mode %d, %d threads: the table differs from the reference at %ld\n", mode, T, first);
+        }
+    subhalo_local_sort_set_mode(0);
+    omp_set_num_threads(saved);
+    message(0, "local sort: %ld particles, record and indirect sorts at 1-4 threads equal the reference\n", N);
+    assert_all_true(bad == 0);
+    free(ref);
+    free(in);
+    teardown_pman();
 }
 
 /* ------------------------------------------------------------------ Phase 5c: the serial key scheduler */
@@ -2203,6 +2316,8 @@ test_subhalo_serial_keys(void ** state)
         /* two large keys, ties in n (equal cost, broken by g), a spread of small ones */
         segs[k].n = k == 3 ? 150000 : (k == 50 ? 25000 : (k % 5 == 0 ? 500 : 1 + (int64_t) (urand(k, 5, 0) * 3000)));
         segs[k].Length = segs[k].n;
+        /* member counts (Phase 5d cost term); equal for the n = 500 keys so that their costs tie */
+        segs[k].Tracks = k % 5 == 0 ? 3 : 1 + k % 13;
         segs[k].inplace = (k % 7 == 6);
         segs[k].ipindex = -1;
         if(!segs[k].inplace) {
@@ -2232,11 +2347,11 @@ test_subhalo_serial_keys(void ** state)
         double total = 0;
         for(k = 0; k < nsegs; k++)
             if(!segs[k].inplace)
-                total += subhalo_key_cost(segs[k].n);
+                total += subhalo_key_cost(segs[k].n, segs[k].Tracks);
         int64_t nalone = 0;
         for(i = 0; i < u.nlog; i++) {
             const int64_t kk = u.log[i].k;
-            const int alone = T > 1 && subhalo_key_cost(segs[kk].n) > total / T;
+            const int alone = T > 1 && subhalo_key_cost(segs[kk].n, segs[kk].Tracks) > total / T;
             nalone += alone;
             LOCAL_CHECK(bad, (u.log[i].nthreads > 1) == alone && (alone ? u.log[i].nthreads == T : u.log[i].nthreads == 1),
                         "serial keys, %d threads: key %ld (n %ld) ran with %d threads\n", T, kk, segs[kk].n, u.log[i].nthreads);
@@ -2251,13 +2366,14 @@ test_subhalo_serial_keys(void ** state)
                 if(u.log[j].base != u.log[i].base || (u.log[j].nthreads > 1) != (u.log[i].nthreads > 1))
                     continue;
                 const int64_t a = u.log[i].k, b = u.log[j].k;
-                LOCAL_CHECK(bad, segs[a].n > segs[b].n || (segs[a].n == segs[b].n && segs[a].g < segs[b].g),
+                const double ca = subhalo_key_cost(segs[a].n, segs[a].Tracks), cb = subhalo_key_cost(segs[b].n, segs[b].Tracks);
+                LOCAL_CHECK(bad, ca > cb || (ca == cb && segs[a].g < segs[b].g),
                             "serial keys, %d threads: key %ld (n %ld) ran before key %ld (n %ld) on one queue\n", T, b, segs[b].n, a, segs[a].n);
                 break;
             }
             if(u.log[i].nthreads > 1)
                 continue;
-            const double c = subhalo_key_cost(segs[u.log[i].k].n);
+            const double c = subhalo_key_cost(segs[u.log[i].k].n, segs[u.log[i].k].Tracks);
             if(c > maxjob)
                 maxjob = c;
             for(q = 0; q < nq; q++)
@@ -2332,10 +2448,10 @@ test_subhalo_serial_keys(void ** state)
         double total = 0, wsum = 0;
         for(k = 0; k < nsegs; k++)
             if(!segs[k].inplace)
-                total += subhalo_key_cost(segs[k].n);
+                total += subhalo_key_cost(segs[k].n, segs[k].Tracks);
         int64_t bad = 0, nthr = 0;
         for(k = 0; k < nsegs; k++) {
-            if(segs[k].inplace || subhalo_key_cost(segs[k].n) > total / T)
+            if(segs[k].inplace || subhalo_key_cost(segs[k].n, segs[k].Tracks) > total / T)
                 continue;
             nthr++;
             wsum += u.dt[k];
@@ -4639,9 +4755,13 @@ test_subhalo_lookup(void ** state)
     }
     struct SubhaloIdHit * out = malloc(sizeof(struct SubhaloIdHit) * (nq + 1));
     int mode;
+    int lmode;
+    for(lmode = 0; lmode < 3; lmode++)
     for(mode = 0; mode < 2; mode++) {
-        /* mode 0: three ids per rank and batch; mode 1: the 1 MB byte cap alone */
+        /* mode 0: three ids per rank and batch; mode 1: the 1 MB byte cap alone; lmode (Phase
+         * 5d): how the answers are found, auto / the sorted index / the scan of the particles */
         subhalo_lookup_set_max_batch(mode == 0 ? 3 : 0);
+        subhalo_lookup_set_mode(lmode);
         subhalo_lookup_ids(q, nq, out, MPI_COMM_WORLD);
         int bad = 0;
         for(i = 0; i < nq; i++) {
@@ -4668,6 +4788,7 @@ test_subhalo_lookup(void ** state)
                   "lookup: byte cap %ld, high water %g\n", sp.SubhaloLookupBatchBytes, gpeak);
     }
     subhalo_lookup_set_max_batch(0);
+    subhalo_lookup_set_mode(0);
     free(out);
     free(q);
     teardown_pman();
@@ -4703,6 +4824,7 @@ int main(void) {
         cmocka_unit_test(test_subhalo_lookup),
         cmocka_unit_test(test_subhalo_serial_keys),
         cmocka_unit_test(test_subhalo_reserve_admission),
+        cmocka_unit_test(test_subhalo_local_sort),
     };
     /* SUBHALO_TEST_ONLY=<substring> runs only the tests whose name contains it */
     const char * only = getenv("SUBHALO_TEST_ONLY");

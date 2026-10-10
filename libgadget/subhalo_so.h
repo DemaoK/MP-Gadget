@@ -107,5 +107,12 @@ void subhalo_so_set_import_buffer_boost(double boost);
 /* Free bytes treewalk.c's ev_begin needs on this rank for a walk of the given pass (1 or 2)
  * with NB pass-1 bins and NT particle types (not counting this module's own buffers). */
 size_t subhalo_so_walk_bytes(int pass, int NB, int NT);
+/* Phase 5d: the field SO walks' elastic export tables (sized by the treewalk from the free
+ * memory) are taken out of the main allocator's low-water mark after every walk; these give the
+ * true low-water mark of the walks since the last reset (SIZE_MAX if none) and their largest
+ * export tables (bytes). */
+void subhalo_so_elastic_reset(void);
+size_t subhalo_so_elastic_min_free(void);
+double subhalo_so_elastic_bytes(void);
 
 #endif

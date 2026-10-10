@@ -721,6 +721,9 @@ subhalo_write_header_attrs(BigBlock * bh, const struct part_manager_type * pman,
     const struct SubhaloCallStats * cs = subhalo_last_call_stats();
     double SubhaloWallTime = cs->WallTime;
     uint64_t SubhaloPeakBytes = cs->PeakBytes > 0 ? (uint64_t) cs->PeakBytes : 0;
+    /* Phase 5d: the finder's own increment (bytes, max over the ranks and stages): the used high
+     * water without the field SO walks' elastic export tables minus the usage at the call's entry */
+    uint64_t SubhaloPeakIncrementBytes = cs->PeakIncrementBytes > 0 ? (uint64_t) cs->PeakIncrementBytes : 0;
 
     if(
     (0 != big_block_set_attr(bh, "NumPartSavedTotal", NumPartSavedTotal, "u8", 6)) ||
@@ -741,6 +744,7 @@ subhalo_write_header_attrs(BigBlock * bh, const struct part_manager_type * pman,
     (0 != big_block_set_attr(bh, "SOThresholds", SOThresholds, "f8", SUBHALO_NSO)) ||
     (0 != big_block_set_attr(bh, "SubhaloWallTime", &SubhaloWallTime, "f8", 1)) ||
     (0 != big_block_set_attr(bh, "SubhaloPeakBytes", &SubhaloPeakBytes, "u8", 1)) ||
+    (0 != big_block_set_attr(bh, "SubhaloPeakIncrementBytes", &SubhaloPeakIncrementBytes, "u8", 1)) ||
     (0 != big_block_set_attr(bh, "SubhaloParameters", params, "S1", strlen(params)))) {
         endrun(0, "Failed to write subhalo header attributes: %s\n", big_file_get_error_message());
     }

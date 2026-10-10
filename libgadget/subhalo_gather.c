@@ -54,6 +54,7 @@
 /* domain_exchange never moves more than this per batch (exchange.c) */
 #define SUBHALO_EXCHANGE_BATCH_BYTES (2040L * 1024L * 1024L)
 
+
 static int
 cmp_int64(const void * a, const void * b)
 {
@@ -116,24 +117,22 @@ subhalo_host_vote(struct SubTrackTable * tab, MPI_Comm Comm)
     if(K < 1 || K > SUBHALO_MAXTRACERS)
         endrun(1, "SubhaloNumTracerHostFinding = %d outside [1, %d].\n", K, SUBHALO_MAXTRACERS);
     /* own-bound live tracer-type particles (H6: a swallowed BH neither votes nor counts) */
-    for(i = 0; i < PartManager->NumPart; i++) {
-        const struct particle_data * p = &P[i];
-        if(part_live(p) && p->TrackId >= 0 && p->BoundTrackId == p->TrackId && ((TracerTypes >> p->Type) & 1))
-            n++;
-    }
+#define VOTE_PRED (part_live(&P[i]) && P[i].TrackId >= 0 && P[i].BoundTrackId == P[i].TrackId && ((TracerTypes >> P[i].Type) & 1))
+    const int nc = subhalo_par_nchunks(PartManager->NumPart);
+    int64_t * off = ta_malloc("SubVoteOff", int64_t, nc + 1);
+    SUBHALO_COUNT_CHUNKS(PartManager->NumPart, nc, off, VOTE_PRED);
+    n = off[nc];
     struct TracerTuple * v = (struct TracerTuple *) mymalloc("SubTracers", sizeof(struct TracerTuple) * (n + 1));
-    n = 0;
-    for(i = 0; i < PartManager->NumPart; i++) {
-        const struct particle_data * p = &P[i];
-        if(part_live(p) && p->TrackId >= 0 && p->BoundTrackId == p->TrackId && ((TracerTypes >> p->Type) & 1)) {
-            v[n].TrackId = p->TrackId;
-            v[n].GrNr = p->GrNr >= 0 ? p->GrNr : -1;
-            v[n].ID = p->ID;
-            v[n].BindRank = p->BindRank;
-            v[n].pad = 0;
-            n++;
-        }
-    }
+    SUBHALO_FILL_CHUNKS(PartManager->NumPart, nc, off, VOTE_PRED, {
+            const struct particle_data * p = &P[i];
+            v[m].TrackId = p->TrackId;
+            v[m].GrNr = p->GrNr >= 0 ? p->GrNr : -1;
+            v[m].ID = p->ID;
+            v[m].BindRank = p->BindRank;
+            v[m].pad = 0;
+        });
+#undef VOTE_PRED
+    ta_free(off);
     qsort_openmp(v, n, sizeof(struct TracerTuple), cmp_tracertuple);
     n = keep_first_tracers(v, n, K);
 
@@ -283,43 +282,53 @@ subhalo_previous_frames(struct SubTrackTable * tab, MPI_Comm Comm)
     int64_t i, j;
     int k;
 
-    int64_t nb = 0;
-    for(i = 0; i < PartManager->NumPart; i++)
-        if(part_live(&P[i]) && P[i].BoundTrackId >= 0)
-            nb++;
+#define FRAME_PRED (part_live(&P[i]) && P[i].BoundTrackId >= 0)
+    const int nc = subhalo_par_nchunks(PartManager->NumPart);
+    int64_t * off = ta_malloc("SubFrameOff", int64_t, nc + 1);
+    SUBHALO_COUNT_CHUNKS(PartManager->NumPart, nc, off, FRAME_PRED);
+    int64_t nb = off[nc];
     struct BoundIndex * idx = (struct BoundIndex *) mymalloc("SubFrameIdx", sizeof(struct BoundIndex) * (nb + 1));
-    nb = 0;
-    for(i = 0; i < PartManager->NumPart; i++)
-        if(part_live(&P[i]) && P[i].BoundTrackId >= 0) {
-            idx[nb].TrackId = P[i].BoundTrackId;
-            idx[nb].ID = P[i].ID;
-            idx[nb].i = i;
-            nb++;
-        }
+    SUBHALO_FILL_CHUNKS(PartManager->NumPart, nc, off, FRAME_PRED, {
+            idx[m].TrackId = P[i].BoundTrackId;
+            idx[m].ID = P[i].ID;
+            idx[m].i = i;
+        });
+#undef FRAME_PRED
+    ta_free(off);
     /* ID order makes the local sums independent of the particle order */
     qsort_openmp(idx, nb, sizeof(struct BoundIndex), cmp_boundindex);
-    int64_t ns = 0;
-    for(i = 0; i < nb; i++)
-        if(i == 0 || idx[i].TrackId != idx[i-1].TrackId)
-            ns++;
+    /* the first entry of every track (threaded, order-preserving) */
+#define TRACK_START(i) ((i) == 0 || idx[i].TrackId != idx[(i)-1].TrackId)
+    const int ncb = subhalo_par_nchunks(nb);
+    int64_t * offb = ta_malloc("SubFrameOffB", int64_t, ncb + 1);
+    SUBHALO_COUNT_CHUNKS(nb, ncb, offb, TRACK_START(i));
+    const int64_t ns = offb[ncb];
+    int64_t * tstart = (int64_t *) mymalloc("SubFrameStart", sizeof(int64_t) * (ns + 1));
+    SUBHALO_FILL_CHUNKS(nb, ncb, offb, TRACK_START(i), tstart[m] = i);
+#undef TRACK_START
+    tstart[ns] = nb;
+    ta_free(offb);
+    int64_t s;
 
     /* 1. the common reference of every track (H7): local candidates to the home rank, the
      *    minimum back to every holder in request order */
     struct FrameRef * myref = (struct FrameRef *) mymalloc("SubFrameRef", sizeof(struct FrameRef) * (ns + 1));
-    int64_t s = -1;
-    for(i = 0; i < nb; i++) {
-        const struct particle_data * p = &P[idx[i].i];
-        struct FrameRef c;
-        c.TrackId = idx[i].TrackId;
-        c.notown = p->TrackId != idx[i].TrackId;
-        c.ID = p->ID;
-        c.BindRank = p->BindRank;
-        for(k = 0; k < 3; k++)
-            c.Pos[k] = p->Pos[k];
-        if(i == 0 || idx[i].TrackId != idx[i-1].TrackId)
-            myref[++s] = c;
-        else if(framereef_less(&c, &myref[s]))
-            myref[s] = c;
+    #pragma omp parallel for private(i, k)
+    for(s = 0; s < ns; s++) {
+        for(i = tstart[s]; i < tstart[s + 1]; i++) {
+            const struct particle_data * p = &P[idx[i].i];
+            struct FrameRef c;
+            c.TrackId = idx[i].TrackId;
+            c.notown = p->TrackId != idx[i].TrackId;
+            c.ID = p->ID;
+            c.BindRank = p->BindRank;
+            for(k = 0; k < 3; k++)
+                c.Pos[k] = p->Pos[k];
+            if(i == tstart[s])
+                myref[s] = c;
+            else if(framereef_less(&c, &myref[s]))
+                myref[s] = c;
+        }
     }
     int64_t * sendcounts = ta_malloc("SubFrameCounts", int64_t, NTask);
     int64_t * recvcounts = ta_malloc("SubFrameRecvCounts", int64_t, NTask);
@@ -367,22 +376,22 @@ subhalo_previous_frames(struct SubTrackTable * tab, MPI_Comm Comm)
 
     /* 2. local sums relative to the common reference, in ID order */
     struct FrameSum * sums = (struct FrameSum *) mymalloc("SubFrameSums", sizeof(struct FrameSum) * (ns + 1));
-    s = -1;
-    for(i = 0; i < nb; i++) {
-        if(i == 0 || idx[i].TrackId != idx[i-1].TrackId) {
-            s++;
-            memset(&sums[s], 0, sizeof(struct FrameSum));
-            sums[s].TrackId = idx[i].TrackId;
-            for(k = 0; k < 3; k++)
-                sums[s].ref[k] = myref[s].Pos[k];
-        }
-        const struct particle_data * p = &P[idx[i].i];
-        const double m = p->Mass;
-        sums[s].count++;
-        sums[s].mass += m;
-        for(k = 0; k < 3; k++) {
-            sums[s].mdx[k] += m * NEAREST(p->Pos[k] - sums[s].ref[k], BoxSize);
-            sums[s].mv[k] += m * p->Vel[k];
+    /* per track in ID order, as before; the tracks in parallel */
+    #pragma omp parallel for private(i, k)
+    for(s = 0; s < ns; s++) {
+        memset(&sums[s], 0, sizeof(struct FrameSum));
+        sums[s].TrackId = idx[tstart[s]].TrackId;
+        for(k = 0; k < 3; k++)
+            sums[s].ref[k] = myref[s].Pos[k];
+        for(i = tstart[s]; i < tstart[s + 1]; i++) {
+            const struct particle_data * p = &P[idx[i].i];
+            const double m = p->Mass;
+            sums[s].count++;
+            sums[s].mass += m;
+            for(k = 0; k < 3; k++) {
+                sums[s].mdx[k] += m * NEAREST(p->Pos[k] - sums[s].ref[k], BoxSize);
+                sums[s].mv[k] += m * p->Vel[k];
+            }
         }
     }
     struct FrameSum * in = NULL;
@@ -429,6 +438,7 @@ subhalo_previous_frames(struct SubTrackTable * tab, MPI_Comm Comm)
     ta_free(recvcounts);
     ta_free(sendcounts);
     myfree(myref);
+    myfree(tstart);
     myfree(idx);
     int64_t tot = 0;
     MPI_Allreduce(&nframes, &tot, 1, MPI_INT64, MPI_SUM, Comm);
@@ -684,7 +694,10 @@ pack_head(const struct HeadKey * hk, int64_t nh, const struct RankBudget * rb, i
     int r, d;
     struct HeadOrder * ord = (struct HeadOrder *) mymalloc("SubHeadOrder", sizeof(struct HeadOrder) * (nh + 1));
     for(k = 0; k < nh; k++) {
-        ord[k].cost = subhalo_key_cost((int64_t) hk[k].dims[0]);
+        /* Phase 5d: without the member term: the directory's Tags counts a track once per rank
+         * holding its particles, which misled the packing at 8 and 16 ranks (rank imbalance
+         * 1.36 -> 1.85 at 16 x 8, a = 1); subhalo_run_serial_keys has the exact count */
+        ord[k].cost = subhalo_key_cost((int64_t) hk[k].dims[0], 0);
         ord[k].g = hk[k].g;
         ord[k].i = k;
     }
@@ -1011,7 +1024,7 @@ subhalo_plan_pack(struct SubhaloDirKey * dk, int64_t ndir, const struct SubhaloD
                 tl[d] += dims[d];
                 if(dims[d] > tmax[d]) tmax[d] = dims[d];
             }
-            tl[PLAN_NDIM] += subhalo_key_cost(dk[k].Length);
+            tl[PLAN_NDIM] += subhalo_key_cost(dk[k].Length, 0);     /* no member term, as the head */
         }
         double TailN[PLAN_NDIM + 1], TailMax[PLAN_NDIM];
         MPI_Allreduce(tl, TailN, PLAN_NDIM + 1, MPI_DOUBLE, MPI_SUM, Comm);
@@ -1241,17 +1254,18 @@ query_field_keys(struct SubTrackTable * tab, struct SubhaloTrackKey ** mapout, i
 {
     const int NTask = tab->NTask;
     int64_t i, n = 0;
-    for(i = 0; i < PartManager->NumPart; i++)
-        if(part_live(&P[i]) && (home_only ? P[i].GrNr == -1 : P[i].GrNr < 0) && P[i].TrackId >= 0)
-            n++;
+#define FK_PRED (part_live(&P[i]) && (home_only ? P[i].GrNr == -1 : P[i].GrNr < 0) && P[i].TrackId >= 0)
+    const int nc = subhalo_par_nchunks(PartManager->NumPart);
+    int64_t * off = ta_malloc("SubFKOff", int64_t, nc + 1);
+    SUBHALO_COUNT_CHUNKS(PartManager->NumPart, nc, off, FK_PRED);
+    n = off[nc];
     struct SubhaloTrackKey * map = (struct SubhaloTrackKey *) mymalloc("SubFieldKeys", sizeof(struct SubhaloTrackKey) * (n + 1));
-    n = 0;
-    for(i = 0; i < PartManager->NumPart; i++)
-        if(part_live(&P[i]) && (home_only ? P[i].GrNr == -1 : P[i].GrNr < 0) && P[i].TrackId >= 0) {
-            map[n].TrackId = P[i].TrackId;
-            map[n].Key = -1;
-            n++;
-        }
+    SUBHALO_FILL_CHUNKS(PartManager->NumPart, nc, off, FK_PRED, {
+            map[m].TrackId = P[i].TrackId;
+            map[m].Key = -1;
+        });
+#undef FK_PRED
+    ta_free(off);
     qsort_openmp(map, n, sizeof(struct SubhaloTrackKey), cmp_trackkey);
     int64_t nu = 0;
     for(i = 0; i < n; i++)
@@ -1431,6 +1445,9 @@ plan_key_centres(const int64_t * O, int64_t nO, int64_t TotNgroups, const struct
     int64_t i, k;
     int d;
     const double BoxSize = PartManager->BoxSize;
+    /* nO is the same on every rank (the reductions below are guarded by it): nothing to do */
+    if(nO == 0)
+        return;
     MyIDType * idmin = (MyIDType *) mymalloc("SubCenId", sizeof(MyIDType) * (nO + 1));
     MyIDType * gidmin = (MyIDType *) mymalloc("SubCenIdG", sizeof(MyIDType) * (nO + 1));
     double * ref = (double *) mymalloc("SubCenRef", sizeof(double) * 3 * (nO + 1));
@@ -1816,32 +1833,53 @@ plan_census_pass(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubTra
     /* ---- local census: (key, type) counts and distinct tags of the particles of the keys ---- */
     struct SubhaloPlanRes res;
     memset(&res, 0, sizeof(res));
-    int64_t ngrp = 0;
-    for(i = 0; i < PartManager->NumPart; i++) {
-        if(P[i].IsGarbage) continue;
-        res.NumLive++;
-        if(part_live(&P[i]) ? plan_key(&P[i], fkmap, nfk, mem, nmem) >= 0 : P[i].GrNr >= 0) ngrp++;
+    /* threaded and order-preserving (Phase 5d): chunk counts, offsets, chunk fills; a swallowed
+     * BH in a group stays in its group key (FOF counted it); a swallowed tagged field BH stays
+     * home */
+#define CENSUS_KEY(i) (part_live(&P[i]) ? plan_key(&P[i], fkmap, nfk, mem, nmem) : P[i].GrNr)
+    const int64_t NumPart = PartManager->NumPart;
+    const int nc = subhalo_par_nchunks(NumPart);
+    int64_t * off = ta_malloc("SubCensusOff", int64_t, nc + 1);
+    int64_t numlive = 0;
+    int c;
+    off[0] = 0;
+    #pragma omp parallel for reduction(+: numlive)
+    for(c = 0; c < nc; c++) {
+        int64_t cnt = 0, j;
+        for(j = c * NumPart / nc; j < (c + 1) * NumPart / nc; j++) {
+            if(P[j].IsGarbage) continue;
+            numlive++;
+            if(CENSUS_KEY(j) >= 0) cnt++;
+        }
+        off[c + 1] = cnt;
     }
+    for(c = 0; c < nc; c++)
+        off[c + 1] += off[c];
+    res.NumLive = numlive;
+    int64_t ngrp = off[nc];
     /* On the top so that it can be freed while the census messages (bottom) live on. */
     struct CensusPart * gt = (struct CensusPart *) mymalloc2("SubCensusKeys", sizeof(struct CensusPart) * (ngrp + 1));
-    ngrp = 0;
     int badgrnr = 0;
-    for(i = 0; i < PartManager->NumPart; i++) {
-        if(P[i].IsGarbage) continue;
-        /* a swallowed BH in a group stays in its group key (FOF counted it); a swallowed
-         * tagged field BH stays home */
-        const int64_t key = part_live(&P[i]) ? plan_key(&P[i], fkmap, nfk, mem, nmem) : P[i].GrNr;
-        if(key < 0) continue;
-        if(P[i].GrNr >= 0 && P[i].GrNr > TotNgroups)
-            badgrnr = 1;
-        if(key < 1 || key > TotKeys)
-            badgrnr = 1;
-        gt[ngrp].g = key;
-        gt[ngrp].TrackId = P[i].TrackId;
-        gt[ngrp].type = P[i].Type;
-        gt[ngrp].field = P[i].GrNr < 0;
-        ngrp++;
+    #pragma omp parallel for reduction(|: badgrnr)
+    for(c = 0; c < nc; c++) {
+        int64_t m = off[c], j;
+        for(j = c * NumPart / nc; j < (c + 1) * NumPart / nc; j++) {
+            if(P[j].IsGarbage) continue;
+            const int64_t key = CENSUS_KEY(j);
+            if(key < 0) continue;
+            if(P[j].GrNr >= 0 && P[j].GrNr > TotNgroups)
+                badgrnr = 1;
+            if(key < 1 || key > TotKeys)
+                badgrnr = 1;
+            gt[m].g = key;
+            gt[m].TrackId = P[j].TrackId;
+            gt[m].type = P[j].Type;
+            gt[m].field = P[j].GrNr < 0;
+            m++;
+        }
     }
+#undef CENSUS_KEY
+    ta_free(off);
     if(badgrnr)
         endrun(5, "Subhalo plan: particle key outside [1, %ld] (%ld groups).\n", TotKeys, TotNgroups);
     qsort_openmp(gt, ngrp, sizeof(struct CensusPart), cmp_censuspart);
@@ -2793,38 +2831,156 @@ order_by_key_track_rank(const void * a, const void * b)
     return (pa->ID > pb->ID) - (pa->ID < pb->ID);
 }
 
+/* Phase 5d: the sort record of a particle, the keys of order_by_key_track_rank and the index in
+ * 32 bytes, so that qsort_openmp sorts it directly (cache-local comparisons, threaded merges)
+ * and the particles move once (permute_openmp). The index is the last key: the order equals the
+ * stable sort of P by order_by_key_track_rank. */
+struct LocalSortRec {
+    int64_t key;
+    int64_t TrackId;
+    MyIDType ID;
+    int32_t BindRank;
+    uint32_t gi;    /* bit 31: IsGarbage; bits 0-30: the index in P */
+};
+
+static int
+cmp_localsortrec(const void * a, const void * b)
+{
+    const struct LocalSortRec * x = (const struct LocalSortRec *) a, * y = (const struct LocalSortRec *) b;
+    const uint32_t gx = x->gi >> 31, gy = y->gi >> 31;
+    if(gx != gy)
+        return (gx > gy) - (gx < gy);
+    if(x->key != y->key)
+        return (x->key > y->key) - (x->key < y->key);
+    if(x->TrackId != y->TrackId)
+        return (x->TrackId > y->TrackId) - (x->TrackId < y->TrackId);
+    if(x->BindRank != y->BindRank)
+        return (x->BindRank > y->BindRank) - (x->BindRank < y->BindRank);
+    if(x->ID != y->ID)
+        return (x->ID > y->ID) - (x->ID < y->ID);
+    const uint32_t ix = x->gi & 0x7fffffffu, iy = y->gi & 0x7fffffffu;
+    return (ix > iy) - (ix < iy);
+}
+
+static int LocalSortMode = 0;
+
+void
+subhalo_local_sort_set_mode(int mode)
+{
+    LocalSortMode = mode;
+}
+
+int
+subhalo_par_nchunks(int64_t n)
+{
+    int64_t nc = 4 * (int64_t) omp_get_max_threads();
+    if(nc > n / 4096 + 1)
+        nc = n / 4096 + 1;
+    return nc > 0 ? (int) nc : 1;
+}
+
+/* Bytes of the record sort beyond the particle table: the records and qsort_openmp's copy, then
+ * the records, the source and cycle lists and the bitmaps of permute_openmp. */
+static double
+local_sort_bytes(int64_t n)
+{
+    return 64. * (double) (n + 1) + 2. * (n / 8 + 1) + 4. * 4096. + 2. * (double) sizeof(struct particle_data) * (n / 1024 + 2)
+        + (double) sizeof(struct particle_data) * omp_get_max_threads() + 65536.;
+}
+
 void
 subhalo_local_sort(void)
 {
-    qsort_openmp(PartManager->Base, PartManager->NumPart, sizeof(struct particle_data), order_by_key_track_rank);
+    const int64_t n = PartManager->NumPart;
+    /* the record sort when the index fits and the memory allows it (it needs 64 bytes per
+     * particle, the planner reserves 32 per MaxPart); otherwise the indirect sort of P (two
+     * pointers per particle). Both give the same order. */
+    if(LocalSortMode == 1 || n >= (int64_t) INT32_MAX || local_sort_bytes(n) > (double) mymalloc_freebytes()) {
+        qsort_openmp(PartManager->Base, n, sizeof(struct particle_data), order_by_key_track_rank);
+        return;
+    }
+    struct LocalSortRec * rec = (struct LocalSortRec *) mymalloc("SubSortRec", sizeof(struct LocalSortRec) * (n + 1));
+    int64_t i;
+    #pragma omp parallel for
+    for(i = 0; i < n; i++) {
+        const struct particle_data * p = &P[i];
+        rec[i].key = subhalo_particle_key(p);
+        rec[i].TrackId = p->TrackId;
+        rec[i].ID = p->ID;
+        rec[i].BindRank = p->BindRank;
+        rec[i].gi = (uint32_t) i | (p->IsGarbage ? 0x80000000u : 0u);
+    }
+    qsort_openmp(rec, n, sizeof(struct LocalSortRec), cmp_localsortrec);
+    int * src = (int *) mymalloc("SubSortSrc", sizeof(int) * (n + 1));
+    int * order = (int *) mymalloc("SubSortOrder", sizeof(int) * (n + 1));
+    #pragma omp parallel for
+    for(i = 0; i < n; i++)
+        src[i] = (int) (rec[i].gi & 0x7fffffffu);
+    permute_openmp(PartManager->Base, n, sizeof(struct particle_data), src, order);
+    myfree(order);
+    myfree(src);
+    myfree(rec);
 }
 
 int64_t
 subhalo_build_segments(const struct SubhaloPlan * plan, struct SubhaloKeySeg ** segs)
 {
-    int64_t i, n = 0;
     const int64_t NumPart = PartManager->NumPart;
-    for(i = 0; i < NumPart && !P[i].IsGarbage; i++)
-        if(subhalo_particle_key(&P[i]) >= 0 && (i == 0 || subhalo_particle_key(&P[i]) != subhalo_particle_key(&P[i-1])))
-            n++;
+    int64_t i, nlive = 0;
+    /* the live particles are a prefix after the sort */
+    #pragma omp parallel for reduction(+: nlive)
+    for(i = 0; i < NumPart; i++)
+        if(!P[i].IsGarbage)
+            nlive++;
+    /* the segment starts in order (chunked, order-preserving) */
+#define SEG_START(i) (subhalo_particle_key(&P[i]) >= 0 && ((i) == 0 || subhalo_particle_key(&P[i]) != subhalo_particle_key(&P[(i)-1])))
+    const int nc = subhalo_par_nchunks(nlive);
+    int64_t * off = ta_malloc("SubSegOff", int64_t, nc + 1);
+    int c;
+    off[0] = 0;
+    #pragma omp parallel for
+    for(c = 0; c < nc; c++) {
+        int64_t cnt = 0, j;
+        for(j = c * nlive / nc; j < (c + 1) * nlive / nc; j++)
+            if(SEG_START(j))
+                cnt++;
+        off[c + 1] = cnt;
+    }
+    for(c = 0; c < nc; c++)
+        off[c + 1] += off[c];
+    const int64_t n = off[nc];
     struct SubhaloKeySeg * s = (struct SubhaloKeySeg *) mymalloc2("SubKeySegs", sizeof(struct SubhaloKeySeg) * (n + 1));
-    int64_t k = 0, nserial = 0;
+    #pragma omp parallel for
+    for(c = 0; c < nc; c++) {
+        int64_t m = off[c], j;
+        for(j = c * nlive / nc; j < (c + 1) * nlive / nc; j++)
+            if(SEG_START(j))
+                s[m++].start = j;
+    }
+#undef SEG_START
+    ta_free(off);
+    int64_t k, nserial = 0;
     int bad = 0;
-    for(i = 0; i < NumPart && !P[i].IsGarbage; ) {
-        const int64_t key = subhalo_particle_key(&P[i]);
-        if(key < 0) {
-            i++;
-            continue;
-        }
-        int64_t j = i;
-        while(j < NumPart && !P[j].IsGarbage && subhalo_particle_key(&P[j]) == key)
+    #pragma omp parallel for reduction(+: nserial) reduction(|: bad)
+    for(k = 0; k < n; k++) {
+        struct SubhaloKeySeg * seg = &s[k];
+        const int64_t start = seg->start;
+        const int64_t key = subhalo_particle_key(&P[start]);
+        int64_t j = start;
+        while(j < nlive && subhalo_particle_key(&P[j]) == key)
             j++;
-        struct SubhaloKeySeg * seg = &s[k++];
         memset(seg, 0, sizeof(*seg));
         seg->g = key;
-        seg->start = i;
-        seg->n = j - i;
+        seg->start = start;
+        seg->n = j - start;
         seg->ipindex = -1;
+        /* the particles of a key are sorted by TrackId: count the distinct tags */
+        {
+            int64_t q;
+            for(q = start; q < j; q++)
+                if(P[q].TrackId >= 0 && (q == start || P[q].TrackId != P[q-1].TrackId))
+                    seg->Tracks++;
+        }
         struct SubhaloAssignedKey akey = {seg->g, 0};
         const struct SubhaloAssignedKey * a = (const struct SubhaloAssignedKey *)
             bsearch(&akey, plan->Assigned, plan->NAssigned, sizeof(akey), cmp_assigned_g);
@@ -2853,7 +3009,6 @@ subhalo_build_segments(const struct SubhaloPlan * plan, struct SubhaloKeySeg ** 
                     seg->ref[d] = ip->ref[d];
             }
         }
-        i = j;
     }
     if(nserial != plan->NAssigned)
         bad = 1;
@@ -2978,14 +3133,14 @@ subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t
     ns = 0;
     for(k = 0; k < nsegs; k++)
         if(!segs[k].inplace) {
-            ord[ns].cost = subhalo_key_cost(segs[k].n);
+            ord[ns].cost = subhalo_key_cost(segs[k].n, segs[k].Tracks);
             ord[ns].n = segs[k].n;
             ord[ns].g = segs[k].g;
             ord[ns].k = k;
             totalcost += ord[ns].cost;
             ns++;
         }
-    /* the cost is increasing in n: the same order as longest first */
+    /* most expensive first, ties by g */
     qsort(ord, ns, sizeof(struct KeyOrder), cmp_keyorder);
 #define KEY_ARENA_BYTES(kk) ((size_t) bytes_per_part * (size_t) segs[kk].n + (size_t) (extra ? extra[kk] : 0) + 64)
     double peakfrac = 0;
@@ -3094,6 +3249,20 @@ subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t
     }
     for(k = nalone; k < ns; k++)
         serial_stats_key(kt[k], ord[k].n, 0);
+    {
+        /* DBG Phase 5d calibration dump (scratch build only) */
+        const char * dp = getenv("SUBHALO_KEYTIME_DUMP");
+        if(dp) {
+            int rank;
+            MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+            char fn[1024];
+            snprintf(fn, sizeof(fn), "%s.%d", dp, rank);
+            FILE * fp = fopen(fn, "a");
+            for(k = nalone; k < ns; k++)
+                fprintf(fp, "%ld %ld %g %d\n", ord[k].n, segs[ord[k].k].Tracks, kt[k], nthreads);
+            fclose(fp);
+        }
+    }
     for(t = 0; t < nthreads; t++)
         if(tpeak[t] > peakfrac)
             peakfrac = tpeak[t];

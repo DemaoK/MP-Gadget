@@ -372,6 +372,33 @@ so2_ngbiter(TreeWalkQuerySO2 * I, TreeWalkResultSO2 * O, TreeWalkNgbIterBase * i
 
 /* ------------------------------------------------------------------ the walks */
 
+/* Phase 5d: the export tables the treewalk sizes from the free memory (NThread x BunchSize
+ * data_index entries) are elastic, not a requirement of the field SO. Every walk replaces them
+ * in the main allocator's low-water mark by the free bytes it would have had without them, so
+ * that the finder's per-stage high water measures its own needs; the true low-water mark of the
+ * walks (the absolute high water, SubhaloPeakBytes) and the largest tables are kept here. */
+static size_t SOWalkMinFree = (size_t) -1;
+static double SOWalkElastic = 0;
+
+void
+subhalo_so_elastic_reset(void)
+{
+    SOWalkMinFree = (size_t) -1;
+    SOWalkElastic = 0;
+}
+
+size_t
+subhalo_so_elastic_min_free(void)
+{
+    return SOWalkMinFree;
+}
+
+double
+subhalo_so_elastic_bytes(void)
+{
+    return SOWalkElastic;
+}
+
 /* One collective walk over the queries rows[batch[0..nq)) (nq may be 0 on any rank). */
 static void
 so_walk(int pass, struct so_priv * pv, int64_t nq, ForceTree * tree)
@@ -403,7 +430,22 @@ so_walk(int pass, struct so_priv * pv, int64_t nq, ForceTree * tree)
         memset(pv->acc, 0, nq * pv->accsize);
     /* the anchors are live particles, distinct and ascending: with haswork NULL and an active
      * set the treewalk takes the list as its queue */
+    const size_t lowbefore = allocator_get_min_free(A_MAIN);
     treewalk_run(tw, (int *) pv->anchor, nq);
+    if(!A_MAIN->use_malloc) {
+        const size_t lowwalk = allocator_get_min_free(A_MAIN);
+        const double elastic = (double) tw->NThread * (double) tw->BunchSize * sizeof(data_index);
+        if(lowwalk < SOWalkMinFree)
+            SOWalkMinFree = lowwalk;
+        if(elastic > SOWalkElastic)
+            SOWalkElastic = elastic;
+        /* the walk's low point without its export tables (they live through every iteration of
+         * the walk, together with the walk's other buffers) */
+        size_t adj = lowwalk + (size_t) elastic;
+        if(adj > lowbefore)
+            adj = lowbefore;
+        A_MAIN->minfree = adj;
+    }
 }
 
 /* Log-linear interpolation of M(<r) between (ra, Ma) (density above K = 4/3 pi rho) and
