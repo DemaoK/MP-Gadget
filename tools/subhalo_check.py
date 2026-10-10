@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Scripted integration checks for Phase 1 of the runtime subhalo finder
-(halofinder_phase1_plan.md section 6). Every subcommand exits 0 on success and 1 on a failed
-check, printing each failure; 2 means the input could not be read.
+"""Scripted integration checks for the runtime subhalo finder: Phase 1
+(halofinder_phase1_plan.md section 6) and Phase 2a (halofinder_phase2a_plan.md section 6).
+Every subcommand exits 0 on success and 1 on a failed check, printing each failure; 2 means the
+input could not be read.
 
   offon OFFDIR ONDIR          check 1: PART_000 byte-identical between the finder-off and -on
                               runs (a warning plus a by-ID roundoff check if not, since MP-Gadget
@@ -10,21 +11,50 @@ check, printing each failure; 2 means the input could not be read.
                               later PART_nnn matched by ID (max displacement report);
                               PIG_000 FOFGroups identical, finder blocks present and complete.
   consistency PIGDIR [...]    check 2: the reader rules on one or more PIGs (groups = subhalos,
-                              slices tile the groups, BindRank dense, bound prefixes, counts).
-  tracking PIG_prev PIG_next  check 3: winners, newborn numbering, sinks and hostless tracks,
-                              recomputed from the two PIGs with the Phase 1 rule.
+                              slices tile the groups, BindRank dense, bound prefixes, counts);
+                              --no-phase1 for Phase 2a catalogues.
+  tracking PIG_prev PIG_next  check 3: host votes, centrals, newborn numbering, sinks,
+                              resurrections, recomputed from the two PIGs. Default: the Phase 2a
+                              rules (weighted ten-tracer vote); --phase1-vote: the Phase 1 rules
+                              (majority vote over every own-bound particle, the most massive
+                              candidate wins, the others sink). The vote runs over the current
+                              population (PIG_next's saved rows, or --part PART_next) with pre-call
+                              tags joined from PIG_prev as the restart join does (exact ID first,
+                              else a spawned child inherits its generation-0 base's record);
+                              previously tagged particles absent from it are omitted (Phase 1) or
+                              make a Phase 2a vote inconclusive (a warning) unless --part is given.
+  hierarchy PIGDIR [...]      Phase 2a: Depth(child) = Depth(parent) + 1, parents hosted in the
+                              same group, CentralTrackId the Rank 0 member of its HostGroup, Rank
+                              dense per group with Ranks 1.. by Mbound descending; hostless tracks
+                              are their own centrals.
+  tags PIGDIR [...]           Phase 2a (D10): own-tag BindRank dense with the exclusive bound
+                              prefix first, BoundTrackId the tag, an ancestor of it, or -1, the
+                              SubhaloMinNumTracerPart lowest ranks of each track of a tracer type
+                              (SubhaloTracerTypes), NboundExclusive <= Nbound, and the full bound
+                              list (every row with BoundTrackId == T, inside T's key) has Nbound
+                              members, NboundType per type, NboundTracer tracers, MboundType mass.
+                              --phase1 for Phase 1 PIGs (section 1 holds stale tags there).
+  orphans PIGDIR [...]        Orphan/*: TracerPos inside the box, SnapTracerLost -1 or <= the
+                              snapshot, Snap* ordering, SinkTrackId / DescendantTrackId /
+                              NestedParentTrackId / CentralTrackId refer to existing tracks.
   compare PIG_A PIG_B         check 5: every Subhalo/* and Orphan/* column equal after sorting by
                               TrackId, and the per-particle tags equal when matched by ID.
   markincomplete PIGDIR       check 6 helper: set Header SubhaloStateComplete (default 0).
   tagcounts PIGDIR            tagged particles per type (to compare with the run log, check 4).
 
 Examples (from the directory holding the run outputs):
-  python3 tools/subhalo_check_phase1.py offon off/output on/output
-  python3 tools/subhalo_check_phase1.py consistency on/output/PIG_00?
-  python3 tools/subhalo_check_phase1.py tracking on/output/PIG_000 on/output/PIG_001
-  python3 tools/subhalo_check_phase1.py compare on/output/PIG_001 offline/output/PIG_001
-  python3 tools/subhalo_check_phase1.py markincomplete restart/output/PIG_001
-  python3 tools/subhalo_check_phase1.py tagcounts on/output/PIG_001
+  python3 tools/subhalo_check.py offon off/output on/output
+  python3 tools/subhalo_check.py consistency on/output/PIG_00?
+  python3 tools/subhalo_check.py tracking --phase1-vote on/output/PIG_000 on/output/PIG_001
+  python3 tools/subhalo_check.py compare on/output/PIG_001 offline/output/PIG_001
+  python3 tools/subhalo_check.py markincomplete restart/output/PIG_001
+  python3 tools/subhalo_check.py tagcounts on/output/PIG_001
+  python3 tools/subhalo_check.py consistency --no-phase1 output/PIG_00?      (Phase 2a)
+  python3 tools/subhalo_check.py hierarchy output/PIG_00?
+  python3 tools/subhalo_check.py tags output/PIG_00?
+  python3 tools/subhalo_check.py tags --phase1 on/output/PIG_00?               (Phase 1)
+  python3 tools/subhalo_check.py orphans output/PIG_00?
+  python3 tools/subhalo_check.py tracking output/PIG_003 output/PIG_004
 
 The Header attribute file format (BigFile attr-v2), used by the markincomplete fallback when the
 Python bigfile module cannot rewrite attributes: one attribute per line,
@@ -498,18 +528,30 @@ def check_consistency(pigdir, ck, phase1=True, expect_field="auto", allow_incomp
 
 
 def _check_bound_prefix(ck, tag, t, prefix, S, trow, starts, lengths, tracks, bt, br):
-    """SliceNbound/FieldSliceNbound: the first nb rows of the slice are bound to the track,
-    and BindRank (if given) is non-decreasing within the slice."""
+    """SliceNbound/FieldSliceNbound (audit H13): nb equals the number of rows of the slice bound to
+    the track (BoundTrackId == TrackId), those rows are exactly the first nb (prefix all bound,
+    suffix none), and BindRank (if given) is non-decreasing within the slice."""
     nb = S[prefix + "NboundByType"][trow, t].astype(np.int64)
     ck.check(np.all((nb >= 0) & (nb <= lengths)), "%s type %d: %sNboundByType outside [0, length]" % (tag, t, prefix))
-    nbad = 0
-    nrank = 0
-    for s, l, k, tid in zip(starts, lengths, nb, tracks):
-        if k > 0 and not np.all(bt[s:s + k] == tid):
-            nbad += 1
+    ncount = nprefix = nsuffix = nrank = 0
+    examples = []
+    for s, l, k, tid in zip(starts.tolist(), lengths.tolist(), nb.tolist(), tracks.tolist()):
+        own = bt[s:s + l] == tid
+        nown = int(np.count_nonzero(own))
+        if nown != k:
+            ncount += 1
+            if len(examples) < 5:
+                examples.append("%d: %d vs %d" % (tid, k, nown))
+        if k > 0 and not np.all(own[:k]):
+            nprefix += 1
+        if np.any(own[max(k, 0):]):
+            nsuffix += 1
         if br is not None and l > 1 and np.any(np.diff(br[s:s + l]) < 0):
             nrank += 1
-    ck.check(nbad == 0, "%s type %d: %d %s bound prefixes contain rows bound to another track" % (tag, t, nbad, prefix))
+    ck.check(ncount == 0, "%s type %d: %d %s slices whose %sNboundByType differs from their rows bound to the track "
+             "(TrackId: recorded vs counted %s)" % (tag, t, ncount, prefix, prefix, ", ".join(examples)))
+    ck.check(nprefix == 0, "%s type %d: %d %s bound prefixes contain rows bound to another track" % (tag, t, nprefix, prefix))
+    ck.check(nsuffix == 0, "%s type %d: %d %s slices have rows bound to the track after the bound prefix" % (tag, t, nsuffix, prefix))
     if br is not None:
         ck.check(nrank == 0, "%s type %d: %d %s slices not ordered by BindRank" % (tag, t, nrank, prefix))
 
@@ -544,33 +586,39 @@ def _all_types(cat, names, section=None):
 
 
 def cmd_tracking(args):
-    ck = Checker("tracking %s -> %s" % (args.prev, args.next))
+    rule = "Phase 1 majority vote" if args.phase1_vote else "Phase 2a weighted ten-tracer vote"
+    ck = Checker("tracking %s -> %s (%s)" % (args.prev, args.next, rule))
     try:
         A, B = SubhaloCatalogue(args.prev), SubhaloCatalogue(args.next)
     except SubhaloFormatError as e:
         print("error: %s" % e)
         return 2
+    ck.check(A.complete() and B.complete(), "both PIGs must be complete (%s, %s)"
+             % (attr(A.header, "SubhaloStateComplete"), attr(B.header, "SubhaloStateComplete")))
+    if args.phase1_vote:
+        _tracking_phase1(ck, A, B, args)
+    else:
+        _tracking_phase2a(ck, A, B, args)
+    return ck.report()
+
+
+def _tracking_phase1(ck, A, B, args):
+    """The Phase 1 rules (halofinder_phase1_plan.md section 6, check 3)."""
     ha, hb = A.header, B.header
     snap_next = int(attr(hb, "SnapshotIndex", snapnum_of(args.next)))
-    ck.check(A.complete() and B.complete(), "both PIGs must be complete (%s, %s)"
-             % (attr(ha, "SubhaloStateComplete"), attr(hb, "SubhaloStateComplete")))
     ntr_a = int(attr(ha, "NumTracksTotal"))
     ntr_b = int(attr(hb, "NumTracksTotal"))
 
-    # previous tags (all saved rows: every tagged particle is saved) and next group membership
-    pa = _all_types(A, ["ID", "TrackId", "BoundTrackId"])
-    nb = _all_types(B, ["ID", "GroupRow"], section=0)
+    # host vote (audit H12): over the current population (every saved row of the next PIG, plus
+    # --part), with pre-call tags joined from the previous PIG; previously tagged particles absent
+    # from the next PIG are omitted (Phase 1 saves every surviving tagged particle, so they were
+    # removed). Largest count, ties to the smaller GroupID; "no group" only with a strict majority.
+    pop = precall_population(A, B, part=args.part, keep_absent=False)
     gid_b = B.groups["GroupID"]
-    bound = (pa["TrackId"] >= 0) & (pa["BoundTrackId"] == pa["TrackId"])
-    vid, vtr = pa["ID"][bound], pa["TrackId"][bound]
-    order = np.argsort(nb["ID"])
-    sid, sgr = nb["ID"][order], nb["GroupRow"][order]
-    pos = np.searchsorted(sid, vid)
-    found = (pos < sid.size) & (sid[np.minimum(pos, max(sid.size - 1, 0))] == vid) if sid.size else np.zeros(vid.size, bool)
-    vgrp = np.full(vid.size, -1, dtype=np.int64)
-    vgrp[found] = gid_b[sgr[pos[found]]]
-
-    # host vote: largest count, ties to the smaller GroupID; "no group" only with a strict majority
+    bound = (pop["TrackId"] >= 0) & (pop["BoundTrackId"] == pop["TrackId"])
+    vtr, vgrp = pop["TrackId"][bound], pop["GroupID"][bound]
+    print("  vote population: %d current particles (%d spawned children inheriting a tag), %d previously tagged "
+          "particles absent and omitted" % (pop["n_current"], pop["n_inherited"], pop["n_absent"]))
     host = {}
     if vtr.size:
         pairs, counts = np.unique(np.stack([vtr, vgrp], axis=1), axis=0, return_counts=True)
@@ -669,7 +717,640 @@ def cmd_tracking(args):
                          % (T, OB["SnapDeath"][r], snap_next))
     print("  %d groups, %d continued, %d newborn, %d hostless/dead candidates, %d new orphans"
           % (len(gid_b), len(gid_b) - len(newborn), len(newborn), nhostless, B.norphans - A.norphans))
-    return ck.report()
+
+
+# ---------------------------------------------------------------------------------- Phase 2a helpers
+def particles(cat, extra=()):
+    """Every saved row of every type with the tag blocks, as one dict of arrays:
+    Type, Row (row in <t>/), Section (0 in a group, 1 field), GroupID (the row's FOF GroupID, -1 in
+    section 1), ID, TrackId, BindRank (int64), BoundTrackId, plus the blocks named in extra
+    (e.g. "Mass") where present (NaN-free zeros otherwise)."""
+    names = ["ID", "TrackId", "BindRank", "BoundTrackId"] + list(extra)
+    out = {n: [] for n in names + ["Type", "Row", "Section", "GroupID"]}
+    gid = cat.groups["GroupID"]
+    for t in range(NTYPES):
+        ns = cat.nsaved(t)
+        if ns == 0 or not cat.has_particle_tags(t):
+            continue
+        ng = cat.ningroup(t)
+        out["Type"].append(np.full(ns, t, dtype=np.int32))
+        out["Row"].append(np.arange(ns, dtype=np.int64))
+        sec = np.ones(ns, dtype=np.int8)
+        sec[:ng] = 0
+        out["Section"].append(sec)
+        g = np.full(ns, -1, dtype=np.int64)
+        g[:ng] = np.repeat(gid, cat.groups["LengthByType"][:, t])
+        out["GroupID"].append(g)
+        for n in names:
+            if n in ("ID", "TrackId", "BindRank", "BoundTrackId") or "%d/%s" % (t, n) in cat.blocks:
+                a = cat.read(t, n)
+                if a.shape[0] != ns:
+                    raise SubhaloFormatError("%s: %d/%s has %d rows, %d saved" % (cat.pigdir, t, n, a.shape[0], ns))
+                out[n].append(a)
+            else:
+                out[n].append(np.zeros(ns, dtype=np.float64))
+    res = {}
+    for n, v in out.items():
+        res[n] = np.concatenate(v) if v else np.zeros(0, dtype=np.int64)
+    res["BindRank"] = res["BindRank"].astype(np.int64)
+    res["TrackId"] = res["TrackId"].astype(np.int64)
+    res["BoundTrackId"] = res["BoundTrackId"].astype(np.int64)
+    return res
+
+
+def lookup(sorted_keys, keys, values=None, default=-1):
+    """Positions (or values[position]) of keys in a sorted array; default where absent."""
+    keys = np.asarray(keys)
+    out = np.full(keys.shape, default, dtype=np.int64 if values is None else np.asarray(values).dtype)
+    if sorted_keys.size == 0 or keys.size == 0:
+        return out
+    pos = np.searchsorted(sorted_keys, keys)
+    posc = np.minimum(pos, sorted_keys.size - 1)
+    hit = sorted_keys[posc] == keys
+    out[hit] = posc[hit] if values is None else np.asarray(values)[posc[hit]]
+    return out
+
+
+ID_GEN_SHIFT = np.uint64(56)
+ID_BASE_MASK = np.uint64((1 << 56) - 1)
+
+
+def precall_population(A, B, part=None, keep_absent=True):
+    """The particles alive at the call that wrote PIG B, with their pre-call tags (audit H12).
+
+    Current population: every saved row of B (both sections), or with part = PART_xxx of the same
+    snapshot every particle in it (types and IDs; group membership still from B's section 0).
+    Pre-call tags are joined from A as the restart join does (subhalo_io.c): an exact saved ID
+    match takes the saved record (an untagged saved record gives untagged); otherwise a spawned
+    child (generation ID >> 56 > 0) inherits the record of its generation-0 base ID
+    (ID & (2^56 - 1)) when that is saved; otherwise untagged. GroupID is the current FOF GroupID
+    (-1 outside groups).
+
+    Previously tagged rows of A whose ID is not in the current population: without part they may
+    be removed particles or live field particles that the call left untagged (not saved); with
+    keep_absent they are appended with Absent = True and their A tags (GroupID -1), else dropped.
+    Returns a dict of arrays (ID, Type, GroupID, TrackId, BoundTrackId, BindRank, Absent) plus the
+    counts n_current, n_inherited, n_absent."""
+    PB = particles(B)
+    sec0 = PB["Section"] == 0
+    if part is not None:
+        fp = bigfile.File(part)
+        ids, typ = [], []
+        for t in range(NTYPES):
+            if "%d/ID" % t in fp.blocks:
+                a = fp["%d/ID" % t][:]
+                ids.append(a.astype(np.uint64))
+                typ.append(np.full(a.shape[0], t, np.int32))
+        cid = np.concatenate(ids) if ids else np.zeros(0, np.uint64)
+        ctyp = np.concatenate(typ) if typ else np.zeros(0, np.int32)
+        so = np.argsort(PB["ID"][sec0].astype(np.uint64))
+        cgid = lookup(PB["ID"][sec0].astype(np.uint64)[so], cid, PB["GroupID"][sec0][so], default=-1)
+    else:
+        cid, ctyp = PB["ID"].astype(np.uint64), PB["Type"]
+        cgid = PB["GroupID"].astype(np.int64)
+    PA = particles(A)
+    aid = PA["ID"].astype(np.uint64)
+    so = np.argsort(aid, kind="stable")
+    aid = aid[so]
+    arow = lookup(aid, cid)
+    gen = cid >> ID_GEN_SHIFT
+    base = cid & ID_BASE_MASK
+    brow = lookup(aid, base)
+    inherit = (arow < 0) & (gen > 0) & (brow >= 0)
+    src = np.where(arow >= 0, arow, np.where(inherit, brow, -1))
+    out = dict(ID=cid, Type=ctyp, GroupID=cgid)
+    for n in ("TrackId", "BoundTrackId", "BindRank"):
+        v = PA[n][so]
+        col = np.full(cid.size, -1, dtype=np.int64)
+        col[src >= 0] = v[src[src >= 0]]
+        out[n] = col
+    out["Absent"] = np.zeros(cid.size, bool)
+    cs = np.sort(cid)
+    absent = (PA["TrackId"][so] >= 0) & (lookup(cs, aid) < 0)
+    out["n_current"] = int(cid.size)
+    out["n_inherited"] = int(np.count_nonzero(inherit & (out["TrackId"] >= 0)))
+    out["n_absent"] = int(np.count_nonzero(absent))
+    if keep_absent and np.any(absent):
+        out["ID"] = np.concatenate([cid, aid[absent]])
+        out["Type"] = np.concatenate([ctyp, PA["Type"][so][absent]])
+        out["GroupID"] = np.concatenate([cgid, np.full(np.count_nonzero(absent), -1, np.int64)])
+        for n in ("TrackId", "BoundTrackId", "BindRank"):
+            out[n] = np.concatenate([out[n], PA[n][so][absent]])
+        out["Absent"] = np.concatenate([out["Absent"], np.ones(np.count_nonzero(absent), bool)])
+    return out
+
+
+def tracer_votes(pop, ntracers, tracer_types):
+    """Phase 2a host vote (plan section 1 steps 0 and 2) over a precall_population: the tracers of
+    track T are the ntracers lowest-BindRank (ties by ID) particles of a tracer type whose pre-call
+    tags have TrackId == BoundTrackId == T; tracer i votes with weight 1/(1 + sqrt(i)) for its
+    current GroupID (-1 outside groups); the largest weight wins, ties to the smaller GroupID (-1
+    first). Returns dict T -> (GroupID, near_tie, inconclusive): near_tie flags a runner-up within
+    1e-6; inconclusive flags a track one of whose ten tracers is an Absent row (removed, or a live
+    field particle left untagged and not saved: only a PART of the snapshot can tell)."""
+    sel = (pop["TrackId"] >= 0) & (pop["BoundTrackId"] == pop["TrackId"]) & np.isin(pop["Type"], tracer_types)
+    T, R, I = pop["TrackId"][sel], pop["BindRank"][sel], pop["ID"][sel]
+    G, X = pop["GroupID"][sel], pop["Absent"][sel]
+    o = np.lexsort((I, R, T))
+    T, G, X = T[o], G[o], X[o]
+    votes = {}
+    if T.size == 0:
+        return votes
+    ut, first, cnt = np.unique(T, return_index=True, return_counts=True)
+    pos = np.arange(T.size) - np.repeat(first, cnt)
+    keep = pos < ntracers
+    T, G, X, pos = T[keep], G[keep], X[keep], pos[keep]
+    inconcl = set(np.unique(T[X]).tolist())
+    w = 1.0 / (1.0 + np.sqrt(pos.astype(np.float64)))
+    pairs, inv = np.unique(np.stack([T, G], axis=1), axis=0, return_inverse=True)
+    wsum = np.bincount(inv.ravel(), weights=w, minlength=pairs.shape[0])
+    o = np.lexsort((pairs[:, 1], -wsum, pairs[:, 0]))
+    pairs, wsum = pairs[o], wsum[o]
+    tids, tstart, tcnt = np.unique(pairs[:, 0], return_index=True, return_counts=True)
+    for T_, s_, c_ in zip(tids.tolist(), tstart.tolist(), tcnt.tolist()):
+        near = c_ > 1 and abs(wsum[s_] - wsum[s_ + 1]) < 1e-6
+        votes[T_] = (int(pairs[s_, 1]), bool(near), T_ in inconcl)
+    return votes
+
+
+def _group_members(cat):
+    """(ID, GroupID) of every section-0 row of every type, i.e. FOF membership at this PIG."""
+    P = particles(cat)
+    m = P["Section"] == 0
+    return P["ID"][m], P["GroupID"][m]
+
+
+def _tracking_phase2a(ck, A, B, args):
+    """Phase 2a rules (halofinder_phase2a_plan.md section 1 steps 1, 2, 7b, 7d, 10)."""
+    snap_next = int(attr(B.header, "SnapshotIndex", snapnum_of(args.next)))
+    ntr_a = int(attr(A.header, "NumTracksTotal"))
+    ntr_b = int(attr(B.header, "NumTracksTotal"))
+    ntracers = args.ntracers or A.int_parameter("SubhaloNumTracerHostFinding", 10)
+    ratio = float(B.parameters().get("SubhaloMajorProgenitorMassRatio", 0.8))
+    SA, OA, SB, OB = A.subhalos, A.orphans, B.subhalos, B.orphans
+    gid_b = B.groups["GroupID"]
+    mid, mgid = _group_members(B)
+    pop = precall_population(A, B, part=args.part, keep_absent=args.part is None)
+    votes = tracer_votes(pop, ntracers, A.tracer_types())
+    print("  vote: %d lowest-BindRank own-bound tracers of types %s, weights 1/(1+sqrt(i)); "
+          "major-progenitor ratio %g" % (ntracers, A.tracer_types(), ratio))
+    print("  vote population: %d current particles (%d spawned children inheriting a tag), %d previously tagged "
+          "particles absent from %s%s" % (pop["n_current"], pop["n_inherited"], pop["n_absent"],
+                                          "the PART" if args.part else "the PIG",
+                                          " (omitted)" if args.part else " (a vote they enter is inconclusive)"))
+    inconcl = sorted(T for T, v in votes.items() if v[2])
+    if inconcl:
+        ck.warn("%d tracks have an absent particle among their tracers; their vote is inconclusive without --part "
+                "(e.g. %s)" % (len(inconcl), inconcl[:8]))
+
+    tid_sb, tid_ob = SB["TrackId"], OB["TrackId"]
+    # 1. every previous track persists (resolved or orphan)
+    prev_all = np.concatenate([SA["TrackId"], OA["TrackId"]])
+    gone = prev_all[(lookup(tid_sb, prev_all) < 0) & (lookup(tid_ob, prev_all) < 0)]
+    ck.check(gone.size == 0, "%d previous tracks are in neither table of %s (e.g. %s)"
+             % (gone.size, args.next, gone[:8].tolist()))
+
+    # host of each previous resolved track; tracks with no tracer at all are hostless
+    host = {int(T): votes.get(int(T), (-1, False, False))[0] for T in SA["TrackId"].tolist()}
+    # an inconclusive vote cannot be checked: the downstream checks take the track's own HostGroup
+    for T in inconcl:
+        rb = B.subhalo_row(T)
+        if rb >= 0:
+            host[T] = int(SB["HostGroup"][rb])
+    notracer = [int(T) for T in SA["TrackId"].tolist() if int(T) not in votes]
+    if notracer:
+        ck.note("%d previous resolved tracks have no own-bound tracer (treated as hostless): %s"
+                % (len(notracer), notracer[:8]))
+    # 2. resolved previous tracks that are resolved now: HostGroup == vote
+    nwrong = 0
+    for r in np.nonzero(lookup(SA["TrackId"], tid_sb) >= 0)[0].tolist():
+        T = int(tid_sb[r])
+        exp, near, incon = votes.get(T, (-1, False, False))
+        got = int(SB["HostGroup"][r])
+        if got != exp:
+            if incon:
+                ck.warn("track %d: HostGroup %d, vote %d is inconclusive (absent tracer)" % (T, got, exp))
+                continue
+            if near:
+                ck.warn("track %d: HostGroup %d, vote %d is a near tie" % (T, got, exp))
+                continue
+            nwrong += 1
+            if nwrong <= 20:
+                ck.fail("track %d: HostGroup %d, the weighted ten-tracer vote gives %d" % (T, got, exp))
+    if nwrong > 20:
+        ck.fail("... %d tracks with a HostGroup other than their vote" % nwrong)
+
+    # 3. orphan hosts from their MostBoundID (step 1); resurrected orphans
+    so = np.argsort(mid)
+    orph_alive = OA["SnapTracerLost"] < 0 if "SnapTracerLost" in OA else np.ones(len(OA["TrackId"]), bool)
+    orph_host = lookup(mid[so], OA["MostBoundID"].astype(mid.dtype), mgid[so], default=-1)
+    orph_host[~orph_alive] = -1
+    resurrected = OA["TrackId"][lookup(tid_sb, OA["TrackId"]) >= 0]
+    for T in resurrected.tolist():
+        ra, rb = A.orphan_row(T), B.subhalo_row(T)
+        ck.check(orph_alive[ra], "orphan %d was resurrected although its tracer was lost at %d"
+                 % (T, OA["SnapTracerLost"][ra]))
+        ck.check(SB["HostGroup"][rb] == orph_host[ra] and SB["Rank"][rb] == 0,
+                 "resurrected orphan %d: HostGroup %d Rank %d, expected the central of group %d "
+                 "(the group holding its MostBoundID %d)" % (T, SB["HostGroup"][rb], SB["Rank"][rb],
+                                                             orph_host[ra], OA["MostBoundID"][ra]))
+
+    # 4. members per group and the central decision (step 7b)
+    cand, ocand = {}, {}
+    mb_prev = dict(zip(SA["TrackId"].tolist(), SA["Mbound"].astype(np.float64).tolist()))
+    for T, g in host.items():
+        if g >= 0:
+            cand.setdefault(g, []).append(T)
+    for T, g, pk in zip(OA["TrackId"].tolist(), orph_host.tolist(), OA["MboundPeak"].astype(np.float64).tolist()):
+        if g >= 0:
+            ocand.setdefault(g, []).append((T, pk))
+    rank0 = {}
+    hosted = SB["HostGroup"] >= 0
+    for r in np.nonzero(hosted & (SB["Rank"] == 0))[0].tolist():
+        rank0.setdefault(int(SB["HostGroup"][r]), []).append(int(tid_sb[r]))
+    ncen_bad = 0
+    for g in gid_b.tolist():
+        cen = rank0.get(g, [])
+        if not ck.check(len(cen) <= 1, "group %d has %d Rank 0 members %s" % (g, len(cen), cen[:5])):
+            continue
+        c = cen[0] if cen else None
+        if g in cand:
+            mmax = max(mb_prev[T] for T in cand[g])
+            elig = sorted(T for T in cand[g] if mb_prev[T] >= ratio * mmax * (1 - 1e-6))
+            if c is None:
+                died = [T for T in elig if B.orphan_row(T) >= 0]
+                if died:
+                    ck.warn("group %d has no Rank 0 member; eligible candidates %s died or sank" % (g, died[:5]))
+                else:
+                    ck.fail("group %d has resolved candidates %s but no Rank 0 member" % (g, cand[g][:5]))
+            elif c not in elig:
+                ncen_bad += 1
+                if ncen_bad <= 20:
+                    ck.fail("group %d: central %d is not an eligible candidate %s (Mbound_prev >= %g x %g)"
+                            % (g, c, elig[:8], ratio, mmax))
+        elif g in ocand:
+            exp = min(ocand[g], key=lambda x: (-x[1], x[0]))[0]
+            if c is None:
+                ck.warn("group %d: orphan %d should have been resurrected; no Rank 0 member (died again?)" % (g, exp))
+            else:
+                ck.check(c == exp, "group %d: central %d, expected the resurrected orphan %d (largest MboundPeak of %s)"
+                         % (g, c, exp, [x[0] for x in ocand[g]][:8]))
+        elif c is not None:
+            ck.check(c >= ntr_a, "group %d has no previous member but its central %d is not newborn" % (g, c))
+    if ncen_bad > 20:
+        ck.fail("... %d groups with an ineligible central" % ncen_bad)
+
+    # 5. newborns: only FOF centrals, in host GroupID order from NumTracksTotal(prev)
+    nbr = np.nonzero(tid_sb >= ntr_a)[0]
+    ck.check(np.all(SB["Rank"][nbr] == 0) and np.all(SB["HostGroup"][nbr] >= 0),
+             "%d newborn tracks are not FOF centrals" % np.count_nonzero((SB["Rank"][nbr] != 0) | (SB["HostGroup"][nbr] < 0)))
+    o = np.argsort(SB["HostGroup"][nbr], kind="stable")
+    got = tid_sb[nbr][o].tolist()
+    expect = list(range(ntr_a, ntr_a + len(nbr)))
+    ck.check(got == expect, "newborn TrackIds by HostGroup %s... are not %s... (host order from NumTracksTotal %d)"
+             % (got[:8], expect[:8], ntr_a))
+    ck.check(ntr_b == ntr_a + len(nbr), "NumTracksTotal %d, expected %d + %d newborn" % (ntr_b, ntr_a, len(nbr)))
+    ck.check(not np.any(tid_ob >= ntr_a), "%d orphans with newborn TrackIds (a newborn that dies gets no TrackId)"
+             % np.count_nonzero(tid_ob >= ntr_a))
+    bad_nb = [int(tid_sb[r]) for r in nbr.tolist() if int(SB["HostGroup"][r]) in cand or int(SB["HostGroup"][r]) in ocand]
+    ck.check(not bad_nb, "newborn tracks %s in groups that had previous members" % bad_nb[:8])
+
+    # 6. new orphans: died or sank at this call
+    new_orph = OB["TrackId"][lookup(SA["TrackId"], tid_ob) >= 0]
+    nsink = ndead = 0
+    for T in new_orph.tolist():
+        r = B.orphan_row(T)
+        ck.check(OB["SnapDeath"][r] == snap_next, "track %d became an orphan with SnapDeath %d, expected %d"
+                 % (T, OB["SnapDeath"][r], snap_next))
+        s = int(OB["SinkTrackId"][r])
+        if s >= 0:
+            nsink += 1
+            ck.check(OB["SnapSink"][r] == snap_next, "track %d sank with SnapSink %d, expected %d" % (T, OB["SnapSink"][r], snap_next))
+            rs = B.subhalo_row(s)
+            if ck.check(rs >= 0, "track %d sank into %d, which is not a resolved subhalo" % (T, s)):
+                ck.check(SB["HostGroup"][rs] == host.get(T, -1),
+                         "track %d (vote %d) sank into %d hosted by %d" % (T, host.get(T, -1), s, SB["HostGroup"][rs]))
+        else:
+            ndead += 1
+    # previous orphans that stay orphans keep their sink and death
+    old_orph = OA["TrackId"][lookup(tid_ob, OA["TrackId"]) >= 0]
+    for T in old_orph.tolist():
+        ra, rb = A.orphan_row(T), B.orphan_row(T)
+        ck.check(OA["SinkTrackId"][ra] == OB["SinkTrackId"][rb] and OA["SnapDeath"][ra] == OB["SnapDeath"][rb],
+                 "orphan %d changed SinkTrackId/SnapDeath (%d, %d) -> (%d, %d)"
+                 % (T, OA["SinkTrackId"][ra], OA["SnapDeath"][ra], OB["SinkTrackId"][rb], OB["SnapDeath"][rb]))
+    nhostless = sum(1 for g in host.values() if g < 0)
+    print("  %d groups, %d with previous resolved members, %d with only orphans, %d newborn, %d hostless votes, "
+          "%d sank, %d died, %d resurrected" % (len(gid_b), len(cand), len(set(ocand) - set(cand)), len(nbr),
+                                                nhostless, nsink, ndead, len(resurrected)))
+
+
+# ---------------------------------------------------------------------------------- hierarchy
+def check_hierarchy(pigdir, ck):
+    try:
+        cat = SubhaloCatalogue(pigdir)
+    except SubhaloFormatError as e:
+        ck.fail(str(e))
+        return
+    tag = os.path.basename(pigdir.rstrip("/"))
+    S = cat.subhalos
+    tid, host, par = S["TrackId"], S["HostGroup"], S["NestedParentTrackId"]
+    cen, rank, depth, mb = S["CentralTrackId"], S["Rank"].astype(np.int64), S["Depth"].astype(np.int64), S["Mbound"]
+    n = tid.size
+    gid = cat.groups["GroupID"]
+    hosted = host >= 0
+    bad = hosted & ~np.isin(host, gid)
+    ck.check(not np.any(bad), "%s: %d subhalos with a HostGroup that is not a FOFGroups GroupID (e.g. %s)"
+             % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    ck.check(np.all(rank >= 0) and np.all(depth >= 0), "%s: %d negative Rank or Depth" % (tag, np.count_nonzero((rank < 0) | (depth < 0))))
+    # parents
+    has_par = par >= 0
+    prow = lookup(tid, par)
+    nores = has_par & (prow < 0)
+    ck.check(not np.any(nores), "%s: %d subhalos whose NestedParentTrackId is not a resolved subhalo (e.g. %s -> %s)"
+             % (tag, np.count_nonzero(nores), tid[nores][:5].tolist(), par[nores][:5].tolist()))
+    ok = has_par & (prow >= 0)
+    pr = prow[ok]
+    bad = depth[ok] != depth[pr] + 1
+    ck.check(not np.any(bad), "%s: %d subhalos with Depth != Depth(parent) + 1 (e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), tid[ok][bad][:5].tolist()))
+    bad = host[ok] != host[pr]
+    ck.check(not np.any(bad), "%s: %d subhalos whose parent is hosted by another group (e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), tid[ok][bad][:5].tolist()))
+    bad = (depth == 0) != ~has_par
+    ck.check(not np.any(bad), "%s: %d subhalos where Depth 0 and 'no parent' disagree (e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    bad = (rank == 0) != (depth == 0)
+    ck.check(not np.any(bad), "%s: %d subhalos where Rank 0 and Depth 0 disagree (the central is the root; e.g. TrackId %s)"
+             % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    # hostless: own centrals (a pseudo-key holds one track)
+    hl = ~hosted
+    bad = hl & ((rank != 0) | (depth != 0) | has_par | (cen != tid))
+    ck.check(not np.any(bad), "%s: %d hostless subhalos that are not their own central (Rank 0, Depth 0, no parent; e.g. %s)"
+             % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    # per group: Rank dense, one central, CentralTrackId, Ranks 1.. by Mbound descending
+    rows = np.nonzero(hosted)[0]
+    o = rows[np.lexsort((rank[rows], host[rows]))]
+    ndense = ncen = nmass = 0
+    if o.size:
+        ug, first, cnt = np.unique(host[o], return_index=True, return_counts=True)
+        pos = np.arange(o.size) - np.repeat(first, cnt)
+        dense = rank[o] == pos
+        ndense = len(np.unique(host[o][~dense]))
+        central_of = np.repeat(tid[o][first], cnt)
+        okc = (rank[o][first] == 0)
+        badc = (cen[o] != central_of) | ~np.repeat(okc, cnt)
+        ncen = len(np.unique(host[o][badc]))
+        # Mbound non-increasing over Ranks 1.. within a group
+        same = np.zeros(o.size, bool)
+        same[1:] = host[o][1:] == host[o][:-1]
+        sat_pair = same & (pos >= 2)
+        incr = sat_pair & (mb[o] > mb[np.roll(o, 1)])
+        nmass = len(np.unique(host[o][incr]))
+        print("  %s: %d subhalos in %d groups (max %d per group), %d hostless, max Depth %d, %d groups without subhalos"
+              % (tag, n, len(ug), cnt.max(), np.count_nonzero(hl), depth.max() if n else 0, len(np.setdiff1d(gid, ug))))
+    else:
+        print("  %s: %d subhalos, none hosted" % (tag, n))
+    ck.check(ndense == 0, "%s: Rank not dense 0..n-1 in %d groups" % (tag, ndense))
+    ck.check(ncen == 0, "%s: in %d groups CentralTrackId is not the Rank 0 member" % (tag, ncen))
+    ck.check(nmass == 0, "%s: in %d groups Ranks 1.. are not ordered by Mbound descending" % (tag, nmass))
+
+
+def cmd_hierarchy(args):
+    rc = 0
+    for p in args.pigdirs:
+        ck = Checker("hierarchy %s" % p)
+        check_hierarchy(p, ck)
+        rc |= ck.report()
+    return rc
+
+
+# ---------------------------------------------------------------------------------- tags
+def check_tags(pigdir, ck, ntracers=None, tracer_rank=True, mass_rtol=1e-4, phase1=False):
+    """With phase1, section 1 is ignored: Phase 1 never retags field particles, which keep the
+    TrackId, BindRank and BoundTrackId of the last call that processed them, and its Nbound and
+    NboundExclusive count the in-group slice only."""
+    try:
+        cat = SubhaloCatalogue(pigdir)
+        P = particles(cat, extra=("Mass",))
+    except SubhaloFormatError as e:
+        ck.fail(str(e))
+        return
+    if phase1:
+        # Phase 1 ranks by distance over every type, so the tracer rule does not apply either
+        keep = P["Section"] == 0
+        P = {k: v[keep] for k, v in P.items()}
+        tracer_rank = False
+    tag = os.path.basename(pigdir.rstrip("/"))
+    S, O = cat.subhalos, cat.orphans
+    tid = S["TrackId"]
+    ntrk = tid.size
+    T, B, R, typ = P["TrackId"], P["BoundTrackId"], P["BindRank"], P["Type"]
+    ttypes = cat.tracer_types()
+    istr = np.isin(typ, ttypes)
+    if ntracers is None:
+        ntracers = cat.int_parameter("SubhaloMinNumTracerPart", 10)
+
+    # untagged rows are never bound; bound owners are resolved subhalos
+    bad = (T < 0) & (B != -1)
+    ck.check(not np.any(bad), "%s: %d untagged rows with BoundTrackId != -1" % (tag, np.count_nonzero(bad)))
+    bown = B >= 0
+    brow = lookup(tid, B[bown])
+    ck.check(np.all(brow >= 0), "%s: %d rows bound to a track that is not a resolved subhalo (e.g. %s)"
+             % (tag, np.count_nonzero(brow < 0), np.unique(B[bown][brow < 0])[:5].tolist()))
+    # tags of orphans: only reported (Phase 1 leaves them on field particles)
+    trow = lookup(tid, T)
+    orph_tag = (T >= 0) & (trow < 0)
+    if np.any(orph_tag):
+        known = np.isin(T[orph_tag], O["TrackId"])
+        ck.check(np.all(known), "%s: %d rows tagged by unknown tracks %s" % (tag, np.count_nonzero(~known), np.unique(T[orph_tag][~known])[:5].tolist()))
+        ck.warn("%s: %d rows carry the tag of an orphan track (%d tracks)" % (tag, np.count_nonzero(orph_tag), len(np.unique(T[orph_tag]))))
+
+    # BoundTrackId is the tag, an ancestor of the tag, or -1
+    other = (T >= 0) & bown & (B != T)
+    if np.any(other):
+        all_tid = np.concatenate([tid, O["TrackId"]])
+        all_par = np.concatenate([S["NestedParentTrackId"], O["NestedParentTrackId"]])
+        so = np.argsort(all_tid)
+        all_tid, all_par = all_tid[so], all_par[so]
+        cur = T[other].copy()
+        found = np.zeros(cur.size, bool)
+        for _ in range(int(S["Depth"].max()) + 2 if ntrk else 1):
+            cur = lookup(all_tid, cur, all_par, default=-1)
+            found |= (cur == B[other]) & (cur >= 0)
+            if not np.any((cur >= 0) & ~found):
+                break
+        ck.check(np.all(found), "%s: %d rows bound to a track that is neither their tag nor an ancestor of it "
+                 "(e.g. tag %s bound %s)" % (tag, np.count_nonzero(~found), T[other][~found][:5].tolist(), B[other][~found][:5].tolist()))
+    print("  %s: %d rows, %d tagged, %d bound, %d bound to an ancestor of their tag, tracer types %s"
+          % (tag, T.size, np.count_nonzero(T >= 0), np.count_nonzero(bown), np.count_nonzero(other), ttypes))
+
+    # own-tag lists of resolved tracks: BindRank dense, exclusive bound prefix first, tracer ranks
+    own = (T >= 0) & (trow >= 0)
+    o = np.nonzero(own)[0]
+    o = o[np.lexsort((R[o], T[o]))]
+    nown = np.zeros(ntrk, np.int64)
+    if o.size:
+        ut, first, cnt = np.unique(T[o], return_index=True, return_counts=True)
+        rows = lookup(tid, ut)
+        nown[rows] = cnt
+        pos = np.arange(o.size) - np.repeat(first, cnt)
+        dense = R[o] == pos
+        ck.check(np.all(dense), "%s: own-tag BindRank not dense 0..n-1 in %d tracks (e.g. %s)"
+                 % (tag, len(np.unique(T[o][~dense])), np.unique(T[o][~dense])[:5].tolist()))
+        nbe = np.repeat(S["NboundExclusive"][rows].astype(np.int64), cnt)
+        isb = B[o] == T[o]
+        prefix_ok = isb == (pos < nbe)
+        ck.check(np.all(prefix_ok), "%s: in %d tracks the own-bound rows (BoundTrackId == TrackId) are not exactly "
+                 "BindRank 0..NboundExclusive-1 (e.g. %s)" % (tag, len(np.unique(T[o][~prefix_ok])), np.unique(T[o][~prefix_ok])[:5].tolist()))
+        if tracer_rank:
+            low = pos < ntracers
+            badt = low & ~istr[o]
+            ck.check(not np.any(badt), "%s: in %d tracks one of the %d lowest BindRanks is not a tracer type %s (e.g. %s)"
+                     % (tag, len(np.unique(T[o][badt])), ntracers, ttypes, np.unique(T[o][badt])[:5].tolist()))
+        # per type exclusive and tail counts
+        for t in range(NTYPES):
+            m = typ[o] == t
+            ex = np.bincount(lookup(tid, T[o][m & isb]), minlength=ntrk) if ntrk else np.zeros(0, np.int64)
+            tl = np.bincount(lookup(tid, T[o][m & ~isb]), minlength=ntrk) if ntrk else np.zeros(0, np.int64)
+            bad = ex != S["NboundExclusiveType"][:, t]
+            ck.check(not np.any(bad), "%s type %d: NboundExclusiveType differs from the own-bound rows in %d tracks (e.g. %s)"
+                     % (tag, t, np.count_nonzero(bad), tid[bad][:5].tolist()))
+            bad = tl != S["NtailType"][:, t]
+            ck.check(not np.any(bad), "%s type %d: NtailType differs from the own-tag rows not bound to the track in %d tracks (e.g. %s)"
+                     % (tag, t, np.count_nonzero(bad), tid[bad][:5].tolist()))
+            sl = S["SliceNboundByType"][:, t].astype(np.int64)
+            if not phase1:
+                sl = sl + S["FieldSliceNboundByType"][:, t]
+            bad = sl != S["NboundExclusiveType"][:, t]
+            ck.check(not np.any(bad), "%s type %d: SliceNbound + FieldSliceNbound != NboundExclusiveType in %d tracks"
+                     % (tag, t, np.count_nonzero(bad)))
+    if tracer_rank:
+        few = nown < np.minimum(ntracers, S["Nbound"].astype(np.int64))
+        ck.check(not np.any(few), "%s: %d tracks with fewer than %d own-tag rows" % (tag, np.count_nonzero(few), ntracers))
+    nbe = S["NboundExclusive"].astype(np.int64)
+    ck.check(np.array_equal(nbe, S["NboundExclusiveType"].sum(axis=1)), "%s: NboundExclusive != sum(NboundExclusiveType)" % tag)
+    bad = nbe > S["Nbound"]
+    ck.check(not np.any(bad), "%s: %d tracks with NboundExclusive > Nbound" % (tag, np.count_nonzero(bad)))
+
+    # full bound lists from BoundTrackId: counts per type, tracers, mass, and inside the key
+    b = np.nonzero(bown)[0]
+    br = lookup(tid, B[b])
+    okb = br >= 0
+    b, br = b[okb], br[okb]
+    for t in range(NTYPES):
+        m = typ[b] == t
+        cnt = np.bincount(br[m], minlength=ntrk) if ntrk else np.zeros(0, np.int64)
+        bad = cnt != S["NboundType"][:, t]
+        ck.check(not np.any(bad), "%s type %d: the full bound list (BoundTrackId) differs from NboundType in %d tracks (e.g. %s: %s vs %s)"
+                 % (tag, t, np.count_nonzero(bad), tid[bad][:3].tolist(), cnt[bad][:3].tolist(), S["NboundType"][bad, t][:3].tolist()))
+        if "%d/Mass" % t in cat.blocks and ntrk:
+            ms = np.bincount(br[m], weights=P["Mass"][b][m].astype(np.float64), minlength=ntrk)
+            bad = ~np.isclose(ms, S["MboundType"][:, t].astype(np.float64), rtol=mass_rtol, atol=0)
+            ck.check(not np.any(bad), "%s type %d: MboundType differs from the full bound list's mass in %d tracks (e.g. %s)"
+                     % (tag, t, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    ntr = np.bincount(br[istr[b]], minlength=ntrk) if ntrk else np.zeros(0, np.int64)
+    bad = ntr != S["NboundTracer"]
+    ck.check(not np.any(bad), "%s: NboundTracer differs from the tracer-type rows of the full bound list in %d tracks (e.g. %s)"
+             % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    # inside the key: a section-0 row lies in the HostGroup of its bound owner; a section-1 row is
+    # tagged by a track with the same HostGroup (hosted owner) or by the owner itself (hostless)
+    owner_host = S["HostGroup"][br]
+    sec0 = P["Section"][b] == 0
+    bad0 = sec0 & (P["GroupID"][b] != owner_host)
+    rtag = lookup(tid, T[b])
+    tag_host = np.where(rtag >= 0, S["HostGroup"][np.maximum(rtag, 0)], -2)
+    bad1 = ~sec0 & np.where(owner_host >= 0, tag_host != owner_host, T[b] != B[b])
+    ck.check(not np.any(bad0), "%s: %d bound rows in a FOF group other than their owner's HostGroup (e.g. owners %s)"
+             % (tag, np.count_nonzero(bad0), np.unique(B[b][bad0])[:5].tolist()))
+    ck.check(not np.any(bad1), "%s: %d bound field rows outside their owner's key (e.g. owners %s)"
+             % (tag, np.count_nonzero(bad1), np.unique(B[b][bad1])[:5].tolist()))
+
+
+def cmd_tags(args):
+    rc = 0
+    for p in args.pigdirs:
+        ck = Checker("tags %s" % p)
+        check_tags(p, ck, ntracers=args.ntracers, tracer_rank=not args.no_tracer_rank, phase1=args.phase1)
+        rc |= ck.report()
+    return rc
+
+
+# ---------------------------------------------------------------------------------- orphans
+def check_orphans(pigdir, ck, tracer_pos=False):
+    try:
+        cat = SubhaloCatalogue(pigdir)
+    except SubhaloFormatError as e:
+        ck.fail(str(e))
+        return
+    tag = os.path.basename(pigdir.rstrip("/"))
+    O, S = cat.orphans, cat.subhalos
+    snap = int(attr(cat.header, "SnapshotIndex", snapnum_of(pigdir)))
+    box = float(attr(cat.header, "BoxSize", np.nan))
+    tid = O["TrackId"]
+    n = tid.size
+    alltid = np.sort(np.concatenate([S["TrackId"], tid]))
+    pos = O["TracerPos"]
+    if np.isfinite(box):
+        bad = ~np.all((pos >= 0) & (pos < box), axis=1) if n else np.zeros(0, bool)
+        ck.check(not np.any(bad), "%s: %d orphans with TracerPos outside [0, BoxSize = %g) (e.g. %s)"
+                 % (tag, np.count_nonzero(bad), box, tid[bad][:5].tolist()))
+    else:
+        ck.fail("%s: Header has no BoxSize" % tag)
+    ck.check(np.all(np.isfinite(pos)) and np.all(np.isfinite(O["TracerVel"])), "%s: non-finite TracerPos or TracerVel" % tag)
+    lost = O["SnapTracerLost"].astype(np.int64)
+    bad = (lost != -1) & ((lost < 0) | (lost > snap))
+    ck.check(not np.any(bad), "%s: %d orphans with SnapTracerLost neither -1 nor in [0, %d] (e.g. %s)"
+             % (tag, np.count_nonzero(bad), snap, tid[bad][:5].tolist()))
+    death = O["SnapDeath"].astype(np.int64)
+    bad = (death < 0) | (death > snap)
+    ck.check(not np.any(bad), "%s: %d orphans with SnapDeath outside [0, %d]" % (tag, np.count_nonzero(bad), snap))
+    bad = (O["SnapBirth"] < 0) | (O["SnapBirth"] > death)
+    ck.check(not np.any(bad), "%s: %d orphans with SnapBirth < 0 or > SnapDeath" % (tag, np.count_nonzero(bad)))
+    bad = (lost >= 0) & (lost < death)
+    ck.check(not np.any(bad), "%s: %d orphans whose tracer was lost before they died" % (tag, np.count_nonzero(bad)))
+    sink = O["SinkTrackId"]
+    sunk = sink >= 0
+    bad = sunk & ((O["SnapSink"] != O["SnapDeath"]) | (sink == tid))
+    ck.check(not np.any(bad), "%s: %d sunk orphans with SnapSink != SnapDeath or sunk into themselves" % (tag, np.count_nonzero(bad)))
+    bad = ~sunk & (O["SnapSink"] != -1)
+    ck.check(not np.any(bad), "%s: %d orphans with SnapSink but no SinkTrackId" % (tag, np.count_nonzero(bad)))
+    for col in ("SinkTrackId", "DescendantTrackId", "NestedParentTrackId", "CentralTrackId"):
+        v = O[col]
+        m = v >= 0
+        bad = m & (lookup(alltid, v) < 0)
+        ck.check(not np.any(bad), "%s: %d orphans whose %s is not an existing track (e.g. %s -> %s)"
+                 % (tag, np.count_nonzero(bad), col, tid[bad][:5].tolist(), v[bad][:5].tolist()))
+        ck.check(np.all(v >= -1), "%s: %s values below -1" % (tag, col))
+    # TracerPos against the tracer particle when it is saved in this PIG (only after the step-1
+    # lookup of Phase 2a; Phase 1 never updates TracerPos)
+    P = particles(cat, extra=("Position",))
+    so = np.argsort(P["ID"])
+    r = lookup(P["ID"][so], O["MostBoundID"].astype(P["ID"].dtype)) if n else np.zeros(0, np.int64)
+    have = (r >= 0) & (lost < 0)
+    nmis = 0
+    if np.any(have) and P["Position"].ndim == 2:
+        ppos = P["Position"][so][r[have]]
+        d = ppos - pos[have]
+        d -= box * np.round(d / box)
+        far = np.sqrt((d ** 2).sum(axis=1)) > 1e-6 * box
+        nmis = int(np.count_nonzero(far))
+    msg = "%s: %d of %d orphans with a live tracer saved in this PIG have TracerPos != its Position" % (tag, nmis, np.count_nonzero(have))
+    if tracer_pos:
+        ck.check(nmis == 0, msg)
+    elif nmis:
+        ck.warn(msg + " (fails with --tracer-pos; Phase 1 never updates TracerPos)")
+    print("  %s: %d orphans (%d sunk, %d tracer lost), %d with the tracer saved in this PIG"
+          % (tag, n, np.count_nonzero(sunk), np.count_nonzero(lost >= 0), np.count_nonzero(r >= 0)))
+
+
+def cmd_orphans(args):
+    rc = 0
+    for p in args.pigdirs:
+        ck = Checker("orphans %s" % p)
+        check_orphans(p, ck, tracer_pos=args.tracer_pos)
+        rc |= ck.report()
+    return rc
 
 
 # ---------------------------------------------------------------------------------- compare
@@ -842,6 +1523,29 @@ def main(argv=None):
     s = sub.add_parser("tracking", help="check 3: tracking between consecutive PIGs")
     s.add_argument("prev")
     s.add_argument("next")
+    s.add_argument("--phase1-vote", action="store_true",
+                   help="Phase 1 rules: majority vote over every own-bound particle, the most massive candidate "
+                        "wins and the others sink (default: Phase 2a weighted ten-tracer vote)")
+    s.add_argument("--ntracers", type=int, default=None,
+                   help="tracers per track in the vote (default SubhaloNumTracerHostFinding of the previous PIG, else 10)")
+    s.add_argument("--part", default=None,
+                   help="PART_xxx of the next snapshot: the live population for the vote (default: the next PIG's "
+                        "saved rows; Phase 2a votes that need an unsaved particle are then inconclusive)")
+    s = sub.add_parser("hierarchy", help="Phase 2a: Rank/Depth/parent/central consistency")
+    s.add_argument("pigdirs", nargs="+")
+    s = sub.add_parser("tags", help="Phase 2a: D10 tag rule, BindRank, BoundTrackId, full bound lists")
+    s.add_argument("pigdirs", nargs="+")
+    s.add_argument("--ntracers", type=int, default=None,
+                   help="lowest ranks that must be tracers (default SubhaloMinNumTracerPart, else 10)")
+    s.add_argument("--no-tracer-rank", action="store_true",
+                   help="skip the tracer-type rule for the lowest ranks (Phase 1 hydro PIGs rank by distance)")
+    s.add_argument("--phase1", action="store_true",
+                   help="Phase 1 PIGs: ignore section 1, whose rows keep the stale tags of the last call that processed "
+                        "them, and skip the tracer-rank rule (Phase 1 ranks by distance over every type)")
+    s = sub.add_parser("orphans", help="Phase 2a: Orphan/* consistency")
+    s.add_argument("pigdirs", nargs="+")
+    s.add_argument("--tracer-pos", action="store_true",
+                   help="fail when TracerPos differs from the saved tracer's Position (Phase 2a; a warning otherwise)")
     s = sub.add_parser("compare", help="check 5: two PIGs of the same snapshot are equal")
     s.add_argument("pig_a")
     s.add_argument("pig_b")
@@ -858,7 +1562,8 @@ def main(argv=None):
     s.add_argument("pigdir")
     args = p.parse_args(argv)
     cmds = dict(offon=cmd_offon, consistency=cmd_consistency, tracking=cmd_tracking, compare=cmd_compare,
-                markincomplete=cmd_markincomplete, tagcounts=cmd_tagcounts)
+                markincomplete=cmd_markincomplete, tagcounts=cmd_tagcounts, hierarchy=cmd_hierarchy,
+                tags=cmd_tags, orphans=cmd_orphans)
     if args.cmd not in cmds:
         p.print_help()
         return 2

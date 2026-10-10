@@ -238,6 +238,42 @@ class SubhaloCatalogue(object):
     def complete(self):
         return int(self.header.get("SubhaloStateComplete", 0)) == 1
 
+    def parameters(self):
+        """The finder parameters of the Header attribute SubhaloParameters ("Name = value" lines,
+        stored as a character array) as a dict of strings; empty if the attribute is absent."""
+        raw = self.header.get("SubhaloParameters")
+        if raw is None:
+            return {}
+        if isinstance(raw, (bytes, np.bytes_)):
+            text = raw.decode("ascii", "replace")
+        elif isinstance(raw, str):
+            text = raw
+        else:
+            text = "".join(c.decode("ascii", "replace") if isinstance(c, (bytes, np.bytes_)) else str(c)
+                           for c in np.atleast_1d(raw).tolist())
+        out = {}
+        for line in text.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip()
+        return out
+
+    def tracer_types(self, default=(1, 4)):
+        """Particle types of the SubhaloTracerTypes bitmask in SubhaloParameters (default types 1, 4)."""
+        p = self.parameters()
+        if "SubhaloTracerTypes" not in p:
+            return list(default)
+        mask = int(p["SubhaloTracerTypes"])
+        return [t for t in range(NTYPES) if mask & (1 << t)]
+
+    def int_parameter(self, name, default):
+        """An integer finder parameter from SubhaloParameters, or default."""
+        p = self.parameters()
+        try:
+            return int(p[name])
+        except (KeyError, ValueError):
+            return default
+
     def nsaved(self, ptype):
         """Rows in PIG/<ptype>/ (both sections)."""
         block = "%d/TrackId" % ptype
