@@ -2,15 +2,19 @@
  * halofinder_phase2b_plan.md step 9). See subhalo_collective.h for the algorithm and the walk
  * contract.
  *
- * Memory (per rank). Per-call scratch on the top of the main stack for every local particle:
- * the source candidate (int32), the in-place claim (int32), flags (uint8), the energy of the
- * last evaluation and the energy in the claimant's list (two doubles): 25 bytes; per candidate
- * a CandState and the per-round vectors (SUBHALO_INPLACE_KEY_BYTES is charged per in-place key
- * by the plan). Per iteration on the bottom: the query and tree lists (8 bytes per bound
- * particle of the round), the tree (force_tree_active_moments: TreeAllocFactor x NumPart nodes,
- * freed after the walk) and the treewalk's export buffers. The ordered sets of a round (mpsort)
- * hold 40 to 80 bytes per bound or unbound particle of the round. The serial arenas have been
- * freed before the first round (subhalo_run_serial_keys).
+ * Memory (per rank; subhalo_coll_estimate is the admission the plan checks before the exchange,
+ * audit Q1). Per-call scratch on the top of the main stack for every local particle: the source
+ * candidate (int32), the in-place claim (int32), flags (uint8), the energy of the last
+ * evaluation and the energy in the claimant's list (two doubles): 25 bytes; per candidate a
+ * CandState and the per-round vectors (SUBHALO_INPLACE_CAND_BYTES); per owned candidate its
+ * previous record. The stages, each freed before the next: the tree and walk (the query and tree
+ * lists, force_tree_active_moments' TreeAllocFactor x NumPart nodes before the shrink, the
+ * treewalk's export buffers); the cores (bounded heaps of K tracers and K non-tracers per
+ * candidate, the owner's receive buffer); the radial ordered set (88-byte records and mpsort's
+ * record-sized copy); the relaxed-source positions (40 + 40 bytes); the final tags (40 + 40
+ * bytes per in-place own-tag particle, the change list); the serial repair (the changes, the
+ * rank queries and replies, routed to the tracks' result ranks: nothing per particle is
+ * replicated). The serial arenas have been freed before the first round (subhalo_run_serial_keys).
  *
  * Deviations from the plan (halofinder_phase2b_plan.md), each a simplification at the edges:
  *  - the scratch is 25 bytes per particle, not 13: the walk label is derived from the source
@@ -23,7 +27,8 @@
  *    final pass (the serial key takes the loop order at the sinking), and a serial survivor that
  *    sinks into an in-place candidate keeps the MostBound* of its serial record;
  *  - a serial tail whose claimant sinks into an in-place candidate while its serial binder
- *    survives is given to the binder, ranked after the binder's exclusive prefix;
+ *    survives is given to the binder and merged into the binder's own-tag sequence by the
+ *    binder's final-pass energy order (the binder ordinals recorded by the serial key, audit Q3);
  *  - the final-tree check of a claim (J2) is applied when the binding owner is an in-place
  *    candidate (serial claims bound serially were checked in their key);
  *  - a rank with (almost) no particles gets a temporarily raised NumPart for the tree build
@@ -71,6 +76,13 @@
 #define KLYPIN_RS_CONSTANT 0.216216
 
 static struct SubhaloCollectiveStats CollStats;
+static subhalo_collective_hook PretagHook = NULL;
+
+void
+subhalo_collective_set_pretag_hook(subhalo_collective_hook fn)
+{
+    PretagHook = fn;
+}
 
 const struct SubhaloCollectiveStats *
 subhalo_collective_last_stats(void)
@@ -471,11 +483,62 @@ coll_walk(struct Coll * C, double * Sum)
     tw->result_type_elsize = sizeof(TreeWalkResultColl);
     tw->priv = &pv;
     tw->tree = &tree;
+    /* the treewalk sizes its export tables from the free memory (BunchSize, capped by the run's
+     * MaxExportBufferBytes): that elastic part is measured apart, and the call's high water
+     * charges the walk with the reserve the admission guarantees (subhalo_collective_walk_bytes) */
+    const size_t lowbefore = allocator_get_min_free(A_MAIN), freebefore = mymalloc_freebytes();
     treewalk_run(tw, ql, nq);
+    {
+        const size_t lowwalk = allocator_get_min_free(A_MAIN);
+        const double took = (double) freebefore - (double) lowwalk;
+        if(took > CollStats.WalkElasticBytes)
+            CollStats.WalkElasticBytes = took;
+        const size_t reserve = subhalo_collective_walk_bytes();
+        size_t low = freebefore > reserve ? freebefore - reserve : 0;
+        if(lowwalk > low)
+            low = lowwalk;
+        A_MAIN->minfree = lowbefore < low ? lowbefore : low;
+    }
     force_tree_free(&tree);
     myfree(tl);
     myfree(ql);
     C->nwalks++;
+}
+
+void
+subhalo_collective_test_walk(DomainDecomp * ddecomp, const int32_t * label, int64_t nlabels, double theta, double h,
+                             int PotentialTypes, double * out)
+{
+    struct Coll C;
+    struct SubhaloUnbindParams up;
+    memset(&C, 0, sizeof(C));
+    memset(&up, 0, sizeof(up));
+    up.OpenAngle = theta;
+    up.h = h;
+    up.PotentialTypes = PotentialTypes;
+    C.up = &up;
+    C.ddecomp = ddecomp;
+    C.Comm = MPI_COMM_WORLD;
+    MPI_Comm_size(MPI_COMM_WORLD, &C.NTask);
+    MPI_Comm_rank(MPI_COMM_WORLD, &C.ThisTask);
+    C.NumPart = PartManager->NumPart;
+    C.c0 = 0;
+    C.c1 = nlabels;
+    C.cs = (struct CandState *) mymalloc("SubTestWalkCs", sizeof(struct CandState) * (nlabels + 1));
+    memset(C.cs, 0, sizeof(struct CandState) * (nlabels + 1));
+    int64_t i;
+    for(i = 0; i < nlabels; i++)
+        C.cs[i].iterating = 1;
+    C.Cand = (int32_t *) mymalloc("SubTestWalkCand", sizeof(int32_t) * (C.NumPart + 1));
+    C.Flag = (uint8_t *) mymalloc("SubTestWalkFlag", C.NumPart + 1);
+    for(i = 0; i < C.NumPart; i++) {
+        C.Cand[i] = label[i] >= 0 && label[i] < nlabels ? label[i] : -1;
+        C.Flag[i] = C.Cand[i] >= 0 ? CF_BOUND : 0;
+    }
+    coll_walk(&C, out);
+    myfree(C.Flag);
+    myfree(C.Cand);
+    myfree(C.cs);
 }
 
 /* ------------------------------------------------------------------ the unbinding loop */
@@ -672,6 +735,51 @@ cmp_corerec_owner(const void * a, const void * b)
     return (x->ID > y->ID) - (x->ID < y->ID);
 }
 
+/* (E, ID) order of the core selection */
+static inline int
+corerec_before(const struct CoreRec * x, const struct CoreRec * y)
+{
+    if(x->E != y->E)
+        return x->E < y->E;
+    return x->ID < y->ID;
+}
+
+/* A bounded max-heap of the K first records in (E, ID) order (audit Q1: a rank keeps at most K
+ * tracers and K non-tracers per candidate instead of a record per bound particle). */
+static void
+core_heap_push(struct CoreRec * h, int64_t * n, int64_t K, const struct CoreRec * e)
+{
+    int64_t j;
+    if(*n < K) {
+        j = (*n)++;
+        while(j > 0) {
+            const int64_t p = (j - 1) / 2;
+            if(!corerec_before(&h[p], e))
+                break;
+            h[j] = h[p];
+            j = p;
+        }
+        h[j] = *e;
+        return;
+    }
+    if(K <= 0 || !corerec_before(e, &h[0]))
+        return;
+    /* replace the largest and sift down */
+    j = 0;
+    for(;;) {
+        int64_t c = 2 * j + 1;
+        if(c >= K)
+            break;
+        if(c + 1 < K && corerec_before(&h[c], &h[c + 1]))
+            c++;
+        if(!corerec_before(e, &h[c]))
+            break;
+        h[j] = h[c];
+        j = c;
+    }
+    h[j] = *e;
+}
+
 /* What the owner tells every rank about a candidate's bound set in energy order. */
 #define CORE_ND 15
 struct CoreOut {
@@ -694,20 +802,33 @@ round_cores(const struct Coll * C, struct CoreOut * out)
     const int K = CoreSize > NR ? CoreSize : NR;
     const int TracerTypes = C->up->TracerTypes;
     const double BoxSize = C->up->BoxSize;
-    int64_t i, n = 0;
+    int64_t i, c0;
     out->d = (double *) mymalloc("SubCollCoreOutD", sizeof(double) * CORE_ND * (nc + 1));
     out->mbID = (MyIDType *) mymalloc("SubCollCoreOutId", sizeof(MyIDType) * (nc + 1));
     out->resv = (int64_t *) mymalloc("SubCollCoreOutRes", sizeof(int64_t) * 2 * NR * (nc + 1));
+    /* per candidate and kind (2 c: non-tracers, 2 c + 1: tracers): the heap capacity min(count, K)
+     * and its slice of the record array */
+    int64_t * hoff = (int64_t *) mymalloc("SubCollCoreHoff", sizeof(int64_t) * (2 * nc + 1));
+    int64_t * hn = (int64_t *) mymalloc("SubCollCoreHn", sizeof(int64_t) * (2 * nc + 1));
+    memset(hoff, 0, sizeof(int64_t) * (2 * nc + 1));
+    memset(hn, 0, sizeof(int64_t) * (2 * nc + 1));
     for(i = 0; i < C->NumPart; i++)
         if(in_round(C, C->Cand[i]) && (C->Flag[i] & CF_BOUND) && C->cs[C->Cand[i]].state == SUBHALO_ST_ALIVE && part_live(&P[i]))
-            n++;
+            hoff[2 * (C->Cand[i] - C->c0) + is_tracer(i, TracerTypes)]++;
+    int64_t n = 0;
+    for(c0 = 0; c0 < 2 * nc; c0++) {
+        const int64_t cap = hoff[c0] < K ? hoff[c0] : K;
+        hoff[c0] = n;
+        n += cap;
+    }
+    hoff[2 * nc] = n;
     struct CoreRec * r = (struct CoreRec *) mymalloc("SubCollCoreRec", sizeof(struct CoreRec) * (n + 1));
-    n = 0;
     for(i = 0; i < C->NumPart; i++) {
         const int32_t c = C->Cand[i];
         if(!(in_round(C, c) && (C->Flag[i] & CF_BOUND) && C->cs[c].state == SUBHALO_ST_ALIVE && part_live(&P[i])))
             continue;
-        struct CoreRec * e = &r[n++];
+        struct CoreRec rec;
+        struct CoreRec * e = &rec;
         memset(e, 0, sizeof(*e));
         e->cand = c;
         e->E = C->En[i];
@@ -722,16 +843,17 @@ round_cores(const struct Coll * C, struct CoreOut * out)
         e->rank = C->ThisTask;
         e->index = i;
         e->owner = C->plan->Cands[c].owner;
+        const int64_t h = 2 * (c - C->c0) + e->tracer;
+        core_heap_push(r + hoff[h], &hn[h], hoff[h + 1] - hoff[h], e);
     }
-    qsort(r, n, sizeof(struct CoreRec), cmp_corerec_owner);
-    /* keep the first K of each kind per candidate */
-    int64_t m = 0, nt = 0, nn = 0;
-    for(i = 0; i < n; i++) {
-        if(i == 0 || r[i].cand != r[i-1].cand)
-            nt = nn = 0;
-        if(r[i].tracer ? nt++ < K : nn++ < K)
-            r[m++] = r[i];
+    /* compact (every heap is full unless the kind had fewer than K records) and order by owner */
+    int64_t m = 0;
+    for(c0 = 0; c0 < 2 * nc; c0++) {
+        if(hoff[c0] != m)
+            memmove(r + m, r + hoff[c0], sizeof(struct CoreRec) * hn[c0]);
+        m += hn[c0];
     }
+    qsort(r, m, sizeof(struct CoreRec), cmp_corerec_owner);
     int64_t * sendcounts = ta_malloc("SubCollCoreCnt", int64_t, C->NTask);
     memset(sendcounts, 0, sizeof(int64_t) * C->NTask);
     for(i = 0; i < m; i++)
@@ -817,6 +939,8 @@ round_cores(const struct Coll * C, struct CoreOut * out)
     myfree(d);
     myfree(in);
     myfree(r);
+    myfree(hn);
+    myfree(hoff);
 }
 
 static void
@@ -2061,6 +2185,9 @@ coll_records(struct Coll * C, const double * maxmerge, const int64_t * slotof, c
             if(m->frank == 0) {
                 rs->MaxMergerMbound = maxmerge[cd->gidx];
                 rs->ipk = cd->gidx;
+                /* Flags bit 2: the group's central decision was taken in the plan step */
+                if(C->plan->Inplace[cd->gidx].central >= 0)
+                    rec->Flags |= SUBHALO_FLAG_PLANCENTRAL;
             }
             continue;
         }
@@ -2105,7 +2232,11 @@ coll_records(struct Coll * C, const double * maxmerge, const int64_t * slotof, c
                 const int64_t gidx = subhalo_plan_inplace_index(C->plan, m->g);
                 rs->MaxMergerMbound = maxmerge[gidx];
                 rs->ipk = gidx;
+                if(C->plan->Inplace[gidx].central >= 0)
+                    rec->Flags |= SUBHALO_FLAG_PLANCENTRAL;
             }
+            else
+                rec->Flags &= ~SUBHALO_FLAG_PLANCENTRAL;
             continue;
         }
         if(rs->state == SUBHALO_ST_ALIVE) {
@@ -2165,48 +2296,471 @@ tagrec_radix(const void * a, void * radix, void * arg)
     memcpy(radix, ((const struct TagRec *) a)->key, 24);
 }
 
-struct Removed {
-    int64_t TrackId;
-    int32_t BindRank, Type;
-    int32_t excl, pad;
+/* The decision for one particle of an oversized key (no side effects; design 7.2 step 9, D10):
+ * a reserved tracer to its candidate; else a valid serial claim (an alive member's tail or a
+ * root's relaxed remainder) keeps its tag; else the in-place claim of the deepest alive candidate
+ * whose relaxed source holds it; a claim whose binding owner is not the claimant or one of its
+ * ancestors in the final tree goes to the binding owner (J2); a serial tail whose claimant sank
+ * into an in-place candidate while its serial binder survives goes to the binder. */
+struct TagDec {
+    int64_t tag;             /* the final TrackId, SUBHALO_NOTRACK */
+    int64_t bT;              /* the final BoundTrackId */
+    int64_t tc;              /* the in-place candidate whose own-tag sequence ranks it, -1 */
+    double E;                /* its energy there */
+    int bound;               /* bound by tc */
+    int j2;                  /* a claim given to its binding owner */
+    int change;              /* serial repair: -1 none, 0 a serial tail taken, 1 a serial exclusive particle taken, 2 given to its serial binder */
+    int64_t chT;             /* the serial track of the change */
+};
+
+enum { CHG_TAIL = 0, CHG_EXCL = 1, CHG_ADD = 2 };
+
+static void
+decide_tag(const struct Coll * C, int64_t i, struct TagDec * d)
+{
+    const struct SubhaloInplaceCand * Cd = C->plan->Cands;
+    const uint8_t f = C->Flag[i];
+    const int64_t T0 = P[i].TrackId, B0 = P[i].BoundTrackId;
+    const int32_t cc = C->Cand[i];
+    int64_t bT = SUBHALO_NOTRACK, bc = -1;
+    if(f & CF_SBOUND)
+        bT = B0;
+    else if(cc >= 0 && (f & CF_BOUND) && C->cs[cc].state == SUBHALO_ST_ALIVE) {
+        bT = Cd[cc].TrackId;
+        bc = cc;
+    }
+    d->tag = SUBHALO_NOTRACK;
+    d->tc = -1;
+    d->bound = 0;
+    d->E = 0;
+    d->j2 = 0;
+    d->change = -1;
+    d->chT = SUBHALO_NOTRACK;
+    const struct SubhaloMember * m0 = member_of(C, T0);
+    const int sclaim = (f & CF_SCLAIM) && m0 && m0->state == SUBHALO_ST_ALIVE && m0->cand < 0;
+    if((f & CF_RES) && bc >= 0) {
+        d->tag = bT;
+        d->tc = bc;
+        d->bound = 1;
+        d->E = C->En[i];
+    }
+    else if(sclaim) {
+        d->tag = T0;
+        if(bc >= 0 && !final_ancestor_c(C, T0, bT)) {
+            d->tag = bT;
+            d->tc = bc;
+            d->bound = 1;
+            d->E = C->En[i];
+            d->j2 = 1;
+        }
+    }
+    else if(C->Claim[i] >= 0 && C->cs[C->Claim[i]].state == SUBHALO_ST_ALIVE) {
+        d->tc = C->Claim[i];
+        d->tag = Cd[d->tc].TrackId;
+        d->bound = bc == d->tc;
+        d->E = d->bound ? C->En[i] : C->ClaimE[i];
+        if(bc >= 0 && bc != d->tc && !final_ancestor_c(C, d->tag, bT)) {
+            d->tag = bT;
+            d->tc = bc;
+            d->bound = 1;
+            d->E = C->En[i];
+            d->j2 = 1;
+        }
+    }
+    else if(bc >= 0) {
+        d->tag = bT;
+        d->tc = bc;
+        d->bound = 1;
+        d->E = C->En[i];
+    }
+    else if(f & CF_SBOUND) {
+        /* a serial tail whose claimant sank into an in-place candidate while its serial binder
+         * survives: the binder's own, merged into its sequence by the binder's energy order */
+        d->tag = bT;
+        d->change = CHG_ADD;
+        d->chT = bT;
+    }
+    /* a serial own-tag particle taken over by an in-place candidate */
+    if((f & CF_SCLAIM) && m0 && m0->cand < 0 && m0->state == SUBHALO_ST_ALIVE && d->tag != T0) {
+        d->change = B0 == T0 ? CHG_EXCL : CHG_TAIL;
+        d->chT = T0;
+    }
+    d->bT = d->tag == SUBHALO_NOTRACK ? SUBHALO_NOTRACK : bT;
+}
+
+/* ---- the serial repair (audit Q2): a change of a serial sub-tree track's own-tag sequence,
+ *      routed to the rank holding the track's result, which owns its ranks and counts ---- */
+struct SerChg {
+    int64_t T;               /* the serial track */
+    int64_t key;             /* removal: the old BindRank; addition: g, set by the owner from its binder ordinals */
+    int64_t f;               /* addition: the position in the binder's final-pass energy order (owner) */
+    MyIDType ID;
+    int64_t index;           /* the particle on its holder */
+    int32_t holder, owner;
+    int32_t kind, type;      /* CHG_* */
+};
+
+struct SerQuery {
+    int64_t T;
+    int64_t r;               /* the particle's old BindRank */
+    int64_t index;
+    int32_t holder, owner;
+};
+
+struct SerReply {
+    int64_t index;
+    int64_t rank;
+    int32_t holder, pad;
 };
 
 static int
-cmp_removed(const void * a, const void * b)
+cmp_serchg_owner(const void * a, const void * b)
 {
-    const struct Removed * x = (const struct Removed *) a, * y = (const struct Removed *) b;
-    if(x->TrackId != y->TrackId) return (x->TrackId > y->TrackId) - (x->TrackId < y->TrackId);
-    return (x->BindRank > y->BindRank) - (x->BindRank < y->BindRank);
+    const struct SerChg * x = (const struct SerChg *) a, * y = (const struct SerChg *) b;
+    return (x->owner > y->owner) - (x->owner < y->owner);
 }
 
-/* The tags of every particle of an oversized key (design 7.2 step 9, D10): a reserved tracer to
- * its candidate; else a valid serial claim (an alive member's tail or a root's relaxed
- * remainder) keeps its tag; else the in-place claim of the deepest alive candidate whose
- * relaxed source holds it; a claim whose binding owner is not the claimant or one of its
- * ancestors in the final tree goes to the binding owner (J2); BoundTrackId the candidate (or
- * serial member) that bound it; dense own-tag ranks of the in-place candidates in their list
- * order (bound by final-pass energy, then the relaxed tail by the energy of its removal); the
- * serial ranks closed over the particles the in-place candidates took; the exclusive and tail
- * counts of the in-place records and the corrections of the serial ones. Collective. */
+/* the owner's order: by track, removals (by old rank) before additions (by g, f, ID) */
+static int
+cmp_serchg_track(const void * a, const void * b)
+{
+    const struct SerChg * x = (const struct SerChg *) a, * y = (const struct SerChg *) b;
+    if(x->T != y->T) return (x->T > y->T) - (x->T < y->T);
+    const int ax = x->kind == CHG_ADD, ay = y->kind == CHG_ADD;
+    if(ax != ay) return ax - ay;
+    if(x->key != y->key) return (x->key > y->key) - (x->key < y->key);
+    if(x->f != y->f) return (x->f > y->f) - (x->f < y->f);
+    return (x->ID > y->ID) - (x->ID < y->ID);
+}
+
+static int
+cmp_serquery_owner(const void * a, const void * b)
+{
+    const struct SerQuery * x = (const struct SerQuery *) a, * y = (const struct SerQuery *) b;
+    return (x->owner > y->owner) - (x->owner < y->owner);
+}
+
+static int
+cmp_serreply_holder(const void * a, const void * b)
+{
+    const struct SerReply * x = (const struct SerReply *) a, * y = (const struct SerReply *) b;
+    return (x->holder > y->holder) - (x->holder < y->holder);
+}
+
+static int
+cmp_int64_c(const void * a, const void * b)
+{
+    const int64_t x = *(const int64_t *) a, y = *(const int64_t *) b;
+    return (x > y) - (x < y);
+}
+
+/* One affected track on its owner: its changes in the sorted list. */
+struct RepTrack {
+    int64_t T;
+    int64_t r0, r1;          /* removals, by old rank */
+    int64_t a0, a1;          /* additions, by (g, f, ID) */
+    int64_t nbex;            /* its serial NboundExclusive (before the repair) */
+};
+
+/* entries of [lo, hi) of the sorted change list with key < x (le = 0) or key <= x (le = 1) */
+static int64_t
+chg_count_below(const struct SerChg * c, int64_t lo, int64_t hi, int64_t x, int le)
+{
+    const int64_t base = lo;
+    while(lo < hi) {
+        const int64_t mid = lo + (hi - lo) / 2;
+        if(c[mid].key < x || (le && c[mid].key == x)) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo - base;
+}
+
+/* The new dense rank of an own-tag particle with old rank r of the track: the removed ranks
+ * below r leave, the additions placed before it (all of them for a tail particle) enter. */
+static int64_t
+rep_new_rank(const struct SerChg * c, const struct RepTrack * t, int64_t r)
+{
+    const int64_t nrem = chg_count_below(c, t->r0, t->r1, r, 0);
+    const int64_t nadd = r < t->nbex ? chg_count_below(c, t->a0, t->a1, r, 1) : t->a1 - t->a0;
+    return r - nrem + nadd;
+}
+
+/* The serial ranks and counts closed over the changes of the final pass (audit Q2, Q3): every
+ * change goes to the rank holding its track's result; there the additions get their binder
+ * ordinals (struct SubhaloBindOrd, by ID), the removed ranks and the additions are sorted per
+ * track, the records' counts corrected, and every affected track's remaining particles ask
+ * their new rank (binary searches over the track's sorted changes). Nothing is replicated but
+ * the list of the affected TrackIds (at most the member table). chg is the local change list
+ * (bottom, the caller frees it). Collective. */
+static void
+serial_repair(struct Coll * C, struct SerChg * chg, int64_t nchg)
+{
+    struct SubhaloCallCtx * ctx = C->ctx;
+    const double t0 = MPI_Wtime();
+    int64_t k, i;
+    int64_t loc[3] = {0, 0, nchg}, tot3[3];
+    for(k = 0; k < nchg; k++) {
+        if(chg[k].kind == CHG_ADD) loc[1]++;
+        else loc[0]++;
+    }
+    MPI_Allreduce(loc, tot3, 3, MPI_INT64, MPI_SUM, C->Comm);
+    CollStats.NStolen = tot3[0];
+    CollStats.NAdded = tot3[1];
+    if(tot3[2] == 0)
+        return;
+    /* 1. the changes to the track owners */
+    int64_t * sendcounts = ta_malloc("SubRepSend", int64_t, C->NTask);
+    memset(sendcounts, 0, sizeof(int64_t) * C->NTask);
+    for(k = 0; k < nchg; k++)
+        sendcounts[chg[k].owner]++;
+    qsort(chg, nchg, sizeof(struct SerChg), cmp_serchg_owner);
+    struct SerChg * in = NULL;
+    const int64_t nin = subhalo_alltoallv(chg, sendcounts, sizeof(struct SerChg), (void **) &in, 0, NULL, C->Comm);
+    /* 2. the binder ordinals of the additions (this rank processed the binder's key) */
+    int bad = 0;
+    for(k = 0; k < nin; k++) {
+        if(in[k].kind != CHG_ADD)
+            continue;
+        int64_t lo = 0, hi = ctx->NBindOrd;
+        while(lo < hi) {
+            const int64_t mid = lo + (hi - lo) / 2;
+            if(ctx->BindOrd[mid].ID < in[k].ID) lo = mid + 1;
+            else hi = mid;
+        }
+        if(lo >= ctx->NBindOrd || ctx->BindOrd[lo].ID != in[k].ID) {
+            if(bad++ < 5)
+                message(1, "Subhalo in place: particle %lu given to its binder %ld has no binder ordinal.\n", (unsigned long) in[k].ID, in[k].T);
+            continue;
+        }
+        in[k].key = ctx->BindOrd[lo].g;
+        in[k].f = ctx->BindOrd[lo].f;
+    }
+    if(MPIU_Any(bad > 0, C->Comm))
+        endrun(5, "Subhalo in place: tails given to their serial binder without a binder ordinal.\n");
+    qsort(in, nin, sizeof(struct SerChg), cmp_serchg_track);
+    /* the affected tracks of this rank, their runs, and the corrections of their records */
+    int64_t ntr = 0;
+    for(k = 0; k < nin; k++)
+        if(k == 0 || in[k].T != in[k - 1].T)
+            ntr++;
+    struct RepTrack * rt = (struct RepTrack *) mymalloc("SubRepTracks", sizeof(struct RepTrack) * (ntr + 1));
+    /* this rank's sub-tree results by TrackId */
+    int64_t nres = 0;
+    for(i = 0; i < ctx->IpResStart; i++)
+        if(ctx->Res[i].subkey >= 0 && ctx->Res[i].valid)
+            nres++;
+    int64_t * rmap = (int64_t *) mymalloc("SubRepResMap", sizeof(int64_t) * 2 * (nres + 1));
+    nres = 0;
+    for(i = 0; i < ctx->IpResStart; i++)
+        if(ctx->Res[i].subkey >= 0 && ctx->Res[i].valid) {
+            rmap[2 * nres] = ctx->Res[i].rec.TrackId;
+            rmap[2 * nres + 1] = i;
+            nres++;
+        }
+    qsort(rmap, nres, 2 * sizeof(int64_t), cmp_int64_c);
+    ntr = 0;
+    k = 0;
+    while(k < nin) {
+        struct RepTrack * t = &rt[ntr++];
+        t->T = in[k].T;
+        t->r0 = k;
+        while(k < nin && in[k].T == t->T && in[k].kind != CHG_ADD)
+            k++;
+        t->r1 = t->a0 = k;
+        while(k < nin && in[k].T == t->T)
+            k++;
+        t->a1 = k;
+        const struct SubhaloMember * m = member_of(C, t->T);
+        if(!m || m->cand >= 0 || m->resrank != C->ThisTask)
+            endrun(5, "Subhalo in place: repair of track %ld on rank %d, which does not hold its result.\n", t->T, C->ThisTask);
+        t->nbex = m->NboundExclusive;
+        /* the additions: their new ranks (k-th addition after g own exclusive particles, less
+         * the removed ones below g) are answered with the queries below */
+        int64_t lo = 0, hi = nres;
+        while(lo < hi) {
+            const int64_t mid = (lo + hi) / 2;
+            if(rmap[2 * mid] < t->T) lo = mid + 1;
+            else hi = mid;
+        }
+        if(lo >= nres || rmap[2 * lo] != t->T)
+            endrun(5, "Subhalo in place: no result of serial track %ld on its owner %d.\n", t->T, C->ThisTask);
+        struct SubTrack * rec = &ctx->Res[rmap[2 * lo + 1]].rec;
+        if(rec->Nbound <= 0)
+            continue;
+        int64_t j;
+        int64_t nex = rec->NboundExclusive;
+        for(j = t->r0; j < t->r1; j++) {
+            if(in[j].kind == CHG_EXCL) {
+                nex--;
+                rec->NboundExclusiveType[in[j].type]--;
+            }
+            else
+                rec->NtailType[in[j].type]--;
+        }
+        for(j = t->a0; j < t->a1; j++) {
+            nex++;
+            rec->NboundExclusiveType[in[j].type]++;
+        }
+        if(!subhalo_count_fits_i32((double) nex) || nex > rec->Nbound)
+            bad = 1;
+        rec->NboundExclusive = (int32_t) nex;
+    }
+    myfree(rmap);
+    /* 3. the affected TrackIds to every rank (bounded by the member table) */
+    int64_t * aff = (int64_t *) mymalloc("SubRepAffLoc", sizeof(int64_t) * (ntr + 1));
+    for(k = 0; k < ntr; k++)
+        aff[k] = rt[k].T;
+    int64_t naff = 0;
+    MPI_Allreduce(&ntr, &naff, 1, MPI_INT64, MPI_SUM, C->Comm);
+    subhalo_check_mpi_count(naff, "the serial tracks to repair", C->Comm);
+    int * counts = ta_malloc("SubRepAffCnt", int, C->NTask);
+    int * displ = ta_malloc("SubRepAffDispl", int, C->NTask);
+    int nloc = (int) ntr;
+    MPI_Allgather(&nloc, 1, MPI_INT, counts, 1, MPI_INT, C->Comm);
+    int64_t s = 0;
+    int r;
+    for(r = 0; r < C->NTask; r++) {
+        displ[r] = (int) s;
+        s += counts[r];
+    }
+    int64_t * allaff = (int64_t *) mymalloc("SubRepAff", sizeof(int64_t) * (naff + 1));
+    MPI_Allgatherv(aff, nloc, MPI_INT64, allaff, counts, displ, MPI_INT64, C->Comm);
+    ta_free(displ);
+    ta_free(counts);
+    qsort(allaff, naff, sizeof(int64_t), cmp_int64_c);
+    /* 4. the remaining own-tag particles of the affected tracks ask their new rank */
+    int64_t nq = 0;
+    for(i = 0; i < C->NumPart; i++) {
+        if(!(C->Flag[i] & CF_UNIV) || (C->Flag[i] & CF_ADDED) || P[i].TrackId < 0 || !part_live(&P[i]))
+            continue;
+        if(bsearch(&P[i].TrackId, allaff, naff, sizeof(int64_t), cmp_int64_c))
+            nq++;
+    }
+    struct SerQuery * q = (struct SerQuery *) mymalloc("SubRepQ", sizeof(struct SerQuery) * (nq + 1));
+    memset(sendcounts, 0, sizeof(int64_t) * C->NTask);
+    nq = 0;
+    for(i = 0; i < C->NumPart; i++) {
+        if(!(C->Flag[i] & CF_UNIV) || (C->Flag[i] & CF_ADDED) || P[i].TrackId < 0 || !part_live(&P[i]))
+            continue;
+        if(!bsearch(&P[i].TrackId, allaff, naff, sizeof(int64_t), cmp_int64_c))
+            continue;
+        const struct SubhaloMember * m = member_of(C, P[i].TrackId);
+        if(!m || m->resrank < 0)
+            endrun(5, "Subhalo in place: affected serial track %ld without a result rank.\n", P[i].TrackId);
+        q[nq].T = P[i].TrackId;
+        q[nq].r = P[i].BindRank;
+        q[nq].index = i;
+        q[nq].holder = C->ThisTask;
+        q[nq].owner = m->resrank;
+        sendcounts[m->resrank]++;
+        nq++;
+    }
+    qsort(q, nq, sizeof(struct SerQuery), cmp_serquery_owner);
+    struct SerQuery * qin = NULL;
+    const int64_t nqin = subhalo_alltoallv(q, sendcounts, sizeof(struct SerQuery), (void **) &qin, 0, NULL, C->Comm);
+    /* 5. the answers: the additions' ranks and the queries' ranks, back to the holders */
+    int64_t nadd = 0;
+    for(k = 0; k < nin; k++)
+        if(in[k].kind == CHG_ADD)
+            nadd++;
+    struct SerReply * rep = (struct SerReply *) mymalloc("SubRepReply", sizeof(struct SerReply) * (nadd + nqin + 1));
+    memset(sendcounts, 0, sizeof(int64_t) * C->NTask);
+    int64_t nrep = 0;
+    for(k = 0; k < ntr; k++) {
+        const struct RepTrack * t = &rt[k];
+        int64_t j;
+        for(j = t->a0; j < t->a1; j++) {
+            const int64_t g = in[j].key;
+            const int64_t nr = g - chg_count_below(in, t->r0, t->r1, g, 0) + (j - t->a0);
+            if(!subhalo_rank_fits_i32(nr))
+                bad = 1;
+            rep[nrep].index = in[j].index;
+            rep[nrep].rank = nr;
+            rep[nrep].holder = in[j].holder;
+            rep[nrep].pad = 0;
+            sendcounts[in[j].holder]++;
+            nrep++;
+        }
+    }
+    for(k = 0; k < nqin; k++) {
+        int64_t lo = 0, hi = ntr;
+        while(lo < hi) {
+            const int64_t mid = (lo + hi) / 2;
+            if(rt[mid].T < qin[k].T) lo = mid + 1;
+            else hi = mid;
+        }
+        if(lo >= ntr || rt[lo].T != qin[k].T)
+            endrun(5, "Subhalo in place: rank query of track %ld on rank %d, which has no change of it.\n", qin[k].T, C->ThisTask);
+        const int64_t nr = rep_new_rank(in, &rt[lo], qin[k].r);
+        if(!subhalo_rank_fits_i32(nr))
+            bad = 1;
+        rep[nrep].index = qin[k].index;
+        rep[nrep].rank = nr;
+        rep[nrep].holder = qin[k].holder;
+        rep[nrep].pad = 0;
+        sendcounts[qin[k].holder]++;
+        nrep++;
+    }
+    /* audit Q4: no rank or count beyond the int32 columns, decided on every rank before writing */
+    if(MPIU_Any(bad, C->Comm))
+        endrun(1, "Subhalo in place: a repaired serial BindRank or count is beyond the catalogue's int32 range.\n");
+    qsort(rep, nrep, sizeof(struct SerReply), cmp_serreply_holder);
+    struct SerReply * rin = NULL;
+    const int64_t nrin = subhalo_alltoallv(rep, sendcounts, sizeof(struct SerReply), (void **) &rin, 0, NULL, C->Comm);
+    for(k = 0; k < nrin; k++) {
+        const int64_t ix = rin[k].index;
+        P[ix].BindRank = (int32_t) rin[k].rank;
+        C->Flag[ix] &= ~CF_ADDED;
+    }
+    int64_t loc2[2] = {nq, nrep}, tot2[2];
+    MPI_Allreduce(loc2, tot2, 2, MPI_INT64, MPI_SUM, C->Comm);
+    CollStats.NRepairQueries = tot2[0];
+    CollStats.NRepairTracks = naff;
+    myfree(rin);
+    myfree(rep);
+    myfree(qin);
+    myfree(q);
+    myfree(allaff);
+    myfree(aff);
+    myfree(rt);
+    myfree(in);
+    ta_free(sendcounts);
+    CollStats.RepairSeconds = MPI_Wtime() - t0;
+}
+
+/* The tags of every particle of an oversized key (decide_tag), BoundTrackId the candidate (or
+ * serial member) that bound it; dense own-tag ranks of the in-place candidates in their list order
+ * (bound by final-pass energy, then the relaxed tail by the energy of its removal); the exclusive
+ * and tail counts of the in-place records; the serial ranks and counts closed over the changes
+ * (serial_repair). Collective. */
 static void
 coll_final_tags(struct Coll * C, const int64_t * slotof)
 {
     struct SubhaloCallCtx * ctx = C->ctx;
     const struct SubhaloInplaceCand * Cd = C->plan->Cands;
     const int64_t ncand = C->plan->NCands;
+    const double t0 = MPI_Wtime();
     int64_t i, k, c;
     int t;
-    int64_t nt = 0, nrm = 0, nwritten = 0, nrel = 0, nj2 = 0;
-    for(i = 0; i < C->NumPart; i++)
-        if(C->Flag[i] & CF_UNIV)
+    int64_t nt = 0, nchg = 0, nwritten = 0, nrel = 0, nj2 = 0;
+    struct TagDec dec;
+    /* the exact sizes first: the in-place own-tag records and the serial changes (audit Q1) */
+    for(i = 0; i < C->NumPart; i++) {
+        if(!(C->Flag[i] & CF_UNIV) || (C->Flag[i] & CF_RELEASE))
+            continue;
+        decide_tag(C, i, &dec);
+        if(dec.tag != SUBHALO_NOTRACK && dec.tc >= 0)
             nt++;
-    struct TagRec * tr = (struct TagRec *) mymalloc("SubCollTagRec", sizeof(struct TagRec) * (nt + 1));
-    struct Removed * rm = (struct Removed *) mymalloc("SubCollRemoved", sizeof(struct Removed) * (nt + 1));
-    MyIDType * ad_id = (MyIDType *) mymalloc("SubCollAddedId", sizeof(MyIDType) * (nt + 1));
+        if(dec.change >= 0)
+            nchg++;
+    }
     /* per candidate and type: exclusive and tail own-tag counts */
     int64_t * cnt = (int64_t *) mymalloc("SubCollTagCnt", sizeof(int64_t) * 12 * (ncand + 1));
     memset(cnt, 0, sizeof(int64_t) * 12 * (ncand + 1));
-    nt = 0;
+    int64_t * g = (int64_t *) mymalloc("SubCollTagCntG", sizeof(int64_t) * 12 * (ncand + 1));
+    struct SerChg * chg = (struct SerChg *) mymalloc("SubCollSerChg", sizeof(struct SerChg) * (nchg + 1));
+    struct TagRec * tr = (struct TagRec *) mymalloc("SubCollTagRec", sizeof(struct TagRec) * (nt + 1));
+    nt = nchg = 0;
     for(i = 0; i < C->NumPart; i++) {
         const uint8_t f = C->Flag[i];
         if(f & CF_RELEASE) {
@@ -2219,208 +2773,54 @@ coll_final_tags(struct Coll * C, const int64_t * slotof)
         if(!(f & CF_UNIV))
             continue;
         nwritten++;
-        const int64_t T0 = P[i].TrackId, B0 = P[i].BoundTrackId;
-        const int32_t cc = C->Cand[i];
-        int64_t bT = SUBHALO_NOTRACK, bc = -1;
-        if(f & CF_SBOUND)
-            bT = B0;
-        else if(cc >= 0 && (f & CF_BOUND) && C->cs[cc].state == SUBHALO_ST_ALIVE) {
-            bT = Cd[cc].TrackId;
-            bc = cc;
+        decide_tag(C, i, &dec);
+        nj2 += dec.j2;
+        if(dec.change >= 0) {
+            struct SerChg * e = &chg[nchg++];
+            memset(e, 0, sizeof(*e));
+            const struct SubhaloMember * m = member_of(C, dec.chT);
+            if(!m || m->resrank < 0)
+                endrun(5, "Subhalo in place: serial track %ld changed without a result rank.\n", dec.chT);
+            e->T = dec.chT;
+            e->key = dec.change == CHG_ADD ? 0 : P[i].BindRank;
+            e->f = 0;
+            e->ID = P[i].ID;
+            e->index = i;
+            e->holder = C->ThisTask;
+            e->owner = m->resrank;
+            e->kind = dec.change;
+            e->type = P[i].Type;
+            if(dec.change == CHG_ADD)
+                C->Flag[i] |= CF_ADDED;
         }
-        int64_t tag = SUBHALO_NOTRACK, tc = -1;
-        int bound = 0;
-        double E = 0;
-        const struct SubhaloMember * m0 = member_of(C, T0);
-        const int sclaim = (f & CF_SCLAIM) && m0 && m0->state == SUBHALO_ST_ALIVE && m0->cand < 0;
-        if((f & CF_RES) && bc >= 0) {
-            tag = bT;
-            tc = bc;
-            bound = 1;
-            E = C->En[i];
-        }
-        else if(sclaim) {
-            tag = T0;
-            if(bc >= 0 && !final_ancestor_c(C, T0, bT)) {
-                tag = bT;
-                tc = bc;
-                bound = 1;
-                E = C->En[i];
-                nj2++;
-            }
-        }
-        else if(C->Claim[i] >= 0 && C->cs[C->Claim[i]].state == SUBHALO_ST_ALIVE) {
-            tc = C->Claim[i];
-            tag = Cd[tc].TrackId;
-            bound = bc == tc;
-            E = bound ? C->En[i] : C->ClaimE[i];
-            if(bc >= 0 && bc != tc && !final_ancestor_c(C, tag, bT)) {
-                tag = bT;
-                tc = bc;
-                bound = 1;
-                E = C->En[i];
-                nj2++;
-            }
-        }
-        else if(bc >= 0) {
-            tag = bT;
-            tc = bc;
-            bound = 1;
-            E = C->En[i];
-        }
-        else if(f & CF_SBOUND) {
-            /* a serial tail whose claimant sank into an in-place candidate while its serial
-             * binder survives: the binder's own (inserted after its exclusive prefix below) */
-            tag = bT;
-            C->Flag[i] |= CF_ADDED;
-            rm[nrm].TrackId = bT;
-            rm[nrm].BindRank = -1;
-            rm[nrm].Type = P[i].Type;
-            rm[nrm].excl = 2;
-            rm[nrm].pad = 0;
-            ad_id[nrm] = P[i].ID;
-            nrm++;
-        }
-        /* a serial own-tag particle taken over by an in-place candidate */
-        if((f & CF_SCLAIM) && m0 && m0->cand < 0 && m0->state == SUBHALO_ST_ALIVE && tag != T0) {
-            rm[nrm].TrackId = T0;
-            rm[nrm].BindRank = P[i].BindRank;
-            rm[nrm].Type = P[i].Type;
-            rm[nrm].excl = B0 == T0;
-            rm[nrm].pad = 0;
-            ad_id[nrm] = P[i].ID;
-            nrm++;
-        }
-        P[i].TrackId = tag;
-        P[i].BoundTrackId = bT;
-        if(tag == SUBHALO_NOTRACK) {
+        P[i].TrackId = dec.tag;
+        P[i].BoundTrackId = dec.bT;
+        if(dec.tag == SUBHALO_NOTRACK) {
             P[i].BindRank = -1;
-            P[i].BoundTrackId = -1;
             continue;
         }
-        if(tc < 0)
-            continue;           /* a serial tag keeps its rank (closed below) */
+        if(dec.tc < 0)
+            continue;           /* a serial tag: its rank is repaired below */
         struct TagRec * e = &tr[nt++];
         e->key[0] = P[i].ID;
-        e->key[1] = double_key(E);
-        e->key[2] = ((uint64_t) tc << 1) | (uint64_t) (bound ? 0 : 1);
+        e->key[1] = double_key(dec.E);
+        e->key[2] = ((uint64_t) dec.tc << 1) | (uint64_t) (dec.bound ? 0 : 1);
         e->rank = C->ThisTask;
         e->type = P[i].Type;
         e->index = i;
-        cnt[12 * tc + (bound ? 0 : 6) + P[i].Type]++;
+        cnt[12 * dec.tc + (dec.bound ? 0 : 6) + P[i].Type]++;
     }
-    /* ---- the serial ranks and counts: the particles the in-place candidates took (excl 0/1) are
-     *      removed from their serial track's dense ranks, the tails given to their serial binder
-     *      (excl 2, ordered by ID) inserted after its exclusive prefix ---- */
-    {
-        int64_t tot = 0, nrem = 0;
-        MPI_Allreduce(&nrm, &tot, 1, MPI_INT64, MPI_SUM, C->Comm);
-        for(k = 0; k < nrm; k++)
-            if(rm[k].excl != 2)
-                nrem++;
-        MPI_Allreduce(MPI_IN_PLACE, &nrem, 1, MPI_INT64, MPI_SUM, C->Comm);
-        CollStats.NStolen = nrem;
-        if(tot > 0) {
-            /* the added entries carry their particle's ID in place of the rank, for the order */
-            for(k = 0; k < nrm; k++)
-                if(rm[k].excl == 2)
-                    rm[k].BindRank = -1;
-            int * counts = ta_malloc("SubCollRmCnt", int, C->NTask);
-            int * displ = ta_malloc("SubCollRmDispl", int, C->NTask);
-            int nb = (int) (nrm * sizeof(struct Removed));
-            MPI_Allgather(&nb, 1, MPI_INT, counts, 1, MPI_INT, C->Comm);
-            int64_t s = 0;
-            int r;
-            for(r = 0; r < C->NTask; r++) {
-                displ[r] = (int) s;
-                s += counts[r];
-            }
-            struct Removed * all = (struct Removed *) mymalloc("SubCollRmAll", sizeof(struct Removed) * (tot + 1));
-            MPI_Allgatherv(rm, nb, MPI_BYTE, all, counts, displ, MPI_BYTE, C->Comm);
-            for(r = 0; r < C->NTask; r++) {
-                displ[r] = (int) (displ[r] / sizeof(struct Removed) * sizeof(MyIDType));
-                counts[r] = (int) (counts[r] / sizeof(struct Removed) * sizeof(MyIDType));
-            }
-            MyIDType * allid = (MyIDType *) mymalloc("SubCollRmIds", sizeof(MyIDType) * (tot + 1));
-            MPI_Allgatherv(ad_id, (int) (nrm * sizeof(MyIDType)), MPI_BYTE, allid, counts, displ, MPI_BYTE, C->Comm);
-            ta_free(displ);
-            ta_free(counts);
-            /* the added ones: their order j among their binder's (by ID), kept in the local
-             * entries as BindRank -(2 + j) */
-            for(k = 0; k < nrm; k++)
-                if(rm[k].excl == 2) {
-                    int64_t j = 0, q;
-                    for(q = 0; q < tot; q++)
-                        if(all[q].excl == 2 && all[q].TrackId == rm[k].TrackId && allid[q] < ad_id[k])
-                            j++;
-                    rm[k].BindRank = (int32_t) (-2 - j);
-                }
-            myfree(allid);
-            qsort(all, tot, sizeof(struct Removed), cmp_removed);
-            for(i = 0; i < C->NumPart; i++) {
-                if(!(C->Flag[i] & CF_UNIV) || P[i].TrackId < 0)
-                    continue;
-                const struct SubhaloMember * m = member_of(C, P[i].TrackId);
-                if(!m || m->cand >= 0)
-                    continue;
-                const int64_t T = P[i].TrackId;
-                int64_t nremb = 0, nremx = 0, nadd = 0;
-                /* the entries of T: a contiguous run of the sorted list */
-                int64_t lo = 0, hi = tot;
-                while(lo < hi) {
-                    const int64_t mid = (lo + hi) / 2;
-                    if(all[mid].TrackId < T) lo = mid + 1;
-                    else hi = mid;
-                }
-                for(k = lo; k < tot && all[k].TrackId == T; k++) {
-                    if(all[k].excl == 2) nadd++;
-                    else {
-                        if(all[k].excl == 1) nremx++;
-                        if(!(C->Flag[i] & CF_ADDED) && all[k].BindRank < P[i].BindRank) nremb++;
-                    }
-                }
-                const int64_t nbex = m->NboundExclusive - nremx;
-                if(C->Flag[i] & CF_ADDED) {
-                    int64_t j = -1;
-                    for(k = 0; k < nrm; k++)
-                        if(rm[k].excl == 2 && ad_id[k] == P[i].ID)
-                            j = -2 - rm[k].BindRank;
-                    if(j < 0)
-                        endrun(5, "Subhalo in place: an added tail particle %lu lost its entry.\n", (unsigned long) P[i].ID);
-                    P[i].BindRank = (int32_t) (nbex + j);
-                    C->Flag[i] &= ~CF_ADDED;
-                    continue;
-                }
-                int64_t rr = P[i].BindRank - nremb;
-                if(rr >= nbex)
-                    rr += nadd;
-                P[i].BindRank = (int32_t) rr;
-            }
-            for(i = 0; i < ctx->IpResStart; i++) {
-                struct SubhaloResult * rs = &ctx->Res[i];
-                if(rs->subkey < 0 || !rs->valid || rs->rec.Nbound <= 0)
-                    continue;
-                int64_t lo = 0, hi = tot;
-                while(lo < hi) {
-                    const int64_t mid = (lo + hi) / 2;
-                    if(all[mid].TrackId < rs->rec.TrackId) lo = mid + 1;
-                    else hi = mid;
-                }
-                for(k = lo; k < tot && all[k].TrackId == rs->rec.TrackId; k++) {
-                    if(all[k].excl == 1) {
-                        rs->rec.NboundExclusive--;
-                        rs->rec.NboundExclusiveType[all[k].Type]--;
-                    }
-                    else if(all[k].excl == 0)
-                        rs->rec.NtailType[all[k].Type]--;
-                    else {
-                        rs->rec.NboundExclusive++;
-                        rs->rec.NboundExclusiveType[all[k].Type]++;
-                    }
-                }
-            }
-            myfree(all);
-        }
+    /* ---- the exclusive and tail counts of the in-place candidates, checked against the int32
+     *      columns on every rank before any rank is written (audit Q4) ---- */
+    if(ncand > 0)
+        MPI_Allreduce(cnt, g, 12 * ncand, MPI_INT64, MPI_SUM, C->Comm);
+    for(c = 0; c < ncand; c++) {
+        int64_t own = 0;
+        for(t = 0; t < 12; t++)
+            own += g[12 * c + t];
+        if(!subhalo_count_fits_i32((double) own))
+            endrun(1, "Subhalo in place: candidate %ld has %ld own-tag particles, beyond the catalogue's int32 ranks and counts.\n",
+                   Cd[c].TrackId, own);
     }
     /* ---- the in-place own-tag ranks: (candidate, bound first, E, ID) ---- */
     {
@@ -2454,7 +2854,8 @@ coll_final_tags(struct Coll * C, const int64_t * slotof)
                     j = 0;
                 }
                 const int64_t rank = off[ncand + cc] + j++;
-                if(rank > INT32_MAX)
+                /* guarded collectively by the totals above */
+                if(!subhalo_rank_fits_i32(rank))
                     endrun(1, "Subhalo in place: BindRank of candidate %ld beyond the int32 range.\n", Cd[cc].TrackId);
                 int64_t * a = ans + 2 * o[tr[k].rank]++;
                 a[0] = tr[k].index;
@@ -2471,33 +2872,32 @@ coll_final_tags(struct Coll * C, const int64_t * slotof)
             myfree(off);
         }
     }
-    /* ---- the exclusive and tail counts of the in-place records ---- */
-    {
-        int64_t * g = (int64_t *) mymalloc("SubCollTagCntG", sizeof(int64_t) * 12 * (ncand + 1));
-        MPI_Allreduce(cnt, g, 12 * ncand, MPI_INT64, MPI_SUM, C->Comm);
-        for(c = 0; c < ncand; c++) {
-            if(slotof[c] < 0 || C->cs[c].state != SUBHALO_ST_ALIVE)
-                continue;
-            struct SubTrack * rec = &ctx->Res[slotof[c]].rec;
-            int64_t nex = 0;
-            for(t = 0; t < 6; t++) {
-                rec->NboundExclusiveType[t] = (int32_t) g[12 * c + t];
-                rec->NtailType[t] = (int32_t) g[12 * c + 6 + t];
-                nex += g[12 * c + t];
-            }
-            rec->NboundExclusive = (int32_t) nex;
-        }
-        myfree(g);
-    }
-    myfree(cnt);
-    myfree(ad_id);
-    myfree(rm);
     myfree(tr);
+    CollStats.TagSortSeconds = MPI_Wtime() - t0;
+    /* ---- the serial ranks and counts (audit Q2, Q3) ---- */
+    serial_repair(C, chg, nchg);
+    /* ---- the exclusive and tail counts of the in-place records ---- */
+    for(c = 0; c < ncand; c++) {
+        if(slotof[c] < 0 || C->cs[c].state != SUBHALO_ST_ALIVE)
+            continue;
+        struct SubTrack * rec = &ctx->Res[slotof[c]].rec;
+        int64_t nex = 0;
+        for(t = 0; t < 6; t++) {
+            rec->NboundExclusiveType[t] = (int32_t) g[12 * c + t];
+            rec->NtailType[t] = (int32_t) g[12 * c + 6 + t];
+            nex += g[12 * c + t];
+        }
+        rec->NboundExclusive = (int32_t) nex;
+    }
+    myfree(chg);
+    myfree(g);
+    myfree(cnt);
     int64_t loc[3] = {nwritten, nrel, nj2}, tot3[3];
     MPI_Allreduce(loc, tot3, 3, MPI_INT64, MPI_SUM, C->Comm);
     ctx->Stats.NFallbackField += nwritten;
     ctx->Stats.NFallbackReleased += nrel;
     CollStats.NJ2 = tot3[2];
+    CollStats.TagSeconds = MPI_Wtime() - t0;
 }
 
 /* ------------------------------------------------------------------ setup */
@@ -2508,21 +2908,112 @@ struct SerialInfo {
     int64_t TrackId;
     int64_t SinkTo;
     int32_t state, Nbound, NboundExclusive, Keep;
-    int32_t has_core, pad;
+    int32_t has_core, rank;  /* rank: the rank holding the result (the repair's track owner) */
     float Mbound, Vmax;
     MyIDType MostBoundID;
     double CorePos[3], CoreVel[3], SigmaX, SigmaV;
 };
 
-/* What every rank holds per in-place key and candidate (the plan's entries, the candidate state,
- * the per-round vectors of the cores, sums, profile and shapes, the hierarchy) and per member of
- * an oversized key (the member table, the gathered serial result, the hierarchy arrays): the
- * budget of the plan (subhalo_plan_default_cfg) charges these constants. */
-_Static_assert(sizeof(struct SubhaloInplaceKey) + sizeof(struct SubhaloInplaceCand) + sizeof(struct CandState)
-               + 8 * (NHS + 2 + CORE_ND + 1 + 2 * SUBHALO_MAXTRACERS + 2 * SUBHALO_NSO + 8 + 9 + 2 * NSUM + 12 + 4) + 4 * 10
-               <= SUBHALO_INPLACE_KEY_BYTES, "SUBHALO_INPLACE_KEY_BYTES does not cover the per-candidate vectors");
+/* What every rank holds per in-place key (the plan's entry, maxmerge, the winner vectors of the
+ * driver), per in-place candidate (its plan entry, its state, its result slot index, the
+ * per-round vectors of the cores and their heaps, sums, profile, shapes, and the final pass's
+ * count vectors) and per member of an oversized key (the member table, the gathered serial result,
+ * the hierarchy arrays): the budget of the plan (subhalo_plan_default_cfg) and the admission
+ * (subhalo_coll_estimate) charge these constants. */
+_Static_assert(sizeof(struct SubhaloInplaceKey) + 8 + 4 * 16 <= SUBHALO_INPLACE_KEY_BYTES,
+               "SUBHALO_INPLACE_KEY_BYTES does not cover the per-key vectors");
+_Static_assert(sizeof(struct SubhaloInplaceCand) + sizeof(struct CandState)
+               + 8 * (NHS + 2 + CORE_ND + 1 + 2 * SUBHALO_MAXTRACERS + 2 * SUBHALO_NSO + 8 + 9 + 2 * NSUM + 12 + 4 + 4 + 3 * 12 + 2 + 1)
+               + 4 * 10 <= SUBHALO_INPLACE_CAND_BYTES, "SUBHALO_INPLACE_CAND_BYTES does not cover the per-candidate vectors");
 _Static_assert(sizeof(struct SubhaloMember) + sizeof(struct SerialInfo) + 32 <= SUBHALO_INPLACE_MEMBER_BYTES,
                "SUBHALO_INPLACE_MEMBER_BYTES does not cover the member table");
+
+const char * const SubhaloCollStageName[SUBHALO_COLL_NSTAGE] = {
+    "setup (serial results, previous records)", "tree build and walk", "core selection", "radial sort",
+    "relaxed-source sort", "final tags", "serial-tag repair"};
+
+/* Fixed slack per stage for the allocator's block headers and alignment and the small NTask- and
+ * leaf-sized vectors of the sorts. */
+#define COLL_STAGE_SLACK (256. * 1024.)
+
+void
+subhalo_coll_estimate(struct SubhaloCollAdmit * a, int64_t NumPart, int64_t MaxPart, int64_t NUniv, int64_t NSubPart,
+                      int64_t NOwned, int64_t OwnedRecv, int64_t NCands, int64_t NMembers, int64_t NSubResults,
+                      int64_t NTopNodes, int64_t NTopLeaves, int64_t NLocalLeaves, double TreeAllocFactor, int nthreads)
+{
+    const struct SubhaloParams * sp = subhalo_get_params();
+    const int CoreSize = sp->SubhaloCoreSize > 0 ? sp->SubhaloCoreSize : 1;
+    const double K = CoreSize > sp->SubhaloMinNumTracerPart ? CoreSize : sp->SubhaloMinNumTracerPart;
+    const double N = (double) NumPart + 1, U = (double) NUniv + 1, S = (double) NSubPart + 1;
+    const double nc = (double) NCands + 1;
+    int s, NTask;
+    MPI_Comm_size(MPI_COMM_WORLD, &NTask);
+    /* through the whole call: per particle the source candidate and the claim (int32), the flags
+     * (uint8), the two energies (double); per candidate its state and vectors; per owned candidate
+     * its previous record and its slot */
+    a->persist = 25. * N + nc * SUBHALO_INPLACE_CAND_BYTES + (double) (NOwned + 1) * (sizeof(struct SubTrack) + 8.);
+    /* setup: the serial results gathered on every rank (local copy and the whole list), the
+     * fetch of the owned previous records, the hierarchy arrays of the member table */
+    {
+        /* the fetch's batch buffers hold this rank's requests and the replies it serves: at most
+         * its owned candidates and every candidate's record, each way */
+        double fetch = 2. * (double) (NOwned + NCands + 2) * (sizeof(struct SubTrack) + 8.) + 4096. * 4;
+        if(fetch > subhalo_table_batch_peak_bytes(NTask))
+            fetch = subhalo_table_batch_peak_bytes(NTask);
+        a->stage[SUBHALO_COLL_SETUP] = 2. * (double) (NSubResults + 1) * sizeof(struct SerialInfo)
+            + (double) (NOwned + 1) * (sizeof(struct SubTrack) + 16.) + fetch
+            + (double) (NMembers + 1) * (2 * sizeof(float) + sizeof(MyIDType) + 2 * sizeof(int64_t) + 1);
+    }
+    /* the tree: force_tree_active_moments sizes its node block by TreeAllocFactor x NumPart (NumPart
+     * raised on a nearly empty rank, coll_walk) + the top nodes before shrinking it (no Father
+     * array: alloc_father = 0); the query and tree lists; the top-leaf labels and the pseudo-data
+     * exchange; the treewalk's export headroom */
+    {
+        double np = (double) NumPart;
+        double need = 2048. + 512. * nthreads + 4. * (double) NLocalLeaves * nthreads;
+        if(need > (double) MaxPart)
+            need = (double) MaxPart;
+        if(np < need)
+            np = need;
+        const double nodes = TreeAllocFactor * np + (double) NTopNodes + 1;
+        a->stage[SUBHALO_COLL_TREE] = nodes * sizeof(struct NODE) + 8. * U + 16. * (double) (NTopLeaves + 1) * 8.
+            + (double) subhalo_collective_walk_bytes();
+    }
+    /* the cores: the bounded heaps (at most K tracers and K non-tracers per candidate), the
+     * owner's receive buffer */
+    {
+        double heap = 2. * K * nc;
+        if(heap > U)
+            heap = U;
+        a->stage[SUBHALO_COLL_CORE] = sizeof(struct CoreRec) * (heap + (double) OwnedRecv + 1);
+    }
+    /* the radial ordered set: the records and mpsort's record-sized exchange copy, then the
+     * positions and cumulative masses */
+    a->stage[SUBHALO_COLL_RADIAL] = 2. * sizeof(struct RadRec) * U;
+    /* the relaxed-source positions: records and mpsort's copy */
+    a->stage[SUBHALO_COLL_SOURCE] = 2. * sizeof(struct UPosRec) * U;
+    /* the final tags: records and mpsort's copy, then records, answers and their receive buffer;
+     * the change list (at most one per particle) lives below them */
+    {
+        const double sort = 2. * sizeof(struct TagRec) * U, ans = sizeof(struct TagRec) * U + 2. * 16. * U;
+        a->stage[SUBHALO_COLL_TAGS] = (sort > ans ? sort : ans) + sizeof(struct SerChg) * U;
+    }
+    /* the serial repair: the changes sent (at most one per particle) and received (at most one per
+     * particle of the sub-tree keys processed here), the affected TrackIds (at most the member
+     * table), the queries and the replies, both ways */
+    a->stage[SUBHALO_COLL_REPAIR] = sizeof(struct SerChg) * (U + S) + 8. * (double) (NMembers + 1) * 2
+        + sizeof(struct SerQuery) * (U + S) + sizeof(struct SerReply) * (U + 2. * S) + sizeof(struct RepTrack) * (double) (NMembers + 1);
+    double mx = 0;
+    for(s = 0; s < SUBHALO_COLL_NSTAGE; s++) {
+        a->stage[s] += COLL_STAGE_SLACK;
+        if(a->stage[s] > mx)
+            mx = a->stage[s];
+    }
+    a->need = a->persist + mx;
+    a->NumPart = NumPart;
+    a->NUniv = NUniv;
+    a->NSubPart = NSubPart;
+}
 
 static void
 gather_serial(struct Coll * C)
@@ -2551,6 +3042,7 @@ gather_serial(struct Coll * C)
         e->NboundExclusive = rs->rec.NboundExclusive;
         e->Keep = rs->Keep;
         e->has_core = rs->has_core;
+        e->rank = C->ThisTask;
         e->Mbound = rs->rec.Mbound;
         e->Vmax = rs->rec.Vmax;
         e->MostBoundID = rs->rec.MostBoundID;
@@ -2576,6 +3068,8 @@ gather_serial(struct Coll * C)
     ta_free(displ);
     ta_free(counts);
     myfree(loc);
+    for(i = 0; i < C->plan->NMembers; i++)
+        C->plan->Members[i].resrank = -1;
     for(i = 0; i < tot; i++) {
         const int64_t j = member_lookup_c(C, all[i].TrackId);
         if(j < 0)
@@ -2587,6 +3081,7 @@ gather_serial(struct Coll * C)
         m->NboundExclusive = all[i].NboundExclusive;
         m->Keep = all[i].Keep;
         m->has_core = all[i].has_core;
+        m->resrank = all[i].rank;
         m->Mbound = all[i].Mbound;
         m->Vmax = all[i].Vmax;
         m->MostBoundID = all[i].MostBoundID;
@@ -2759,6 +3254,20 @@ run_round(struct Coll * C, int r, const int64_t * slotof, const struct SubTrack 
     round_cores(C, &fin);
     struct RoundProps rp;
     round_props(C, &fin, &rp);
+    /* audit Q4: the full bound counts (descendants' tails included) against the catalogue's int32
+     * columns before anything is narrowed or published; the sums are reduced, so every rank
+     * takes the same decision */
+    for(c = C->c0; c < C->c1; c++) {
+        if(C->cs[c].state != SUBHALO_ST_ALIVE)
+            continue;
+        const double * h = rp.hs + NHS * (c - C->c0);
+        int ok = subhalo_count_fits_i32(h[HS_N]) && subhalo_count_fits_i32(h[HS_NTR]), t;
+        for(t = 0; t < 6; t++)
+            ok = ok && subhalo_count_fits_i32(h[HS_NT + t]);
+        if(!ok)
+            endrun(1, "Subhalo in place: candidate %ld has %.0f bound particles, beyond the catalogue's int32 counts.\n",
+                   plan->Cands[c].TrackId, h[HS_N]);
+    }
     const double G = up->G;
     for(c = C->c0; c < C->c1; c++) {
         struct CandState * s = &C->cs[c];
@@ -2811,6 +3320,9 @@ subhalo_collective_run(struct SubhaloPlan * plan, struct SubhaloCallCtx * ctx, D
     memset(&CollStats, 0, sizeof(CollStats));
     if(plan->NCands == 0)
         return;
+    /* the measured high water of the call against the plan's admission (audit Q1) */
+    const double Free0 = (double) mymalloc_freebytes();
+    allocator_reset_min_free(A_MAIN);
     struct Coll C;
     memset(&C, 0, sizeof(C));
     C.plan = plan;
@@ -2900,6 +3412,8 @@ subhalo_collective_run(struct SubhaloPlan * plan, struct SubhaloCallCtx * ctx, D
     myfree(maxmerge);
 
     /* 5. the final tags */
+    if(PretagHook)
+        PretagHook(ctx, plan);
     coll_final_tags(&C, slotof);
     walltime_measure("/Subhalo/InPlace/Tags");
 
@@ -2911,6 +3425,33 @@ subhalo_collective_run(struct SubhaloPlan * plan, struct SubhaloCallCtx * ctx, D
     myfree(C.cs);
     myfree(oldrec);
     myfree(slotof);
+    {
+        const double meas = Free0 - (double) allocator_get_min_free(A_MAIN);
+        const double est = plan->Admit.checked ? plan->Admit.need : 0;
+        struct { double v; int r; } in[3], out[3];
+        in[0].v = meas;
+        in[1].v = est;
+        in[2].v = est > 0 ? meas / est : 0;
+        in[0].r = in[1].r = in[2].r = C.ThisTask;
+        MPI_Allreduce(in, out, 3, MPI_DOUBLE_INT, MPI_MAXLOC, Comm);
+        CollStats.MeasPeakBytes = out[0].v;
+        CollStats.MeasPeakRank = out[0].r;
+        CollStats.EstPeakBytes = out[1].v;
+        CollStats.EstPeakRank = out[1].r;
+        CollStats.MaxMeasOverEst = out[2].v;
+        double av[2] = {plan->Admit.checked ? -plan->Admit.avail : 0, -Free0}, avg[2];
+        MPI_Allreduce(av, avg, 2, MPI_DOUBLE, MPI_MAX, Comm);
+        CollStats.EstAvailBytes = -avg[0];
+        CollStats.FreeAtStartBytes = -avg[1];
+        double el = CollStats.WalkElasticBytes;
+        MPI_Allreduce(MPI_IN_PLACE, &el, 1, MPI_DOUBLE, MPI_MAX, Comm);
+        CollStats.WalkElasticBytes = el;
+        message(0, "Subhalo in place: memory high water %g MB (rank %d; the walks charged their reserve %g MB, they took up to %g MB of "
+                   "the free memory for their export tables), admitted estimate %g MB (rank %d), largest measured/estimated %.3f; "
+                   "least free at the start %g MB (the plan expected at least %g MB).\n", CollStats.MeasPeakBytes / 1048576.,
+                CollStats.MeasPeakRank, subhalo_collective_walk_bytes() / 1048576., el / 1048576., CollStats.EstPeakBytes / 1048576.,
+                CollStats.EstPeakRank, CollStats.MaxMeasOverEst, CollStats.FreeAtStartBytes / 1048576., CollStats.EstAvailBytes / 1048576.);
+    }
 
     /* the candidate-level diagnostics are identical on every rank: counted once */
     if(C.ThisTask == 0) {
@@ -2926,6 +3467,8 @@ subhalo_collective_run(struct SubhaloPlan * plan, struct SubhaloCallCtx * ctx, D
     for(r = 0; r < plan->NRounds && r < 16; r++)
         iters += CollStats.Iterations[r];
     message(0, "Subhalo in place: %ld candidates in %d round(s), %ld tree builds and walks, %ld alive, %ld died, %ld descendants sunk; "
-               "%ld serial own-tag particles taken by in-place candidates, %ld claims given to the binding owner (J2); %g s.\n",
-            ncand, plan->NRounds, iters, CollStats.NAlive, CollStats.NDied, CollStats.NSunk, CollStats.NStolen, CollStats.NJ2, MPI_Wtime() - t0);
+               "%ld serial own-tag particles taken by in-place candidates, %ld serial tails given to their binder, %ld claims given to the "
+               "binding owner (J2); final tags %g s (serial repair of %ld tracks, %ld rank queries: %g s); %g s.\n",
+            ncand, plan->NRounds, iters, CollStats.NAlive, CollStats.NDied, CollStats.NSunk, CollStats.NStolen, CollStats.NAdded,
+            CollStats.NJ2, CollStats.TagSeconds, CollStats.NRepairTracks, CollStats.NRepairQueries, CollStats.RepairSeconds, MPI_Wtime() - t0);
 }

@@ -268,6 +268,11 @@ int subhalo_last_call_snapshot(void);     /* snapshot number of the most recent 
 int subhalo_state_snapshot(void);         /* snapshot whose state the tags currently describe */
 double subhalo_state_time(void);          /* and its time */
 double subhalo_time_since_previous_call(void);
+/* The comoving SO thresholds (vir, 200b, 200c, 500c, 2500c; internal mass / length^3, those of
+ * subhalo_so_thresholds) of the call whose records the table holds: the last completed call, or
+ * the loaded state's Header SOThresholds; -1 if unknown. */
+void subhalo_state_so_thresholds(double rho[SUBHALO_NSO]);
+void subhalo_set_state_so_thresholds(const double rho[SUBHALO_NSO]);
 /* Count tagged particles per type on this rank (debug/diagnostic). */
 void subhalo_count_tagged(const struct part_manager_type * pman, int64_t ntagged[6]);
 

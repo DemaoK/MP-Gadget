@@ -95,6 +95,7 @@ allocator_reset(Allocator * alloc, int zero)
     alloc->refcount = 1;
     alloc->top = alloc->size;
     alloc->bottom = 0;
+    alloc->minfree = alloc->size;
 
     if(zero) {
         memset(alloc->base, 0, alloc->size);
@@ -135,6 +136,9 @@ allocator_alloc_va(Allocator * alloc, const char * name, const size_t request_si
         /* wrong dir cannot allocate */
         return NULL;
     }
+
+    if(alloc->top - alloc->bottom < alloc->minfree)
+        alloc->minfree = alloc->top - alloc->bottom;
 
     struct BlockHeader * header = (struct BlockHeader *) ptr;
     memcpy(header->magic, MAGIC, 8);
@@ -240,6 +244,20 @@ int
 allocator_iter_ended(AllocatorIter * iter)
 {
     return iter->_ended;
+}
+
+size_t
+allocator_get_min_free(Allocator * alloc)
+{
+    if(alloc->use_malloc)
+        return allocator_get_free_size(alloc);
+    return alloc->minfree;
+}
+
+void
+allocator_reset_min_free(Allocator * alloc)
+{
+    alloc->minfree = alloc->top - alloc->bottom;
 }
 
 size_t

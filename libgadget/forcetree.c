@@ -43,6 +43,12 @@ init_forcetree_params(const double treeallocfactor)
     ForceTreeParams.TreeAllocFactor = treeallocfactor;
 }
 
+double
+force_tree_get_alloc_factor(void)
+{
+    return ForceTreeParams.TreeAllocFactor;
+}
+
 static ForceTree
 force_tree_build(int mask, DomainDecomp * ddecomp, const ActiveParticles * act, const int DoMoments, const int alloc_father, const char * EmergencyOutputDir);
 

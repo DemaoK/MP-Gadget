@@ -29,8 +29,17 @@
  *     candidates on their owners and the hierarchy columns of the serial sub-tree results;
  *  5. the final tag pass: reservation, deepest valid claim (serial claims first, then the in-place
  *     ones) with the final-tree check of the binding owner (J2), BoundTrackId, dense own-tag ranks
- *     of the in-place candidates from one more mpsort_mpi, the serial ranks and counts corrected
- *     for the particles the in-place ancestors took over.
+ *     of the in-place candidates from one more mpsort_mpi; the serial ranks and counts repaired
+ *     (audit Q2) for the particles the in-place candidates took over and for the tails returned to
+ *     their surviving serial binder (merged into its own-tag sequence by its final-pass energy
+ *     order, from the binder ordinals the serial keys recorded, audit Q3): each change goes to the
+ *     rank holding its track's result, which sorts the track's removed ranks and additions, corrects
+ *     the record and answers the rank queries of the track's remaining particles (binary searches);
+ *     only the list of the affected TrackIds is replicated.
+ *
+ * Memory: the plan admits the call (subhalo_coll_estimate, audit Q1) before the exchange; every
+ * count and rank is checked against the catalogue's int32 columns on every rank before it is
+ * narrowed (audit Q4).
  *
  * Walk contract (the potential-only visit): query = position, round label, own particle index;
  * result = sum_j m_j W(r_ij, h) with W = grav_spline_potential and h = FORCE_SOFTENING(); the
@@ -66,6 +75,22 @@ struct SubhaloCollectiveStats {
     int64_t NAlive;
     int64_t NStolen;              /* serial own-tag particles taken over by an in-place ancestor */
     int64_t NJ2;                  /* claims across the final tree (J2) given to the binding owner */
+    /* the final tag pass (audit Q2) */
+    int64_t NAdded;               /* serial tails given to their surviving serial binder (Q3) */
+    int64_t NRepairTracks;        /* serial tracks whose ranks were repaired */
+    int64_t NRepairQueries;       /* own-tag particles of those tracks that asked their new rank */
+    double TagSortSeconds;        /* the decisions and the in-place own-tag ranks */
+    double RepairSeconds;         /* the distributed serial repair */
+    double TagSeconds;            /* the whole final tag pass */
+    /* memory (audit Q1): this call's admission estimate and the measured high water of the
+     * collective call, the largest over the ranks (bytes) */
+    double EstPeakBytes;          /* persistent + largest stage, as admitted by the plan */
+    double MeasPeakBytes;         /* free bytes at the start of the call minus the least free bytes during it */
+    double EstAvailBytes;         /* free bytes the plan expected at the start of the call */
+    double FreeAtStartBytes;      /* measured free bytes at the start of the call */
+    double MaxMeasOverEst;        /* largest measured / estimated over the ranks */
+    double WalkElasticBytes;      /* this rank: the most a walk took from the free memory (elastic export tables, not in MeasPeakBytes beyond the reserve) */
+    int EstPeakRank, MeasPeakRank;
 };
 const struct SubhaloCollectiveStats * subhalo_collective_last_stats(void);
 
@@ -77,5 +102,19 @@ const struct SubhaloCollectiveStats * subhalo_collective_last_stats(void);
  * returns at once). */
 void subhalo_collective_run(struct SubhaloPlan * plan, struct SubhaloCallCtx * ctx, DomainDecomp * ddecomp,
                             struct SubTrackTable * tab, MPI_Comm Comm);
+
+/* ---- test hooks ---- */
+/* The potential-only walk alone: for every local particle with label[i] in [0, nlabels) (dense
+ * labels; -1 outside every candidate), out[i] = sum_j m_j W(r_ij, h) over the other live particles
+ * j of its label whose type is in PotentialTypes, with the opening angle theta (theta^2 capped at
+ * 0.33 as in the rounds); out[i] is not written for the other particles. Needs a decomposed
+ * domain. Collective. */
+void subhalo_collective_test_walk(DomainDecomp * ddecomp, const int32_t * label, int64_t nlabels, double theta, double h,
+                                  int PotentialTypes, double * out);
+/* A function called on every rank right before the final tag pass of the next calls (NULL: none),
+ * with the call context (ctx->BindOrd: the binder ordinals of this rank) and the plan; P then holds
+ * the serial keys' (provisional) tags. */
+typedef void (*subhalo_collective_hook)(const struct SubhaloCallCtx * ctx, const struct SubhaloPlan * plan);
+void subhalo_collective_set_pretag_hook(subhalo_collective_hook fn);
 
 #endif

@@ -14,7 +14,9 @@ input could not be read.
   consistency PIGDIR [...]    check 2: the reader rules on one or more PIGs (groups = subhalos,
                               slices tile the groups, BindRank dense, bound prefixes, counts);
                               --no-phase1 for Phase 2a catalogues.
-  tracking PIG_prev PIG_next  check 3: host votes, centrals, newborn numbering, sinks,
+  tracking PIG_prev PIG_next  check 3: host votes, centrals, newborn numbering, sinks (the target
+                              resolved, or an orphan of the same call: same-call sink chains as in
+                              tree, without cycles, the first resolved target hosted by the vote),
                               resurrections, recomputed from the two PIGs. Default: the Phase 2a
                               rules (weighted ten-tracer vote); --phase1-vote: the Phase 1 rules
                               (majority vote over every own-bound particle, the most massive
@@ -1045,7 +1047,7 @@ def _tracking_phase2a(ck, A, B, args):
 
     # 6. new orphans: died or sank at this call
     new_orph = OB["TrackId"][lookup(SA["TrackId"], tid_ob) >= 0]
-    nsink = ndead = 0
+    nsink = ndead = nchain = 0
     for T in new_orph.tolist():
         r = B.orphan_row(T)
         ck.check(OB["SnapDeath"][r] == snap_next, "track %d became an orphan with SnapDeath %d, expected %d"
@@ -1054,12 +1056,39 @@ def _tracking_phase2a(ck, A, B, args):
         if s >= 0:
             nsink += 1
             ck.check(OB["SnapSink"][r] == snap_next, "track %d sank with SnapSink %d, expected %d" % (T, OB["SnapSink"][r], snap_next))
-            rs = B.subhalo_row(s)
-            if ck.check(rs >= 0, "track %d sank into %d, which is not a resolved subhalo" % (T, s)):
+            # SinkTrackId is the sink edge of the call, not the final owner: in a same-call chain
+            # L -> P -> C the target P sank (or died) after L sank into it, so P is an orphan of
+            # this call too (the tree check's rule, subhalo_track.c merge_subtree, the in-place
+            # rounds). Follow the orphan targets that died in this call, without cycles, to the
+            # first resolved one; its host is the vote's.
+            seen = {T}
+            t = s
+            rs = B.subhalo_row(t)
+            ok = True
+            while rs < 0:
+                ro = B.orphan_row(t)
+                if not ck.check(ro >= 0 and OB["SnapDeath"][ro] == snap_next,
+                                "track %d sank into %d, which is neither a resolved subhalo nor an orphan of this call" % (T, t)):
+                    ok = False
+                    break
+                if not ck.check(t not in seen, "track %d: same-call sink chain with a cycle at %d" % (T, t)):
+                    ok = False
+                    break
+                seen.add(t)
+                nxt = int(OB["SinkTrackId"][ro])
+                if nxt < 0:
+                    break           # the chain ends in a track that died in this call
+                t = nxt
+                rs = B.subhalo_row(t)
+            if t != s:
+                nchain += 1
+            if ok and rs >= 0:
                 ck.check(SB["HostGroup"][rs] == host.get(T, -1),
-                         "track %d (vote %d) sank into %d hosted by %d" % (T, host.get(T, -1), s, SB["HostGroup"][rs]))
+                         "track %d (vote %d) sank into %d (via %d) hosted by %d" % (T, host.get(T, -1), t, s, SB["HostGroup"][rs]))
         else:
             ndead += 1
+    if nchain:
+        print("  %d sunk tracks whose sink target sank or died in the same call (same-call sink chains)" % nchain)
     # previous orphans that stay orphans keep their sink and death
     old_orph = OA["TrackId"][lookup(tid_ob, OA["TrackId"]) >= 0]
     for T in old_orph.tolist():

@@ -46,7 +46,8 @@ static struct {
     int StateSnapshot;          /* PIG number whose membership the tags describe, -1 if none */
     double StateTime;           /* scale factor of that state, -1 if none */
     double TimeSincePrevious;   /* scale-factor interval between the last two completed calls, -1 if none */
-} SubStatus = {0, -1, -1, -1., -1.};
+    double SOThresholds[SUBHALO_NSO];   /* comoving SO thresholds of the call the records describe, -1 if unknown */
+} SubStatus = {0, -1, -1, -1., -1., {-1., -1., -1., -1., -1.}};
 
 #define SUBHALO_TABLE_INITIAL_BYTES (64L * 1024L * 1024L)
 
@@ -1181,6 +1182,20 @@ double subhalo_state_time(void) { return SubStatus.StateTime; }
 double subhalo_time_since_previous_call(void) { return SubStatus.TimeSincePrevious; }
 
 void
+subhalo_state_so_thresholds(double rho[SUBHALO_NSO])
+{
+    memcpy(rho, SubStatus.SOThresholds, sizeof(SubStatus.SOThresholds));
+}
+
+void
+subhalo_set_state_so_thresholds(const double rho[SUBHALO_NSO])
+{
+    int d;
+    for(d = 0; d < SUBHALO_NSO; d++)
+        SubStatus.SOThresholds[d] = rho ? rho[d] : -1.;
+}
+
+void
 subhalo_count_tagged(const struct part_manager_type * pman, int64_t ntagged[6])
 {
     int64_t i;
@@ -1232,6 +1247,7 @@ subhalo_init(int RestartSnapNum, int MaxStateSnapNum, const char * OutputDir, MP
     SubStatus.StateSnapshot = -1;
     SubStatus.StateTime = -1;
     SubStatus.TimeSincePrevious = -1;
+    subhalo_set_state_so_thresholds(NULL);
 
     if(!subhalo_finder_on())
         return;
@@ -2050,7 +2066,19 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     const int64_t NHostless = subhalo_assign_keys(tab, fof->TotNgroups, Comm);
     struct SubhaloPlan plan = {0};
     subhalo_plan_set_frame(atime, hubble_function(CP, atime));
-    subhalo_plan_build(&plan, fof, tab, NHostless, Comm);
+    if(subhalo_plan_build(&plan, fof, tab, NHostless, ddecomp, Comm)) {
+        /* audit Q1: the in-place stage of this plan cannot fit on some rank. Nothing in P has
+         * changed yet (no target, no encoded GrNr), so the domain needs no restore. */
+        message(0, "Subhalo finder: the in-place stage of snapshot %d does not fit in memory on rank %d (stage: %s); the call is "
+                   "skipped before the exchange. Tags and track table are unchanged; this PIG will be marked incomplete. "
+                   "Run with more memory per rank or more ranks.\n", SnapNum, plan.Admit.failrank,
+                plan.Admit.failstage >= 0 ? SubhaloCollStageName[plan.Admit.failstage] : "?");
+        subhalo_restore_field_grnr(&plan);
+        subhalo_plan_free(&plan);
+        walltime_measure("/Subhalo/Plan");
+        SubStatus.LastCallComplete = 0;
+        return 0;
+    }
     walltime_measure("/Subhalo/Plan");
 
     /* Step 4: exchange whole serial keys, tags travel unchanged. */
@@ -2144,6 +2172,7 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     subhalo_restore_domain(ddecomp);
     walltime_measure("/Subhalo/Restore");
     subhalo_collective_run(&plan, &ctx, ddecomp, tab, Comm);
+    subhalo_free_bind_ord(&ctx);
     walltime_measure("/Subhalo/InPlace");
 
     /* Step 10: new TrackIds in host order. */
@@ -2254,6 +2283,7 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     SubStatus.LastCallSnapshot = SnapNum;
     SubStatus.StateSnapshot = SnapNum;
     SubStatus.StateTime = atime;
+    subhalo_set_state_so_thresholds(ctx.rho);
     message(0, "Subhalo finder: time since the previous call (scale factor) %g.\n", SubStatus.TimeSincePrevious);
     return 1;
 }

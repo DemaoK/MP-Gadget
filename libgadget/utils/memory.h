@@ -26,6 +26,7 @@ struct Allocator {
 
     int refcount;
     int use_malloc; /* only do the book keeping. delegate to libc malloc/free */
+    size_t minfree; /* low-water mark of top - bottom since the last allocator_reset_min_free */
 };
 
 typedef struct AllocatorIter AllocatorIter;
@@ -55,6 +56,11 @@ allocator_split(Allocator * alloc, Allocator * parent, const char * name, const 
 
 int
 allocator_destroy(Allocator * alloc);
+
+/* The least free size (top - bottom) since the last reset (the allocator's high-water mark seen
+ * from the free side); reset sets it to the current free size. */
+size_t allocator_get_min_free(Allocator * alloc);
+void allocator_reset_min_free(Allocator * alloc);
 
 void *
 allocator_alloc(Allocator * alloc, const char * name, const size_t size, const int dir, const char * fmt, ...);

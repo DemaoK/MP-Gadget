@@ -161,6 +161,8 @@ _Static_assert(sizeof(struct SubNode) <= SUBHALO_NODE_BYTES, "SUBHALO_NODE_BYTES
 struct SerialCtx {
     struct SubhaloCallCtx * ctx;
     struct SubNode * Nodes;          /* parallel to ctx->Res */
+    const int64_t * BindStart;       /* per segment: its slice of ctx->BindOrd (audit Q3) */
+    int64_t * BindCount;             /* per segment: the entries written */
 };
 
 static inline int
@@ -1105,6 +1107,37 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
         P[start + i].BindRank = -1;
         P[start + i].BoundTrackId = -1;
     }
+    /* audit Q3: in a sub-tree key, every particle a survivor binds while another member holds its
+     * tag gets its binder ordinals (the binder's own exclusive particles before it in the binder's
+     * final-pass energy order, and its position there): should the claim become void in the
+     * rounds, the final tag pass merges it into the binder's own-tag sequence by energy */
+    if(subkey && sc->BindStart) {
+        struct SubhaloBindOrd * bo = ctx->BindOrd + sc->BindStart[k];
+        int64_t nbo = 0;
+        for(v = 0; v < nn; v++) {
+            const struct SubNode * x = &nd[v];
+            if(x->state != ST_ALIVE)
+                continue;
+            int64_t own = 0;
+            for(j = 0; j < x->c.Nbound; j++) {
+                const int64_t pi = x->c.Index[j];
+                const int t = tagnode[pi - start];
+                if(t < 0)
+                    continue;
+                if((t & ~TAG_RESERVED) == v) {
+                    own++;
+                    continue;
+                }
+                if(nbo >= n)
+                    endrun(5, "Sub-tree key %ld: more binder ordinals than particles.\n", g);
+                bo[nbo].ID = P[pi].ID;
+                bo[nbo].g = own;
+                bo[nbo].f = j;
+                nbo++;
+            }
+        }
+        sc->BindCount[k] = nbo;
+    }
 
     /* ---- h: descendants of the tracks resolved at the previous call that died or sank: their
      *      step-0 tracers in the key (by ID), the rest queued for step 11 ---- */
@@ -1213,6 +1246,13 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
     stats_merge(&ctx->Stats, &ks);
 }
 
+static int
+cmp_bindord_id(const void * a, const void * b)
+{
+    const MyIDType x = ((const struct SubhaloBindOrd *) a)->ID, y = ((const struct SubhaloBindOrd *) b)->ID;
+    return (x > y) - (x < y);
+}
+
 void
 subhalo_process_serial(const struct SubhaloKeySeg * segs, int64_t nsegs, struct SubhaloCallCtx * ctx)
 {
@@ -1224,9 +1264,42 @@ subhalo_process_serial(const struct SubhaloKeySeg * segs, int64_t nsegs, struct 
     int64_t k;
     for(k = 0; k < nsegs; k++)
         extra[k] = (ctx->HostedStart[k + 1] - ctx->HostedStart[k] + 1) * (int64_t) SUBHALO_ARENA_NODE_BYTES;
+    /* audit Q3: one binder-ordinal slot per particle of the sub-tree keys processed here, on the top
+     * (it survives the restore; the plan charges SubKeyPartBytes per such particle) */
+    int64_t * bstart = (int64_t *) mymalloc("SubBindStart", sizeof(int64_t) * (nsegs + 1));
+    int64_t * bcount = (int64_t *) mymalloc("SubBindCount", sizeof(int64_t) * (nsegs + 1));
+    int64_t nbo = 0;
+    for(k = 0; k < nsegs; k++) {
+        bstart[k] = nbo;
+        bcount[k] = 0;
+        if(ctx->plan && segs[k].g >= ctx->plan->SubKeyBase)
+            nbo += segs[k].n;
+    }
+    ctx->BindOrd = (struct SubhaloBindOrd *) mymalloc2("SubBindOrd", sizeof(struct SubhaloBindOrd) * (nbo + 1));
+    ctx->NBindOrd = 0;
+    sc.BindStart = bstart;
+    sc.BindCount = bcount;
     const double peak = subhalo_run_serial_keys(segs, nsegs, subhalo_arena_bytes_per_part(), extra, process_serial_key, &sc);
     if(peak > ctx->Stats.ArenaPeakFrac)
         ctx->Stats.ArenaPeakFrac = peak;
+    /* compact and sort by ID */
+    for(k = 0; k < nsegs; k++) {
+        if(bcount[k] > 0 && bstart[k] != ctx->NBindOrd)
+            memmove(ctx->BindOrd + ctx->NBindOrd, ctx->BindOrd + bstart[k], sizeof(struct SubhaloBindOrd) * bcount[k]);
+        ctx->NBindOrd += bcount[k];
+    }
+    qsort(ctx->BindOrd, ctx->NBindOrd, sizeof(struct SubhaloBindOrd), cmp_bindord_id);
+    myfree(bcount);
+    myfree(bstart);
     myfree(extra);
     myfree(sc.Nodes);
+}
+
+void
+subhalo_free_bind_ord(struct SubhaloCallCtx * ctx)
+{
+    if(ctx->BindOrd)
+        myfree(ctx->BindOrd);
+    ctx->BindOrd = NULL;
+    ctx->NBindOrd = 0;
 }

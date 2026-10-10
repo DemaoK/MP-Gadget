@@ -713,6 +713,9 @@ subhalo_write_header_attrs(BigBlock * bh, const struct part_manager_type * pman,
     subhalo_get_units(&UnitLength_in_cm, &UnitMass_in_g, &UnitVelocity_in_cm_per_s);
     char params[4096];
     subhalo_format_params(params, sizeof(params));
+    /* the comoving thresholds (vir, 200b, 200c, 500c, 2500c) of the call the records describe */
+    double SOThresholds[SUBHALO_NSO];
+    subhalo_state_so_thresholds(SOThresholds);
 
     if(
     (0 != big_block_set_attr(bh, "NumPartSavedTotal", NumPartSavedTotal, "u8", 6)) ||
@@ -730,6 +733,7 @@ subhalo_write_header_attrs(BigBlock * bh, const struct part_manager_type * pman,
     (0 != big_block_set_attr(bh, "UnitLength_in_cm", &UnitLength_in_cm, "f8", 1)) ||
     (0 != big_block_set_attr(bh, "UnitMass_in_g", &UnitMass_in_g, "f8", 1)) ||
     (0 != big_block_set_attr(bh, "UnitVelocity_in_cm_per_s", &UnitVelocity_in_cm_per_s, "f8", 1)) ||
+    (0 != big_block_set_attr(bh, "SOThresholds", SOThresholds, "f8", SUBHALO_NSO)) ||
     (0 != big_block_set_attr(bh, "SubhaloParameters", params, "S1", strlen(params)))) {
         endrun(0, "Failed to write subhalo header attributes: %s\n", big_file_get_error_message());
     }
@@ -1012,6 +1016,14 @@ subhalo_read_state_checked(const char * pigname, struct SubTrackTable * tab, dou
        (0 != big_block_get_attr(&bh, "SubhaloSchemaVersion", &schema, "i4", 1)) ||
        (0 != big_block_get_attr(&bh, "SubhaloStateTime", &StateTime, "f8", 1)))
         SUBHALO_STATE_FATAL(pigname, "Subhalo state attributes missing in %s: %s\n", pigname, big_file_get_error_message());
+    /* the SO thresholds of the state's call (optional: absent before they were written) */
+    {
+        double so[SUBHALO_NSO];
+        if(0 == big_block_get_attr(&bh, "SOThresholds", so, "f8", SUBHALO_NSO))
+            subhalo_set_state_so_thresholds(so);
+        else
+            subhalo_set_state_so_thresholds(NULL);
+    }
     if(0 != big_block_mpi_close(&bh, Comm))
         SUBHALO_STATE_FATAL(pigname, "Failed to close the header of %s\n", pigname);
     if(schema != SUBHALO_SCHEMA_VERSION)
