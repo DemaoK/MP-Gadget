@@ -49,7 +49,7 @@ int fof_select_func(int i, const struct particle_data * Parts)
 /* Particles that take part in the PIG exchange: in a group, or, with the subhalo finder on,
  * selected by subhalo_save_select (in a group or tagged, and not swallowed). */
 static inline int
-fof_pig_member(int i, const struct particle_data * Parts, const int finder)
+fof_pig_member(int64_t i, const struct particle_data * Parts, const int finder)
 {
     if(finder)
         return subhalo_save_select(i, Parts);
@@ -71,7 +71,7 @@ fof_pig_snapnum(const char * fname)
 }
 
 int fof_save_particles(FOFGroups * fof, char * fname, int SaveParticles, Cosmology * CP, double atime, const double * MassTable, int MetalReturnOn, MPI_Comm Comm) {
-    int i;
+    int64_t i;
     struct IOTable FOFIOTable = {0};
 
     fof_register_io_blocks(MetalReturnOn, &FOFIOTable);
@@ -85,8 +85,14 @@ int fof_save_particles(FOFGroups * fof, char * fname, int SaveParticles, Cosmolo
     }
     const int finder = subhalo_finder_on();
     fof_select_finder = finder;
-    if(finder)
+    if(finder) {
         subhalo_set_output_snapshot(fof_pig_snapnum(fname));
+        /* The host IO path indexes local particles with int (petaio_build_selection, the
+         * IOTable getters): fail cleanly rather than wrap (H4). */
+        if(MPIU_Any(PartManager->NumPart > INT_MAX, Comm))
+            endrun(1, "The PIG writer with the subhalo finder supports at most %d particles per rank (this rank: %ld); run with more ranks.\n",
+                   INT_MAX, PartManager->NumPart);
+    }
     myfree(fname);
     struct conversions conv = {0};
     conv.atime = atime;
@@ -408,11 +414,25 @@ fof_distribute_particles(struct part_manager_type * halo_pman, struct slots_mana
     message(0, "GrNrMax is %ld\n", GrNrMaxGlobal);
 
     fof_find_target_task(pi, NpigLocal, task_origin_offset, finder ? 2 : 1, Comm);
-    const double FOFPartAllocFactor = (double) PartManager->MaxPart / PartManager->NumPart;
+    /* MaxPart / NumPart is infinite on a rank without particles (H5): use the global ratio
+     * there (or 1.5 if every rank is empty), so that the capacities below stay finite. The
+     * distributed sort keeps each rank's number of selected particles, so an empty rank
+     * receives nothing and only needs the small minimum. */
+    double FOFPartAllocFactor = 1.5;
+    {
+        int64_t loc[2] = {PartManager->NumPart, PartManager->MaxPart}, tot[2];
+        MPI_Allreduce(loc, tot, 2, MPI_INT64, MPI_SUM, Comm);
+        if(PartManager->NumPart > 0)
+            FOFPartAllocFactor = (double) PartManager->MaxPart / PartManager->NumPart;
+        else if(tot[0] > 0)
+            FOFPartAllocFactor = (double) tot[1] / tot[0];
+    }
 
     /* Initialise the new halo structure*/
     if(halo_pman != PartManager) {
         halo_pman->MaxPart = NpigLocal * FOFPartAllocFactor;
+        if(halo_pman->MaxPart < NpigLocal + 16)
+            halo_pman->MaxPart = NpigLocal + 16;
         struct particle_data * halopart = (struct particle_data *) mymalloc("HaloParticle", sizeof(struct particle_data) * halo_pman->MaxPart);
         halo_pman->Base = halopart;
         halo_pman->NumPart = NpigLocal;
@@ -511,7 +531,7 @@ static void fof_write_header(BigFile * bf, int64_t TotNgroups, const double atim
     if(0 != big_file_mpi_create_block(bf, &bh, "Header", NULL, 0, 0, 0, Comm)) {
         endrun(0, "Failed to create header\n");
     }
-    int i;
+    int64_t i;
     int k;
     int64_t npartLocal[6];
     int64_t npartTotal[6];

@@ -12,6 +12,7 @@
 #include <string.h>
 #include <math.h>
 #include <limits.h>
+#include <sys/stat.h>
 
 #include <bigfile-mpi.h>
 
@@ -23,6 +24,7 @@
 #include "utils/string.h"
 
 #include "subhalo.h"
+#include "subhalo_internal.h"
 #include "partmanager.h"
 #include "slotsmanager.h"
 #include "petaio.h"
@@ -39,7 +41,7 @@ subhalo_set_output_snapshot(int SnapNum)
 /* ------------------------------------------------------------------ selection and sort key */
 
 int
-subhalo_save_select(int i, const struct particle_data * Parts)
+subhalo_save_select(int64_t i, const struct particle_data * Parts)
 {
     if(Parts[i].Swallowed)
         return 0;
@@ -480,12 +482,6 @@ subhalo_record_slices(const struct part_manager_type * pman, const int * selecti
     const int64_t npieces = subhalo_collect_pieces(pman, selection, ptype_offset, ptype_count, global_offset, NULL);
     const int64_t NTotal = tab ? tab->NTotal : 0;
 
-    int * sendcounts = (int *) mymalloc("SliceSendCounts", 4 * sizeof(int) * NTask);
-    int * senddispls = sendcounts + NTask;
-    int * recvcounts = sendcounts + 2 * NTask;
-    int * recvdispls = sendcounts + 3 * NTask;
-    memset(sendcounts, 0, 4 * sizeof(int) * NTask);
-
     struct SlicePiece * pieces = (struct SlicePiece *) mymalloc("SlicePieces", sizeof(struct SlicePiece) * (npieces + 1));
     subhalo_collect_pieces(pman, selection, ptype_offset, ptype_count, global_offset, pieces);
 
@@ -493,30 +489,20 @@ subhalo_record_slices(const struct part_manager_type * pman, const int * selecti
         if(pieces[i].TrackId >= NTotal || tab == NULL || tab->Chunk <= 0)
             endrun(5, "Particle tag %ld in the PIG write is not a track of the table (NTotal %ld)\n", pieces[i].TrackId, NTotal);
     }
-    /* Home ranks are monotonic in TrackId, so a sort by TrackId groups the pieces by target. */
+    /* Home ranks are monotonic in TrackId, so a sort by TrackId groups the pieces by target.
+     * Counts in 64 bits, checked against the MPI int limit inside subhalo_alltoallv (H3). */
     qsort_openmp(pieces, npieces, sizeof(struct SlicePiece), slice_piece_cmp_track);
+    int64_t * sendcounts = ta_malloc("SliceSendCounts", int64_t, NTask);
+    memset(sendcounts, 0, sizeof(int64_t) * NTask);
     for(i = 0; i < npieces; i++) {
         const int home = subhalo_table_home_rank(tab, pieces[i].TrackId);
         if(home < 0 || home >= NTask)
             endrun(5, "TrackId %ld has home rank %d of %d\n", pieces[i].TrackId, home, NTask);
         sendcounts[home]++;
     }
-    MPI_Alltoall(sendcounts, 1, MPI_INT, recvcounts, 1, MPI_INT, Comm);
-    int64_t nrecv = 0;
-    for(t = 0; t < NTask; t++) {
-        senddispls[t] = (t == 0) ? 0 : senddispls[t-1] + sendcounts[t-1];
-        recvdispls[t] = (t == 0) ? 0 : recvdispls[t-1] + recvcounts[t-1];
-        nrecv += recvcounts[t];
-    }
-    if(nrecv > INT_MAX)
-        endrun(5, "Too many slice pieces (%ld) for one rank\n", nrecv);
-
-    struct SlicePiece * recv = (struct SlicePiece *) mymalloc("SliceRecv", sizeof(struct SlicePiece) * (nrecv + 1));
-    MPI_Datatype MPI_PIECE;
-    MPI_Type_contiguous(sizeof(struct SlicePiece), MPI_BYTE, &MPI_PIECE);
-    MPI_Type_commit(&MPI_PIECE);
-    MPI_Alltoallv_sparse(pieces, sendcounts, senddispls, MPI_PIECE, recv, recvcounts, recvdispls, MPI_PIECE, Comm);
-    MPI_Type_free(&MPI_PIECE);
+    struct SlicePiece * recv = NULL;
+    const int64_t nrecv = subhalo_alltoallv(pieces, sendcounts, sizeof(struct SlicePiece), (void **) &recv, 0, NULL, Comm);
+    ta_free(sendcounts);
 
     /* Merge the pieces of each run, then keep one run per (TrackId, type, section). */
     qsort_openmp(recv, nrecv, sizeof(struct SlicePiece), slice_piece_cmp_full);
@@ -566,7 +552,6 @@ subhalo_record_slices(const struct part_manager_type * pman, const int * selecti
 
     myfree(recv);
     myfree(pieces);
-    myfree(sendcounts);
 
     int64_t diag[2] = {nsplit, nnoncontig}, diagtot[2];
     MPI_Allreduce(diag, diagtot, 2, MPI_INT64, MPI_SUM, Comm);
@@ -620,8 +605,10 @@ subhalo_write_tables(BigFile * bf, MPI_Comm Comm)
         petaio_alloc_buffer(&array, ent, n);
         char * p = (char *) array.data;
         int64_t j;
+        /* the IOTable getters take an int index: call them on the record itself (index 0 of a
+         * rebased base pointer), so no local row count is narrowed (H4) */
         for(j = 0; j < n; j++) {
-            ent->getter(idx[j], p, tab->Track, NULL, &conv);
+            ent->getter(0, p, &tab->Track[idx[j]], NULL, &conv);
             p += array.strides[0];
         }
         petaio_save_block(bf, blockname, &array, 0);
@@ -722,6 +709,8 @@ subhalo_write_header_attrs(BigBlock * bh, const struct part_manager_type * pman,
     double SubhaloStateTime = subhalo_state_time();
     double TimeSincePreviousFinderCall = subhalo_time_since_previous_call();
     const char * VelocityConvention = "peculiar_physical_kms";
+    double UnitLength_in_cm, UnitMass_in_g, UnitVelocity_in_cm_per_s;
+    subhalo_get_units(&UnitLength_in_cm, &UnitMass_in_g, &UnitVelocity_in_cm_per_s);
     char params[4096];
     subhalo_format_params(params, sizeof(params));
 
@@ -738,6 +727,9 @@ subhalo_write_header_attrs(BigBlock * bh, const struct part_manager_type * pman,
     (0 != big_block_set_attr(bh, "SubhaloStateTime", &SubhaloStateTime, "f8", 1)) ||
     (0 != big_block_set_attr(bh, "TimeSincePreviousFinderCall", &TimeSincePreviousFinderCall, "f8", 1)) ||
     (0 != big_block_set_attr(bh, "VelocityConvention", VelocityConvention, "S1", strlen(VelocityConvention))) ||
+    (0 != big_block_set_attr(bh, "UnitLength_in_cm", &UnitLength_in_cm, "f8", 1)) ||
+    (0 != big_block_set_attr(bh, "UnitMass_in_g", &UnitMass_in_g, "f8", 1)) ||
+    (0 != big_block_set_attr(bh, "UnitVelocity_in_cm_per_s", &UnitVelocity_in_cm_per_s, "f8", 1)) ||
     (0 != big_block_set_attr(bh, "SubhaloParameters", params, "S1", strlen(params)))) {
         endrun(0, "Failed to write subhalo header attributes: %s\n", big_file_get_error_message());
     }
@@ -776,18 +768,45 @@ subhalo_finalize_output(BigFile * bf, int complete, MPI_Comm Comm)
 
 /* ------------------------------------------------------------------ restart: state search */
 
-/* Serial check that a block exists with the given number of rows and members. */
+/* Serial check (H8) that a block exists with the given number of rows and members, that its
+ * dtype is the schema's (kind and width; BigFile converts the byte order on read, but not
+ * precision), and that every payload file its header declares exists with the declared size
+ * (fsize rows x nmemb x itemsize bytes): a block header surviving a missing or truncated
+ * payload is not a readable state. Returns the number of problems (0 if the block is good). */
 static int
-subhalo_probe_block(BigFile * bf, const char * blockname, int64_t size, int nmemb)
+subhalo_probe_block(BigFile * bf, const char * blockname, int64_t size, int nmemb, const char * dtype)
 {
     BigBlock bb;
     if(0 != big_file_open_block(bf, &bb, blockname)) {
         message(0, "  block %s missing\n", blockname);
         return 1;
     }
-    int bad = ((int64_t) bb.size != size) || (nmemb > 0 && bb.nmemb != nmemb);
-    if(bad)
+    int bad = 0;
+    if((int64_t) bb.size != size || (nmemb > 0 && bb.nmemb != nmemb)) {
         message(0, "  block %s has %ld x %d entries, expected %ld x %d\n", blockname, (int64_t) bb.size, bb.nmemb, size, nmemb);
+        bad++;
+    }
+    if(dtype && (big_file_dtype_kind(bb.dtype) != big_file_dtype_kind(dtype) ||
+                 big_file_dtype_itemsize(bb.dtype) != big_file_dtype_itemsize(dtype))) {
+        message(0, "  block %s has dtype %s, the schema says %s\n", blockname, bb.dtype, dtype);
+        bad++;
+    }
+    const int64_t rowbytes = (int64_t) bb.nmemb * big_file_dtype_itemsize(bb.dtype);
+    int f;
+    for(f = 0; f < bb.Nfile && !bad; f++) {
+        char * fname = fastpm_strdup_printf("%s/%06X", bb.basename, f);
+        struct stat st;
+        const int64_t expect = (int64_t) bb.fsize[f] * rowbytes;
+        if(0 != stat(fname, &st)) {
+            message(0, "  block %s: payload file %s missing (%ld bytes declared)\n", blockname, fname, expect);
+            bad++;
+        }
+        else if((int64_t) st.st_size != expect) {
+            message(0, "  block %s: payload file %s has %ld bytes, %ld declared\n", blockname, fname, (int64_t) st.st_size, expect);
+            bad++;
+        }
+        myfree(fname);
+    }
     big_block_close(&bb);
     return bad;
 }
@@ -834,6 +853,11 @@ subhalo_state_valid(const char * fname, int m)
         message(0, "PIG %s: subhalo schema version %d, this build reads %d, skipping.\n", fname, schema, SUBHALO_SCHEMA_VERSION);
         goto header_done;
     }
+    /* finite-value checks first: under -ffast-math a NaN comparison proves nothing */
+    if(!subhalo_isfinite(statetime) || !subhalo_isfinite(time) || statetime <= 0 || time <= 0) {
+        message(0, "PIG %s: non-finite or non-positive state time (%g, file %g), skipping.\n", fname, statetime, time);
+        goto header_done;
+    }
     if(statesnap != m || fabs(statetime - time) > 1e-6 * fabs(time)) {
         message(0, "PIG %s: state of snapshot %d at a = %g does not match the file (snapshot %d, a = %g), skipping.\n",
                 fname, statesnap, statetime, m, time);
@@ -858,7 +882,7 @@ header_done:
     for(e = 0; e < T.used; e++) {
         char blockname[128];
         snprintf(blockname, sizeof(blockname), "%s/%s", subhalo_table_dir(T.ent[e].ptype), T.ent[e].name);
-        bad += subhalo_probe_block(&bf, blockname, (T.ent[e].ptype == PTYPE_SUBHALO) ? nsub : norph, T.ent[e].items);
+        bad += subhalo_probe_block(&bf, blockname, (T.ent[e].ptype == PTYPE_SUBHALO) ? nsub : norph, T.ent[e].items, T.ent[e].dtype);
     }
     destroy_io_blocks(&T);
     /* The particle tags and IDs the join reads. */
@@ -867,11 +891,12 @@ header_done:
         if(nsaved[t] == 0)
             continue;
         const char * names[4] = {"ID", "TrackId", "BindRank", "BoundTrackId"};
+        const char * dtypes[4] = {"u8", "i8", "i4", "i8"};
         int k;
         for(k = 0; k < 4; k++) {
             char blockname[128];
             snprintf(blockname, sizeof(blockname), "%d/%s", t, names[k]);
-            bad += subhalo_probe_block(&bf, blockname, nsaved[t], 1);
+            bad += subhalo_probe_block(&bf, blockname, nsaved[t], 1, dtypes[k]);
         }
     }
     big_file_close(&bf);
@@ -919,36 +944,54 @@ subhalo_split_rows(int64_t N, int ThisTask, int NTask, int64_t * start, int64_t 
     *n = e - s;
 }
 
+/* A restart-state read failure after the state was probed complete is fatal (H8): the message
+ * names the PIG and the two ways out. */
+#define SUBHALO_STATE_FATAL(pigname, ...) do { \
+        message(1, __VA_ARGS__); \
+        endrun(1, "Subhalo restart state %s is unreadable or inconsistent (see above). Clear its marker " \
+                  "(set Header/SubhaloStateComplete = 0 in that PIG) so that the previous complete state is used, " \
+                  "or set SubhaloRestartFresh = 1 to restart with an empty track table.\n", (pigname)); \
+    } while(0)
+
 /* Read this rank's rows of a block (rank order = the balanced split) into buf, which holds
  * nlocal x nmemb items of dtype. big_block_mpi_read reads each rank's dims[0] rows in rank
  * order from ptr, so every rank seeks to 0. Concurrency is the number of ranks (petaio's
- * IO.NumWriters is private to petaio.c). Collective. */
+ * IO.NumWriters is private to petaio.c). Collective; any failure is fatal (H8). */
 static void
-subhalo_read_rows(BigFile * bf, const char * blockname, const char * dtype, int nmemb, int64_t ntotal, int64_t nlocal, void * buf, MPI_Comm Comm)
+subhalo_read_rows(BigFile * bf, const char * pigname, const char * blockname, const char * dtype, int nmemb, int64_t ntotal, int64_t nlocal, void * buf, MPI_Comm Comm)
 {
     int NTask;
     MPI_Comm_size(Comm, &NTask);
     BigBlock bb;
     BigBlockPtr ptr;
     if(0 != big_file_mpi_open_block(bf, &bb, blockname, Comm))
-        endrun(0, "Failed to open block %s: %s\n", blockname, big_file_get_error_message());
+        SUBHALO_STATE_FATAL(pigname, "Failed to open block %s of %s: %s\n", blockname, pigname, big_file_get_error_message());
     if((int64_t) bb.size != ntotal || bb.nmemb != nmemb)
-        endrun(0, "Block %s has %ld x %d entries, expected %ld x %d\n", blockname, (int64_t) bb.size, bb.nmemb, ntotal, nmemb);
+        SUBHALO_STATE_FATAL(pigname, "Block %s of %s has %ld x %d entries, expected %ld x %d\n", blockname, pigname, (int64_t) bb.size, bb.nmemb, ntotal, nmemb);
     size_t dims[2] = {nlocal, nmemb};
     const int elsize = big_file_dtype_itemsize(dtype);
     ptrdiff_t strides[2] = {elsize * nmemb, elsize};
     BigArray array = {0};
     big_array_init(&array, buf, dtype, 2, dims, strides);
-    if(0 != big_block_seek(&bb, &ptr, 0))
-        endrun(1, "Failed to seek block %s: %s\n", blockname, big_file_get_error_message());
-    if(0 != big_block_mpi_read(&bb, &ptr, &array, NTask, Comm))
-        endrun(1, "Failed to read block %s: %s\n", blockname, big_file_get_error_message());
+    int fail = (0 != big_block_seek(&bb, &ptr, 0));
+    if(!fail)
+        fail = (0 != big_block_mpi_read(&bb, &ptr, &array, NTask, Comm));
+    if(fail)
+        SUBHALO_STATE_FATAL(pigname, "Failed to read block %s of %s: %s\n", blockname, pigname, big_file_get_error_message());
     if(0 != big_block_mpi_close(&bb, Comm))
-        endrun(0, "Failed to close block %s: %s\n", blockname, big_file_get_error_message());
+        SUBHALO_STATE_FATAL(pigname, "Failed to close block %s of %s: %s\n", blockname, pigname, big_file_get_error_message());
 }
 
-double
-subhalo_read_state(const char * pigname, struct SubTrackTable * tab, MPI_Comm Comm)
+/* An unsigned 8-byte header count read into an int64_t: reject values a corrupted header could
+ * hold that no table can have. */
+static int
+subhalo_count_ok(int64_t n)
+{
+    return n >= 0 && n < (1LL << 62);
+}
+
+int
+subhalo_read_state_checked(const char * pigname, struct SubTrackTable * tab, double * StateTimeOut, MPI_Comm Comm)
 {
     int ThisTask, NTask;
     MPI_Comm_rank(Comm, &ThisTask);
@@ -956,23 +999,27 @@ subhalo_read_state(const char * pigname, struct SubTrackTable * tab, MPI_Comm Co
 
     BigFile bf = {0};
     if(0 != big_file_mpi_open(&bf, pigname, Comm))
-        endrun(0, "Failed to open subhalo state %s: %s\n", pigname, big_file_get_error_message());
+        SUBHALO_STATE_FATAL(pigname, "Failed to open subhalo state %s: %s\n", pigname, big_file_get_error_message());
     BigBlock bh;
     if(0 != big_file_mpi_open_block(&bf, &bh, "Header", Comm))
-        endrun(0, "Failed to open the header of %s: %s\n", pigname, big_file_get_error_message());
-    int64_t NumSubhalosTotal, NumOrphansTotal, NumTracksTotal;
-    int schema;
-    double StateTime;
+        SUBHALO_STATE_FATAL(pigname, "Failed to open the header of %s: %s\n", pigname, big_file_get_error_message());
+    int64_t NumSubhalosTotal = -1, NumOrphansTotal = -1, NumTracksTotal = -1;
+    int schema = -1;
+    double StateTime = -1;
     if((0 != big_block_get_attr(&bh, "NumSubhalosTotal", &NumSubhalosTotal, "u8", 1)) ||
        (0 != big_block_get_attr(&bh, "NumOrphansTotal", &NumOrphansTotal, "u8", 1)) ||
        (0 != big_block_get_attr(&bh, "NumTracksTotal", &NumTracksTotal, "u8", 1)) ||
        (0 != big_block_get_attr(&bh, "SubhaloSchemaVersion", &schema, "i4", 1)) ||
        (0 != big_block_get_attr(&bh, "SubhaloStateTime", &StateTime, "f8", 1)))
-        endrun(0, "Subhalo state attributes missing in %s: %s\n", pigname, big_file_get_error_message());
+        SUBHALO_STATE_FATAL(pigname, "Subhalo state attributes missing in %s: %s\n", pigname, big_file_get_error_message());
     if(0 != big_block_mpi_close(&bh, Comm))
-        endrun(0, "Failed to close the header of %s\n", pigname);
+        SUBHALO_STATE_FATAL(pigname, "Failed to close the header of %s\n", pigname);
     if(schema != SUBHALO_SCHEMA_VERSION)
-        endrun(0, "Subhalo schema %d in %s, this build reads %d\n", schema, pigname, SUBHALO_SCHEMA_VERSION);
+        SUBHALO_STATE_FATAL(pigname, "Subhalo schema %d in %s, this build reads %d\n", schema, pigname, SUBHALO_SCHEMA_VERSION);
+    if(!subhalo_count_ok(NumSubhalosTotal) || !subhalo_count_ok(NumOrphansTotal) || !subhalo_count_ok(NumTracksTotal)
+            || NumSubhalosTotal + NumOrphansTotal != NumTracksTotal || !subhalo_isfinite(StateTime))
+        SUBHALO_STATE_FATAL(pigname, "Subhalo state %s: inconsistent header (%ld subhalos + %ld orphans, %ld tracks, a = %g)\n",
+                            pigname, NumSubhalosTotal, NumOrphansTotal, NumTracksTotal, StateTime);
 
     int64_t sub_start, nsub, orph_start, norph;
     subhalo_split_rows(NumSubhalosTotal, ThisTask, NTask, &sub_start, &nsub);
@@ -996,18 +1043,19 @@ subhalo_read_state(const char * pigname, struct SubTrackTable * tab, MPI_Comm Co
         snprintf(blockname, sizeof(blockname), "%s/%s", subhalo_table_dir(ent->ptype), ent->name);
         BigArray array = {0};
         petaio_alloc_buffer(&array, ent, n);
-        subhalo_read_rows(&bf, blockname, ent->dtype, ent->items, issub ? NumSubhalosTotal : NumOrphansTotal, n, array.data, Comm);
+        subhalo_read_rows(&bf, pigname, blockname, ent->dtype, ent->items, issub ? NumSubhalosTotal : NumOrphansTotal, n, array.data, Comm);
         char * p = (char *) array.data;
         int64_t j;
+        /* int setters on rebased single records (H4) */
         for(j = 0; j < n; j++) {
-            ent->setter(j, p, base, NULL, &conv);
+            ent->setter(0, p, &base[j], NULL, &conv);
             p += array.strides[0];
         }
         petaio_destroy_buffer(&array);
     }
     destroy_io_blocks(&T);
     if(0 != big_file_mpi_close(&bf, Comm))
-        endrun(0, "Failed to close %s\n", pigname);
+        SUBHALO_STATE_FATAL(pigname, "Failed to close %s\n", pigname);
 
     /* Orphan rows carry no counts: an orphan has no bound particles. */
     for(i = nsub; i < nsub + norph; i++) {
@@ -1019,20 +1067,86 @@ subhalo_read_state(const char * pigname, struct SubTrackTable * tab, MPI_Comm Co
             recs[i].MboundType[k] = 0;
         }
     }
-    int bad = 0;
-    for(i = 0; i < nsub + norph; i++)
+    /* Identity and classification (H9): every TrackId in range; a Subhalo row is resolved
+     * (Nbound > 0, not dead), an Orphan row is dead or sunk (SnapDeath set). */
+    int64_t badrange = 0, badclass = 0;
+    for(i = 0; i < nsub + norph; i++) {
         if(recs[i].TrackId < 0 || recs[i].TrackId >= NumTracksTotal)
-            bad = 1;
-    if(MPIU_Any(bad, Comm))
-        endrun(0, "Subhalo state %s has TrackIds outside [0, %ld)\n", pigname, NumTracksTotal);
+            badrange++;
+        if(i < nsub && (recs[i].Nbound <= 0 || recs[i].SnapDeath >= 0))
+            badclass++;
+        if(i >= nsub && recs[i].SnapDeath < 0)
+            badclass++;
+    }
+    if(MPIU_Any(badrange > 0 || badclass > 0, Comm)) {
+        message(1, "Subhalo state %s on rank %d: %ld TrackIds outside [0, %ld), %ld rows whose Subhalo/Orphan classification "
+                   "contradicts their Nbound/SnapDeath\n", pigname, ThisTask, badrange, NumTracksTotal, badclass);
+        myfree(recs);
+        return 1;
+    }
 
+    /* Route every row to its home and require exactly one row per homed TrackId (H9): no
+     * duplicate, no hole. subhalo_table_store is not used here because it accepts duplicates. */
     tab->NTotal = NumTracksTotal;
     subhalo_table_redistribute(tab, Comm);
-    subhalo_table_store(tab, recs, nsub + norph, Comm);
+    int64_t * sendcounts = ta_malloc("SubReadCounts", int64_t, NTask);
+    int64_t * fill = ta_malloc("SubReadFill", int64_t, NTask);
+    memset(sendcounts, 0, sizeof(int64_t) * NTask);
+    for(i = 0; i < nsub + norph; i++)
+        sendcounts[subhalo_table_home_rank(tab, recs[i].TrackId)]++;
+    fill[0] = 0;
+    int r;
+    for(r = 1; r < NTask; r++)
+        fill[r] = fill[r-1] + sendcounts[r-1];
+    struct SubTrack * sendbuf = (struct SubTrack *) mymalloc("SubReadSend", sizeof(struct SubTrack) * (nsub + norph + 1));
+    for(i = 0; i < nsub + norph; i++)
+        sendbuf[fill[subhalo_table_home_rank(tab, recs[i].TrackId)]++] = recs[i];
+    struct SubTrack * in = NULL;
+    const int64_t nin = subhalo_alltoallv(sendbuf, sendcounts, sizeof(struct SubTrack), (void **) &in, 0, NULL, Comm);
+    char * seen = (char *) mymalloc("SubReadSeen", tab->NLocal + 1);
+    memset(seen, 0, tab->NLocal + 1);
+    const int64_t first = (int64_t) tab->ThisTask * tab->Chunk;
+    int64_t ndup = 0, nhole = 0, nmisplaced = 0;
+    for(i = 0; i < nin; i++) {
+        const int64_t li = in[i].TrackId - first;
+        if(li < 0 || li >= tab->NLocal) {
+            nmisplaced++;
+            continue;
+        }
+        if(seen[li]) {
+            ndup++;
+            continue;
+        }
+        seen[li] = 1;
+        tab->Track[li] = in[i];
+    }
+    for(i = 0; i < tab->NLocal; i++)
+        if(!seen[i])
+            nhole++;
+    myfree(seen);
+    myfree(in);
+    myfree(sendbuf);
+    ta_free(fill);
+    ta_free(sendcounts);
     myfree(recs);
+    if(MPIU_Any(ndup > 0 || nhole > 0 || nmisplaced > 0, Comm)) {
+        message(1, "Subhalo state %s on rank %d: %ld duplicate TrackIds, %ld TrackIds of [0, %ld) without a row, %ld misplaced rows\n",
+                pigname, ThisTask, ndup, nhole, NumTracksTotal, nmisplaced);
+        return 1;
+    }
 
     message(0, "Read subhalo state from %s: %ld subhalos, %ld orphans, %ld tracks, a = %g.\n",
             pigname, NumSubhalosTotal, NumOrphansTotal, NumTracksTotal, StateTime);
+    *StateTimeOut = StateTime;
+    return 0;
+}
+
+double
+subhalo_read_state(const char * pigname, struct SubTrackTable * tab, MPI_Comm Comm)
+{
+    double StateTime = -1;
+    if(subhalo_read_state_checked(pigname, tab, &StateTime, Comm))
+        SUBHALO_STATE_FATAL(pigname, "Subhalo state %s failed validation.\n", pigname);
     return StateTime;
 }
 
@@ -1107,7 +1221,18 @@ subhalo_join_tags(const char * pigname, struct part_manager_type * pman, MPI_Com
 
     BigFile bf = {0};
     if(0 != big_file_mpi_open(&bf, pigname, Comm))
-        endrun(0, "Failed to open %s for the tag join: %s\n", pigname, big_file_get_error_message());
+        SUBHALO_STATE_FATAL(pigname, "Failed to open %s for the tag join: %s\n", pigname, big_file_get_error_message());
+    /* the number of tracks of the state, for the range checks of the saved tags (H9) */
+    int64_t NumTracksTotal = -1;
+    {
+        BigBlock bh;
+        if(0 != big_file_mpi_open_block(&bf, &bh, "Header", Comm))
+            SUBHALO_STATE_FATAL(pigname, "Failed to open the header of %s: %s\n", pigname, big_file_get_error_message());
+        if(0 != big_block_get_attr(&bh, "NumTracksTotal", &NumTracksTotal, "u8", 1) || !subhalo_count_ok(NumTracksTotal))
+            SUBHALO_STATE_FATAL(pigname, "%s: NumTracksTotal missing or invalid\n", pigname);
+        if(0 != big_block_mpi_close(&bh, Comm))
+            SUBHALO_STATE_FATAL(pigname, "Failed to close the header of %s\n", pigname);
+    }
 
     /* Row counts of the saved tags per type (-1: block absent). */
     int64_t Nsaved[6];
@@ -1122,7 +1247,7 @@ subhalo_join_tags(const char * pigname, struct part_manager_type * pman, MPI_Com
             continue;
         Nsaved[t] = bb.size;
         if(0 != big_block_mpi_close(&bb, Comm))
-            endrun(0, "Failed to close %s\n", blockname);
+            SUBHALO_STATE_FATAL(pigname, "Failed to close %s of %s\n", blockname, pigname);
         int64_t start, n;
         subhalo_split_rows(Nsaved[t], ThisTask, NTask, &start, &n);
         maxsaved += n;
@@ -1134,7 +1259,7 @@ subhalo_join_tags(const char * pigname, struct part_manager_type * pman, MPI_Com
 
     struct JoinRec * recs = (struct JoinRec *) mymalloc("JoinRecs", sizeof(struct JoinRec) * (maxsaved + nlocalpart + 1));
     int64_t n = 0;
-    int64_t nsavedrecs = 0;
+    int64_t nsavedrecs = 0, badtags = 0;
     for(t = 0; t < 6; t++) {
         if(Nsaved[t] < 0)
             continue;
@@ -1146,17 +1271,23 @@ subhalo_join_tags(const char * pigname, struct part_manager_type * pman, MPI_Com
         int64_t * boundtrackid = (int64_t *) mymalloc2("JoinBoundTrackId", sizeof(int64_t) * (nrow + 1));
         char blockname[128];
         snprintf(blockname, sizeof(blockname), "%d/ID", t);
-        subhalo_read_rows(&bf, blockname, "u8", 1, Nsaved[t], nrow, id, Comm);
+        subhalo_read_rows(&bf, pigname, blockname, "u8", 1, Nsaved[t], nrow, id, Comm);
         snprintf(blockname, sizeof(blockname), "%d/TrackId", t);
-        subhalo_read_rows(&bf, blockname, "i8", 1, Nsaved[t], nrow, trackid, Comm);
+        subhalo_read_rows(&bf, pigname, blockname, "i8", 1, Nsaved[t], nrow, trackid, Comm);
         snprintf(blockname, sizeof(blockname), "%d/BindRank", t);
-        subhalo_read_rows(&bf, blockname, "i4", 1, Nsaved[t], nrow, bindrank, Comm);
+        subhalo_read_rows(&bf, pigname, blockname, "i4", 1, Nsaved[t], nrow, bindrank, Comm);
         snprintf(blockname, sizeof(blockname), "%d/BoundTrackId", t);
-        subhalo_read_rows(&bf, blockname, "i8", 1, Nsaved[t], nrow, boundtrackid, Comm);
+        subhalo_read_rows(&bf, pigname, blockname, "i8", 1, Nsaved[t], nrow, boundtrackid, Comm);
         int64_t j;
         for(j = 0; j < nrow; j++) {
-            if(trackid[j] < 0)
-                continue;
+            /* the saved tags must name tracks of the state, and a tagged row a rank (H9) */
+            if(trackid[j] < -1 || trackid[j] >= NumTracksTotal || boundtrackid[j] < -1 || boundtrackid[j] >= NumTracksTotal
+                    || (trackid[j] >= 0 && bindrank[j] < 0))
+                badtags++;
+            /* Every saved row takes part, untagged ones included (H11): an exact match to a row
+             * saved untagged gives -1 instead of the generation-0 parent's tag. */
+            if(trackid[j] >= 0)
+                nsavedrecs++;
             struct JoinRec * r = &recs[n++];
             r->ID = id[j];
             r->TrackId = trackid[j];
@@ -1172,9 +1303,11 @@ subhalo_join_tags(const char * pigname, struct part_manager_type * pman, MPI_Com
         myfree(trackid);
         myfree(id);
     }
-    nsavedrecs = n;
     if(0 != big_file_mpi_close(&bf, Comm))
-        endrun(0, "Failed to close %s\n", pigname);
+        SUBHALO_STATE_FATAL(pigname, "Failed to close %s\n", pigname);
+    if(MPIU_Any(badtags > 0, Comm))
+        SUBHALO_STATE_FATAL(pigname, "Subhalo state %s on rank %d: %ld saved particle rows with a TrackId/BoundTrackId outside [-1, %ld) "
+                            "or a tagged row with BindRank < 0\n", pigname, ThisTask, badtags, NumTracksTotal);
 
     for(i = 0; i < pman->NumPart; i++) {
         if(pman->Base[i].IsGarbage)
@@ -1301,28 +1434,17 @@ subhalo_join_tags(const char * pigname, struct part_manager_type * pman, MPI_Com
         }
     }
 
-    /* Return the results to the owners. */
-    int * sendcounts = (int *) mymalloc2("JoinCounts", 4 * sizeof(int) * NTask);
-    int * senddispls = sendcounts + NTask;
-    int * recvcounts = sendcounts + 2 * NTask;
-    int * recvdispls = sendcounts + 3 * NTask;
-    memset(sendcounts, 0, 4 * sizeof(int) * NTask);
+    /* Return the results to the owners (64-bit counts, checked in subhalo_alltoallv, H3). */
+    int64_t * sendcounts = ta_malloc("JoinCounts", int64_t, NTask);
+    memset(sendcounts, 0, sizeof(int64_t) * NTask);
     for(i = 0; i < n; i++)
         if(recs[i].kind == 1)
             sendcounts[recs[i].task]++;
-    MPI_Alltoall(sendcounts, 1, MPI_INT, recvcounts, 1, MPI_INT, Comm);
-    int64_t nrecv = 0;
-    for(t = 0; t < NTask; t++) {
-        senddispls[t] = (t == 0) ? 0 : senddispls[t-1] + sendcounts[t-1];
-        recvdispls[t] = (t == 0) ? 0 : recvdispls[t-1] + recvcounts[t-1];
-        nrecv += recvcounts[t];
-    }
-    if(nrecv != nlocalpart)
-        endrun(5, "Tag join returned %ld results for %ld particles\n", nrecv, nlocalpart);
-
     struct JoinResult * send = (struct JoinResult *) mymalloc2("JoinSend", sizeof(struct JoinResult) * (nlocalrecs + 1));
-    int * fill = (int *) mymalloc2("JoinFill", sizeof(int) * NTask);
-    memcpy(fill, senddispls, sizeof(int) * NTask);
+    int64_t * fill = ta_malloc("JoinFill", int64_t, NTask);
+    fill[0] = 0;
+    for(t = 1; t < NTask; t++)
+        fill[t] = fill[t-1] + sendcounts[t-1];
     for(i = 0; i < n; i++) {
         if(recs[i].kind != 1)
             continue;
@@ -1333,15 +1455,13 @@ subhalo_join_tags(const char * pigname, struct part_manager_type * pman, MPI_Com
         s->BindRank = recs[i].BindRank;
         s->inherited = recs[i].inherited;
     }
-    myfree(fill);
+    ta_free(fill);
     myfree(recs);
 
-    struct JoinResult * recv = (struct JoinResult *) mymalloc("JoinRecv", sizeof(struct JoinResult) * (nrecv + 1));
-    MPI_Datatype MPI_RESULT;
-    MPI_Type_contiguous(sizeof(struct JoinResult), MPI_BYTE, &MPI_RESULT);
-    MPI_Type_commit(&MPI_RESULT);
-    MPI_Alltoallv_sparse(send, sendcounts, senddispls, MPI_RESULT, recv, recvcounts, recvdispls, MPI_RESULT, Comm);
-    MPI_Type_free(&MPI_RESULT);
+    struct JoinResult * recv = NULL;
+    const int64_t nrecv = subhalo_alltoallv(send, sendcounts, sizeof(struct JoinResult), (void **) &recv, 0, NULL, Comm);
+    if(nrecv != nlocalpart)
+        endrun(5, "Tag join returned %ld results for %ld particles\n", nrecv, nlocalpart);
 
     #pragma omp parallel for
     for(i = 0; i < pman->NumPart; i++) {
@@ -1351,9 +1471,9 @@ subhalo_join_tags(const char * pigname, struct part_manager_type * pman, MPI_Com
     }
     int64_t ninherited = 0, nexact = 0;
     for(i = 0; i < nrecv; i++) {
-        struct particle_data * p = &pman->Base[recv[i].index];
-        if(recv[i].index < 0 || recv[i].index >= pman->NumPart || p->IsGarbage)
+        if(recv[i].index < 0 || recv[i].index >= pman->NumPart || pman->Base[recv[i].index].IsGarbage)
             endrun(5, "Tag join result for invalid particle index %ld\n", recv[i].index);
+        struct particle_data * p = &pman->Base[recv[i].index];
         p->TrackId = recv[i].TrackId;
         p->BoundTrackId = recv[i].BoundTrackId;
         p->BindRank = recv[i].BindRank;
@@ -1366,7 +1486,7 @@ subhalo_join_tags(const char * pigname, struct part_manager_type * pman, MPI_Com
     }
     myfree(recv);
     myfree(send);
-    myfree(sendcounts);
+    ta_free(sendcounts);
 
     int64_t cnt[3] = {nsavedrecs, nexact, ninherited}, tot[3];
     MPI_Allreduce(cnt, tot, 3, MPI_INT64, MPI_SUM, Comm);

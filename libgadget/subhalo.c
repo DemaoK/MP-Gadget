@@ -10,11 +10,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <limits.h>
 #include <omp.h>
 
 #include "utils/endrun.h"
 #include "utils/mymalloc.h"
 #include "utils/mpsort.h"
+#include "utils/openmpsort.h"
 #include "utils/system.h"
 #include "utils/string.h"
 
@@ -42,16 +44,79 @@ static struct {
 
 #define SUBHALO_TABLE_INITIAL_BYTES (64L * 1024L * 1024L)
 
+/* The run's units (design 7.10); MP-Gadget's defaults until subhalo_set_units is called. */
+static struct {
+    double UnitLength_in_cm;
+    double UnitMass_in_g;
+    double UnitVelocity_in_cm_per_s;
+} SubUnits = {3.085678e21, 1.989e43, 1e5};
+
+int
+subhalo_isfinite(double x)
+{
+    uint64_t u;
+    memcpy(&u, &x, sizeof(u));
+    return ((u >> 52) & 0x7FF) != 0x7FF;
+}
+
+/* Largest double below 2^62, the range in which the integer-valued parameters are converted. */
+#define SUBHALO_INT_PARAM_MAX 4.6e18
+
+/* Validation of the values Phase 1 uses (H14). Every failure is endrun(1) on every rank: the
+ * caller runs it on every rank with the broadcast values. */
+static void
+subhalo_validate_params(const struct SubhaloParams * sp)
+{
+    if(!subhalo_isfinite(sp->SubhaloMaxGatherFraction) || sp->SubhaloMaxGatherFraction <= 0)
+        endrun(1, "SubhaloMaxGatherFraction = %g must be finite and positive (values above 1 are allowed for testing).\n", sp->SubhaloMaxGatherFraction);
+    if(sp->SubhaloCollectiveMinPart < 0)
+        endrun(1, "SubhaloCollectiveMinPart = %ld must not be negative.\n", sp->SubhaloCollectiveMinPart);
+    if(sp->SubhaloLookupBatchBytes < 1024L * 1024L)
+        endrun(1, "SubhaloLookupBatchBytes = %ld must be at least 1 MB.\n", sp->SubhaloLookupBatchBytes);
+    if(sp->SubhaloTracerTypes < 0 || sp->SubhaloTracerTypes > 63)
+        endrun(1, "SubhaloTracerTypes = %d must be a bitmask of the six particle types (0-63).\n", sp->SubhaloTracerTypes);
+    if(sp->SubhaloPotentialTypes < 0 || sp->SubhaloPotentialTypes > 63)
+        endrun(1, "SubhaloPotentialTypes = %d must be a bitmask of the six particle types (0-63).\n", sp->SubhaloPotentialTypes);
+    if(sp->SubhaloMinNumTracerPart < 1 || sp->SubhaloNumTracerHostFinding < 1)
+        endrun(1, "SubhaloMinNumTracerPart = %d and SubhaloNumTracerHostFinding = %d must be at least 1.\n",
+               sp->SubhaloMinNumTracerPart, sp->SubhaloNumTracerHostFinding);
+    if(sp->SubhaloNumTracerHostFinding > sp->SubhaloMinNumTracerPart)
+        endrun(1, "SubhaloNumTracerHostFinding = %d must not exceed SubhaloMinNumTracerPart = %d.\n",
+               sp->SubhaloNumTracerHostFinding, sp->SubhaloMinNumTracerPart);
+    if(sp->SubhaloMinNumPart < 1)
+        endrun(1, "SubhaloMinNumPart = %d must be at least 1.\n", sp->SubhaloMinNumPart);
+    if(!subhalo_isfinite(sp->SubhaloMajorMergerRatio) || sp->SubhaloMajorMergerRatio < 0)
+        endrun(1, "SubhaloMajorMergerRatio = %g must be finite and non-negative.\n", sp->SubhaloMajorMergerRatio);
+    /* Later-phase knobs: only their finiteness, so that a typo cannot reach any arithmetic. */
+    const double later[5] = {sp->SubhaloMajorProgenitorMassRatio, sp->SubhaloBoundMassPrecision,
+                             sp->SubhaloSourceRelaxFactor, sp->SubhaloTreeOpenAngle, sp->SubhaloSOSearchFactor};
+    int k;
+    for(k = 0; k < 5; k++)
+        if(!subhalo_isfinite(later[k]))
+            endrun(1, "A floating-point Subhalo* parameter is not finite (%g).\n", later[k]);
+}
+
+/* A double parameter that must hold a non-negative integer, checked before the conversion. */
+static int64_t
+subhalo_int_param(double v, const char * name)
+{
+    if(!subhalo_isfinite(v) || v < 0 || v > SUBHALO_INT_PARAM_MAX || v != floor(v))
+        endrun(1, "%s = %g must be a non-negative integer below %g.\n", name, v, SUBHALO_INT_PARAM_MAX);
+    return (int64_t) v;
+}
+
 void
 set_subhalo_params(ParameterSet * ps)
 {
     int ThisTask;
     MPI_Comm_rank(MPI_COMM_WORLD, &ThisTask);
     int checks[2] = {0, 0};
+    /* the two integer-valued doubles, converted on every rank after validation */
+    double raw[2] = {0, 0};
     if(ThisTask == 0) {
         SubParams.SubhaloFinderOn = param_get_int(ps, "SubhaloFinderOn");
         SubParams.SubhaloMaxGatherFraction = param_get_double(ps, "SubhaloMaxGatherFraction");
-        SubParams.SubhaloCollectiveMinPart = (int64_t) param_get_double(ps, "SubhaloCollectiveMinPart");
+        raw[0] = param_get_double(ps, "SubhaloCollectiveMinPart");
         SubParams.SubhaloMaxUnbindIterations = param_get_int(ps, "SubhaloMaxUnbindIterations");
         SubParams.SubhaloRestartFresh = param_get_int(ps, "SubhaloRestartFresh");
         SubParams.SubhaloTracerTypes = param_get_int(ps, "SubhaloTracerTypes");
@@ -59,7 +124,7 @@ set_subhalo_params(ParameterSet * ps)
         SubParams.SubhaloMinNumPart = param_get_int(ps, "SubhaloMinNumPart");
         SubParams.SubhaloMinNumTracerPart = param_get_int(ps, "SubhaloMinNumTracerPart");
         SubParams.SubhaloNumTracerHostFinding = param_get_int(ps, "SubhaloNumTracerHostFinding");
-        SubParams.SubhaloLookupBatchBytes = (int64_t) param_get_double(ps, "SubhaloLookupBatchBytes");
+        raw[1] = param_get_double(ps, "SubhaloLookupBatchBytes");
         SubParams.SubhaloMajorProgenitorMassRatio = param_get_double(ps, "SubhaloMajorProgenitorMassRatio");
         SubParams.SubhaloBoundMassPrecision = param_get_double(ps, "SubhaloBoundMassPrecision");
         SubParams.SubhaloSourceRelaxFactor = param_get_double(ps, "SubhaloSourceRelaxFactor");
@@ -84,27 +149,59 @@ set_subhalo_params(ParameterSet * ps)
     }
     MPI_Bcast(&SubParams, sizeof(struct SubhaloParams), MPI_BYTE, 0, MPI_COMM_WORLD);
     MPI_Bcast(checks, 2, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(raw, 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Bcast(SubhaloFOFFileBase, sizeof(SubhaloFOFFileBase), MPI_CHAR, 0, MPI_COMM_WORLD);
 
-    if(!SubParams.SubhaloFinderOn)
+    if(!SubParams.SubhaloFinderOn) {
+        /* unused while off; keep the conversion defined */
+        SubParams.SubhaloCollectiveMinPart = 0;
+        SubParams.SubhaloLookupBatchBytes = 64L * 1024L * 1024L;
         return;
+    }
     if(checks[0] != 1)
-        endrun(0, "SubhaloFinderOn = 1 requires SnapshotWithFOF = 1 (the finder runs at every PART/PIG output).\n");
+        endrun(1, "SubhaloFinderOn = 1 requires SnapshotWithFOF = 1 (the finder runs at every PART/PIG output).\n");
     if(checks[1] != 1)
-        endrun(0, "SubhaloFinderOn = 1 requires FOFSaveParticles = 1 (the PIG particle blocks are the finder's restart state).\n");
-    if(SubParams.SubhaloMaxGatherFraction <= 0)
-        endrun(0, "SubhaloMaxGatherFraction = %g must be positive.\n", SubParams.SubhaloMaxGatherFraction);
-    if(SubParams.SubhaloCollectiveMinPart < 0)
-        endrun(0, "SubhaloCollectiveMinPart = %ld must not be negative.\n", SubParams.SubhaloCollectiveMinPart);
-    if(SubParams.SubhaloNumTracerHostFinding > SubParams.SubhaloMinNumTracerPart)
-        endrun(0, "SubhaloNumTracerHostFinding = %d must not exceed SubhaloMinNumTracerPart = %d.\n",
-               SubParams.SubhaloNumTracerHostFinding, SubParams.SubhaloMinNumTracerPart);
+        endrun(1, "SubhaloFinderOn = 1 requires FOFSaveParticles = 1 (the PIG particle blocks are the finder's restart state).\n");
+    SubParams.SubhaloCollectiveMinPart = subhalo_int_param(raw[0], "SubhaloCollectiveMinPart");
+    SubParams.SubhaloLookupBatchBytes = subhalo_int_param(raw[1], "SubhaloLookupBatchBytes");
+    subhalo_validate_params(&SubParams);
 }
 
 void
 subhalo_set_testpar(struct SubhaloParams params)
 {
+    if(params.SubhaloFinderOn)
+        subhalo_validate_params(&params);
     SubParams = params;
+}
+
+void
+subhalo_set_units(double UnitLength_in_cm, double UnitMass_in_g, double UnitVelocity_in_cm_per_s)
+{
+    if(!subhalo_isfinite(UnitLength_in_cm) || UnitLength_in_cm <= 0 ||
+       !subhalo_isfinite(UnitMass_in_g) || UnitMass_in_g <= 0 ||
+       !subhalo_isfinite(UnitVelocity_in_cm_per_s) || UnitVelocity_in_cm_per_s <= 0)
+        endrun(1, "Subhalo finder: invalid unit system (%g cm, %g g, %g cm/s).\n",
+               UnitLength_in_cm, UnitMass_in_g, UnitVelocity_in_cm_per_s);
+    SubUnits.UnitLength_in_cm = UnitLength_in_cm;
+    SubUnits.UnitMass_in_g = UnitMass_in_g;
+    SubUnits.UnitVelocity_in_cm_per_s = UnitVelocity_in_cm_per_s;
+}
+
+void
+subhalo_get_units(double * UnitLength_in_cm, double * UnitMass_in_g, double * UnitVelocity_in_cm_per_s)
+{
+    *UnitLength_in_cm = SubUnits.UnitLength_in_cm;
+    *UnitMass_in_g = SubUnits.UnitMass_in_g;
+    *UnitVelocity_in_cm_per_s = SubUnits.UnitVelocity_in_cm_per_s;
+}
+
+double
+subhalo_vel_to_kms(double atime)
+{
+    /* internal Vel = a * v_pec (whatever UsePeculiarVelocity, which only affects the snapshot
+     * convention): physical peculiar velocity in cm/s is Vel * UnitVelocity / a */
+    return SubUnits.UnitVelocity_in_cm_per_s / (1e5 * atime);
 }
 
 int
@@ -274,25 +371,49 @@ subhalo_history_update(struct SubTrack * rec, int SnapNum, double MaxSinkMbound)
 
 /* ------------------------------------------------------------------ shared MPI helper */
 
+void
+subhalo_check_mpi_count(int64_t value, const char * what, MPI_Comm Comm)
+{
+    if(MPIU_Any(value < 0 || value > INT_MAX, Comm))
+        endrun(1, "Subhalo finder: %s exceeds the MPI int limit on some rank (here %ld). "
+                  "Phase 1 does not batch this exchange; run with more ranks.\n", what, value);
+}
+
 int64_t
-subhalo_alltoallv(const void * sendbuf, const int * sendcounts, size_t elsize, void ** recvbuf, int top, int * recvcounts_out, MPI_Comm Comm)
+subhalo_alltoallv(const void * sendbuf, const int64_t * sendcounts, size_t elsize, void ** recvbuf, int top, int64_t * recvcounts_out, MPI_Comm Comm)
 {
     int NTask, i;
     MPI_Comm_size(Comm, &NTask);
+    int64_t * recvcounts64 = ta_malloc("SubRecvCounts64", int64_t, NTask);
+    MPI_Alltoall((void *) sendcounts, 1, MPI_INT64, recvcounts64, 1, MPI_INT64, Comm);
+    int64_t nsend = 0, nrecv = 0;
+    int bad = 0;
+    for(i = 0; i < NTask; i++) {
+        if(sendcounts[i] < 0 || recvcounts64[i] < 0)
+            bad = 1;
+        nsend += sendcounts[i];
+        nrecv += recvcounts64[i];
+    }
+    /* every count and displacement is bounded by the totals */
+    if(nsend > INT_MAX || nrecv > INT_MAX)
+        bad = 1;
+    if(MPIU_Any(bad, Comm))
+        endrun(1, "Subhalo exchange of %ld / %ld elements of %lu bytes exceeds the MPI int counts on some rank. "
+                  "Phase 1 does not batch this exchange; run with more ranks.\n", nsend, nrecv, (unsigned long) elsize);
+
+    int * scounts = ta_malloc("SubSendCounts", int, NTask);
     int * recvcounts = ta_malloc("SubRecvCounts", int, NTask);
     int * sdispls = ta_malloc("SubSendDispls", int, NTask);
     int * rdispls = ta_malloc("SubRecvDispls", int, NTask);
-
-    MPI_Alltoall(sendcounts, 1, MPI_INT, recvcounts, 1, MPI_INT, Comm);
-    int64_t nsend = 0, nrecv = 0;
+    int64_t so = 0, ro = 0;
     for(i = 0; i < NTask; i++) {
-        sdispls[i] = nsend;
-        rdispls[i] = nrecv;
-        nsend += sendcounts[i];
-        nrecv += recvcounts[i];
+        scounts[i] = (int) sendcounts[i];
+        recvcounts[i] = (int) recvcounts64[i];
+        sdispls[i] = (int) so;
+        rdispls[i] = (int) ro;
+        so += sendcounts[i];
+        ro += recvcounts64[i];
     }
-    if(nsend >= INT32_MAX || nrecv >= INT32_MAX)
-        endrun(5, "Subhalo exchange of %ld / %ld elements overflows the MPI counts.\n", nsend, nrecv);
 
     char * recv;
     if(top)
@@ -303,14 +424,16 @@ subhalo_alltoallv(const void * sendbuf, const int * sendcounts, size_t elsize, v
     MPI_Datatype dtype;
     MPI_Type_contiguous(elsize, MPI_BYTE, &dtype);
     MPI_Type_commit(&dtype);
-    MPI_Alltoallv_sparse((void *) sendbuf, (int *) sendcounts, sdispls, dtype, recv, recvcounts, rdispls, dtype, Comm);
+    MPI_Alltoallv_sparse((void *) sendbuf, scounts, sdispls, dtype, recv, recvcounts, rdispls, dtype, Comm);
     MPI_Type_free(&dtype);
 
     if(recvcounts_out)
-        memcpy(recvcounts_out, recvcounts, sizeof(int) * NTask);
+        memcpy(recvcounts_out, recvcounts64, sizeof(int64_t) * NTask);
     ta_free(rdispls);
     ta_free(sdispls);
     ta_free(recvcounts);
+    ta_free(scounts);
+    ta_free(recvcounts64);
     *recvbuf = recv;
     return nrecv;
 }
@@ -438,9 +561,10 @@ subhalo_table_redistribute(struct SubTrackTable * tab, MPI_Comm Comm)
         return;
     }
 
-    /* Full exchange of the records to their new homes. */
-    int * sendcounts = ta_malloc("SubTabSendCounts", int, tab->NTask);
-    memset(sendcounts, 0, sizeof(int) * tab->NTask);
+    /* Full exchange of the records to their new homes. Counts and offsets in 64 bits; the
+     * MPI ints are checked collectively before narrowing. */
+    int64_t * sendcounts = ta_malloc("SubTabSendCounts", int64_t, tab->NTask);
+    memset(sendcounts, 0, sizeof(int64_t) * tab->NTask);
     int bad = 0;
     for(i = 0; i < tab->NLocal; i++) {
         const int64_t T = tab->Track[i].TrackId;
@@ -452,6 +576,15 @@ subhalo_table_redistribute(struct SubTrackTable * tab, MPI_Comm Comm)
     }
     if(bad)
         endrun(5, "Track table on rank %d holds a TrackId outside [0, %ld).\n", tab->ThisTask, tab->NTotal);
+    int64_t * recvcounts = ta_malloc("SubTabRecvCounts", int64_t, tab->NTask);
+    MPI_Alltoall(sendcounts, 1, MPI_INT64, recvcounts, 1, MPI_INT64, Comm);
+    int64_t nrecv = 0, nsend = 0;
+    int r;
+    for(r = 0; r < tab->NTask; r++) {
+        nsend += sendcounts[r];
+        nrecv += recvcounts[r];
+    }
+    subhalo_check_mpi_count(nsend > nrecv ? nsend : nrecv, "the track table redistribution", Comm);
 
     /* Send buffer in the table allocator, on the same side as the current block. */
     const int onbottom = table_block_on_bottom(tab);
@@ -460,8 +593,7 @@ subhalo_table_redistribute(struct SubTrackTable * tab, MPI_Comm Comm)
         sendbuf = (struct SubTrack *) allocator_alloc_bot(tab->alloc, "SubTrackSend", sizeof(struct SubTrack) * (tab->NLocal + 1));
     else
         sendbuf = (struct SubTrack *) allocator_alloc_top(tab->alloc, "SubTrackSend", sizeof(struct SubTrack) * (tab->NLocal + 1));
-    int * offset = ta_malloc("SubTabOffset", int, tab->NTask);
-    int r;
+    int64_t * offset = ta_malloc("SubTabOffset", int64_t, tab->NTask);
     offset[0] = 0;
     for(r = 1; r < tab->NTask; r++)
         offset[r] = offset[r-1] + sendcounts[r-1];
@@ -484,19 +616,19 @@ subhalo_table_redistribute(struct SubTrackTable * tab, MPI_Comm Comm)
         subhalo_track_clear(&newtrack[i], first + i);
 
     /* Receive buffer on the same side as the new block, after it (freed first). */
-    int * recvcounts = ta_malloc("SubTabRecvCounts", int, tab->NTask);
+    int * scounts = ta_malloc("SubTabSendCounts32", int, tab->NTask);
+    int * rcounts = ta_malloc("SubTabRecvCounts32", int, tab->NTask);
     int * sdispls = ta_malloc("SubTabSendDispls", int, tab->NTask);
     int * rdispls = ta_malloc("SubTabRecvDispls", int, tab->NTask);
-    MPI_Alltoall(sendcounts, 1, MPI_INT, recvcounts, 1, MPI_INT, Comm);
-    int64_t nrecv = 0, nsend = 0;
+    int64_t so = 0, ro = 0;
     for(r = 0; r < tab->NTask; r++) {
-        sdispls[r] = nsend;
-        rdispls[r] = nrecv;
-        nsend += sendcounts[r];
-        nrecv += recvcounts[r];
+        scounts[r] = (int) sendcounts[r];
+        rcounts[r] = (int) recvcounts[r];
+        sdispls[r] = (int) so;
+        rdispls[r] = (int) ro;
+        so += sendcounts[r];
+        ro += recvcounts[r];
     }
-    if(nrecv >= INT32_MAX || nsend >= INT32_MAX)
-        endrun(5, "Track table redistribution overflows the MPI counts.\n");
     struct SubTrack * recvbuf;
     if(onbottom)
         recvbuf = (struct SubTrack *) allocator_alloc_top(tab->alloc, "SubTrackRecv", sizeof(struct SubTrack) * (nrecv + 1));
@@ -505,7 +637,7 @@ subhalo_table_redistribute(struct SubTrackTable * tab, MPI_Comm Comm)
     MPI_Datatype dtype;
     MPI_Type_contiguous(sizeof(struct SubTrack), MPI_BYTE, &dtype);
     MPI_Type_commit(&dtype);
-    MPI_Alltoallv_sparse(sendbuf, sendcounts, sdispls, dtype, recvbuf, recvcounts, rdispls, dtype, Comm);
+    MPI_Alltoallv_sparse(sendbuf, scounts, sdispls, dtype, recvbuf, rcounts, rdispls, dtype, Comm);
     MPI_Type_free(&dtype);
 
     int64_t nplaced = 0;
@@ -519,9 +651,11 @@ subhalo_table_redistribute(struct SubTrackTable * tab, MPI_Comm Comm)
     allocator_free(recvbuf);
     ta_free(rdispls);
     ta_free(sdispls);
-    ta_free(recvcounts);
+    ta_free(rcounts);
+    ta_free(scounts);
     allocator_free(sendbuf);
     allocator_free(tab->Track);
+    ta_free(recvcounts);
     ta_free(sendcounts);
 
     tab->Track = newtrack;
@@ -533,11 +667,50 @@ subhalo_table_redistribute(struct SubTrackTable * tab, MPI_Comm Comm)
     message(0, "Track table redistributed: %ld tracks (%ld records moved or kept), chunk %ld.\n", tab->NTotal, nplaced_tot, tab->Chunk);
 }
 
-/* Sort helper: request index ordered by destination. */
-struct TableReq {
-    int64_t TrackId;
-    int64_t index;
-};
+/* ---- batched record fetch and store (H1) ----
+ * Requests are grouped by home rank through a permutation (8 bytes per request, the only
+ * allocation proportional to n). Each batch sends at most PairCap requests to every home
+ * rank, PairCap = max(1, SubhaloLookupBatchBytes / (NTask * (sizeof(SubTrack) + 8))), so that
+ * one batch moves at most max(SubhaloLookupBatchBytes, NTask * (sizeof(SubTrack) + 8)) bytes
+ * into and out of any rank whatever the request pattern. The batches are collective: the loop
+ * runs while any rank has requests left. subhalo_table_batch_peak_bytes is the bound the plan
+ * reserves for the buffers of one batch. */
+static int64_t
+table_pair_cap(int NTask)
+{
+    const int64_t per = (int64_t) sizeof(struct SubTrack) + 8;
+    const int64_t bb = subhalo_get_params()->SubhaloLookupBatchBytes > 0 ? subhalo_get_params()->SubhaloLookupBatchBytes : 64L * 1024L * 1024L;
+    int64_t cap = bb / ((int64_t) NTask * per);
+    return cap > 0 ? cap : 1;
+}
+
+double
+subhalo_table_batch_peak_bytes(int NTask)
+{
+    const double per = (double) sizeof(struct SubTrack) + 8;
+    /* requests and replies of one batch: at most PairCap * NTask of each in and out */
+    return 2. * (double) table_pair_cap(NTask) * NTask * per + 4096. * 4;
+}
+
+/* Group n items by home rank: perm[j] is the item at grouped position j; cnt/off per rank. */
+static void
+table_group_by_home(struct SubTrackTable * tab, const int64_t * ids, const struct SubTrack * recs, int64_t n,
+                    int64_t * perm, int64_t * cnt, int64_t * off)
+{
+    int64_t i;
+    int r;
+    memset(cnt, 0, sizeof(int64_t) * tab->NTask);
+    for(i = 0; i < n; i++)
+        cnt[subhalo_table_home_rank(tab, ids ? ids[i] : recs[i].TrackId)]++;
+    off[0] = 0;
+    for(r = 1; r < tab->NTask; r++)
+        off[r] = off[r-1] + cnt[r-1];
+    int64_t * fill = ta_malloc("SubTabFill", int64_t, tab->NTask);
+    memcpy(fill, off, sizeof(int64_t) * tab->NTask);
+    for(i = 0; i < n; i++)
+        perm[fill[subhalo_table_home_rank(tab, ids ? ids[i] : recs[i].TrackId)]++] = i;
+    ta_free(fill);
+}
 
 void
 subhalo_table_fetch(struct SubTrackTable * tab, const int64_t * ids, int64_t n, struct SubTrack * out, MPI_Comm Comm)
@@ -552,55 +725,70 @@ subhalo_table_fetch(struct SubTrackTable * tab, const int64_t * ids, int64_t n, 
     if(bad)
         endrun(5, "subhalo_table_fetch: TrackId outside [0, %ld) on rank %d.\n", tab->NTotal, tab->ThisTask);
 
-    int * sendcounts = ta_malloc("SubFetchCounts", int, NTask);
-    int * recvcounts = ta_malloc("SubFetchRecvCounts", int, NTask);
-    int * offset = ta_malloc("SubFetchOffset", int, NTask);
-    memset(sendcounts, 0, sizeof(int) * NTask);
-    for(i = 0; i < n; i++)
-        sendcounts[subhalo_table_home_rank(tab, ids[i])]++;
-    offset[0] = 0;
-    for(r = 1; r < NTask; r++)
-        offset[r] = offset[r-1] + sendcounts[r-1];
-
-    int64_t * reqids = (int64_t *) mymalloc("SubFetchIds", sizeof(int64_t) * (n + 1));
+    int64_t * cnt = ta_malloc("SubFetchCnt", int64_t, NTask);
+    int64_t * off = ta_malloc("SubFetchOff", int64_t, NTask);
+    int64_t * done = ta_malloc("SubFetchDone", int64_t, NTask);
+    int64_t * sendcounts = ta_malloc("SubFetchSend", int64_t, NTask);
+    int64_t * recvcounts = ta_malloc("SubFetchRecv", int64_t, NTask);
     int64_t * perm = (int64_t *) mymalloc("SubFetchPerm", sizeof(int64_t) * (n + 1));
-    for(i = 0; i < n; i++) {
-        const int dest = subhalo_table_home_rank(tab, ids[i]);
-        perm[offset[dest]] = i;
-        reqids[offset[dest]] = ids[i];
-        offset[dest]++;
-    }
-    /* request */
-    int64_t * inids = NULL;
-    int64_t nin = subhalo_alltoallv(reqids, sendcounts, sizeof(int64_t), (void **) &inids, 0, recvcounts, Comm);
-    struct SubTrack * reply = (struct SubTrack *) mymalloc("SubFetchReply", sizeof(struct SubTrack) * (nin + 1));
-    int missing = 0;
-    for(i = 0; i < nin; i++) {
-        struct SubTrack * rec = subhalo_table_get(tab, inids[i]);
-        if(!rec) {
-            missing = 1;
-            subhalo_track_clear(&reply[i], inids[i]);
-            continue;
+    table_group_by_home(tab, ids, NULL, n, perm, cnt, off);
+    memset(done, 0, sizeof(int64_t) * NTask);
+    const int64_t cap = table_pair_cap(NTask);
+
+    while(1) {
+        int64_t nb = 0;
+        for(r = 0; r < NTask; r++) {
+            sendcounts[r] = cnt[r] - done[r] < cap ? cnt[r] - done[r] : cap;
+            nb += sendcounts[r];
         }
-        reply[i] = *rec;
+        if(!MPIU_Any(nb > 0, Comm))
+            break;
+        int64_t * reqids = (int64_t *) mymalloc("SubFetchIds", sizeof(int64_t) * (nb + 1));
+        int64_t j = 0;
+        for(r = 0; r < NTask; r++) {
+            int64_t k;
+            for(k = 0; k < sendcounts[r]; k++)
+                reqids[j++] = ids[perm[off[r] + done[r] + k]];
+        }
+        /* request */
+        int64_t * inids = NULL;
+        int64_t nin = subhalo_alltoallv(reqids, sendcounts, sizeof(int64_t), (void **) &inids, 0, recvcounts, Comm);
+        struct SubTrack * reply = (struct SubTrack *) mymalloc("SubFetchReply", sizeof(struct SubTrack) * (nin + 1));
+        int missing = 0;
+        for(i = 0; i < nin; i++) {
+            struct SubTrack * rec = subhalo_table_get(tab, inids[i]);
+            if(!rec) {
+                missing = 1;
+                subhalo_track_clear(&reply[i], inids[i]);
+                continue;
+            }
+            reply[i] = *rec;
+        }
+        if(missing)
+            endrun(5, "subhalo_table_fetch: a requested track is not homed on rank %d.\n", tab->ThisTask);
+        /* reply: what we received from r goes back to r */
+        struct SubTrack * got = NULL;
+        int64_t ngot = subhalo_alltoallv(reply, recvcounts, sizeof(struct SubTrack), (void **) &got, 0, NULL, Comm);
+        if(ngot != nb)
+            endrun(5, "subhalo_table_fetch: got %ld records for %ld requests.\n", ngot, nb);
+        j = 0;
+        for(r = 0; r < NTask; r++) {
+            int64_t k;
+            for(k = 0; k < sendcounts[r]; k++)
+                out[perm[off[r] + done[r] + k]] = got[j++];
+            done[r] += sendcounts[r];
+        }
+        myfree(got);
+        myfree(reply);
+        myfree(inids);
+        myfree(reqids);
     }
-    if(missing)
-        endrun(5, "subhalo_table_fetch: a requested track is not homed on rank %d.\n", tab->ThisTask);
-    /* reply: what we received from r goes back to r */
-    struct SubTrack * got = NULL;
-    int64_t ngot = subhalo_alltoallv(reply, recvcounts, sizeof(struct SubTrack), (void **) &got, 0, NULL, Comm);
-    if(ngot != n)
-        endrun(5, "subhalo_table_fetch: got %ld records for %ld requests.\n", ngot, n);
-    for(i = 0; i < n; i++)
-        out[perm[i]] = got[i];
-    myfree(got);
-    myfree(reply);
-    myfree(inids);
     myfree(perm);
-    myfree(reqids);
-    ta_free(offset);
     ta_free(recvcounts);
     ta_free(sendcounts);
+    ta_free(done);
+    ta_free(off);
+    ta_free(cnt);
 }
 
 void
@@ -616,36 +804,52 @@ subhalo_table_store(struct SubTrackTable * tab, const struct SubTrack * recs, in
     if(bad)
         endrun(5, "subhalo_table_store: TrackId outside [0, %ld) on rank %d.\n", tab->NTotal, tab->ThisTask);
 
-    int * sendcounts = ta_malloc("SubStoreCounts", int, NTask);
-    int * offset = ta_malloc("SubStoreOffset", int, NTask);
-    memset(sendcounts, 0, sizeof(int) * NTask);
-    for(i = 0; i < n; i++)
-        sendcounts[subhalo_table_home_rank(tab, recs[i].TrackId)]++;
-    offset[0] = 0;
-    for(r = 1; r < NTask; r++)
-        offset[r] = offset[r-1] + sendcounts[r-1];
-    struct SubTrack * sendbuf = (struct SubTrack *) mymalloc("SubStoreSend", sizeof(struct SubTrack) * (n + 1));
-    for(i = 0; i < n; i++) {
-        const int dest = subhalo_table_home_rank(tab, recs[i].TrackId);
-        sendbuf[offset[dest]++] = recs[i];
-    }
-    struct SubTrack * in = NULL;
-    int64_t nin = subhalo_alltoallv(sendbuf, sendcounts, sizeof(struct SubTrack), (void **) &in, 0, NULL, Comm);
+    int64_t * cnt = ta_malloc("SubStoreCnt", int64_t, NTask);
+    int64_t * off = ta_malloc("SubStoreOff", int64_t, NTask);
+    int64_t * done = ta_malloc("SubStoreDone", int64_t, NTask);
+    int64_t * sendcounts = ta_malloc("SubStoreSend", int64_t, NTask);
+    int64_t * perm = (int64_t *) mymalloc("SubStorePerm", sizeof(int64_t) * (n + 1));
+    table_group_by_home(tab, NULL, recs, n, perm, cnt, off);
+    memset(done, 0, sizeof(int64_t) * NTask);
+    const int64_t cap = table_pair_cap(NTask);
     int missing = 0;
-    for(i = 0; i < nin; i++) {
-        struct SubTrack * rec = subhalo_table_get(tab, in[i].TrackId);
-        if(!rec) {
-            missing = 1;
-            continue;
+    while(1) {
+        int64_t nb = 0;
+        for(r = 0; r < NTask; r++) {
+            sendcounts[r] = cnt[r] - done[r] < cap ? cnt[r] - done[r] : cap;
+            nb += sendcounts[r];
         }
-        *rec = in[i];
+        if(!MPIU_Any(nb > 0, Comm))
+            break;
+        struct SubTrack * sendbuf = (struct SubTrack *) mymalloc("SubStoreSend", sizeof(struct SubTrack) * (nb + 1));
+        int64_t j = 0;
+        for(r = 0; r < NTask; r++) {
+            int64_t k;
+            for(k = 0; k < sendcounts[r]; k++)
+                sendbuf[j++] = recs[perm[off[r] + done[r] + k]];
+            done[r] += sendcounts[r];
+        }
+        struct SubTrack * in = NULL;
+        int64_t nin = subhalo_alltoallv(sendbuf, sendcounts, sizeof(struct SubTrack), (void **) &in, 0, NULL, Comm);
+        /* duplicates (identical in-place copies of a member) overwrite each other */
+        for(i = 0; i < nin; i++) {
+            struct SubTrack * rec = subhalo_table_get(tab, in[i].TrackId);
+            if(!rec) {
+                missing = 1;
+                continue;
+            }
+            *rec = in[i];
+        }
+        myfree(in);
+        myfree(sendbuf);
     }
     if(missing)
         endrun(5, "subhalo_table_store: a stored track is not homed on rank %d (redistribute first).\n", tab->ThisTask);
-    myfree(in);
-    myfree(sendbuf);
-    ta_free(offset);
+    myfree(perm);
     ta_free(sendcounts);
+    ta_free(done);
+    ta_free(off);
+    ta_free(cnt);
 }
 
 struct SubTrackTable *
@@ -671,7 +875,9 @@ subhalo_count_tagged(const struct part_manager_type * pman, int64_t ntagged[6])
     #pragma omp parallel for reduction(+: n0, n1, n2, n3, n4, n5)
     for(i = 0; i < pman->NumPart; i++) {
         const struct particle_data * p = &pman->Base[i];
-        if(p->IsGarbage || p->TrackId < 0)
+        /* the live-particle predicate of the finder (H6): swallowed BHs keep their tags but
+         * no longer count */
+        if(p->IsGarbage || p->Swallowed || p->TrackId < 0)
             continue;
         switch(p->Type) {
             case 0: n0++; break;
@@ -847,8 +1053,8 @@ subhalo_number_newborns(struct SubhaloKeyResult * res, int64_t nres, int64_t Tot
 
     /* 2. store the (ordinal -> final) pairs on the key directory rank of g */
     const int64_t KChunk = subhalo_key_chunk(TotNgroups, NTask);
-    int * sendcounts = ta_malloc("SubNbCounts", int, NTask);
-    memset(sendcounts, 0, sizeof(int) * NTask);
+    int64_t * sendcounts = ta_malloc("SubNbCounts", int64_t, NTask);
+    memset(sendcounts, 0, sizeof(int64_t) * NTask);
     for(i = 0; i < nlocal; i++)
         sendcounts[subhalo_key_dir_rank(ent[i].g, KChunk)]++;
     /* ent is sorted by g, hence by directory rank */
@@ -881,7 +1087,7 @@ subhalo_number_newborns(struct SubhaloKeyResult * res, int64_t nres, int64_t Tot
     for(i = 0; i < nreq; i++)
         if(nuniq == 0 || req[i] != req[nuniq-1])
             req[nuniq++] = req[i];
-    memset(sendcounts, 0, sizeof(int) * NTask);
+    memset(sendcounts, 0, sizeof(int64_t) * NTask);
     int badord = 0;
     for(i = 0; i < nuniq; i++) {
         if(req[i] < 1 || req[i] > TotNgroups) {
@@ -892,7 +1098,7 @@ subhalo_number_newborns(struct SubhaloKeyResult * res, int64_t nres, int64_t Tot
     }
     if(badord)
         endrun(5, "A provisional TrackId names a key outside [1, %ld].\n", TotNgroups);
-    int * recvcounts = ta_malloc("SubNbRecvCounts", int, NTask);
+    int64_t * recvcounts = ta_malloc("SubNbRecvCounts", int64_t, NTask);
     int64_t * asked = NULL;
     int64_t nasked = subhalo_alltoallv(req, sendcounts, sizeof(int64_t), (void **) &asked, 0, recvcounts, Comm);
     struct NewbornEntry * answer = (struct NewbornEntry *) mymalloc("SubNbAnswer", sizeof(struct NewbornEntry) * (nasked + 1));
@@ -955,9 +1161,24 @@ subhalo_number_newborns(struct SubhaloKeyResult * res, int64_t nres, int64_t Tot
 
 /* ------------------------------------------------------------------ step 7f: hostless and dead tracks */
 
-/* Partial sums of a track's own-tag field particles on one rank. The centre is carried as a
- * local mass-weighted mean relative to the first local particle, combined at the home rank
- * with periodic wrapping relative to the first contribution. */
+/* The live-particle predicate of the finder (H6): garbage and swallowed particles neither vote
+ * nor count, but their tags are left untouched. */
+static inline int
+subhalo_live(const struct particle_data * p)
+{
+    return !p->IsGarbage && !p->Swallowed;
+}
+
+/* The common periodic reference of a hostless track (H7): the position of its globally
+ * minimum-ID live field particle, found through the home rank. */
+struct FieldRef {
+    int64_t TrackId;
+    MyIDType ID;
+    double Pos[3];
+};
+
+/* Partial sums of a track's own-tag field particles on one rank, positions as nearest-image
+ * displacements from the track's common reference. */
 struct FieldSum {
     int64_t TrackId;
     int64_t count;
@@ -965,7 +1186,8 @@ struct FieldSum {
     int64_t LenType[6];
     double MassType[6];
     double mass;
-    double cen[3];      /* local centre of mass, translated frame */
+    double ref[3];      /* the common reference (identical in every contribution) */
+    double mdx[3];      /* sum m * NEAREST(x - ref) */
     double mv[3];       /* sum m * Vel */
 };
 
@@ -974,6 +1196,15 @@ cmp_fieldsum(const void * a, const void * b)
 {
     const int64_t x = ((const struct FieldSum *) a)->TrackId, y = ((const struct FieldSum *) b)->TrackId;
     return (x > y) - (x < y);
+}
+
+static int
+cmp_fieldref(const void * a, const void * b)
+{
+    const struct FieldRef * x = (const struct FieldRef *) a, * y = (const struct FieldRef *) b;
+    if(x->TrackId != y->TrackId)
+        return (x->TrackId > y->TrackId) - (x->TrackId < y->TrackId);
+    return (x->ID > y->ID) - (x->ID < y->ID);
 }
 
 struct TagIndex {
@@ -1000,60 +1231,136 @@ wrap_box(double x, double BoxSize)
     return x;
 }
 
-/* Collective. Returns the global numbers of hostless and dead tracks. */
+/* Stable merge sort by TrackId: contributions of one track keep the source-rank order of the
+ * Alltoallv receive buffer, so the home rank sums them in rank order. */
 static void
+fieldsum_stable_sort(struct FieldSum * in, int64_t nin)
+{
+    struct FieldSum * tmp = (struct FieldSum *) mymalloc("SubFieldTmp", sizeof(struct FieldSum) * (nin + 1));
+    int64_t width;
+    for(width = 1; width < nin; width *= 2) {
+        int64_t lo;
+        for(lo = 0; lo < nin; lo += 2 * width) {
+            int64_t mid = lo + width < nin ? lo + width : nin;
+            int64_t hi = lo + 2 * width < nin ? lo + 2 * width : nin;
+            int64_t a = lo, b = mid, o = lo;
+            while(a < mid && b < hi) {
+                if(cmp_fieldsum(&in[b], &in[a]) < 0) tmp[o++] = in[b++];
+                else tmp[o++] = in[a++];
+            }
+            while(a < mid) tmp[o++] = in[a++];
+            while(b < hi) tmp[o++] = in[b++];
+        }
+        memcpy(in, tmp, sizeof(struct FieldSum) * nin);
+    }
+    myfree(tmp);
+}
+
+/* Collective. Returns the global numbers of hostless and dead tracks.
+ * Centre of a hostless track: one common reference per track (the minimum-ID live field
+ * particle, H7), mass-weighted nearest-image displacements from it summed per rank in ID order,
+ * then over ranks in rank order on the home rank. The result does not depend on the rank
+ * partition beyond floating-point summation order: bit-level rank-count independence is not
+ * claimed for these sums. */
+void
 subhalo_update_unhosted(struct SubTrackTable * tab, int SnapNum, double atime, int64_t * nhostless, int64_t * ndead, MPI_Comm Comm)
 {
     int NTask;
     MPI_Comm_size(Comm, &NTask);
     int64_t i, j;
+    int k;
     const double BoxSize = PartManager->BoxSize;
     const int TracerTypes = SubParams.SubhaloTracerTypes;
+    const double vfac = subhalo_vel_to_kms(atime);
 
-    /* own-tag field particles, grouped by track (Phase 1 never touches their tags) */
+    /* own-tag live field particles, grouped by track (Phase 1 never touches their tags) */
     int64_t nf = 0;
     for(i = 0; i < PartManager->NumPart; i++)
-        if(!P[i].IsGarbage && P[i].GrNr < 0 && P[i].TrackId >= 0)
+        if(subhalo_live(&P[i]) && P[i].GrNr < 0 && P[i].TrackId >= 0)
             nf++;
     struct TagIndex * idx = (struct TagIndex *) mymalloc("SubFieldIdx", sizeof(struct TagIndex) * (nf + 1));
     nf = 0;
     for(i = 0; i < PartManager->NumPart; i++)
-        if(!P[i].IsGarbage && P[i].GrNr < 0 && P[i].TrackId >= 0) {
+        if(subhalo_live(&P[i]) && P[i].GrNr < 0 && P[i].TrackId >= 0) {
             idx[nf].TrackId = P[i].TrackId;
             idx[nf].i = i;
             nf++;
         }
-    qsort(idx, nf, sizeof(struct TagIndex), cmp_tagindex);
+    qsort_openmp(idx, nf, sizeof(struct TagIndex), cmp_tagindex);
     int64_t ns = 0;
     for(i = 0; i < nf; i++)
         if(i == 0 || idx[i].TrackId != idx[i-1].TrackId)
             ns++;
-    struct FieldSum * sums = (struct FieldSum *) mymalloc("SubFieldSums", sizeof(struct FieldSum) * (ns + 1));
+
+    /* 1. the common reference: local minimum-ID particle of each track to the home rank, the
+     *    global minimum back to every holder (request/reply in the same order) */
+    struct FieldRef * myref = (struct FieldRef *) mymalloc("SubFieldRef", sizeof(struct FieldRef) * (ns + 1));
     int64_t s = -1;
-    double ref[3] = {0, 0, 0};
-    double mdx[3] = {0, 0, 0};
-    for(i = 0; i <= nf; i++) {
-        if(i == nf || i == 0 || idx[i].TrackId != idx[i-1].TrackId) {
-            /* close the previous sum */
-            if(s >= 0) {
-                int k;
-                for(k = 0; k < 3; k++)
-                    sums[s].cen[k] = ref[k] + (sums[s].mass > 0 ? mdx[k] / sums[s].mass : 0);
+    for(i = 0; i < nf; i++)
+        if(i == 0 || idx[i].TrackId != idx[i-1].TrackId) {
+            s++;
+            myref[s].TrackId = idx[i].TrackId;
+            myref[s].ID = P[idx[i].i].ID;
+            for(k = 0; k < 3; k++)
+                myref[s].Pos[k] = P[idx[i].i].Pos[k];
+        }
+    int64_t * sendcounts = ta_malloc("SubFieldCounts", int64_t, NTask);
+    int64_t * recvcounts = ta_malloc("SubFieldRecvCounts", int64_t, NTask);
+    memset(sendcounts, 0, sizeof(int64_t) * NTask);
+    /* sorted by TrackId, hence by home rank */
+    for(j = 0; j < ns; j++)
+        sendcounts[subhalo_table_home_rank(tab, myref[j].TrackId)]++;
+    {
+        struct FieldRef * inref = NULL;
+        int64_t nin = subhalo_alltoallv(myref, sendcounts, sizeof(struct FieldRef), (void **) &inref, 0, recvcounts, Comm);
+        struct FieldRef * minref = (struct FieldRef *) mymalloc("SubFieldMinRef", sizeof(struct FieldRef) * (nin + 1));
+        memcpy(minref, inref, sizeof(struct FieldRef) * nin);
+        qsort(minref, nin, sizeof(struct FieldRef), cmp_fieldref);
+        /* keep the first (minimum-ID) entry of each track */
+        int64_t nmin = 0;
+        for(i = 0; i < nin; i++)
+            if(nmin == 0 || minref[i].TrackId != minref[nmin-1].TrackId)
+                minref[nmin++] = minref[i];
+        for(i = 0; i < nin; i++) {
+            struct FieldRef key = {inref[i].TrackId, 0, {0, 0, 0}};
+            /* binary search on TrackId alone */
+            int64_t lo = 0, hi = nmin;
+            while(lo < hi) {
+                int64_t mid = (lo + hi) / 2;
+                if(minref[mid].TrackId < key.TrackId) lo = mid + 1;
+                else hi = mid;
             }
-            if(i == nf)
-                break;
+            if(lo >= nmin || minref[lo].TrackId != key.TrackId)
+                endrun(5, "Hostless reference of track %ld lost on its home rank.\n", key.TrackId);
+            inref[i] = minref[lo];
+        }
+        myfree(minref);
+        struct FieldRef * back = NULL;
+        int64_t nback = subhalo_alltoallv(inref, recvcounts, sizeof(struct FieldRef), (void **) &back, 0, NULL, Comm);
+        if(nback != ns)
+            endrun(5, "Hostless reference exchange returned %ld entries for %ld tracks.\n", nback, ns);
+        for(j = 0; j < ns; j++) {
+            if(back[j].TrackId != myref[j].TrackId)
+                endrun(5, "Hostless reference exchange out of order (%ld for %ld).\n", back[j].TrackId, myref[j].TrackId);
+            myref[j] = back[j];
+        }
+        myfree(back);
+        myfree(inref);
+    }
+
+    /* 2. local sums relative to the common reference, in ID order */
+    struct FieldSum * sums = (struct FieldSum *) mymalloc("SubFieldSums", sizeof(struct FieldSum) * (ns + 1));
+    s = -1;
+    for(i = 0; i < nf; i++) {
+        if(i == 0 || idx[i].TrackId != idx[i-1].TrackId) {
             s++;
             memset(&sums[s], 0, sizeof(struct FieldSum));
             sums[s].TrackId = idx[i].TrackId;
-            int k;
-            for(k = 0; k < 3; k++) {
-                ref[k] = P[idx[i].i].Pos[k];
-                mdx[k] = 0;
-            }
+            for(k = 0; k < 3; k++)
+                sums[s].ref[k] = myref[s].Pos[k];
         }
         const struct particle_data * p = &P[idx[i].i];
         const double m = p->Mass;
-        int k;
         sums[s].count++;
         sums[s].LenType[p->Type]++;
         sums[s].MassType[p->Type] += m;
@@ -1061,45 +1368,20 @@ subhalo_update_unhosted(struct SubTrackTable * tab, int SnapNum, double atime, i
         if(TracerTypes & (1 << p->Type))
             sums[s].ntracer++;
         for(k = 0; k < 3; k++) {
-            mdx[k] += m * NEAREST(p->Pos[k] - ref[k], BoxSize);
+            sums[s].mdx[k] += m * NEAREST(p->Pos[k] - sums[s].ref[k], BoxSize);
             sums[s].mv[k] += m * p->Vel[k];
         }
     }
-    /* sums are sorted by TrackId, hence by home rank */
-    int * sendcounts = ta_malloc("SubFieldCounts", int, NTask);
-    memset(sendcounts, 0, sizeof(int) * NTask);
-    for(j = 0; j < ns; j++)
-        sendcounts[subhalo_table_home_rank(tab, sums[j].TrackId)]++;
     struct FieldSum * in = NULL;
     int64_t nin = subhalo_alltoallv(sums, sendcounts, sizeof(struct FieldSum), (void **) &in, 0, NULL, Comm);
-    /* stable merge so contributions combine in rank order */
-    {
-        /* insertion into TrackId order keeping the source order: use a stable merge sort */
-        struct FieldSum * tmp = (struct FieldSum *) mymalloc("SubFieldTmp", sizeof(struct FieldSum) * (nin + 1));
-        int64_t width;
-        for(width = 1; width < nin; width *= 2) {
-            int64_t lo;
-            for(lo = 0; lo < nin; lo += 2 * width) {
-                int64_t mid = lo + width < nin ? lo + width : nin;
-                int64_t hi = lo + 2 * width < nin ? lo + 2 * width : nin;
-                int64_t a = lo, b = mid, o = lo;
-                while(a < mid && b < hi) {
-                    if(cmp_fieldsum(&in[b], &in[a]) < 0) tmp[o++] = in[b++];
-                    else tmp[o++] = in[a++];
-                }
-                while(a < mid) tmp[o++] = in[a++];
-                while(b < hi) tmp[o++] = in[b++];
-            }
-            memcpy(in, tmp, sizeof(struct FieldSum) * nin);
-        }
-        myfree(tmp);
-    }
+    fieldsum_stable_sort(in, nin);
 
+    /* 3. the home ranks: hostless resolved tracks and dead tracks */
     int64_t nh = 0, nd = 0;
     int64_t a = 0;
+    int toolarge = 0;
     for(j = 0; j < tab->NLocal; j++) {
         struct SubTrack * t = &tab->Track[j];
-        /* contributions for this track */
         while(a < nin && in[a].TrackId < t->TrackId)
             a++;
         int64_t b = a;
@@ -1110,12 +1392,10 @@ subhalo_update_unhosted(struct SubTrackTable * tab, int SnapNum, double atime, i
             continue;
         }
         if(b > a) {
-            /* hostless resolved track: keeps its field particles */
+            /* hostless resolved track: keeps its field particles; sums over ranks in rank order */
             int64_t count = 0, ntracer = 0, LenType[6] = {0};
-            double MassType[6] = {0}, mass = 0, mdxw[3] = {0}, mv[3] = {0};
+            double MassType[6] = {0}, mass = 0, mdx[3] = {0}, mv[3] = {0};
             int64_t c;
-            int k;
-            const double * c0 = in[a].cen;
             for(c = a; c < b; c++) {
                 count += in[c].count;
                 ntracer += in[c].ntracer;
@@ -1125,44 +1405,51 @@ subhalo_update_unhosted(struct SubTrackTable * tab, int SnapNum, double atime, i
                 }
                 mass += in[c].mass;
                 for(k = 0; k < 3; k++) {
-                    mdxw[k] += in[c].mass * NEAREST(in[c].cen[k] - c0[k], BoxSize);
+                    mdx[k] += in[c].mdx[k];
                     mv[k] += in[c].mv[k];
                 }
             }
+            /* the i4 count columns: abort rather than wrap (H4) */
+            if(count > INT32_MAX || ntracer > INT32_MAX)
+                toolarge = 1;
             t->HostGroup = -1;
             t->Rank = t->Depth = 0;
             t->NestedParentTrackId = -1;
             t->CentralTrackId = t->TrackId;
             t->SinkTrackId = -1;
             t->DescendantTrackId = t->TrackId;
-            t->Nbound = t->NboundExclusive = count;
-            t->NboundTracer = ntracer;
+            t->Nbound = t->NboundExclusive = (int32_t) count;
+            t->NboundTracer = (int32_t) ntracer;
             t->Mbound = mass;
             for(k = 0; k < 6; k++) {
-                t->NboundType[k] = t->NboundExclusiveType[k] = LenType[k];
+                t->NboundType[k] = t->NboundExclusiveType[k] = (int32_t) LenType[k];
                 t->NtailType[k] = 0;
                 t->MboundType[k] = MassType[k];
             }
             for(k = 0; k < 3; k++) {
-                const double cen = c0[k] + (mass > 0 ? mdxw[k] / mass : 0);
+                const double cen = in[a].ref[k] + (mass > 0 ? mdx[k] / mass : 0);
                 t->CorePos[k] = t->CoMPos[k] = wrap_box(cen - PartManager->CurrentParticleOffset[k], BoxSize);
-                t->CoreVel[k] = t->CoMVel[k] = (mass > 0 ? mv[k] / mass : 0) / atime;
+                t->CoreVel[k] = t->CoMVel[k] = (mass > 0 ? mv[k] / mass : 0) * vfac;
             }
             /* MostBound*: no binding order for hostless particles in Phase 1; the previous values stay. */
             t->Alive = 1;
             subhalo_history_update(t, SnapNum, 0);
             nh++;
+            if(toolarge)
+                endrun(1, "Hostless track %ld has %ld particles, more than the i4 count columns hold.\n", t->TrackId, count);
         }
         else if(t->NboundPrev > 0) {
-            /* resolved at the previous call, no particles anywhere now and not sunk: dead */
+            /* resolved at the previous call, no live particles anywhere now and not sunk: dead */
             subhalo_track_make_orphan(t, SUBHALO_NOTRACK, SnapNum);
             nd++;
         }
         a = b;
     }
     myfree(in);
-    ta_free(sendcounts);
     myfree(sums);
+    ta_free(recvcounts);
+    ta_free(sendcounts);
+    myfree(myref);
     myfree(idx);
 
     MPI_Allreduce(&nh, nhostless, 1, MPI_INT64, MPI_SUM, Comm);
@@ -1307,6 +1594,13 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
             out[nout++] = members[i];
     subhalo_table_store(tab, out, nout, Comm);
     myfree(out);
+    /* The per-key buffers are no longer needed: release them (reverse order) before the
+     * hostless update, which then runs with the memory of an ordinary host routine. */
+    myfree(res);
+    myfree(sinkwinner);
+    myfree(members);
+    myfree(segs);
+    subhalo_plan_free(&plan);
 
     /* Step 7f: hostless and dead tracks, on the home ranks. */
     int64_t nhostless = 0, ndead = 0;
@@ -1322,12 +1616,6 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     message(0, "Subhalo finder: snapshot %d done: %ld newborn, %ld sunk, %ld hostless, %ld dead; %ld tracks in total.\n",
             SnapNum, nnew, nsunk, nhostless, ndead, tab->NTotal);
     log_tagged("after the call", Comm);
-
-    myfree(res);
-    myfree(sinkwinner);
-    myfree(members);
-    myfree(segs);
-    subhalo_plan_free(&plan);
 
     if(SubStatus.StateSnapshot >= 0 && SubStatus.StateTime > 0)
         SubStatus.TimeSincePrevious = atime - SubStatus.StateTime;

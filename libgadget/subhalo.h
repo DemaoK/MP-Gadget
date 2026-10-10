@@ -71,8 +71,15 @@ struct SubhaloParams {
 /* Read the parameters on rank 0 and broadcast. Validates SubhaloFinderOn against
  * SnapshotWithFOF and FOFSaveParticles (endrun on an invalid combination). */
 void set_subhalo_params(ParameterSet * ps);
-/* Test helper: set the parameters without a ParameterSet. */
+/* Test helper: set the parameters without a ParameterSet (validated like the parameter file;
+ * endrun(1) on an invalid value). */
 void subhalo_set_testpar(struct SubhaloParams params);
+/* The run's unit system (the snapshot header values, design 7.10): catalogue velocities are
+ * Vel * UnitVelocity_in_cm_per_s / (1e5 * a) km/s; positions stay in the run's length unit.
+ * The three values are also written to the PIG Header. Called from begrun; the defaults are
+ * MP-Gadget's (kpc/h, 1e10 Msun/h, km/s). endrun(1) on a non-finite or non-positive value. */
+void subhalo_set_units(double UnitLength_in_cm, double UnitMass_in_g, double UnitVelocity_in_cm_per_s);
+void subhalo_get_units(double * UnitLength_in_cm, double * UnitMass_in_g, double * UnitVelocity_in_cm_per_s);
 int subhalo_finder_on(void);
 const struct SubhaloParams * subhalo_get_params(void);
 
@@ -198,10 +205,13 @@ void subhalo_table_reserve(struct SubTrackTable * tab, int64_t n);
  * is below NTotal. */
 void subhalo_table_redistribute(struct SubTrackTable * tab, MPI_Comm Comm);
 /* Fetch copies of records for the requested TrackIds (any ranks, duplicates allowed) from their
- * home ranks: out[i] is the record of ids[i]. Collective (request/reply, two MPI_Alltoallv). */
+ * home ranks: out[i] is the record of ids[i]. Collective (request/reply MPI_Alltoallv pairs,
+ * batched by SubhaloLookupBatchBytes so that one batch holds a bounded number of records on
+ * every rank; the batches loop while any rank has requests left). */
 void subhalo_table_fetch(struct SubTrackTable * tab, const int64_t * ids, int64_t n, struct SubTrack * out, MPI_Comm Comm);
-/* Write modified records back to their home ranks (collective; one MPI_Alltoallv). The
- * transient fields are copied too. */
+/* Write modified records back to their home ranks (collective; batched like the fetch). The
+ * transient fields are copied too. Duplicate stores of one TrackId are allowed (the last one
+ * received wins; the driver only stores identical duplicates). */
 void subhalo_table_store(struct SubTrackTable * tab, const struct SubTrack * recs, int64_t n, MPI_Comm Comm);
 /* The global table of the running finder (subhalo.c). */
 struct SubTrackTable * subhalo_get_table(void);
@@ -235,8 +245,14 @@ void subhalo_count_tagged(const struct part_manager_type * pman, int64_t ntagged
 /* ------------------------------------------------------------------ IO (design 9, subhalo_io.c) */
 
 /* Selection predicate for the PIG particle write: in a group or tagged, and not swallowed.
- * With the finder off this reduces to GrNr >= 0 && !Swallowed. */
-int subhalo_save_select(int i, const struct particle_data * Parts);
+ * With the finder off this reduces to GrNr >= 0 && !Swallowed.
+ * Size limit: the host IO path (petaio_build_selection's int selection, the int index of the
+ * IOTable getters) indexes local particles with int, so the PIG writer with the finder on
+ * checks collectively that every rank holds at most INT_MAX particles (endrun(1) otherwise).
+ * The finder's own table IO calls the int getters/setters on rebased single rows and has no
+ * such limit; the int32 count columns (Nbound, NboundType, slice lengths) are range-checked
+ * before they are stored (endrun(1) rather than wrap). */
+int subhalo_save_select(int64_t i, const struct particle_data * Parts);
 
 /* The 16-byte radix key of design 9 for the PIG exchange sort, 112 bits used:
  * section (1) | key (39) | TrackId + 1 (40) | BindRank (32), most significant first.
@@ -281,17 +297,26 @@ void subhalo_set_output_snapshot(int SnapNum);
 /* ------------------------------------------------------------------ restart (design 11, subhalo_io.c) */
 
 /* Search PIG_m, m = MaxStateSnapNum down to 0, for a complete, readable state (marker,
- * schema, SubhaloStateSnapshot == m, counts match row counts, required blocks present).
- * Returns m or -1. Collective (rank 0 probes, broadcasts). FOFFileBase is All.FOFFileBase. */
+ * schema, SubhaloStateSnapshot == m, finite state time equal to the file's, counts match row
+ * counts, every required block present with the schema's dtype and with every payload file its
+ * header declares present at the declared size). Returns m or -1. Collective (rank 0 probes,
+ * broadcasts). FOFFileBase is All.FOFFileBase. */
 int subhalo_find_state(const char * OutputDir, const char * FOFFileBase, int MaxStateSnapNum, MPI_Comm Comm);
 
 /* Read Subhalo/<column> and Orphan/<column> of that PIG into the table (contiguous row slices per rank, then
- * redistributed to home ranks), set NTotal from NumTracksTotal, return the state time. Collective. */
+ * routed to the home ranks), set NTotal from NumTracksTotal, return the state time. Requires
+ * exactly one row per TrackId in [0, NumTracksTotal) (no duplicate, no hole), Subhalo rows
+ * resolved (Nbound > 0, SnapDeath < 0) and Orphan rows dead or sunk (SnapDeath >= 0). Any read
+ * failure or violation is fatal (endrun(1)) with a message naming the PIG and the remedies
+ * (clear its SubhaloStateComplete marker, or SubhaloRestartFresh = 1). Collective. */
 double subhalo_read_state(const char * pigname, struct SubTrackTable * tab, MPI_Comm Comm);
 
 /* Join the saved per-particle tags onto pman by lineage base ID (low 56 bits of the ID), the
  * joint mpsort_mpi of saved and local records with nearest-non-empty-rank boundary
- * reconciliation. A local particle with an exact saved ID match takes its tag; otherwise, if
+ * reconciliation. Every saved row takes part, untagged rows included, and the saved tags are
+ * validated first (TrackId and BoundTrackId in [-1, NumTracksTotal), BindRank >= 0 for a tagged
+ * row; fatal otherwise, like a read failure). A local particle with an exact saved ID match
+ * takes its tag, -1 if it was saved untagged; otherwise, if
  * its own generation byte (ID >> 56) is > 0, it inherits the tag of the saved record whose ID
  * equals its lineage base (generation 0, always the spawning parent in MP-Gadget:
  * slots_split_particle gives children base + (g << 56) and stars never spawn), if there is

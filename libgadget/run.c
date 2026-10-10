@@ -231,6 +231,8 @@ begrun(const int RestartSnapNum, struct header_data * head)
         slots_set_enabled(5, sizeof(struct bh_particle_data), SlotsManager);
 
     const struct UnitSystem units = get_unitsystem(head->UnitLength_in_cm, head->UnitMass_in_g, head->UnitVelocity_in_cm_per_s);
+    /* The subhalo catalogue converts velocities to km/s with the run's units (design 7.10). */
+    subhalo_set_units(head->UnitLength_in_cm, head->UnitMass_in_g, head->UnitVelocity_in_cm_per_s);
     /* convert some physical input parameters to internal units */
     init_cosmology(&All.CP, head->TimeIC, units);
 

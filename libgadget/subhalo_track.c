@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdint.h>
 #include <omp.h>
 
 #include "utils/endrun.h"
@@ -62,6 +63,10 @@ struct KeySums {
     double mv[3];
 };
 #define KEYSUMS_NDOUBLE (sizeof(struct KeySums) / sizeof(double))
+/* subhalo_process_inplace holds, on every rank and for every in-place key, two KeySums, seven
+ * 8-byte vectors and the plan's SubhaloInplaceKey: the plan charges SUBHALO_INPLACE_KEY_BYTES. */
+_Static_assert(2 * sizeof(struct KeySums) + 7 * sizeof(int64_t) + sizeof(struct SubhaloInplaceKey) <= SUBHALO_INPLACE_KEY_BYTES,
+               "SUBHALO_INPLACE_KEY_BYTES does not cover the in-place vectors");
 
 static void
 key_sums(struct KeySums * s, int64_t start, int64_t n, const double ref[3], int TracerTypes, double BoxSize)
@@ -132,6 +137,9 @@ fill_winner_record(struct SubTrack * rec, const struct SubTrack * old, int64_t w
     rec->SinkTrackId = -1;
     rec->DescendantTrackId = winner;
     rec->SnapDeath = rec->SnapSink = -1;
+    /* the i4 count columns: abort rather than wrap (H4) */
+    if(s->count > INT32_MAX || s->ntracer > INT32_MAX)
+        endrun(1, "Key %ld has %g particles, more than the i4 count columns of the catalogue hold.\n", g, s->count);
     rec->Nbound = rec->NboundExclusive = (int32_t) s->count;
     rec->NboundTracer = (int32_t) s->ntracer;
     rec->Flags = inplace ? SUBHALO_FLAG_INPLACE : 0;
@@ -141,18 +149,19 @@ fill_winner_record(struct SubTrack * rec, const struct SubTrack * old, int64_t w
         rec->NtailType[t] = 0;
         rec->MboundType[t] = s->MassType[t];
     }
+    /* physical peculiar km/s (design 7.10): Vel * UnitVelocity_in_cm_per_s / (1e5 a) */
+    const double vfac = subhalo_vel_to_kms(ctx->atime);
     for(d = 0; d < 3; d++) {
         const double pos = wrap_box(cen[d] - ctx->Offset[d], ctx->BoxSize);
         rec->CorePos[d] = rec->CoMPos[d] = pos;
-        /* internal Vel = a * v_pec whatever UsePeculiarVelocity: physical peculiar km/s is Vel / a */
-        const double v = (s->mass > 0 ? s->mv[d] / s->mass : 0) / ctx->atime;
+        const double v = (s->mass > 0 ? s->mv[d] / s->mass : 0) * vfac;
         rec->CoreVel[d] = rec->CoMVel[d] = v;
     }
     if(mb >= 0) {
         rec->MostBoundID = P[mb].ID;
         for(d = 0; d < 3; d++) {
             rec->MostBoundPos[d] = wrap_box(P[mb].Pos[d] - ctx->Offset[d], ctx->BoxSize);
-            rec->MostBoundVel[d] = P[mb].Vel[d] / ctx->atime;
+            rec->MostBoundVel[d] = P[mb].Vel[d] * vfac;
         }
     }
     rec->Alive = 1;
