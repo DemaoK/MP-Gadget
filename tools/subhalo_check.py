@@ -16,7 +16,10 @@ input could not be read.
                               --no-phase1 for Phase 2a catalogues.
   tracking PIG_prev PIG_next  check 3: host votes, centrals, newborn numbering, sinks (the target
                               resolved, or an orphan of the same call: same-call sink chains as in
-                              tree, without cycles, the first resolved target hosted by the vote),
+                              tree, followed to the first resolved target, which must be hosted by
+                              the vote; a target absent or dead before the call, or a cycle, fails;
+                              a chain ending in a track that died in the call without sinking, as
+                              after a failed re-unbinding, is a warning),
                               resurrections, recomputed from the two PIGs. Default: the Phase 2a
                               rules (weighted ten-tracer vote); --phase1-vote: the Phase 1 rules
                               (majority vote over every own-bound particle, the most massive
@@ -913,6 +916,47 @@ def _group_members(cat):
     return P["ID"][m], P["GroupID"][m]
 
 
+def follow_sink_chain(cat, T, s, snap):
+    """Follow the sink edge of track T, which became an orphan sunk into s at output `snap`, to the
+    first track resolved at that output.
+
+    SinkTrackId is the sink edge of the call, not the final owner: in a same-call chain
+    L -> P -> C the target P sank (or died) after L sank into it, so P is an orphan of this call
+    too (the tree check's rule, audit P6; subhalo_track.c merge_subtree and the re-unbinding of
+    the reference after it; the in-place rounds of subhalo_collective.c). Each orphan on the chain
+    must have died in this call (SnapDeath == snap: only a track alive at the call's start takes
+    sinkers); the walk is bounded by the number of tracks and stops at a cycle.
+
+    Returns (end, row, path, why): `path` the targets visited (s first), `end` the last of them,
+    `row` its Subhalo/* row when resolved (else -1), and `why` None when the chain ends in a
+    resolved track, "dead-end" when it ends in an orphan of this call that did not sink (a target
+    that failed its re-unbinding after absorbing sinkers: allowed, reported as a warning), else
+    the reason of a failure (a target absent, dead before this call, a cycle, an unbounded walk).
+    `cat` needs subhalo_row, orphan_row and orphans["SinkTrackId"], orphans["SnapDeath"]."""
+    OB = cat.orphans
+    seen = {int(T)}
+    path = []
+    t = int(s)
+    for _ in range(len(cat.subhalos.get("TrackId", ())) + len(OB.get("TrackId", ())) + 1):
+        path.append(t)
+        rs = cat.subhalo_row(t)
+        if rs >= 0:
+            return t, rs, path, None
+        ro = cat.orphan_row(t)
+        if ro < 0:
+            return t, -1, path, "%d is neither a resolved subhalo nor an orphan at this output" % t
+        if int(OB["SnapDeath"][ro]) != snap:
+            return t, -1, path, "%d is an orphan that died at %d, not in this call (%d)" % (t, OB["SnapDeath"][ro], snap)
+        if t in seen:
+            return t, -1, path, "same-call sink chain with a cycle at %d" % t
+        seen.add(t)
+        nxt = int(OB["SinkTrackId"][ro])
+        if nxt < 0:
+            return t, -1, path, "dead-end"
+        t = nxt
+    return t, -1, path, "same-call sink chain longer than the number of tracks"
+
+
 def _tracking_phase2a(ck, A, B, args):
     """Phase 2a rules (halofinder_phase2a_plan.md section 1 steps 1, 2, 7b, 7d, 10)."""
     snap_next = int(attr(B.header, "SnapshotIndex", snapnum_of(args.next)))
@@ -1050,7 +1094,7 @@ def _tracking_phase2a(ck, A, B, args):
 
     # 6. new orphans: died or sank at this call
     new_orph = OB["TrackId"][lookup(SA["TrackId"], tid_ob) >= 0]
-    nsink = ndead = nchain = 0
+    nsink = ndead = nchain = ndeadend = 0
     for T in new_orph.tolist():
         r = B.orphan_row(T)
         ck.check(OB["SnapDeath"][r] == snap_next, "track %d became an orphan with SnapDeath %d, expected %d"
@@ -1059,39 +1103,24 @@ def _tracking_phase2a(ck, A, B, args):
         if s >= 0:
             nsink += 1
             ck.check(OB["SnapSink"][r] == snap_next, "track %d sank with SnapSink %d, expected %d" % (T, OB["SnapSink"][r], snap_next))
-            # SinkTrackId is the sink edge of the call, not the final owner: in a same-call chain
-            # L -> P -> C the target P sank (or died) after L sank into it, so P is an orphan of
-            # this call too (the tree check's rule, subhalo_track.c merge_subtree, the in-place
-            # rounds). Follow the orphan targets that died in this call, without cycles, to the
-            # first resolved one; its host is the vote's.
-            seen = {T}
-            t = s
-            rs = B.subhalo_row(t)
-            ok = True
-            while rs < 0:
-                ro = B.orphan_row(t)
-                if not ck.check(ro >= 0 and OB["SnapDeath"][ro] == snap_next,
-                                "track %d sank into %d, which is neither a resolved subhalo nor an orphan of this call" % (T, t)):
-                    ok = False
-                    break
-                if not ck.check(t not in seen, "track %d: same-call sink chain with a cycle at %d" % (T, t)):
-                    ok = False
-                    break
-                seen.add(t)
-                nxt = int(OB["SinkTrackId"][ro])
-                if nxt < 0:
-                    break           # the chain ends in a track that died in this call
-                t = nxt
-                rs = B.subhalo_row(t)
-            if t != s:
+            end, rs, path, why = follow_sink_chain(B, T, s, snap_next)
+            if len(path) > 1:
                 nchain += 1
-            if ok and rs >= 0:
+            if why == "dead-end":
+                ndeadend += 1
+                ck.warn("track %d sank into %d, whose same-call sink chain %s ends in track %d that died in this call "
+                        "without sinking (allowed: a target that absorbed sinkers can fail its re-unbinding, "
+                        "subhalo_track.c)" % (T, s, " -> ".join(map(str, [T] + path)), end))
+            elif why is not None:
+                ck.fail("track %d sank into %d: %s (chain %s)" % (T, s, why, " -> ".join(map(str, [T] + path))))
+            else:
                 ck.check(SB["HostGroup"][rs] == host.get(T, -1),
-                         "track %d (vote %d) sank into %d (via %d) hosted by %d" % (T, host.get(T, -1), t, s, SB["HostGroup"][rs]))
+                         "track %d (vote %d) sank into %d (via %d) hosted by %d" % (T, host.get(T, -1), end, s, SB["HostGroup"][rs]))
         else:
             ndead += 1
     if nchain:
-        print("  %d sunk tracks whose sink target sank or died in the same call (same-call sink chains)" % nchain)
+        print("  %d sunk tracks whose sink target sank or died in the same call (same-call sink chains, %d ending "
+              "in a dead track)" % (nchain, ndeadend))
     # previous orphans that stay orphans keep their sink and death
     old_orph = OA["TrackId"][lookup(tid_ob, OA["TrackId"]) >= 0]
     for T in old_orph.tolist():
