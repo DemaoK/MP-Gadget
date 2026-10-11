@@ -48,11 +48,13 @@ catalogue as in Rockstar's, so they are not converted); p10/p50/p90 of each rati
 defined (> 0), with the counts of pairs where our value is undefined (-1 until Phase 3 fills the
 column), Rockstar's is (0), or our column is absent from the file. Rockstar's values are
 bound-only (BOUND_PROPS 1); its host's set includes its subhalos' particles while our central's
-bound set does not (design 4.1, D10), so central masses are expected slightly below Rockstar's.
+bound set does not (design 4.1, D10), and our central's source is its FOF group only (D3, HBT
+FeedCentrals), so central masses are expected slightly below Rockstar's.
 
 --field: our centrals matched the same way against the strict run's hosts; MSO[0] against the
 strict Mvir_all, MSO[1..4] against M200b..M2500c unless every halo has M200b = M200c = M500c = M2500c
-= Mvir_all, the fork's io_bgc2.c:230-231 threshold bug (design 4.3), which is detected and reported;
+= Mvir_all, the io_bgc2.c:230-231 threshold bug of builds before the fork's cc1630f (design
+Appendix A), which is detected and reported;
 RSO[0] against (3 M / 4 pi rho_vir)^(1/3) of the strict mass when the Header has SOThresholds.
 
 Phase 5 summary (centrals <-> hosts within the tolerance, our Nbound >= --min-np): the median ratio

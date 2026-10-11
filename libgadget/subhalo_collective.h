@@ -13,7 +13,8 @@
  *     scratch label, the tags are not rewritten during the rounds): own tag of an in-place
  *     candidate; the provisional remainder of a serial sub-tree (BoundTrackId -1) to the
  *     candidate above its root; untagged and foreign-tagged group particles to the central;
- *     particles bound by a serial member are excluded;
+ *     particles bound by a serial member are excluded; the central's own particles outside the
+ *     group are released (its source is the group only, HBT FeedCentrals);
  *  3. for every round: the HBT loop with one global tree (force_tree_active_moments over the
  *     bound potential-type particles of the round) and one potential-only walk per iteration,
  *     the per-candidate frames, counts and tracer counts by one MPI_Allreduce, kill, convergence

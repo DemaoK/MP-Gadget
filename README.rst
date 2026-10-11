@@ -127,7 +127,7 @@ With ``SubhaloFinderOn = 1`` (requires ``SnapshotWithFOF = 1`` and ``FOFSavePart
 Membership is tracked from output to output as in HBT-HERONS (unbinding, sinking, orphans); properties follow Rockstar's recipes on the bound sets, with field spherical-overdensity masses for centrals.
 The catalogue is written into the PIG: ``Subhalo/*`` (one row per resolved track) and ``Orphan/*`` blocks, the per-particle ``TrackId``, ``BindRank`` and ``BoundTrackId`` blocks, and Header attributes (``NumSubhalosTotal``, ``SubhaloStateComplete``, ``SubhaloWallTime``, ...). The PIG is also the finder's restart state.
 ``MP-Gadget <paramfile> 3 <n>`` reruns FOF and the finder for snapshot n from ``PART_n``.
-Python tools: ``tools/subhalo_reader.py`` (reader), ``tools/subhalo_check.py`` (checks), ``tools/subhalo_compare_rockstar.py`` (comparison with Rockstar).
+Python tools: ``tools/subhalo_reader.py`` (reader), ``tools/subhalo_check.py`` (checks), ``tools/subhalo_compare_rockstar.py`` (comparison with Rockstar), ``tools/subhalo_compare_hbt.py`` (comparison with HBT-HERONS).
 Parameters and defaults (meanings in ``gadget/params.c``):
 
 ===================================  =======  ========================  ========  ===============================  =======
