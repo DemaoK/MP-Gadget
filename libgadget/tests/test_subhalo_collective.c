@@ -2911,8 +2911,8 @@ test_collective_props_identity(void ** state)
  * same call with the free memory squeezed on every rank to halfway between the need without the
  * properties stage (the admission before the fix) and the need with it: the admission fails at
  * the properties stage, before the exchange, where the old estimate would have admitted it. Also
- * (audit R3) the walltime children /Subhalo/Rounds/{Setup,Rounds,Tags,Cleanup} add up to the
- * summary's rounds time. */
+ * (audit R3, decision 47.5) the walltime children /Subhalo/Rounds/{Setup,Rounds,Tree,Walk,Tags,
+ * Cleanup} add up to the summary's rounds time. */
 #define ML_NX 16
 #define ML_NYZ 12
 #define ML_NG (ML_NX * ML_NYZ * ML_NYZ)
@@ -3017,16 +3017,20 @@ test_collective_admission_props(void ** state)
         for(i = 0; i < CT.Nmax; i++)
             CT.C[i].time = CT.AC[i].time = 0;
     }
-    double wt0 = ml_clock_sum("/Subhalo/Rounds/"), wcl = ml_clock_sum("/Subhalo/Rounds/Cleanup");
+    double wt0 = ml_clock_sum("/Subhalo/Rounds/"), wcl = ml_clock_sum("/Subhalo/Rounds/Cleanup"), wtr = ml_clock_sum("/Subhalo/Rounds/Tree");
     double t0 = MPI_Wtime();
     int ret = run_finder_call_ex(1, &CP, &ng, ml_pre, ml_post, &c);
     const double wt1 = ml_clock_sum("/Subhalo/Rounds/");
     wcl = ml_clock_sum("/Subhalo/Rounds/Cleanup") - wcl;
+    wtr = ml_clock_sum("/Subhalo/Rounds/Tree") - wtr;
     {
         const struct SubhaloCallStats * st = subhalo_last_call_stats();
-        message(0, "many labels (a): walltime /Subhalo/Rounds children %.4f s (cleanup %.4f s), the summary's rounds %.4f s (max), %.4f s (mean)\n",
-                wt1 - wt0, wcl, st->StageMax[SUBHALO_STAGE_ROUNDS], st->StageMean[SUBHALO_STAGE_ROUNDS]);
-        /* the children cover the stage (less the tree builds' own clocks), the cleanup a small part */
+        message(0, "many labels (a): walltime /Subhalo/Rounds children %.4f s (cleanup %.4f s, tree builds %.4f s), the summary's rounds %.4f s "
+                   "(max), %.4f s (mean): coverage %.3f\n", wt1 - wt0, wcl, wtr, st->StageMax[SUBHALO_STAGE_ROUNDS],
+                st->StageMean[SUBHALO_STAGE_ROUNDS], (wt1 - wt0) / st->StageMean[SUBHALO_STAGE_ROUNDS]);
+        CHECK(wtr > 0, "many labels (a): no time on /Subhalo/Rounds/Tree (%g s)\n", wtr);
+        /* the children cover the stage (the tree builds included, as /Subhalo/Rounds/Tree), the
+         * cleanup a small part */
         CHECK(wt1 - wt0 <= st->StageMax[SUBHALO_STAGE_ROUNDS] * (1 + 1e-6) + 1e-4 && wt1 - wt0 >= 0.8 * st->StageMean[SUBHALO_STAGE_ROUNDS]
               && wcl < 0.5 * (wt1 - wt0), "many labels (a): walltime rounds %g s (cleanup %g s), summary %g / %g s\n", wt1 - wt0, wcl,
               st->StageMax[SUBHALO_STAGE_ROUNDS], st->StageMean[SUBHALO_STAGE_ROUNDS]);

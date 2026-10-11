@@ -373,6 +373,18 @@ run_finder_call(int snap, Cosmology * CP, int64_t * TotNgroups)
     return ret;
 }
 
+/* The summed time of this rank's walltime clocks whose names start with prefix (decision 47.5). */
+static double
+clock_sum(const char * prefix)
+{
+    double t = 0;
+    int i;
+    for(i = 0; i < CT.N; i++)
+        if(strncmp(CT.C[i].name, prefix, strlen(prefix)) == 0)
+            t += CT.C[i].time;
+    return t;
+}
+
 /* Phase 5c: the consistency of the per-call statistics of the last subhalo_find. */
 static void
 check_call_stats(const char * what, int complete)
@@ -3564,6 +3576,14 @@ test_subhalo_twohalo(void ** state)
     int call;
     /* a cold gas particle at rest at A's centre: the most bound particle of A, but not a tracer */
     const MyIDType coldgas = 31;
+    /* decision 47.5: the field SO stage's walltime children /Subhalo/FieldSO/{Setup,Tree,Walks}
+     * cover the stage (this rank; new clocks would inherit the times of earlier tests' slots:
+     * cleared here) */
+    {
+        int i;
+        for(i = 0; i < CT.Nmax; i++)
+            CT.C[i].time = CT.AC[i].time = 0;
+    }
     for(call = 0; call < 3; call++) {
         p2_place(0.5 + 0.05 * call, CP.GravInternal, cen, bulk);
         {
@@ -3577,9 +3597,20 @@ test_subhalo_twohalo(void ** state)
                     }
         }
         int64_t ng, n;
+        const double fso0 = clock_sum("/Subhalo/FieldSO/"), ftr0 = clock_sum("/Subhalo/FieldSO/Tree");
         int ret = run_finder_call(call, &CP, &ng);
         CHECK(ret == 1 && ng == 2, "two haloes, call %d: ret %d, %ld groups\n", call, ret, ng);
         check_call_stats("two haloes", 1);
+        {
+            const struct SubhaloCallStats * st = subhalo_last_call_stats();
+            const double fso = clock_sum("/Subhalo/FieldSO/") - fso0, ftr = clock_sum("/Subhalo/FieldSO/Tree") - ftr0;
+            message(0, "two haloes, call %d: walltime /Subhalo/FieldSO children %.5f s (tree build %.5f s), the summary's field SO "
+                       "%.5f s (max), %.5f s (mean)\n", call, fso, ftr, st->StageMax[SUBHALO_STAGE_FIELDSO], st->StageMean[SUBHALO_STAGE_FIELDSO]);
+            CHECK(ftr > 0 && fso <= st->StageMax[SUBHALO_STAGE_FIELDSO] * (1 + 1e-6) + 1e-4
+                  && fso >= 0.8 * st->StageMean[SUBHALO_STAGE_FIELDSO] - 1e-4,
+                  "two haloes, call %d: walltime field SO %g s (tree %g s), summary %g / %g s\n", call, fso, ftr,
+                  st->StageMax[SUBHALO_STAGE_FIELDSO], st->StageMean[SUBHALO_STAGE_FIELDSO]);
+        }
         {
             const struct SubhaloCallStats * st = subhalo_last_call_stats();
             CHECK(st->NSerialKeys == 2 && st->LargestSerial > P2_NB && st->NCands == 0 && st->FieldSOCentrals == 2

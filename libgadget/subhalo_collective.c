@@ -460,10 +460,13 @@ coll_walk(struct Coll * C, double * Sum)
         if(PartManager->NumPart < need)
             PartManager->NumPart = need;
     }
-    /* the walltime clocks (audit R3): close the interval before the tree build, whose own clocks
-     * would otherwise book it as /Misc */
+    /* the walltime clocks (audit R3, decision 47.5): close the interval before the tree build and
+     * book the whole build to /Subhalo/Rounds/Tree, not to forcetree.c's own /Misc and
+     * /Tree/Build/{Nodes,Moments}, so that the /Subhalo/Rounds children cover the stage */
     walltime_measure("/Subhalo/Rounds/Rounds");
+    walltime_redirect_begin("/Subhalo/Rounds/Tree");
     force_tree_active_moments(&tree, C->ddecomp, &act, 0, 0, NULL);
+    walltime_redirect_end();
     PartManager->NumPart = NumPartSave;
     label_tree(&tree, C->ddecomp, C->Cand, C->c0);
 

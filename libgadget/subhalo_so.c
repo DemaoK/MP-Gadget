@@ -84,6 +84,7 @@
 #include "subhalo_unbind.h"   /* subhalo_so_thresholds, the NFW fit and Klypin helpers */
 #include "subhalo_internal.h" /* subhalo_vel_to_kms */
 #include "subhalo_so.h"
+#include "walltime.h"
 
 #define SO_NT 6
 /* definitions with per-type masses: vir (SO slot 0) and 200c (SO slot 2) */
@@ -1218,8 +1219,15 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
         list[c] = c;
     }
 
+    /* the walltime clocks (decision 47.5): the rows and the guest records as /Subhalo/FieldSO/Setup,
+     * the whole tree build as /Subhalo/FieldSO/Tree (not forcetree.c's own /Misc and
+     * /Tree/Build/{Nodes,Moments}); the finder's end of the stage books the rest (the walks) as
+     * /Subhalo/FieldSO/Walks, so that the /Subhalo/FieldSO children cover the stage */
+    walltime_measure("/Subhalo/FieldSO/Setup");
     ForceTree tree = {0};
+    walltime_redirect_begin("/Subhalo/FieldSO/Tree");
     force_tree_full(&tree, ddecomp, 0, NULL);
+    walltime_redirect_end();
 
     /* the treewalk's reserve (ev_begin) against the free memory after the tree build: pass 1
      * halves its bins down to SO_SHRINKBINS until it fits on every rank, pass 2 runs only if it

@@ -2122,16 +2122,20 @@ stats_reduce(const struct SubhaloCallStats * loc, struct SubhaloCallStats * tot,
 const char * const SubhaloStageName[SUBHALO_NSTAGE] = {
     "setup", "vote", "frames", "lookup", "plan", "exchange", "sort", "fetch", "serial", "restore",
     "rounds", "number", "descendants", "history", "store", "unhosted", "orphansync", "fieldso"};
-/* The rounds stage is split by subhalo_collective_run into /Subhalo/Rounds/{Setup,Rounds,Walk,
- * Tags} (Walk: the potential-only walks); the driver's end of the stage measures the rest as
- * /Subhalo/Rounds/Cleanup (all of the stage when there is no in-place candidate), so that the
- * parent /Subhalo/Rounds, the sum of its children, is the summary's rounds time (Phase 5 audit R3)
- * less the tree builds of the walks, which forcetree.c books as /Tree/Build/{Nodes,Moments}. */
+/* The rounds stage is split by subhalo_collective_run into /Subhalo/Rounds/{Setup,Rounds,Tree,
+ * Walk,Tags} (Tree: the tree builds of the potential-only walks, redirected from forcetree.c's own
+ * /Misc and /Tree/Build/{Nodes,Moments} clocks; Walk: the walks); the driver's end of the stage
+ * measures the rest as /Subhalo/Rounds/Cleanup (all of the stage when there is no in-place
+ * candidate), so that the parent /Subhalo/Rounds, the sum of its children, is this rank's rounds
+ * time of the summary (Phase 5 audit R3, decision 47.5) at any thread count. Likewise the field SO
+ * stage: subhalo_field_so_full measures /Subhalo/FieldSO/{Setup,Tree} (Tree: its tree build,
+ * redirected from forcetree.c's clocks) and the driver's end of the stage the rest, the walks, as
+ * /Subhalo/FieldSO/Walks. */
 static const char * const SubhaloStageClock[SUBHALO_NSTAGE] = {
     "/Subhalo/Setup", "/Subhalo/Vote", "/Subhalo/Frames", "/Subhalo/Lookup", "/Subhalo/Plan", "/Subhalo/Exchange",
     "/Subhalo/Sort", "/Subhalo/Fetch", "/Subhalo/Serial", "/Subhalo/Restore", "/Subhalo/Rounds/Cleanup", "/Subhalo/Number",
     "/Subhalo/Descendants", "/Subhalo/History", "/Subhalo/Store", "/Subhalo/Unhosted", "/Subhalo/OrphanSync",
-    "/Subhalo/FieldSO"};
+    "/Subhalo/FieldSO/Walks"};
 
 /* This rank's stage clock of the current call: wall time and main-allocator used high water per
  * stage (the high water from the allocator's low-water mark of the free bytes, reset at every
