@@ -120,6 +120,32 @@ Find examples in examples/.
 
 Control number of threads with `OMP_NUM_THREADS`. Generally the code is faster with more threads per rank, up to hardware limits. On Frontera we run optimally with 28 threads, the number of cpus per hardware socket.
 
+Runtime subhalo finder
+----------------------
+
+With ``SubhaloFinderOn = 1`` (requires ``SnapshotWithFOF = 1`` and ``FOFSaveParticles = 1``) a subhalo finder runs after FOF at every PART/PIG output.
+Membership is tracked from output to output as in HBT-HERONS (unbinding, sinking, orphans); properties follow Rockstar's recipes on the bound sets, with field spherical-overdensity masses for centrals.
+The catalogue is written into the PIG: ``Subhalo/*`` (one row per resolved track) and ``Orphan/*`` blocks, the per-particle ``TrackId``, ``BindRank`` and ``BoundTrackId`` blocks, and Header attributes (``NumSubhalosTotal``, ``SubhaloStateComplete``, ``SubhaloWallTime``, ...). The PIG is also the finder's restart state.
+``MP-Gadget <paramfile> 3 <n>`` reruns FOF and the finder for snapshot n from ``PART_n``.
+Python tools: ``tools/subhalo_reader.py`` (reader), ``tools/subhalo_check.py`` (checks), ``tools/subhalo_compare_rockstar.py`` (comparison with Rockstar).
+Parameters and defaults (meanings in ``gadget/params.c``):
+
+===================================  =======  ========================  ========  ===============================  =======
+Parameter                            Default  Parameter                 Default   Parameter                        Default
+===================================  =======  ========================  ========  ===============================  =======
+SubhaloFinderOn                      0        SubhaloMaxGatherFraction  0.5       SubhaloCollectiveMinPart         0
+SubhaloMaxUnbindIterations           50       SubhaloRestartFresh       0         SubhaloTracerTypes               18
+SubhaloPotentialTypes                51       SubhaloMinNumPart         20        SubhaloMinNumTracerPart          10
+SubhaloNumTracerHostFinding          10       SubhaloLookupBatchBytes   67108864  SubhaloMajorProgenitorMassRatio  0.8
+SubhaloBoundMassPrecision            0.995    SubhaloSourceRelaxFactor  3         SubhaloPotentialSampleSize       1000
+SubhaloFinalPass                     0        SubhaloTreeOpenAngle      0.45      SubhaloMergeTrapped              1
+SubhaloSinkSymmetric                 0        SubhaloCoreSize           20        SubhaloReassignGas               1
+SubhaloNumNeighboursForReassignment  10       SubhaloUnbindWithThermal  0         SubhaloFieldSO                   1
+SubhaloSOBins                        64       SubhaloSOSearchFactor     2         SubhaloSOMaxDoublings            3
+SubhaloSORefineMinPart               1000     SubhaloMajorMergerRatio   0.3       SubhaloGeometricParents          0
+SubhaloDebugForceExchangeFailure     0
+===================================  =======  ========================  ========  ===============================  =======
+
 User Guide
 ----------
 
