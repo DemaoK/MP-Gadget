@@ -32,9 +32,9 @@
  * Phase 2a (halofinder_phase2a_plan.md) replaced the membership rule of every serial key, so
  * tests 5, 9 and 10 assert the Phase 2a outcome of their scenarios: BindRank in energy order (the
  * most bound tenth near the core) instead of distance order, CorePos near rather than equal to
- * CoMPos, field particles retagged with their track's key (A's displaced particles at stage 3
- * move fast and are its unbound tail), B landing on A as a full ball at stage 4 and sinking into
- * A (the central chosen by the kinetic distance), the dispersed hostless tracks on a 40 kpc/h
+ * CoMPos, field particles retagged with their track's key (decision 52: A's displaced particles
+ * at stage 3 are untagged, a central's source being its FOF group only), B landing on A as a full
+ * ball at stage 4 and sinking into A (the central chosen by the kinetic distance), the dispersed hostless tracks on a 40 kpc/h
  * lattice (bound, unambiguous centre), and thresholds of 5 particles for the 6..10-particle
  * clumps of test 10. Tests 6 to 8 are unchanged. Phase 2b (halofinder_phase2b_plan.md) unbinds
  * the oversized keys in place with the HBT recipe: test 6 expects the serial outcome with the
@@ -42,6 +42,8 @@
  * in place, two rounds; the hostless pseudo-key in place) assert the HBT outcome, and
  * p2_check_tags applies the D10 invariants to in-place records too.
  * test_subhalo_nocentral: Phase 3 audit P2 (no surviving central: CentralTrackId -1).
+ * test_subhalo_central_source: decision 52 (a central's FOF-less particles are untagged, a
+ * satellite's kept).
  * Phase 5c (instrumentation, cost-aware packing, reserve admission): the per-call statistics
  * (subhalo_last_call_stats) are checked after the calls of tests 11 and the mixed call, the PIG
  * header's SubhaloWallTime and SubhaloPeakBytes in test 9 (Phase 5d: also SubhaloPeakIncrementBytes, and
@@ -1310,9 +1312,9 @@ test_subhalo_join(void ** state)
  *  stage 2: the third of B with the largest x moves into A;   A 720, B 240
  *  stage 3: 600 field particles move into B, 30 A particles are dispersed into the field;
  *           B (840) is now the larger group, so the GrNr order swaps; A 690; the 30 dispersed
- *           particles keep tag 0 outside any group
- *  stage 4: the 30 come back to A and B is translated onto A: one group of 1560; track 1 wins
- *           by previous Nbound (840 > 690) although its TrackId is larger, track 0 sinks into 1. */
+ *           particles lose tag 0: a central's source is its FOF group only (HBT FeedCentrals)
+ *  stage 4: the 30 come back to A and B is translated onto A: one group of 1560; both are major
+ *           members (840, 690), the kinetic distance picks track 0 and track 1 sinks into it. */
 #define BOXSIZE 1000.
 #define T5_NA 600
 #define T5_NB 360
@@ -1416,7 +1418,7 @@ t5_expect(MyIDType id, int stage, int * label, int64_t * track)
      * picks track 0 and track 1 sinks into it */
     if(id < T5_NA) {
         *label = (stage == 3 && id < T5_NDISP) ? -1 : 0;
-        *track = 0;
+        *track = (stage == 3 && id < T5_NDISP) ? -1 : 0;
         return;
     }
     if(id < T5_NA + T5_NB) {
@@ -1455,10 +1457,9 @@ t5_move_to_stage(int stage)
     int64_t i;
     for(i = 0; i < PartManager->NumPart; i++) {
         t5_position(P[i].ID, stage, P[i].Pos);
-        /* Phase 2a: the particles displaced from A into the field at stage 3 fly away fast, so
-         * that they are unbound (A's tail) rather than bound at hundreds of kpc by a cold clump */
-        P[i].Vel[0] = (stage == 3 && P[i].ID < T5_NDISP) ? 2000 : 0;
-        P[i].Vel[1] = P[i].Vel[2] = 0;
+        /* the particles displaced from A at stage 3 are cold (bound to A were they in its
+         * source): they are dropped as the central's FOF-less particles, whatever their energy */
+        P[i].Vel[0] = P[i].Vel[1] = P[i].Vel[2] = 0;
     }
 }
 
@@ -1643,15 +1644,10 @@ t5_check_stage(int stage, int ret, int64_t TotNgroups, const struct tagrec * r, 
         LOCAL_CHECK(bad, r[i].TrackId == track, "stage %d: particle %ld (label %d) TrackId %ld, expected %ld\n",
                 stage, i, label, r[i].TrackId, track);
         if(track < 0)
-            LOCAL_CHECK(bad, r[i].BoundTrackId == -1, "stage %d: untagged particle %ld has BoundTrackId %ld\n", stage, i, r[i].BoundTrackId);
-        else if(label >= 0)
-            LOCAL_CHECK(bad, r[i].BoundTrackId == track, "stage %d: particle %ld BoundTrackId %ld != TrackId %ld\n", stage, i, r[i].BoundTrackId, track);
+            LOCAL_CHECK(bad, r[i].BoundTrackId == -1 && r[i].BindRank == -1, "stage %d: untagged particle %ld has BindRank %d BoundTrackId %ld\n",
+                    stage, i, r[i].BindRank, r[i].BoundTrackId);
         else
-            /* Phase 2a: a tagged field particle travels with its track's key and is retagged
-             * there; the fast displaced particles are the unbound tail of their track */
-            LOCAL_CHECK(bad, r[i].BoundTrackId == -1 && r[i].BindRank >= 0,
-                    "stage %d: field particle %ld: TrackId %ld BindRank %d BoundTrackId %ld, expected an unbound tail\n", stage, i,
-                    r[i].TrackId, r[i].BindRank, r[i].BoundTrackId);
+            LOCAL_CHECK(bad, r[i].BoundTrackId == track, "stage %d: particle %ld BoundTrackId %ld != TrackId %ld\n", stage, i, r[i].BoundTrackId, track);
     }
     CHECK(bad == 0, "stage %d: particle tags wrong\n", stage);
     CHECK(check_group_invariants(r, n) == 0, "stage %d: group invariants violated\n", stage);
@@ -4123,6 +4119,88 @@ test_subhalo_overlap(void ** state)
     rm_tree(dir);
 }
 
+/* The j-th tracer id of clump c counted from its end (gas ids are skipped: no reassignment by type). */
+static MyIDType
+cs_moved_id(int c, int j)
+{
+    MyIDType id = c == 0 ? P2_NA : P2_NA + P2_NB;
+    int k = -1;
+    while(k < j)
+        if(p2_type(--id) == 1)
+            k++;
+    return id;
+}
+
+/* Decision 52 (HBT FeedCentrals): a central's source is its FOF group only. B falls into A as in
+ * the overlap test, and 20 cold tracers of each clump, tagged at the first call, are moved into the
+ * field far from the group: A's (the central's) are untagged, B's (the satellite's) keep tag 1.
+ * test_subhalo_lifecycle_pig checks that a hostless pseudo-key keeps all its field particles. */
+#define CS_NMOVE 20
+static void
+test_subhalo_central_source(void ** state)
+{
+    Cosmology CP;
+    p2_setup(&CP);
+    double cen[2][3] = {{P2_cA[0], P2_cA[1], P2_cA[2]}, {P2_cB[0], P2_cB[1], P2_cB[2]}};
+    double bulk[2][3] = {{0, 0, 0}, {0, 0, 0}};
+    p2_place(0.5, CP.GravInternal, cen, bulk);
+    int64_t ng, n, i;
+    int ret = run_finder_call(0, &CP, &ng);
+    CHECK(ret == 1 && ng == 2, "central source: first call returned %d with %ld groups\n", ret, ng);
+    struct tagrec * r = gather_tags(&n);
+    int c, j, bad = 0;
+    for(c = 0; c < 2; c++)
+        for(j = 0; j < CS_NMOVE; j++) {
+            const MyIDType id = cs_moved_id(c, j);
+            CHECK(id < (MyIDType) n && r[id].ID == id && r[id].TrackId == c && r[id].GrNr >= 0,
+                  "central source: particle %lu of clump %d not tagged by it at the first call\n", (unsigned long) id, c);
+        }
+    free(r);
+    p2_infall(&CP, 0.55);
+    /* the moved tracers at rest on a 62.5 kpc/h line, 37 kpc/h from the field lattice and far from the group */
+    for(i = 0; i < PartManager->NumPart; i++)
+        for(c = 0; c < 2; c++)
+            for(j = 0; j < CS_NMOVE; j++)
+                if(P[i].ID == cs_moved_id(c, j)) {
+                    P[i].Pos[0] = 72.5 + 62.5 * (j % 16);
+                    P[i].Pos[1] = 135. + 250. * c + 62.5 * (j / 16);
+                    P[i].Pos[2] = 135.;
+                    P[i].Vel[0] = P[i].Vel[1] = P[i].Vel[2] = 0;
+                }
+    ret = run_finder_call(1, &CP, &ng);
+    CHECK(ret == 1 && ng == 1, "central source: second call returned %d with %ld groups\n", ret, ng);
+    r = gather_tags(&n);
+    struct SubTrack * rec = fetch_all_tracks(2);
+    CHECK(rec[0].Rank == 0 && rec[1].Rank == 1 && rec[1].NestedParentTrackId == 0 && rec[1].Nbound > 0,
+          "central source: track 0 Rank %d, track 1 Rank %d parent %ld Nbound %d\n", rec[0].Rank, rec[1].Rank, rec[1].NestedParentTrackId,
+          rec[1].Nbound);
+    int64_t nA = 0, nB = 0;
+    for(c = 0; c < 2; c++)
+        for(j = 0; j < CS_NMOVE; j++) {
+            const struct tagrec * q = &r[cs_moved_id(c, j)];
+            LOCAL_CHECK(bad, q->GrNr == -1, "central source: moved particle %lu in group %ld\n", (unsigned long) q->ID, q->GrNr);
+            if(c == 0) {
+                nA += q->TrackId == -1 && q->BindRank == -1 && q->BoundTrackId == -1;
+                LOCAL_CHECK(bad, q->TrackId == -1 && q->BindRank == -1 && q->BoundTrackId == -1,
+                            "central source: the central's FOF-less particle %lu has (%ld %d %ld), expected untagged\n", (unsigned long) q->ID,
+                            q->TrackId, q->BindRank, q->BoundTrackId);
+            }
+            else {
+                nB += q->TrackId == 1 && q->BindRank >= 0;
+                LOCAL_CHECK(bad, q->TrackId == 1 && q->BindRank >= 0,
+                            "central source: the satellite's FOF-less particle %lu has (%ld %d %ld), expected tag 1\n", (unsigned long) q->ID,
+                            q->TrackId, q->BindRank, q->BoundTrackId);
+            }
+        }
+    message(0, "Central source: of %d FOF-less particles each, %ld of the central untagged, %ld of the satellite kept; Nbound %d / %d\n",
+            CS_NMOVE, nA, nB, rec[0].Nbound, rec[1].Nbound);
+    CHECK(bad == 0, "central source: FOF-less particles\n");
+    CHECK(p2_check_tags(r, n, rec, 2, "central source") == 0, "central source: tag invariants\n");
+    free(rec);
+    free(r);
+    p2_teardown();
+}
+
 /* Test 7 of the plan: B placed on A's core with its velocity sinks; its tracer is followed at
  * the next call; isolated with 30 field particles in a new group it is resurrected. */
 static void
@@ -4865,7 +4943,8 @@ test_subhalo_nocentral(void ** state)
  * Stage 0-1 serial (the overlap scenario: B a satellite of A with a tail partly bound by A);
  * stage 2 the group is oversized (SubhaloCollectiveMinPart 100), 40 of A's and 20 of B's
  * particles are in the field: Phase 2b unbinds B's sub-tree key in place (round 0) and then A
- * (round 1), B stays A's satellite, the moved particles stay in their tracks' in-place sources;
+ * (round 1), B stays A's satellite, B's moved particles stay in its in-place source and A's are
+ * released (decision 52);
  * stage 3 the same; stage 4 every clump particle dispersed: A and B are hostless with oversized
  * pseudo-keys, unbound in place; stage 5 serial again. Tag invariants, the restart
  * round trip of the PIG and the orphan links at every stage. SUBHALO_TEST_KEEP keeps the PIGs
@@ -4949,14 +5028,17 @@ test_subhalo_fallback(void ** state)
             for(i = 0; i < n; i++) {
                 const int c = p2_clump(r[i].ID);
                 const int moved = (c == 0 && r[i].ID % 50 == 7) || (c == 1 && (r[i].ID - P2_NA) % 30 == 11);
-                /* Phase 2b: the moved particles stayed home with their tracks' tags and are in the
-                 * in-place sources: B's unbound tail (bound by A or not), A's own, or untagged */
-                if(moved && r[i].GrNr < 0)
-                    LOCAL_CHECK(bad, r[i].TrackId == -1 || ((r[i].TrackId == 0 || r[i].TrackId == 1)
-                                && (r[i].BoundTrackId == -1 || r[i].BoundTrackId == 0 || r[i].BoundTrackId == r[i].TrackId)),
-                                "%s: field particle %lu tagged %ld bound %ld\n", what, (unsigned long) r[i].ID, r[i].TrackId, r[i].BoundTrackId);
+                /* Phase 2b: B's moved particles stay in its in-place source (its tail, bound by A or
+                 * not); decision 52: A's, the central's FOF-less particles, are released untagged */
+                if(moved && r[i].GrNr < 0 && c == 1)
+                    LOCAL_CHECK(bad, r[i].TrackId == 1 && (r[i].BoundTrackId == -1 || r[i].BoundTrackId == 0 || r[i].BoundTrackId == 1),
+                                "%s: field particle %lu of B tagged %ld bound %ld\n", what, (unsigned long) r[i].ID, r[i].TrackId, r[i].BoundTrackId);
+                if(moved && r[i].GrNr < 0 && c == 0)
+                    LOCAL_CHECK(bad, r[i].TrackId == -1 && r[i].BoundTrackId == -1 && r[i].BindRank == -1,
+                                "%s: field particle %lu of A tagged %ld bound %ld\n", what, (unsigned long) r[i].ID, r[i].TrackId, r[i].BoundTrackId);
             }
             CHECK(bad == 0, "%s: field particles of the oversized key\n", what);
+            CHECK(st->NFallbackReleased == (stage == 2 ? 40 : 0), "%s: %ld field tags released\n", what, st->NFallbackReleased);
             /* both A and B's sub-tree key are above SubhaloCollectiveMinPart: two rounds, B (depth 1)
              * then A, B stays A's satellite as in the serial stage 1 */
             CHECK((rec[0].Flags & SUBHALO_FLAG_INPLACE) && rec[0].Rank == 0 && rec[0].Nbound > rec[0].NboundExclusive
@@ -5263,6 +5345,7 @@ int main(void) {
         cmocka_unit_test(test_subhalo_many_keys),
         cmocka_unit_test(test_subhalo_twohalo),
         cmocka_unit_test(test_subhalo_overlap),
+        cmocka_unit_test(test_subhalo_central_source),
         cmocka_unit_test(test_subhalo_sink_orphan),
         cmocka_unit_test(test_subhalo_nest_tree),
         cmocka_unit_test(test_subhalo_deep_chain),

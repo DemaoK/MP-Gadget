@@ -747,7 +747,7 @@ struct SubhaloCallStats {
     int64_t NFinalBound;     /* bound particles of the final passes */
     int64_t NTailRejected;   /* tail claims crossing the binding owner's final branch (J2) */
     int64_t NFallbackField;  /* Phase 2b: particles of the oversized keys whose tags the final pass of the rounds wrote */
-    int64_t NFallbackReleased; /* of which released (stale tags of orphans in the field) */
+    int64_t NFallbackReleased; /* field particles of the oversized keys untagged instead (stale orphan tags, the central's); not in NFallbackField */
     double ArenaPeakFrac;    /* largest arena high-water mark of a key / its arena size */
     /* ---- Phase 5c instrumentation (global, set by subhalo_find on every return path; on a
      * failed call the counters above and below are zero, the wall times and memory peaks of the

@@ -641,8 +641,10 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
         int o = -1;
         if(part_live(p)) {
             const int t = p->TrackId >= 0 ? node_index(nd, nn, p->TrackId) : -1;
-            if(t >= 0 && nd[t].kind == NODE_RESOLVED)
-                o = t;                      /* a resolved member's own particles (both in g and in the field) */
+            /* the central's source is the FOF group only, as HBT's FeedCentrals swap (decision 52); pseudo-keys
+             * and sub-tree keys (whose root is never the central) keep their FOF-less particles */
+            if(t >= 0 && nd[t].kind == NODE_RESOLVED && (pseudo || subkey || t != ci || p->GrNr == g))
+                o = t;                      /* a resolved member's own particles (a satellite's also in the field) */
             else if(pseudo || p->GrNr == g)
                 o = ci;                     /* every other FOF particle feeds the central */
         }

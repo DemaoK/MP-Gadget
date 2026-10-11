@@ -41,6 +41,8 @@
  *     identical bound sets, cores and radial orders, three rank layouts; bitwise for equal masses.
  * 17. test_collective_admission_props    R1: 2304 candidates in one round; the properties stage is
  *     the largest, a squeeze between the old and the new need fails the admission there.
+ * 18. test_collective_central_source     decision 52: the central's FOF-less particles leave its source
+ *     and are untagged (serial, in place, sub-tree key), the satellite's are kept.
  * SUBHALO_TEST_ONLY=<substring> runs only the matching tests. */
 
 #define _GNU_SOURCE
@@ -2102,6 +2104,132 @@ test_collective_sunk_root_field(void ** state)
     outcome_free(&a);
 }
 
+/* ---- test 18: the central's source is its FOF group only (decision 52, HBT FeedCentrals) ----
+ * A (0, 3000) the central with FA, 20 of its previous particles at rest in the field far away
+ * (bound to A were they in its source); B (1, 200) its satellite 5 kpc/h out with FB, 10 field
+ * particles bound to B. Serially, with A in place and B a sub-tree key, and with both in place:
+ * FA untagged (the in-place final pass releases them), FB kept by B. */
+#define CS_FA0 3000
+#define CS_B0 3020
+#define CS_FB0 3220
+#define CS_END 3230
+
+static void
+cs_particle(MyIDType id, double atime, struct SynPart * s, void * ud)
+{
+    const double cA[3] = {500, 500, 500};
+    const double cB[3] = {500 + 5 / atime, 500, 500};
+    const double zero[3] = {0, 0, 0}, vB[3] = {0, 40, 0};
+    double u[3], v[3];
+    int d;
+    (void) ud;
+    if(id >= CS_END)
+        return;
+    if(id < CS_FA0) {
+        syn_ball(id, 121, cA, 1.5, zero, 20, atime, s);
+        s->tag = s->bound = 0;
+        s->rank = id;
+    }
+    else if(id < CS_B0) {
+        /* a sparse line far from the group, 15 kpc/h apart, at rest */
+        s->pos[0] = 125 + 15 * (id - CS_FA0);
+        s->pos[1] = 125;
+        s->pos[2] = 125;
+        s->tag = s->bound = 0;
+        s->rank = id;
+    }
+    else if(id < CS_FB0) {
+        syn_ball(id, 122, cB, 0.8, vB, 6, atime, s);
+        s->tag = s->bound = 1;
+        s->rank = id - CS_B0;
+    }
+    else {
+        sr_dir(id - CS_FB0, 1, u);
+        rand_in_ball(id, 123, 1.0, zero, v);
+        for(d = 0; d < 3; d++) {
+            s->pos[d] = cB[d] + 30 * u[d];
+            s->vel[d] = atime * (vB[d] + v[d]);
+        }
+        s->tag = s->bound = 1;
+        s->rank = 200 + id - CS_FB0;
+    }
+}
+
+static void
+cs_run(int64_t collective, struct Outcome * o, int64_t * nreleased)
+{
+    Cosmology CP;
+    struct SubhaloParams sp = default_subhalo_params();
+    sp.SubhaloFieldSO = 0;
+    sp.SubhaloPotentialSampleSize = 0;
+    sp.SubhaloTreeOpenAngle = COLL_TEST_THETA;
+    sp.SubhaloCollectiveMinPart = collective;
+    syn_setup(&CP, CS_END + SYN_NFIELD, sp);
+    struct SubTrack recs[2];
+    recs[0] = syn_rec(0, 3020, 0.302, -1, 0, 0, 0);
+    recs[1] = syn_rec(1, 210, 0.021, 0, 0, 1, 1);
+    syn_records(recs, 2);
+    syn_place(cs_particle, NULL, 0.55, 1);
+    int64_t ng;
+    const int ret = run_finder_call(1, &CP, &ng);
+    CHECK(ret == 1 && ng == 1, "central source (%ld): %ld groups\n", collective, ng);
+    *nreleased = subhalo_last_call_stats()->NFallbackReleased;
+    outcome_take(o);
+    syn_teardown();
+}
+
+/* The FOF-less particles of the central untagged, the satellite's kept and bound by it. */
+static void
+cs_check(const struct Outcome * o, const char * what)
+{
+    int64_t i, nFA = 0, nFAu = 0, nFB = 0, nFBk = 0, nfield = 0;
+    for(i = 0; i < o->n; i++) {
+        const struct tagrec * q = &o->r[i];
+        if(q->ID >= CS_FA0 && q->ID < CS_B0) {
+            nFA++;
+            nFAu += q->TrackId == -1 && q->BindRank == -1 && q->BoundTrackId == -1;
+            nfield += q->GrNr == -1;
+        }
+        if(q->ID >= CS_FB0 && q->ID < CS_END) {
+            nFB++;
+            nFBk += q->TrackId == 1 && q->BoundTrackId == 1 && q->BindRank >= 0;
+            nfield += q->GrNr == -1;
+        }
+    }
+    message(0, "%s: A Nbound %d Rank %d, B Nbound %d Rank %d parent %ld; the central's FOF-less %ld/%ld untagged, the satellite's %ld/%ld "
+               "kept, %ld outside the group\n", what, o->rec[0].Nbound, o->rec[0].Rank, o->rec[1].Nbound, o->rec[1].Rank,
+            o->rec[1].NestedParentTrackId, nFAu, nFA, nFBk, nFB, nfield);
+    CHECK(o->rec[0].Rank == 0 && o->rec[1].Rank == 1 && o->rec[1].NestedParentTrackId == 0 && o->rec[1].Nbound > 0,
+          "%s: the hierarchy\n", what);
+    CHECK(nFA == CS_B0 - CS_FA0 && nFAu == nFA && nFB == CS_END - CS_FB0 && nFBk == nFB && nfield == nFA + nFB,
+          "%s: FOF-less particles (%ld/%ld untagged, %ld/%ld kept)\n", what, nFAu, nFA, nFBk, nFB);
+    CHECK(o->rec[0].Nbound <= CS_FA0, "%s: A binds %d particles, more than its group part\n", what, o->rec[0].Nbound);
+    CHECK(p2_check_tags(o->r, o->n, o->rec, o->nt, what) == 0, "%s: tag invariants\n", what);
+}
+
+static void
+test_collective_central_source(void ** state)
+{
+    struct Outcome a, b, c;
+    int64_t ra, rb, rc;
+    cs_run(0, &a, &ra);
+    cs_run(1000, &b, &rb);
+    cs_run(100, &c, &rc);
+    message(0, "central source: candidates %ld / %ld / %ld, released %ld / %ld / %ld (serial, A in place, A and B in place)\n",
+            a.st.NCands, b.st.NCands, c.st.NCands, ra, rb, rc);
+    CHECK(a.st.NCands == 0 && b.st.NCands == 1 && c.st.NCands == 2, "central source: candidates %ld / %ld / %ld\n", a.st.NCands,
+          b.st.NCands, c.st.NCands);
+    CHECK(ra == 0 && rb == CS_B0 - CS_FA0 && rc == CS_B0 - CS_FA0, "central source: released %ld / %ld / %ld\n", ra, rb, rc);
+    cs_check(&a, "central source, serial");
+    cs_check(&b, "central source, A in place");
+    cs_check(&c, "central source, A and B in place");
+    compare_outcomes(&a, &b, 2e-3, 1e-2, 0, "central source, A in place");
+    compare_outcomes(&a, &c, 2e-3, 1e-2, 0, "central source, A and B in place");
+    outcome_free(&c);
+    outcome_free(&b);
+    outcome_free(&a);
+}
+
 /* ---- test 10: a failed exchange after a real split ----
  * The sunk-root fixture with A in place (sub-tree key R + D, its group particles and the field
  * particles FR, FD travel encoded) and SubhaloDebugForceExchangeFailure: GrNr, the tags and the
@@ -3172,6 +3300,7 @@ int main(void) {
         cmocka_unit_test(test_collective_guards),
         cmocka_unit_test(test_collective_walk_theta),
         cmocka_unit_test(test_collective_props_identity),
+        cmocka_unit_test(test_collective_central_source),
     };
     const char * only = getenv("SUBHALO_TEST_ONLY");
     if(only && only[0]) {

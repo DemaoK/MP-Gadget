@@ -69,7 +69,7 @@
                           * remainder inside its relaxed source), valid while that member is alive */
 #define CF_SBOUND  8     /* bound by a serial sub-tree member (BoundTrackId), excluded from the sources */
 #define CF_UNIV    16    /* a particle of an oversized key: the final tag pass writes it */
-#define CF_RELEASE 32    /* a stale tag of an orphan in the field: untagged by the final pass */
+#define CF_RELEASE 32    /* a field particle tagged by an orphan or the central: untagged by the final pass */
 
 /* Shape fit as subhalo_props.c */
 #define SHAPE_MINPART 20
@@ -3403,7 +3403,7 @@ gather_serial(struct Coll * C)
  * (BoundTrackId -1) to the candidate above its root, with a serial claim if it is a tail of an
  * alive member or inside an alive root's relaxed source; a particle bound by a serial member is
  * excluded (and keeps its tag); an untagged or foreign-tagged group particle to the central; a
- * field particle with a stale orphan tag is released. */
+ * field particle with a stale orphan tag or the central's tag is released (HBT FeedCentrals). */
 static void
 init_sources(struct Coll * C)
 {
@@ -3419,19 +3419,25 @@ init_sources(struct Coll * C)
         const struct particle_data * p = &P[i];
         if(!part_live(p))
             continue;
-        int64_t u = -1;
+        int64_t u = -1, ku = -1;
         const struct SubhaloMember * m = p->TrackId >= 0 ? member_of(C, p->TrackId) : NULL;
-        if(p->GrNr >= 1 && subhalo_plan_inplace_index(plan, p->GrNr) >= 0)
+        if(p->GrNr >= 1 && (ku = subhalo_plan_inplace_index(plan, p->GrNr)) >= 0)
             u = p->GrNr;
-        else if(p->GrNr < 0 && m)
+        else if(p->GrNr < 0 && m) {
             u = m->g;
+            /* a FOF key's central: its source is the group only, as HBT's FeedCentrals swap (decision 52);
+             * its field particles are released below; a pseudo-key (u > TotNgroups) keeps them */
+            if(u <= plan->TotNgroups)
+                ku = subhalo_plan_inplace_index(plan, u);
+        }
         if(u < 0)
             continue;
         if(m && m->g != u)
             m = NULL;
         C->Flag[i] = CF_UNIV;
         nuniv++;
-        if(m && m->cand >= 0 && (m->kind != SUBHALO_MEM_ORPHAN || p->GrNr == u))
+        const int central = ku >= 0 ? plan->Inplace[ku].central : -1;
+        if(m && m->cand >= 0 && (m->kind != SUBHALO_MEM_ORPHAN || p->GrNr == u) && (m->cand != central || p->GrNr == u))
             C->Cand[i] = m->cand;
         else if(m && m->cand < 0 && m->SubKey >= 0) {
             const struct SubhaloSubKey * sk = &plan->SubKeys[m->SubKey - plan->SubKeyBase];
@@ -3446,12 +3452,10 @@ init_sources(struct Coll * C)
                     C->Flag[i] |= CF_SCLAIM;
             }
         }
-        else if(p->GrNr == u) {
-            const int64_t k = subhalo_plan_inplace_index(plan, u);
-            C->Cand[i] = plan->Inplace[k].central;
-        }
+        else if(p->GrNr == u)
+            C->Cand[i] = central;       /* a group particle: ku was found above */
         else {
-            /* a field particle tagged by an orphan member: a stale tag */
+            /* a field particle tagged by an orphan member (a stale tag) or by the central */
             C->Flag[i] = CF_RELEASE;
             nuniv--;
         }

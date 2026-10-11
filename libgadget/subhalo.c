@@ -2658,7 +2658,7 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     subhalo_finish_call(SnapNum, 1, &locstats, &plan, sp->SubhaloFieldSO ? &sostats : NULL, Comm);
     message(0, "Subhalo diagnostics: %ld unbindings, %ld at the iteration cap (worst Nbound/Nlast %g, track %ld); "
                "%ld of %ld final-pass bound particles with E >= 0; %ld tail claims across the final branch dropped; "
-               "in-place tags written %ld (%ld stale field tags released); %ld orphan hosts updated; arena high water %.3f.\n",
+               "in-place tags written %ld, field tags released %ld; %ld orphan hosts updated; arena high water %.3f.\n",
             SubLastStats.NCandidates, SubLastStats.NItercap, SubLastStats.WorstConvRatio, SubLastStats.WorstTrackId,
             SubLastStats.NFinalPositive, SubLastStats.NFinalBound, SubLastStats.NTailRejected,
             SubLastStats.NFallbackField, SubLastStats.NFallbackReleased, norphsync_tot, SubLastStats.ArenaPeakFrac);
