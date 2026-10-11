@@ -20,8 +20,13 @@ input could not be read.
                               the vote; a target absent or dead before the call, or a cycle, fails;
                               a chain ending in a track that died in the call without sinking, as
                               after a failed re-unbinding, is a warning),
-                              resurrections, recomputed from the two PIGs. Default: the Phase 2a
-                              rules (weighted ten-tracer vote); --phase1-vote: the Phase 1 rules
+                              resurrections, recomputed from the two PIGs. A group with resolved
+                              survivors has one Rank 0 member, the most massive (CompareMass) and
+                              a previous member; in an orphan-only group the orphan nearest in
+                              kinetic distance (H from RSDFactor, float32 roundoff allowed) is
+                              resurrected; hostless (pseudo-key) centrals are not checked.
+                              Default: the Phase 2a rules (weighted ten-tracer vote);
+                              --phase1-vote: the Phase 1 rules
                               (majority vote over every own-bound particle, the most massive
                               candidate wins, the others sink). The vote runs over the current
                               population (PIG_next's saved rows, or --part PART_next) with pre-call
@@ -968,6 +973,68 @@ def follow_sink_chain(cat, T, s, snap):
     return t, -1, path, "same-call sink chain longer than the number of tracks"
 
 
+def _hubble_from_header(header):
+    """(a, H(a)) in internal units from Header/RSDFactor (petaio.c: 1/(a H), or 1/(a^2 H) without
+    UsePeculiarVelocity), the finder's hubble_function including radiation; H None if absent."""
+    a = float(attr(header, "Time", 1.0))
+    R = attr(header, "RSDFactor", None)
+    if R is None or not float(R) > 0:
+        return a, None
+    return a, 1.0 / (float(R) * a * (1.0 if int(attr(header, "UsePeculiarVelocity", 0)) else a))
+
+
+def _kinetic_frame(cat, groups):
+    """Per group: mass-weighted centre and velocity (subhalo_track.c step a), unwrapped extent, largest |v|
+    component; the rows' (ID, Position, peculiar velocity) by ID; eps of the saved Position, Velocity, Mass."""
+    groups = np.unique(np.asarray(groups, dtype=np.int64))
+    box = float(attr(cat.header, "BoxSize"))
+    a = float(attr(cat.header, "Time", 1.0))
+    vdiv = 1.0 if int(attr(cat.header, "UsePeculiarVelocity", 0)) else a
+    mtab = np.atleast_1d(cat.header.get("MassTable", np.zeros(NTYPES)))
+    gid = cat.groups["GroupID"]
+    e64 = np.finfo(np.float64).eps
+    eps = [e64, e64, e64]
+    I, X, V, M, G = [], [], [], [], []
+    for t in range(NTYPES):
+        ng = cat.ningroup(t)
+        if ng == 0:
+            continue
+        g = np.repeat(gid, cat.groups["LengthByType"][:, t])
+        sel = np.isin(g, groups)
+        if not np.any(sel):
+            continue
+        x, v, m = cat.read(t, "Position"), cat.read(t, "Velocity"), cat.read(t, "Mass")
+        eps = [max(eps[0], np.finfo(x.dtype).eps), max(eps[1], np.finfo(v.dtype).eps),
+               max(eps[2], np.finfo(m.dtype).eps if m.size else e64)]
+        G.append(g[sel])
+        I.append(cat.read(t, "ID")[:ng][sel])
+        X.append(np.asarray(x[:ng][sel], dtype=np.float64))
+        V.append(np.asarray(v[:ng][sel], dtype=np.float64) / vdiv)
+        M.append(np.asarray(m[:ng][sel], dtype=np.float64) if m.size else np.full(np.count_nonzero(sel), mtab[t]))
+    if not G:
+        return {}, (np.zeros(0, np.int64), np.zeros((0, 3)), np.zeros((0, 3))), tuple(eps)
+    G, I, X, V, M = (np.concatenate(z) for z in (G, I, X, V, M))
+    ug, first, inv = np.unique(G, return_index=True, return_inverse=True)
+    dx = _periodic(X - X[first][inv], box)
+    Mg = np.bincount(inv, weights=M, minlength=ug.size)
+    cx = np.stack([np.bincount(inv, weights=M * dx[:, d], minlength=ug.size) for d in range(3)], axis=1) / Mg[:, None]
+    cv = np.stack([np.bincount(inv, weights=M * V[:, d], minlength=ug.size) for d in range(3)], axis=1) / Mg[:, None]
+    cx = np.mod(X[first] + cx, box)
+    lo, hi, vmax = np.full((ug.size, 3), np.inf), np.full((ug.size, 3), -np.inf), np.zeros(ug.size)
+    np.minimum.at(lo, inv, dx)
+    np.maximum.at(hi, inv, dx)
+    np.maximum.at(vmax, inv, np.abs(V).max(axis=1))
+    frame = {g: (cx[k], cv[k], hi[k] - lo[k], vmax[k]) for k, g in enumerate(ug.tolist())}
+    o = np.argsort(I, kind="stable")
+    return frame, (I[o], X[o], V[o]), tuple(eps)
+
+
+def _kinetic_distance(x1, v1, x2, v2, box, a, H):
+    """|v1 - v2 + H a dx| with peculiar velocities (subhalo_track.c kinetic_distance, HBT KineticDistance)."""
+    dx = _periodic(np.asarray(x1, dtype=np.float64) - np.asarray(x2, dtype=np.float64), box)
+    return float(np.sqrt(np.sum((np.asarray(v1) - np.asarray(v2) + H * a * dx) ** 2)))
+
+
 def _tracking_phase2a(ck, A, B, args):
     """Phase 2a rules (halofinder_phase2a_plan.md section 1 steps 1, 2, 7b, 7d, 10)."""
     snap_next = int(attr(B.header, "SnapshotIndex", snapnum_of(args.next)))
@@ -1043,50 +1110,109 @@ def _tracking_phase2a(ck, A, B, args):
                  "(the group holding its MostBoundID %d)" % (T, SB["HostGroup"][rb], SB["Rank"][rb],
                                                              orph_host[ra], OA["MostBoundID"][ra]))
 
-    # 4. members per group and the central decision (step 7b)
+    # 4. members per group and the central decision (step 7b); hostless (pseudo-key) centrals are not checked here
     cand, ocand = {}, {}
     mb_prev = dict(zip(SA["TrackId"].tolist(), SA["Mbound"].astype(np.float64).tolist()))
     for T, g in host.items():
         if g >= 0:
             cand.setdefault(g, []).append(T)
-    for T, g, pk in zip(OA["TrackId"].tolist(), orph_host.tolist(), OA["MboundPeak"].astype(np.float64).tolist()):
+    for T, g in zip(OA["TrackId"].tolist(), orph_host.tolist()):
         if g >= 0:
-            ocand.setdefault(g, []).append((T, pk))
-    rank0 = {}
+            ocand.setdefault(g, []).append(T)
+    rank0, top = {}, {}
     hosted = SB["HostGroup"] >= 0
     for r in np.nonzero(hosted & (SB["Rank"] == 0))[0].tolist():
         rank0.setdefault(int(SB["HostGroup"][r]), []).append(int(tid_sb[r]))
-    ncen_bad = 0
+    # the most massive survivor per group, ordered as HBT's CompareMass (subhalo_track.c mass_before)
+    mkey = lambda r: (float(SB["Mbound"][r]), float(SB["Vmax"][r]), int(SB["MostBoundID"][r]), int(tid_sb[r]))  # noqa: E731
+    for r in np.nonzero(hosted)[0].tolist():
+        g = int(SB["HostGroup"][r])
+        if g not in top or mkey(r) > mkey(top[g]):
+            top[g] = r
+    top = {g: int(tid_sb[r]) for g, r in top.items()}
+    # orphan-only groups: HBT resurrects the orphan nearest in kinetic distance to the group's frame
+    multi = [g for g, v in ocand.items() if g not in cand and len(v) > 1]
+    a_b, H_b = _hubble_from_header(B.header)
+    box_b = float(attr(B.header, "BoxSize", 0.0))
+    frame, (fid, fx, fv), (ex, ev, em) = _kinetic_frame(B, multi) if multi and H_b is not None else ({}, (None,) * 3, (0,) * 3)
+    if multi and H_b is None:
+        ck.warn("%s has no Header/RSDFactor: the orphan choice in %d groups is not checked" % (args.next, len(multi)))
+    mbid = dict(zip(OA["TrackId"].tolist(), OA["MostBoundID"].tolist()))
+    ncen_bad = npromo = 0
     for g in gid_b.tolist():
         cen = rank0.get(g, [])
         if not ck.check(len(cen) <= 1, "group %d has %d Rank 0 members %s" % (g, len(cen), cen[:5])):
             continue
         c = cen[0] if cen else None
+        # UpdateTracks ranks the survivors by CompareMass and makes the first the central, unconditionally
+        if g in top:
+            if c is None:
+                ck.fail("group %d has resolved survivors but no Rank 0 member (the most massive is %d)" % (g, top[g]))
+                continue
+            if not ck.check(c == top[g], "group %d: central %d is not the most massive survivor %d (CompareMass)"
+                            % (g, c, top[g])):
+                continue
         if g in cand:
             mmax = max(mb_prev[T] for T in cand[g])
             elig = sorted(T for T in cand[g] if mb_prev[T] >= ratio * mmax * (1 - 1e-6))
             if c is None:
                 died = [T for T in elig if B.orphan_row(T) >= 0]
                 if died:
-                    ck.warn("group %d has no Rank 0 member; eligible candidates %s died or sank" % (g, died[:5]))
+                    ck.warn("group %d has no resolved survivor; eligible candidates %s died or sank" % (g, died[:5]))
                 else:
                     ck.fail("group %d has resolved candidates %s but no Rank 0 member" % (g, cand[g][:5]))
-            elif c not in elig:
+            elif c not in cand[g]:
                 ncen_bad += 1
                 if ncen_bad <= 20:
-                    ck.fail("group %d: central %d is not an eligible candidate %s (Mbound_prev >= %g x %g)"
-                            % (g, c, elig[:8], ratio, mmax))
+                    ck.fail("group %d: central %d is not a previous resolved member voting for it %s" % (g, c, cand[g][:8]))
+            elif c not in elig:
+                # a diagnostic: the DecideCentrals candidate died or lost the CompareMass ranking
+                npromo += 1
         elif g in ocand:
-            exp = min(ocand[g], key=lambda x: (-x[1], x[0]))[0]
+            ids = sorted(ocand[g])
             if c is None:
-                ck.warn("group %d: orphan %d should have been resurrected; no Rank 0 member (died again?)" % (g, exp))
+                ck.warn("group %d has no resolved survivor; one of its orphans %s should have been resurrected "
+                        "(died again?)" % (g, ids[:8]))
+            elif c not in ids:
+                ck.fail("group %d: central %d is not one of its orphans %s" % (g, c, ids[:8]))
+            elif g not in frame:
+                if len(ids) > 1 and H_b is not None:
+                    ck.fail("group %d: no section-0 particles for its orphans %s" % (g, ids[:8]))
+            elif np.any(frame[g][2] >= box_b / 2):
+                # a group wider than half the box: its periodic centre depends on the finder's reference particle
+                ck.warn("group %d spans %s of box %g: the orphan choice (central %d) is inconclusive"
+                        % (g, np.round(frame[g][2], 4).tolist(), box_b, c))
             else:
-                ck.check(c == exp, "group %d: central %d, expected the resurrected orphan %d (largest MboundPeak of %s)"
-                         % (g, c, exp, [x[0] for x in ocand[g]][:8]))
+                cx, cv, ext, vmax = frame[g]
+                dist, err = {}, {}
+                # bound on the distance error from rounding the saved positions, velocities and masses
+                dxe = 2 * ex * box_b + em * float(np.max(ext)) + 8 * np.finfo(np.float64).eps * box_b
+                for T in ids:
+                    k = lookup(fid, [mbid[T]])[0]
+                    if k < 0:
+                        dist[T], err[T] = np.inf, 0.0
+                        continue
+                    dist[T] = _kinetic_distance(fx[k], fv[k], cx, cv, box_b, a_b, H_b)
+                    err[T] = np.sqrt(3) * (ev * (np.abs(fv[k]).max() + vmax) + 2 * em * vmax + H_b * a_b * dxe)
+                exp = min(ids, key=lambda T: (dist[T], T))
+                dc, de = dist[c], dist[exp]
+                tol = 1e-5 * max(dc, de) + err[c] + err[exp]
+                if c == exp:
+                    ck.check(True, "")
+                elif dc != de and dc - de <= tol:
+                    ck.warn("group %d: central %d, the nearest orphan in kinetic distance is %d (%.9g vs %.9g, within "
+                            "the roundoff bound %.3g)" % (g, c, exp, dc, de, tol))
+                else:
+                    ck.fail("group %d: central %d, expected the resurrected orphan %d (nearest in kinetic distance, "
+                            "the smaller TrackId on a tie; bound %.3g) of %s: %s" % (g, c, exp, tol, ids[:8],
+                                                                                    ["%.9g" % dist[T] for T in ids[:8]]))
         elif c is not None:
             ck.check(c >= ntr_a, "group %d has no previous member but its central %d is not newborn" % (g, c))
     if ncen_bad > 20:
-        ck.fail("... %d groups with an ineligible central" % ncen_bad)
+        ck.fail("... %d groups whose central is not a previous member" % ncen_bad)
+    if npromo:
+        ck.note("%d groups have a promoted central (the most massive survivor, not a DecideCentrals-eligible "
+                "candidate)" % npromo)
 
     # 5. newborns: only FOF centrals, in host GroupID order from NumTracksTotal(prev)
     nbr = np.nonzero(tid_sb >= ntr_a)[0]
