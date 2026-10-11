@@ -317,6 +317,9 @@ void subhalo_record_slices(const struct part_manager_type * pman, const int * se
 /* Header attributes of design 9 / Appendix B, with SubhaloStateComplete = 0. Called inside
  * fof_write_header while the Header block is open. Collective (reductions for the totals). */
 void subhalo_write_header_attrs(BigBlock * bh, const struct part_manager_type * pman, double atime, MPI_Comm Comm);
+/* The header's SubhaloParameters string ("Name = value" lines, all parameters, doubles %.17g).
+ * Provenance only: a restart uses the supplied parameter file. */
+void subhalo_format_params(char * buf, size_t size);
 
 /* Write PIG_xxx/Subhalo/<column> (Nbound > 0) and PIG_xxx/Orphan/<column> (Nbound == 0) from the home-rank
  * records, each in TrackId order (globally sorted by the static partition). Collective. */

@@ -633,13 +633,15 @@ subhalo_write_tables(BigFile * bf, MPI_Comm Comm)
 
 /* ------------------------------------------------------------------ header and marker */
 
-static void
+/* Provenance only: restart continuation uses the supplied parameter file, never this string.
+ * Every parameter, doubles with round-trip precision (%.17g). */
+void
 subhalo_format_params(char * buf, size_t size)
 {
     const struct SubhaloParams * sp = subhalo_get_params();
     snprintf(buf, size,
         "SubhaloFinderOn = %d\n"
-        "SubhaloMaxGatherFraction = %g\n"
+        "SubhaloMaxGatherFraction = %.17g\n"
         "SubhaloCollectiveMinPart = %ld\n"
         "SubhaloMaxUnbindIterations = %d\n"
         "SubhaloRestartFresh = %d\n"
@@ -649,23 +651,24 @@ subhalo_format_params(char * buf, size_t size)
         "SubhaloMinNumTracerPart = %d\n"
         "SubhaloNumTracerHostFinding = %d\n"
         "SubhaloLookupBatchBytes = %ld\n"
-        "SubhaloMajorProgenitorMassRatio = %g\n"
-        "SubhaloBoundMassPrecision = %g\n"
-        "SubhaloSourceRelaxFactor = %g\n"
+        "SubhaloMajorProgenitorMassRatio = %.17g\n"
+        "SubhaloBoundMassPrecision = %.17g\n"
+        "SubhaloSourceRelaxFactor = %.17g\n"
         "SubhaloPotentialSampleSize = %d\n"
         "SubhaloFinalPass = %d\n"
-        "SubhaloTreeOpenAngle = %g\n"
+        "SubhaloTreeOpenAngle = %.17g\n"
         "SubhaloMergeTrapped = %d\n"
         "SubhaloSinkSymmetric = %d\n"
         "SubhaloCoreSize = %d\n"
         "SubhaloReassignGas = %d\n"
+        "SubhaloNumNeighboursForReassignment = %d\n"
         "SubhaloUnbindWithThermal = %d\n"
         "SubhaloFieldSO = %d\n"
         "SubhaloSOBins = %d\n"
-        "SubhaloSOSearchFactor = %g\n"
+        "SubhaloSOSearchFactor = %.17g\n"
         "SubhaloSOMaxDoublings = %d\n"
         "SubhaloSORefineMinPart = %d\n"
-        "SubhaloMajorMergerRatio = %g\n"
+        "SubhaloMajorMergerRatio = %.17g\n"
         "SubhaloGeometricParents = %d\n"
         "SubhaloDebugForceExchangeFailure = %d\n",
         sp->SubhaloFinderOn, sp->SubhaloMaxGatherFraction, sp->SubhaloCollectiveMinPart,
@@ -675,7 +678,7 @@ subhalo_format_params(char * buf, size_t size)
         sp->SubhaloMajorProgenitorMassRatio, sp->SubhaloBoundMassPrecision,
         sp->SubhaloSourceRelaxFactor, sp->SubhaloPotentialSampleSize, sp->SubhaloFinalPass, sp->SubhaloTreeOpenAngle,
         sp->SubhaloMergeTrapped, sp->SubhaloSinkSymmetric, sp->SubhaloCoreSize,
-        sp->SubhaloReassignGas, sp->SubhaloUnbindWithThermal, sp->SubhaloFieldSO,
+        sp->SubhaloReassignGas, sp->SubhaloNumNeighboursForReassignment, sp->SubhaloUnbindWithThermal, sp->SubhaloFieldSO,
         sp->SubhaloSOBins, sp->SubhaloSOSearchFactor, sp->SubhaloSOMaxDoublings,
         sp->SubhaloSORefineMinPart, sp->SubhaloMajorMergerRatio, sp->SubhaloGeometricParents,
         sp->SubhaloDebugForceExchangeFailure);

@@ -464,6 +464,12 @@ check_header_cost(const char * dir, int snap, const char * what)
         if(0 != big_block_get_attr(&bh, "SubhaloWallTime", &w, "f8", 1) || 0 != big_block_get_attr(&bh, "SubhaloPeakBytes", &pb, "u8", 1)
            || 0 != big_block_get_attr(&bh, "SubhaloPeakIncrementBytes", &pi, "u8", 1))
             ok = 0;
+        /* R3: the written SubhaloParameters is the formatter's string for the run's parameters */
+        char want[4096];
+        subhalo_format_params(want, sizeof(want));
+        BigAttr * a = big_block_lookup_attr(&bh, "SubhaloParameters");
+        if(!a || a->nmemb != (int) strlen(want) || 0 != memcmp(a->data, want, a->nmemb))
+            ok = 0;
         big_block_close(&bh);
         big_file_close(&bf);
         myfree(f);
@@ -588,6 +594,75 @@ check_fetch(struct SubTrackTable * tab, int64_t NTotal, const int32_t * nbound_o
                 i, out[i].TrackId, ids[i], out[i].Nbound, nbound_of[ids[i]]);
     free(out);
     free(ids);
+}
+
+/* R3: every parameter appears once in SubhaloParameters and parses back bit for bit, including
+ * a non-default neighbour count and doubles that %g would round. */
+static void
+test_subhalo_header_params(void ** state)
+{
+    const struct SubhaloParams saved = *subhalo_get_params();
+    struct SubhaloParams p = default_subhalo_params();
+    p.SubhaloNumNeighboursForReassignment = 7;
+    p.SubhaloBoundMassPrecision = 0.9950001;
+    p.SubhaloMaxGatherFraction = 0.1 + 0.2;
+    p.SubhaloMajorProgenitorMassRatio = 0.80000000000000004 - 1e-16;
+    p.SubhaloSourceRelaxFactor = 2.718281828459045;
+    p.SubhaloTreeOpenAngle = 0.45000000000000001 + 1e-12;
+    p.SubhaloSOSearchFactor = 1.0 / 3.0 + 1;
+    p.SubhaloMajorMergerRatio = 0.30000001;
+    p.SubhaloCollectiveMinPart = 123456789012L;
+    p.SubhaloLookupBatchBytes = 3L * 1024 * 1024 + 1;
+    subhalo_set_testpar(p);
+    char buf[4096];
+    subhalo_format_params(buf, sizeof(buf));
+    CHECK(strlen(buf) < sizeof(buf) - 1, "SubhaloParameters fills its buffer (%zu bytes)\n", strlen(buf));
+    char g[32];
+    snprintf(g, sizeof(g), "%g", p.SubhaloBoundMassPrecision);
+    CHECK(strtod(g, NULL) != p.SubhaloBoundMassPrecision, "%%g keeps 0.9950001 (%s): the fixture tests nothing\n", g);
+#define D(f) {#f, 1, 0, &p.f}
+#define I(f) {#f, 0, 0, &p.f}
+#define L(f) {#f, 2, 0, &p.f}
+    struct { const char * name; int kind; int seen; void * val; } f[] = {
+        I(SubhaloFinderOn), D(SubhaloMaxGatherFraction), L(SubhaloCollectiveMinPart), I(SubhaloMaxUnbindIterations),
+        I(SubhaloRestartFresh), I(SubhaloTracerTypes), I(SubhaloPotentialTypes), I(SubhaloMinNumPart),
+        I(SubhaloMinNumTracerPart), I(SubhaloNumTracerHostFinding), L(SubhaloLookupBatchBytes),
+        D(SubhaloMajorProgenitorMassRatio), D(SubhaloBoundMassPrecision), D(SubhaloSourceRelaxFactor),
+        I(SubhaloPotentialSampleSize), I(SubhaloFinalPass), D(SubhaloTreeOpenAngle), I(SubhaloMergeTrapped),
+        I(SubhaloSinkSymmetric), I(SubhaloCoreSize), I(SubhaloReassignGas), I(SubhaloNumNeighboursForReassignment),
+        I(SubhaloUnbindWithThermal), I(SubhaloFieldSO), I(SubhaloSOBins), D(SubhaloSOSearchFactor),
+        I(SubhaloSOMaxDoublings), I(SubhaloSORefineMinPart), D(SubhaloMajorMergerRatio), I(SubhaloGeometricParents),
+        I(SubhaloDebugForceExchangeFailure),
+    };
+#undef D
+#undef I
+#undef L
+    const int nf = sizeof(f) / sizeof(f[0]);
+    int nlines = 0, bad = 0, k;
+    char * save = NULL, * line;
+    for(line = strtok_r(buf, "\n", &save); line; line = strtok_r(NULL, "\n", &save), nlines++) {
+        char name[128], val[64];
+        if(2 != sscanf(line, "%127s = %63s", name, val)) {
+            LOCAL_CHECK(bad, 0, "unparsable line '%s'\n", line);
+            continue;
+        }
+        for(k = 0; k < nf; k++)
+            if(0 == strcmp(name, f[k].name))
+                break;
+        LOCAL_CHECK(bad, k < nf, "unknown parameter '%s'\n", name);
+        if(k == nf)
+            continue;
+        f[k].seen++;
+        int same = f[k].kind == 1 ? strtod(val, NULL) == *(double *) f[k].val
+                 : f[k].kind == 2 ? strtoll(val, NULL, 10) == *(int64_t *) f[k].val
+                 : strtol(val, NULL, 10) == *(int *) f[k].val;
+        LOCAL_CHECK(bad, same, "%s = %s does not round-trip\n", name, val);
+    }
+    for(k = 0; k < nf; k++)
+        LOCAL_CHECK(bad, f[k].seen == 1, "%s appears %d times\n", f[k].name, f[k].seen);
+    LOCAL_CHECK(bad, nlines == nf, "%d lines for %d parameters\n", nlines, nf);
+    assert_all_true(bad == 0);
+    subhalo_set_testpar(saved);
 }
 
 static void
@@ -3666,6 +3741,174 @@ test_subhalo_twohalo(void ** state)
     p2_teardown();
 }
 
+/* R1: one call of the default-pass sequence on the two-halo fixture; the PIG saved when dir is set. */
+static int
+sd_call(int snap, Cosmology * CP, const char * dir)
+{
+    const double atime = 0.5 + 0.05 * snap;
+    const double cen[2][3] = {{P2_cA[0], P2_cA[1], P2_cA[2]}, {P2_cB[0], P2_cB[1], P2_cB[2]}};
+    const double bulk[2][3] = {{0, 0, 0}, {30. * snap, 0, 0}};
+    p2_place(atime, CP->GravInternal, cen, bulk);
+    DomainDecomp ddecomp = {0};
+    domain_decompose_full(&ddecomp, MPI_COMM_WORLD);
+    FOFGroups fof = fof_fof(&ddecomp, 1, MPI_COMM_WORLD);
+    const int ret = subhalo_find(&fof, &ddecomp, snap, atime, CP, 0, MPI_COMM_WORLD);
+    if(dir) {
+        double MassTable[6] = {0};
+        if(fof_save_groups(&fof, dir, "PIG", snap, CP, atime, MassTable, 0, MPI_COMM_WORLD)) {
+            slots_gc_sorted(PartManager, SlotsManager);
+            if(domain_maintain(&ddecomp, NULL))
+                endrun(1, "test: domain exchange after the PIG write failed\n");
+            slots_gc_sorted(PartManager, SlotsManager);
+        }
+    }
+    fof_finish(&fof);
+    domain_free(&ddecomp);
+    return ret;
+}
+
+/* R1: non-default core size and reserved tracer count for sd_sequence (0 = defaults) */
+static int SdCoreSize = 0, SdMinTracers = 0;
+
+struct sd_state {
+    struct tagrec * r[2];
+    struct SubTrack * rec[2];
+    int64_t n[2], nt[2];
+};
+
+/* Calls 0, 1 (PIGs saved), then call 2 in memory or after reloading PIG_001; the tags and records
+ * after calls 1 and 2. T threads; finalpass the SubhaloFinalPass option. */
+static void
+sd_sequence(int T, int reload, int finalpass, struct sd_state * out)
+{
+    Cosmology CP;
+    const int saved = omp_get_max_threads();
+    omp_set_num_threads(T);
+    p2_setup(&CP);
+    struct SubhaloParams sp = default_subhalo_params();
+    sp.SubhaloFieldSO = 1;
+    sp.SubhaloFinalPass = finalpass;
+    if(SdCoreSize > 0)
+        sp.SubhaloCoreSize = SdCoreSize;
+    if(SdMinTracers > 0)
+        sp.SubhaloMinNumTracerPart = SdMinTracers;
+    subhalo_set_testpar(sp);
+    const char * base = getenv("SUBHALO_TEST_DIR") ? getenv("SUBHALO_TEST_DIR") : "test_subhalo_lc";
+    char * dir = fastpm_strdup_printf("%s/sd_T%d_r%d_f%d", base, T, reload, finalpass);
+    rm_tree(dir);
+    if(get_thistask() == 0 && mkdir(base, 0755) != 0 && errno != EEXIST)
+        endrun(1, "test: cannot create %s\n", base);
+    if(get_thistask() == 0 && mkdir(dir, 0755) != 0 && errno != EEXIST)
+        endrun(1, "test: cannot create %s\n", dir);
+    MPI_Barrier(MPI_COMM_WORLD);
+    int snap;
+    for(snap = 0; snap < 3; snap++) {
+        if(snap == 2 && reload) {
+            subhalo_init(1, 1, dir, MPI_COMM_WORLD);
+            CHECK(subhalo_state_snapshot() == 1, "sampled default: reload gave state %d\n", subhalo_state_snapshot());
+        }
+        const int ret = sd_call(snap, &CP, snap < 2 ? dir : NULL);
+        const struct SubhaloCallStats * st = subhalo_last_call_stats();
+        CHECK(ret == 1 && st->Complete && st->NSerialKeys == 2 && st->NCands == 0,
+              "sampled default, %d threads, call %d: ret %d, %ld keys, %ld collective candidates\n", T, snap, ret, st->NSerialKeys, st->NCands);
+        /* at 2 threads clump A (2000 particles, above SubhaloPotentialSampleSize) runs alone, threaded */
+        CHECK(T == 1 || st->NAloneKeys >= 1, "sampled default, %d threads, call %d: %ld keys alone\n", T, snap, st->NAloneKeys);
+        if(snap == 0)
+            continue;
+        const int k = snap - 1;
+        out->r[k] = gather_tags(&out->n[k]);
+        out->nt[k] = subhalo_get_table()->NTotal;
+        out->rec[k] = fetch_all_tracks(out->nt[k]);
+    }
+    rm_tree(dir);
+    myfree(dir);
+    p2_teardown();
+    omp_set_num_threads(saved);
+}
+
+/* Tags and persistent record columns of two sequences equal; returns the differences. */
+static int
+sd_compare(const struct sd_state * a, const struct sd_state * b, const char * what)
+{
+    int bad = 0, k;
+    int64_t i;
+    for(k = 0; k < 2; k++) {
+        LOCAL_CHECK(bad, a->n[k] == b->n[k] && a->nt[k] == b->nt[k], "%s, call %d: %ld/%ld particles, %ld/%ld tracks\n", what, k + 1,
+                    a->n[k], b->n[k], a->nt[k], b->nt[k]);
+        if(a->n[k] != b->n[k] || a->nt[k] != b->nt[k])
+            continue;
+        for(i = 0; i < a->n[k]; i++) {
+            const struct tagrec * x = &a->r[k][i], * y = &b->r[k][i];
+            LOCAL_CHECK(bad, x->ID == y->ID && x->GrNr == y->GrNr && x->TrackId == y->TrackId && x->BoundTrackId == y->BoundTrackId
+                        && x->BindRank == y->BindRank && x->Type == y->Type,
+                        "%s, call %d: particle %lu: (%ld %ld %ld %d) vs (%ld %ld %ld %d)\n", what, k + 1, (unsigned long) x->ID, x->GrNr,
+                        x->TrackId, x->BoundTrackId, x->BindRank, y->GrNr, y->TrackId, y->BoundTrackId, y->BindRank);
+        }
+        /* every persisted column: the record up to the per-call scratch (check_restart_roundtrip) */
+        for(i = 0; i < a->nt[k]; i++)
+            LOCAL_CHECK(bad, 0 == memcmp(&a->rec[k][i], &b->rec[k][i], offsetof(struct SubTrack, Host)),
+                        "%s, call %d: record %ld differs (Nbound %d/%d Vmax %g/%g Epot %g/%g RsSO %g/%g)\n", what, k + 1, i,
+                        a->rec[k][i].Nbound, b->rec[k][i].Nbound, a->rec[k][i].Vmax, b->rec[k][i].Vmax, a->rec[k][i].Epot,
+                        b->rec[k][i].Epot, a->rec[k][i].RsSO, b->rec[k][i].RsSO);
+    }
+    return bad;
+}
+
+static void
+sd_free(struct sd_state * s)
+{
+    int k;
+    for(k = 0; k < 2; k++) {
+        free(s->r[k]);
+        free(s->rec[k]);
+    }
+}
+
+/* R1: the real driver with the production default (SubhaloFinalPass = 0, sampled final pass) on
+ * the two-halo fixture (clump A above SubhaloPotentialSampleSize): tags and every persisted record
+ * column after calls 1 and 2 are the same at 1 and 2 threads (A runs alone, threaded), and with
+ * call 2 continued in memory or after reloading PIG_001. The exact pass (SubhaloFinalPass = 1)
+ * gives a different binding order, so the default path is the one exercised. */
+static void
+test_subhalo_sampled_default(void ** state)
+{
+    struct sd_state ref, x;
+    int bad = 0;
+    sd_sequence(1, 0, 0, &ref);
+    const int Ts[3] = {2, 1, 2}, Rl[3] = {0, 1, 1};
+    int c;
+    for(c = 0; c < 3; c++) {
+        char what[96];
+        snprintf(what, sizeof(what), "sampled default, %d threads%s vs 1 thread", Ts[c], Rl[c] ? " with a reload" : "");
+        sd_sequence(Ts[c], Rl[c], 0, &x);
+        const int b = sd_compare(&ref, &x, what);
+        message(0, "%s: %d differences\n", what, b);
+        bad += b;
+        sd_free(&x);
+    }
+    assert_all_true(bad == 0);
+    /* the default differs from the exact pass in clump A's order (the sampled pass ran) */
+    sd_sequence(1, 0, 1, &x);
+    int64_t i, ndiff = 0;
+    for(i = 0; i < ref.n[0] && i < x.n[0]; i++)
+        ndiff += ref.r[0][i].ID == x.r[0][i].ID && ref.r[0][i].BindRank != x.r[0][i].BindRank;
+    message(0, "sampled default vs exact pass, call 1: %ld of %ld BindRank differ\n", ndiff, ref.n[0]);
+    CHECK(ndiff > 0, "sampled default: the binding order equals the exact pass's (%ld differences)\n", ndiff);
+    sd_free(&x);
+    sd_free(&ref);
+    /* a non-default core (37) and reserved tracer count (45): a 225-tracer exact head, 1 vs 2 threads */
+    SdCoreSize = 37;
+    SdMinTracers = 45;
+    sd_sequence(1, 0, 0, &ref);
+    sd_sequence(2, 1, 0, &x);
+    bad = sd_compare(&ref, &x, "sampled default, core 37, 2 threads with a reload vs 1 thread");
+    message(0, "sampled default, core 37 / 45 reserved tracers, 2 threads with a reload vs 1 thread: %d differences\n", bad);
+    SdCoreSize = SdMinTracers = 0;
+    assert_all_true(bad == 0);
+    sd_free(&x);
+    sd_free(&ref);
+}
+
 /* Phase 5c: the reserve admission. The two haloes with A (2000 particles) in place: a first call
  * completes and gives the plan's reserve on every rank; the second call runs with the free memory
  * squeezed to 2 MB below that reserve, where the collective stage alone still fits: the call
@@ -5031,6 +5274,8 @@ int main(void) {
         cmocka_unit_test(test_subhalo_serial_keys),
         cmocka_unit_test(test_subhalo_reserve_admission),
         cmocka_unit_test(test_subhalo_local_sort),
+        cmocka_unit_test(test_subhalo_header_params),
+        cmocka_unit_test(test_subhalo_sampled_default),
     };
     /* SUBHALO_TEST_ONLY=<substring> runs only the tests whose name contains it */
     const char * only = getenv("SUBHALO_TEST_ONLY");

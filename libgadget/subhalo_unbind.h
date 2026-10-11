@@ -74,9 +74,9 @@ struct SubhaloUnbindParams {
     int MaxIter;
     double OpenAngle, BoundMassPrecision;
     int WithThermal;
-    /* 1 - SubhaloFinalPass: 0 (zero-initialised) = the exact final pass, 1 = the sampled one
-     * (see subhalo_final_pass). Inverted so that a parameter struct built with memset gets the
-     * default. */
+    /* 1 - SubhaloFinalPass: 0 = the exact final pass, 1 = the sampled one (subhalo_final_pass).
+     * Zero initialisation gives the exact pass (historical behaviour); the production default
+     * SubhaloFinalPass = 0 (sampled) comes from gadget/params.c. */
     int SampledFinalPass;
     /* Tracers whose order the sampled pass takes from exact energies (the caller's
      * max(SubhaloCoreSize, SubhaloMinNumTracerPart): the core and the reserved tracers, which
@@ -139,9 +139,11 @@ int subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * u
  * particles. The head gets the exact pass's energies (the tree over the whole prefix in the
  * final frame, built exactly as the exact pass builds it, K walks: bitwise the exact pass's
  * values for those particles) and is sorted by them. So the most-bound tracer (MostBoundID),
- * the reserved tracers and the core (the first Kt tracers) are the exact pass's whenever the
- * true ones are among the loop order's first T tracers; the rest of the order (BindRank beyond
- * K) is the loop's. Energy[0, Nbound) is then recomputed in the final frame with
+ * the reserved tracers and the core (the first Kt tracers) equal the exact pass's only if the
+ * true ones lie inside the selected head, the shortest prefix of the order after HBT's refinement
+ * holding T = 5 x max(20, CoreSize, MinNumTracerPart) tracers (variable particle length); SampleSize
+ * = 0 and the in-place path never sample. The rest of the order (BindRank beyond K) is the loop's.
+ * Energy[0, Nbound) is then recomputed in the final frame with
  * the loop's estimator (the SampleSize-particle subsample of a seeded shuffle of the prefix,
  * masses upscaled per type), for the energy sums of the properties (Epot, SpinPeebles) and
  * NboundPositive only: it is not sorted and not used for the order. The caller must not have

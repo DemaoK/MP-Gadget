@@ -68,6 +68,7 @@
 #include <setjmp.h>
 #include <cmocka.h>
 #include <math.h>
+#include <float.h>
 #include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1111,6 +1112,7 @@ mixed_setup_particles(const struct mixed_geom * gm)
 
 struct mixed_result {
     double MSO[SUBHALO_NSO], MTVir[6], MT200c[6], Rsearch;
+    double RSOvir, P3[4];             /* f4 RSO[vir]; RsSO, RsKlypinSO, VmaxSO, RmaxSO (R2) */
 };
 
 /* One call with the central on rank `owner`; results gathered on every rank. */
@@ -1142,8 +1144,134 @@ mixed_run(DomainDecomp * dd, int owner, const Cosmology * CP, const struct Subha
             mine.MT200c[d] = rec.MTypeSO200c[d];
         }
         mine.Rsearch = Rs;
+        mine.RSOvir = rec.RSO[0];
+        mine.P3[0] = rec.RsSO;
+        mine.P3[1] = rec.RsKlypinSO;
+        mine.P3[2] = rec.VmaxSO;
+        mine.P3[3] = rec.RmaxSO;
     }
     MPI_Allreduce(&mine, res, sizeof(mine) / sizeof(double), MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+}
+
+/* R2: the pass-3 columns rebuilt from the gathered particles: a brute-force histogram of the
+ * published f4 sphere (fixed-point unit from the global count and largest mass), then
+ * so_profile_finish's recipe. Returns the failures; *nin the particles inside. */
+static int
+mixed_p3_reference(const struct gpart * g, int64_t ng, const struct mixed_result * r, const Cosmology * CP, double rhovir,
+                   double out[4], int64_t * nin, const char * what)
+{
+    const int NP = SUBHALO_SO_NPROF;
+    const double R = (float) r->RSOvir, Mso = (float) r->MSO[0];
+    const double Rin = SUBHALO_SO_PROF_RIN * R, pscale = NP / log(1. / SUBHALO_SO_PROF_RIN);
+    double mmaxall = 0, mmax = 0, mmin = DBL_MAX, margin = DBL_MAX;
+    int64_t i, nlive = 0, N = 0;
+    for(i = 0; i < ng; i++)
+        if(!g[i].excluded) {
+            nlive++;
+            mmaxall = fmax(mmaxall, g[i].m);
+        }
+    const double qscale = subhalo_so_prof_unit(nlive, mmaxall);
+    subhalo_so_q Q[SUBHALO_SO_NPROF] = {0};
+    long double msum = 0;
+    for(i = 0; i < ng; i++) {
+        if(g[i].excluded)
+            continue;
+        double r2 = 0;
+        int d;
+        for(d = 0; d < 3; d++) {
+            const double dx = nearest(g[i].x[d] - CenM[d]);
+            r2 += dx * dx;
+        }
+        const double rr = sqrt(r2);
+        margin = fmin(margin, fabs(rr - R) / R);
+        if(!(rr <= R))
+            continue;
+        int k = 0;
+        if(rr > Rin) {
+            const double x = log(rr / Rin) * pscale;
+            margin = fmin(margin, fabs(x - nearbyint(x)) / pscale);
+            k = (int) floor(x);
+            k = k < 0 ? 0 : (k >= NP ? NP - 1 : k);
+        }
+        else
+            margin = fmin(margin, fabs(rr - Rin) / Rin);
+        Q[k] += subhalo_so_prof_quantise(g[i].m, qscale);
+        msum += g[i].m;
+        N++;
+        mmax = fmax(mmax, g[i].m);
+        mmin = fmin(mmin, g[i].m);
+    }
+    *nin = N;
+    int bad = 0;
+    /* no particle within 1e-9 (relative, ln r) of a profile edge or of R: the walk's distances classify alike */
+    if(!(margin > 1e-9)) {
+        message(0, "%s: a particle lies %g from a profile edge: the fixture is ambiguous\n", what, margin);
+        bad++;
+    }
+    double e[SUBHALO_SO_NPROF + 1], C[SUBHALO_SO_NPROF + 1];
+    subhalo_so_q cq = 0;
+    int j, b;
+    e[0] = C[0] = 0;
+    for(j = 1; j <= NP; j++) {
+        cq += Q[j - 1];
+        C[j] = (double) cq / qscale;
+        e[j] = j < NP ? Rin * exp(j / pscale) : R;
+    }
+    if(!(fabsl((C[NP] - msum) / msum) < 1e-12) || !(mmax > 1.5 * mmin)) {
+        message(0, "%s: quantised mass %.17g vs %.17Lg, masses %g..%g (not mixed)\n", what, C[NP], msum, mmin, mmax);
+        bad++;
+    }
+    out[0] = out[1] = out[2] = out[3] = -1;
+    if(N < SUBHALO_NFW_MINPART)
+        return bad;
+    const double soft = FORCE_SOFTENING() / 2.8, K = 4. / 3. * M_PI * rhovir;
+    double best = 0, rbest = -1;
+    for(j = 1; j <= NP; j++) {
+        const double rr = fmax(e[j], soft);
+        if(C[j] > K * rr * rr * rr && C[j] / rr > best) {
+            best = C[j] / rr;
+            rbest = rr;
+        }
+    }
+    if(!(best > 0))
+        return bad;
+    out[2] = (float) (sqrt(CP->GravInternal * best / 1.0) * subhalo_vel_to_kms(1.0));
+    out[3] = (float) rbest;
+    const double rk = subhalo_klypin_rs(R, Mso, best, rbest);
+    out[1] = (float) (rk > 0 ? rk : -1);
+    double mpbin, edge[SUBHALO_NFW_MAXBINS + 1];
+    const int nb = subhalo_nfw_bin_plan(N, C[NP], mmax, &mpbin);
+    edge[0] = 0;
+    j = 1;
+    for(b = 1; b <= nb; b++) {
+        const double T = subhalo_nfw_threshold(b, mpbin);
+        while(j <= NP && C[j] < T)
+            j++;
+        if(j > NP)
+            break;
+        const double f = fmin(1, fmax(0, (b * mpbin - C[j - 1]) / (C[j] - C[j - 1])));
+        edge[b] = j == 1 ? e[1] * cbrt(f) : e[j - 1] * pow(e[j] / e[j - 1], f);
+    }
+    const double rs = subhalo_nfw_fit(rk, edge, b - 1, 3 * soft);
+    out[0] = (float) (rs > 0 ? rs : -1);
+    return bad;
+}
+
+/* R2: one run's pass-3 columns bitwise equal to the reference of its own f4 sphere. */
+static int
+mixed_p3_check(const struct mixed_result * r, const struct gpart * g, int64_t ng, const Cosmology * CP, double rhovir,
+               const char * what)
+{
+    static const char * nm[4] = {"RsSO", "RsKlypinSO", "VmaxSO", "RmaxSO"};
+    double ref[4];
+    int64_t nin;
+    int bad = mixed_p3_reference(g, ng, r, CP, rhovir, ref, &nin, what), k;
+    for(k = 0; k < 4; k++) {
+        message(0, "%s: %s %.9g reference %.9g (%ld particles in the f4 sphere %.9g)\n", what, nm[k], r->P3[k], ref[k], nin, r->RSOvir);
+        if(r->P3[k] != ref[k] || !(ref[k] > 0))
+            bad++;
+    }
+    return bad;
 }
 
 /* Checks of one partition against the references and the default-domain result (ref0 may be
@@ -1259,21 +1387,45 @@ test_subhalo_field_so_mixed(void ** state)
     struct mixed_result r0, r1, r2;
     struct SubhaloSOStats st;
     mixed_run(&ddecomp, 0, &CP, &par, rho, &r0, &st);
-    CHECK(st.Nrefined == 1 && st.Ndoubled == 0 && st.NTypes == 3 && st.Pass2,
-          "mixed: %ld refined %ld doubled %d types pass 2 %d\n", st.Nrefined, st.Ndoubled, st.NTypes, st.Pass2);
+    CHECK(st.Nrefined == 1 && st.Ndoubled == 0 && st.NTypes == 3 && st.Pass2 && st.Pass3 && st.Nprofile == 1,
+          "mixed: %ld refined %ld doubled %d types pass 2 %d pass 3 %d profiled %ld\n", st.Nrefined, st.Ndoubled, st.NTypes, st.Pass2,
+          st.Pass3, st.Nprofile);
     int bad = mixed_check(&r0, NULL, &gm, Mref, MTref, "mixed default");
     CHECK(bad == 0, "mixed default domain: %d failures\n", bad);
+    /* R2: pass 3 against the brute-force reference; the f4 sphere spans several ranks (imports) */
+    {
+        const double R = (float) r0.RSOvir;
+        int has = 0, nr = 0;
+        for(i = 0; i < PartManager->NumPart; i++) {
+            double r2 = 0;
+            for(d = 0; d < 3; d++) {
+                const double dx = nearest(wrap(P[i].Pos[d] - Offset[d]) - CenM[d]);
+                r2 += dx * dx;
+            }
+            has |= r2 <= R * R;
+        }
+        MPI_Allreduce(&has, &nr, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+        CHECK(NTask < 2 || nr >= 2, "mixed pass 3: the sphere is on %d ranks only\n", nr);
+    }
+    int64_t ng;
+    struct gpart * g = gather_particles(&ng);
+    bad = mixed_p3_check(&r0, g, ng, &CP, rho[0], "mixed pass 3 default");
+    CHECK(bad == 0, "mixed pass 3 default domain: %d failures\n", bad);
 
     /* the local particle order reversed: other tree, other summation order */
     reverse_particles();
     mixed_run(&ddecomp, NTask - 1, &CP, &par, rho, &r1, &st);
     bad = mixed_check(&r1, &r0, &gm, Mref, MTref, "mixed reversed");
     CHECK(bad == 0, "mixed reversed order: %d failures\n", bad);
+    bad = mixed_p3_check(&r1, g, ng, &CP, rho[0], "mixed pass 3 reversed");
+    CHECK(bad == 0, "mixed pass 3 reversed order: %d failures\n", bad);
     subhalo_so_set_max_batch(1);
     mixed_run(&ddecomp, 0, &CP, &par, rho, &r1, &st);
     subhalo_so_set_max_batch(0);
     bad = mixed_check(&r1, &r0, &gm, Mref, MTref, "mixed reversed batch 1");
     CHECK(bad == 0, "mixed reversed order, batches of one: %d failures\n", bad);
+    bad = mixed_p3_check(&r1, g, ng, &CP, rho[0], "mixed pass 3 batch 1");
+    CHECK(bad == 0, "mixed pass 3, batches of one: %d failures\n", bad);
 
     /* a rank emptied: its particles go to its neighbour */
     if(NTask >= 2) {
@@ -1281,7 +1433,10 @@ test_subhalo_field_so_mixed(void ** state)
         mixed_run(&ddecomp, NTask / 2, &CP, &par, rho, &r2, &st);
         bad = mixed_check(&r2, &r0, &gm, Mref, MTref, "mixed emptied rank");
         CHECK(bad == 0, "mixed emptied rank: %d failures\n", bad);
+        bad = mixed_p3_check(&r2, g, ng, &CP, rho[0], "mixed pass 3 emptied rank");
+        CHECK(bad == 0, "mixed pass 3 emptied rank: %d failures\n", bad);
     }
+    free(g);
     for(d = 0; d < SUBHALO_NSO; d++)
         message(0, "mixed: %s MSO %.9g\n", DefName[d], r0.MSO[d]);
 
