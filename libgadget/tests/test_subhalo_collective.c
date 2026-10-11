@@ -1,48 +1,24 @@
-/* Unit tests of the oversized candidates unbound in place (Phase 2b plan section 5, tests 1-4,
- * halofinder_phase2b_plan.md). Run as: mpirun -np 4 .objs/test_subhalo_collective
- *
- *  1. test_collective_serial_vs_inplace  a Hernquist clump with an embedded satellite (the overlap
- *     scenario of test_subhalo.c), processed (a) serially and (b) with SubhaloCollectiveMinPart =
- *     1 (both the central and the satellite's sub-tree in place, two rounds), subsampling off:
- *     Nbound within 0.1 %, the ten most-bound tracers identical, BoundTrackId of every particle
- *     agreeing to 0.2 %, the properties within the tree tolerance.
- *  2. test_collective_subtree_keys       a central with two satellites, one carrying its own
- *     satellite, forced in place for the central only: the sub-trees are serial keys, the
- *     satellite's stripped particles (its provisional remainder) are bound by the in-place
- *     central under the satellite's tail tag, the D10 invariants, agreement with the serial run.
- *  3. test_collective_merger             two groups above the forced threshold merge: the loser's
- *     sub-tree in place at depth 1 (round 0), then the central (round 1); the loser is a
- *     satellite with its mass within tolerance of the serial run.
- *  4. test_collective_kill_passup        an in-place satellite that dies passes its particles to
- *     its parent candidate in the next round, which binds them.
- * The Phase 2b audit fixes (halofinder_phase2b_audit_codex.md, Q1-Q5):
- *  5. test_collective_binder             Q3: tails returned to their surviving serial binder are
- *     merged by the binder's energy order (rank by rank against the serial run, IDs opposed).
- *  6. test_collective_serial_repairs     Q2: three groups of returned tails and reserved tracers;
- *     every serial rank against a reference computed here from the pre-pass tags.
- *  7. test_collective_relaxed_boundary   exact tags of a sub-tree remainder on both sides of the
- *     relaxed-source boundary.
- *  8. test_collective_dead_field         a dead in-place candidate with field particles on other
- *     ranks; its previous tracers vote remotely.
- *  9. test_collective_sunk_root_field    a serial root with field particles sinks into the in-place
- *     central while its descendant (with field particles and claims) survives.
- * 10. test_collective_failure_after_split  the exchange failure after a real split (encoded group
- *     and field particles): GrNr, tags and records restored, incomplete call.
- * 11. test_collective_voided_claim       the accepted voided-claim rule over three rounds, the
- *     central promotion and the in-place J2 branch.
- * 12. test_collective_long_chain         four in-place rounds, two groups of unequal depth.
- * 13. test_collective_admission          Q1: every key promoted under a memory squeeze and the
- *     collective stage refused before the exchange; the next call completes.
- * 14. test_collective_guards             Q4: int32 and MPI byte-count guards, the estimate.
- * 15. test_collective_walk_theta         the potential-only walk at 0.45 and 0.15 against a direct
- *     sum across the periodic boundary.
- * The Phase 5 audit fixes (halofinder_phase5_audit_codex.md):
- * 16. test_collective_props_identity     R4: the serial and the distributed deferred recipes on
- *     identical bound sets, cores and radial orders, three rank layouts; bitwise for equal masses.
- * 17. test_collective_admission_props    R1: 2304 candidates in one round; the properties stage is
- *     the largest, a squeeze between the old and the new need fails the admission there.
- * 18. test_collective_central_source     decision 52: the central's FOF-less particles leave its source
- *     and are untagged (serial, in place, sub-tree key), the satellite's are kept.
+/* Tests of the oversized candidates unbound in place (subhalo_collective.c, design 7.8), MPI.
+ * Run as: mpirun -np 4 .objs/test_subhalo_collective (green at 1 to 4 threads).
+ * Tests (the test_collective_ prefix omitted):
+ *  1. serial_vs_inplace   a clump with an embedded satellite, serial against fully in place.
+ *  2. subtree_keys        the central in place, its satellites' sub-trees as serial keys; D10.
+ *  3. merger              two oversized groups: the loser's sub-tree in round 0, then the central.
+ *  4. kill_passup         a dying in-place satellite passes its particles to its parent.
+ *  5. binder              tails returned to a surviving serial binder, in its energy order.
+ *  6. serial_repairs      returned tails and reserved tracers against a reference from the old tags.
+ *  7. relaxed_boundary    sub-tree remainder tags on both sides of the relaxed-source boundary.
+ *  8. dead_field          a dead in-place candidate with field particles on other ranks.
+ *  9. sunk_root_field     a serial root sinks into the in-place central, its descendant survives.
+ * 10. failure_after_split exchange failure after a real split: tags and records restored.
+ * 11. voided_claim        the voided-claim rule over three rounds and the central promotion.
+ * 12. long_chain          four in-place rounds, two groups of unequal depth.
+ * 13. admission           a memory squeeze refuses the collective stage before the exchange.
+ * 14. admission_props     the deferred-properties stage as the largest admission need.
+ * 15. guards              int32 and MPI byte-count guards.
+ * 16. walk_theta          the potential-only walk at two opening angles against a direct sum.
+ * 17. props_identity      serial and distributed deferred properties agree on four layouts.
+ * 18. central_source      decision 52: a central's FOF-less particles untagged, a satellite's kept.
  * SUBHALO_TEST_ONLY=<substring> runs only the matching tests. */
 
 #define _GNU_SOURCE

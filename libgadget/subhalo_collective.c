@@ -1,40 +1,16 @@
-/* Oversized candidates unbound in place with the global tree (design 7.8, Phase 2b plan
- * halofinder_phase2b_plan.md step 9). See subhalo_collective.h for the algorithm and the walk
- * contract.
+/* Oversized candidates unbound in place with the global tree (design 7.8); the outline and the
+ * walk contract are in subhalo_collective.h.
  *
- * Memory (per rank; subhalo_coll_estimate is the admission the plan checks before the exchange,
- * audit Q1). Per-call scratch on the top of the main stack for every local particle: the source
- * candidate (int32), the in-place claim (int32), flags (uint8), the energy of the last
- * evaluation and the energy in the claimant's list (two doubles): 25 bytes; per candidate a
- * CandState and the per-round vectors (SUBHALO_INPLACE_CAND_BYTES); per owned candidate its
- * previous record. The stages, each freed before the next: the tree and walk (the query and tree
- * lists, force_tree_active_moments' TreeAllocFactor x NumPart nodes before the shrink, the
- * treewalk's export buffers); the cores (bounded heaps of K tracers and K non-tracers per
- * candidate, the owner's receive buffer); the radial ordered set (88-byte records and mpsort's
- * record-sized copy); the properties (the records with their positions and cumulative masses, per
- * candidate of the round SUBHALO_INPLACE_CAND_PROPS_BYTES of profile vectors and deferred-recipe
- * reductions, Phase 5 audit R1); the relaxed-source positions (40 + 40 bytes); the final tags (40 + 40
- * bytes per in-place own-tag particle, the change list); the serial repair (the changes, the
- * rank queries and replies, routed to the tracks' result ranks: nothing per particle is
- * replicated). The serial arenas have been freed before the first round (subhalo_run_serial_keys).
+ * Memory per rank (admitted by the plan through subhalo_coll_estimate): for the whole call 25 bytes
+ * of scratch per local particle (source candidate, claim, flags, two energies) and the per-candidate
+ * vectors; then the stages, each freed before the next: tree and walk, cores, radial set,
+ * properties, relaxed sources, final tags, serial repair.
  *
- * Deviations from the plan (halofinder_phase2b_plan.md), each a simplification at the edges:
- *  - the scratch is 25 bytes per particle, not 13: the walk label is derived from the source
- *    candidate (label = candidate - RoundStart[round]), and the claim and its list energy are
- *    kept for the final tag pass;
- *  - a claim of a candidate (or serial member) that sinks later is void; the particle becomes
- *    claimable by the sink and the candidates after it, not by intermediate candidates already
- *    processed;
- *  - the most-bound tracer of an in-place survivor that sinks in a later round is that of its
- *    final pass (the serial key takes the loop order at the sinking), and a serial survivor that
- *    sinks into an in-place candidate keeps the MostBound* of its serial record;
- *  - a serial tail whose claimant sinks into an in-place candidate while its serial binder
- *    survives is given to the binder and merged into the binder's own-tag sequence by the
- *    binder's final-pass energy order (the binder ordinals recorded by the serial key, audit Q3);
- *  - the final-tree check of a claim (J2) is applied when the binding owner is an in-place
- *    candidate (serial claims bound serially were checked in their key);
- *  - a rank with (almost) no particles gets a temporarily raised NumPart for the tree build
- *    (forcetree.c sizes its node block by NumPart). */
+ * Edge cases: a claim of a candidate or serial member that sinks later is void; an in-place survivor
+ * that sinks in a later round keeps its final-pass most-bound tracer, a serial one that of its
+ * record; a serial tail whose claimant sank while its serial binder survives goes to the binder, in
+ * the binder's final-pass energy order; the final-tree check of a claim (J2) applies to in-place
+ * binders only (serial ones were checked in their key). */
 
 #include <mpi.h>
 #include <math.h>
@@ -121,7 +97,6 @@ struct CandState {
 struct Coll {
     struct SubhaloPlan * plan;
     struct SubhaloCallCtx * ctx;
-    struct SubTrackTable * tab;
     DomainDecomp * ddecomp;
     MPI_Comm Comm;
     int NTask, ThisTask;
@@ -447,9 +422,8 @@ coll_walk(struct Coll * C, double * Sum)
     act.Particles = PartManager->Base;
     ForceTree tree;
     memset(&tree, 0, sizeof(tree));
-    /* force_tree_build sizes its node block by NumPart: a rank with (almost) no particles could
-     * not hold the top-level grid with the per-thread node caches, so the count is raised for the
-     * build only (the tree inserts the listed particles alone; nothing above NumPart is read) */
+    /* force_tree_build sizes its node block by NumPart: raised for the build only on a nearly empty
+     * rank, to hold the top-level grid and the per-thread node caches (only listed particles are inserted) */
     const int64_t NumPartSave = PartManager->NumPart;
     {
         const int nthr = omp_get_max_threads();
@@ -460,9 +434,8 @@ coll_walk(struct Coll * C, double * Sum)
         if(PartManager->NumPart < need)
             PartManager->NumPart = need;
     }
-    /* the walltime clocks (audit R3, decision 47.5): close the interval before the tree build and
-     * book the whole build to /Subhalo/Rounds/Tree, not to forcetree.c's own /Misc and
-     * /Tree/Build/{Nodes,Moments}, so that the /Subhalo/Rounds children cover the stage */
+    /* the whole build booked to /Subhalo/Rounds/Tree, not forcetree.c's own clocks, so that the
+     * /Subhalo/Rounds children cover the stage (decision 47.5) */
     walltime_measure("/Subhalo/Rounds/Rounds");
     walltime_redirect_begin("/Subhalo/Rounds/Tree");
     force_tree_active_moments(&tree, C->ddecomp, &act, 0, 0, NULL);
@@ -491,9 +464,8 @@ coll_walk(struct Coll * C, double * Sum)
     tw->result_type_elsize = sizeof(TreeWalkResultColl);
     tw->priv = &pv;
     tw->tree = &tree;
-    /* the treewalk sizes its export tables from the free memory (BunchSize, capped by the run's
-     * MaxExportBufferBytes): that elastic part is measured apart, and the call's high water
-     * charges the walk with the reserve the admission guarantees (subhalo_collective_walk_bytes) */
+    /* the treewalk sizes its export tables from the free memory: that elastic part is measured
+     * apart, and the high water charges the walk with the reserve the admission guarantees */
     const size_t lowbefore = allocator_get_min_free(A_MAIN), freebefore = mymalloc_freebytes();
     treewalk_run(tw, ql, nq);
     walltime_measure("/Subhalo/Rounds/Walk");
@@ -753,8 +725,8 @@ corerec_before(const struct CoreRec * x, const struct CoreRec * y)
     return x->ID < y->ID;
 }
 
-/* A bounded max-heap of the K first records in (E, ID) order (audit Q1: a rank keeps at most K
- * tracers and K non-tracers per candidate instead of a record per bound particle). */
+/* A bounded max-heap of the K first records in (E, ID) order: a rank keeps at most K tracers and K
+ * non-tracers per candidate, not a record per bound particle. */
 static void
 core_heap_push(struct CoreRec * h, int64_t * n, int64_t K, const struct CoreRec * e)
 {
@@ -797,11 +769,9 @@ struct CoreOut {
     int64_t * resv;          /* [nc][2 K]: (rank, index) of the reserved tracers, -1 */
 };
 
-/* The core of the SubhaloCoreSize most-bound tracers with non-tracer fill (subhalo_core), the
- * most-bound tracer (else the most bound particle) and the MinNumTracerPart most-bound tracers,
- * for every alive candidate of the round, over its bound particles in (En, ID) order: every rank
- * sends its first K tracers and K non-tracers per candidate to the owner, which merges them;
- * the results are reduced to every rank. Collective. */
+/* The core (subhalo_core), the most-bound tracer and the MinNumTracerPart reserved tracers of the
+ * round's alive candidates in (En, ID) order: every rank sends its first K tracers and K non-tracers
+ * per candidate to the owner, which merges them; the results are reduced to every rank. Collective. */
 static void
 round_cores(const struct Coll * C, struct CoreOut * out)
 {
@@ -960,9 +930,8 @@ free_cores(struct CoreOut * o)
     myfree(o->d);
 }
 
-/* The previous most-bound tracer of the candidates of the round that died (the first own-tag
- * tracer in BindRank order, ties by ID; process_serial_key): every rank's best by (BindRank, ID),
- * reduced. Collective. */
+/* The previous most-bound tracer of the round's dead candidates, as process_serial_key: the first
+ * own-tag tracer in (BindRank, ID) order over all ranks. Collective. */
 static void
 dead_mb(struct Coll * C)
 {
@@ -1061,7 +1030,7 @@ struct RoundProps {
     double * prof;           /* [nc][8]: hbt best M/r, Rmax, vir best M/r, RmaxVir, rhalf, Renclose, (unused) x2 */
     double * jv;             /* [nc][9]: JVir sums 3, x sums 3, v sums 3 */
     float * shape;           /* [nc][2][5]: BtoA, CtoA, AxisA[3] (vir, 500c), -1 */
-    double * dfr;            /* [nc][8]: Rs, RockstarCoreVel 3, BulkVel 3, Vrms (km/s), -1 (Phase 5) */
+    double * dfr;            /* [nc][8]: Rs, RockstarCoreVel 3, BulkVel 3, Vrms (km/s), -1 */
 };
 
 struct RadRec {
@@ -1198,8 +1167,8 @@ shapes_distributed(const struct Coll * C, const struct RadRec * rr, int64_t nr, 
     myfree(orth);
 }
 
-/* The compensated sums (subhalo_ksum_*, audit R4) as an MPI operation on pairs of doubles,
- * non-commutative: MPI applies it in rank order, the order of the radial ordered set. */
+/* The compensated sums (subhalo_ksum_*) as a non-commutative MPI operation on pairs of doubles:
+ * MPI applies it in rank order, the order of the radial ordered set. */
 static MPI_Datatype KsumType = MPI_DATATYPE_NULL;
 static MPI_Op KsumOp = MPI_OP_NULL;
 
@@ -1228,12 +1197,8 @@ ksum_mpi_init(void)
     MPI_Op_create(ksum_mpi_op, 0, &KsumOp);
 }
 
-/* Per-candidate transient scratch of round_props (bytes per candidate of the round, on every rank;
- * subhalo_coll_estimate charges it, audit R1): the holder-side sums (NHS + 2), then, kept to the
- * end, the radial positions and compensated prefix masses (2 int64 + 2 pairs) and the profile's
- * local and reduced candidates (2 NL), with at most two more NL vectors (the maxima, the second
- * reduction) or JVir's local sums (9), the deferred recipes (COLL_DFR_DOUBLES doubles and 3
- * int64) or the shape fit (9 + 3 + 2 + 8 + 8 doubles, an int, the aperture counts and radii). */
+/* Per-candidate transient scratch of round_props on every rank, charged by subhalo_coll_estimate:
+ * the vectors kept to the end plus the largest later stage (asserted below). */
 #define COLL_NL (8 + 2 * SUBHALO_NSO)
 #define COLL_DFR_NA 8                          /* (1) ncore, M, Sb 3, S2 3: pairs */
 #define COLL_DFR_NW 4                          /* (4) the core: Mcore, Sc 3: pairs */
@@ -1255,17 +1220,9 @@ _Static_assert(COLL_PROPS_CAND_BYTES <= SUBHALO_INPLACE_CAND_PROPS_BYTES,
 #define COLL_PROPS_NALLOC 32
 #define COLL_ALLOC_OVERHEAD (2. * 4096.)
 
-/* The Phase 5 recipes of subhalo_props_deferred on the radial ordered set of the round (rr[0, nr)
- * sorted by (label, r, ID), pos the global positions within each label, Mc the cumulative masses
- * M(<= r)), after the profile (rp->kc, Mso, prof, hs) is known: Rockstar's aperture (decision 44,
- * as the serial deferred_on_order), pos < kc[vir] for the velocities and the NFW fit alike
- * (decision 47.1: the crossing particle excluded, not the one before it), the fit of mass Mfit =
- * Mc at pos kc[vir] - 1.
- * Four reductions over the labels: (1) the aperture velocity sums about the core velocity and the
- * count inside 0.1 Rvir, (2) the largest particle mass and Mfit, (3) the position closing each equal-mass
- * bin (the first with Mc >= subhalo_nfw_threshold), (4) the radii around each closing position
- * and the core velocity sums; the fit itself (subhalo_nfw_fit) is replicated per label. Results
- * in rp->dfr (km/s, the run's length unit), -1 where undefined. Collective. */
+/* subhalo_props_deferred's recipes on the round's radial set (rr by (label, r, ID), pos, Mc = M(<= r)):
+ * Rockstar's aperture pos < kc[vir] for the velocities and the NFW fit (decisions 44, 47.1), in four
+ * reductions (1)-(4). Results in rp->dfr (km/s, run length unit), -1 undefined. Collective. */
 static void
 deferred_distributed(const struct Coll * C, const struct CoreOut * core, const struct RadRec * rr, int64_t nr,
                      const int64_t * pos, const double * Mc, struct RoundProps * rp)
@@ -1297,10 +1254,8 @@ deferred_distributed(const struct Coll * C, const struct CoreOut * core, const s
         Rv[2 * c] = kc[3 * c] >= 0 ? cbrt(3 * rp->Mso[SUBHALO_NSO * c] / (4 * M_PI * rho[0])) : -1;
     }
 
-    /* (1) the aperture pos < kc: velocity sums about the core velocity, the count inside 0.1
-     * Rvir, as compensated pairs merged in rank order (audit R4); (2) over the same aperture
-     * the largest particle mass (X[c * (NB + 1)]) and the profile's M(<= r) at its last position
-     * kc - 1 (X[c * (NB + 1) + 1], held by one record: a MAX of it and zeros) */
+    /* (1) inside the aperture: velocity sums about the core velocity and the count inside 0.1 Rvir
+     * (compensated pairs); (2) the largest particle mass and M(<= r) at kc - 1 (one record: a MAX) */
     memset(A, 0, sizeof(double) * NA * nc);
     for(c = 0; c < nc; c++)
         X[(NB + 1) * c] = X[(NB + 1) * c + 1] = 0;
@@ -1346,9 +1301,8 @@ deferred_distributed(const struct Coll * C, const struct CoreOut * core, const s
         kc[3 * c + 2] = subhalo_nfw_bin_plan(nfit, V[2 * c + 1], V[2 * c], &Rv[2 * c + 1]);
     }
 
-    /* (3) the closing positions: the first local record of each label reaching each threshold,
-     * the global minimum by a MAX of the negated positions; Mc is the profile's compensated
-     * M(<= r), the value the serial recipe compares */
+    /* (3) the closing position of each bin: the first record reaching its threshold, the global
+     * minimum by a MAX of the negated positions */
     for(k = 0; k < (NB + 1) * nc; k++)
         X[k] = -1e300;
     {
@@ -1463,36 +1417,17 @@ deferred_distributed(const struct Coll * C, const struct CoreOut * core, const s
     myfree(A);
 }
 
-/* The properties of the alive candidates of the round (subhalo_props_hbt, subhalo_props_rockstar
- * and subhalo_props_baryons with the same formulas), from the final-pass energies, the final
- * frames and the final cores. Collective; rp is allocated here (bottom) and freed by the caller
- * with free_round_props. */
-static void
-round_props(const struct Coll * C, const struct CoreOut * core, struct RoundProps * rp)
+/* The holder-side sums of the round's alive candidates (counts, masses, energies, J, inertia,
+ * baryons) and the most massive BH, reduced into rp->hs/bhm/bhid (allocated by the caller);
+ * returns the local bound count. Collective. */
+static int64_t
+round_holder_sums(const struct Coll * C, const struct CoreOut * core, struct RoundProps * rp)
 {
     const int64_t nc = C->c1 - C->c0;
     const struct SubhaloUnbindParams * up = C->up;
     const double a = up->atime, BoxSize = up->BoxSize;
-    const double rfloor = up->h / 2.8;
-    const double * rho = C->ctx->rho;
-    int64_t i, c, k;
-    int d, s;
-
-    rp->hs = (double *) mymalloc("SubCollHs", sizeof(double) * NHS * (nc + 1));
-    rp->bhm = (double *) mymalloc("SubCollBhm", sizeof(double) * (nc + 1));
-    rp->bhid = (MyIDType *) mymalloc("SubCollBhid", sizeof(MyIDType) * (nc + 1));
-    rp->Mso = (double *) mymalloc("SubCollMso", sizeof(double) * SUBHALO_NSO * (nc + 1));
-    rp->kc = (int64_t *) mymalloc("SubCollKc", sizeof(int64_t) * SUBHALO_NSO * (nc + 1));
-    rp->prof = (double *) mymalloc("SubCollProf", sizeof(double) * 8 * (nc + 1));
-    rp->jv = (double *) mymalloc("SubCollJv", sizeof(double) * 9 * (nc + 1));
-    rp->shape = (float *) mymalloc("SubCollShape", sizeof(float) * 10 * (nc + 1));
-    for(k = 0; k < 10 * nc; k++)
-        rp->shape[k] = -1;
-    rp->dfr = (double *) mymalloc("SubCollDfr", sizeof(double) * 8 * (nc + 1));
-    for(k = 0; k < 8 * nc; k++)
-        rp->dfr[k] = -1;
-
-    /* ---- holder-side sums: counts, masses, energies, J, inertia, baryons ---- */
+    int64_t i, c;
+    int d;
     double * hs = (double *) mymalloc("SubCollHsLoc", sizeof(double) * NHS * (nc + 1));
     double * bm = (double *) mymalloc("SubCollBhmLoc", sizeof(double) * (nc + 1));
     MyIDType * bid = (MyIDType *) mymalloc("SubCollBhidLoc", sizeof(MyIDType) * (nc + 1));
@@ -1574,6 +1509,39 @@ round_props(const struct Coll * C, const struct CoreOut * core, struct RoundProp
     myfree(bid);
     myfree(bm);
     myfree(hs);
+    return nb;
+}
+
+/* The properties of the round's alive candidates with the formulas of subhalo_props_hbt, _rockstar
+ * and _baryons, from the final-pass energies, frames and cores. Collective; rp is allocated here
+ * (bottom) and freed by the caller (free_round_props). */
+static void
+round_props(const struct Coll * C, const struct CoreOut * core, struct RoundProps * rp)
+{
+    const int64_t nc = C->c1 - C->c0;
+    const struct SubhaloUnbindParams * up = C->up;
+    const double BoxSize = up->BoxSize;
+    const double rfloor = up->h / 2.8;
+    const double * rho = C->ctx->rho;
+    int64_t i, c, k;
+    int d, s;
+
+    rp->hs = (double *) mymalloc("SubCollHs", sizeof(double) * NHS * (nc + 1));
+    rp->bhm = (double *) mymalloc("SubCollBhm", sizeof(double) * (nc + 1));
+    rp->bhid = (MyIDType *) mymalloc("SubCollBhid", sizeof(MyIDType) * (nc + 1));
+    rp->Mso = (double *) mymalloc("SubCollMso", sizeof(double) * SUBHALO_NSO * (nc + 1));
+    rp->kc = (int64_t *) mymalloc("SubCollKc", sizeof(int64_t) * SUBHALO_NSO * (nc + 1));
+    rp->prof = (double *) mymalloc("SubCollProf", sizeof(double) * 8 * (nc + 1));
+    rp->jv = (double *) mymalloc("SubCollJv", sizeof(double) * 9 * (nc + 1));
+    rp->shape = (float *) mymalloc("SubCollShape", sizeof(float) * 10 * (nc + 1));
+    for(k = 0; k < 10 * nc; k++)
+        rp->shape[k] = -1;
+    rp->dfr = (double *) mymalloc("SubCollDfr", sizeof(double) * 8 * (nc + 1));
+    for(k = 0; k < 8 * nc; k++)
+        rp->dfr[k] = -1;
+
+    /* ---- the holder-side sums ---- */
+    int64_t nb = round_holder_sums(C, core, rp);
 
     /* ---- the radial ordered set about the cores: (label, r, ID), M(<= r) by a vector Exscan ---- */
     int64_t ntot = 0;
@@ -1612,9 +1580,8 @@ round_props(const struct Coll * C, const struct CoreOut * core, struct RoundProp
         e->key[2] = (uint64_t) (cc - C->c0);
     }
     mpsort_mpi(rr, nb, sizeof(struct RadRec), radrec_radix, 24, NULL, C->Comm);
-    /* positions and cumulative masses: local prefix per label + vector Exscan */
-    /* the masses as compensated pairs, merged in rank order by the Exscan (audit R4): M(<= r) is
-     * the serial recipe's compensated sum over the same radial order */
+    /* positions and cumulative masses: a local prefix per label plus a vector Exscan, the masses as
+     * compensated pairs in rank order, so M(<= r) is the serial recipe's sum */
     ksum_mpi_init();
     int64_t * cnt = (int64_t *) mymalloc("SubCollRadCnt", sizeof(int64_t) * 2 * (nc + 1));
     double * msum = (double *) mymalloc("SubCollRadM", sizeof(double) * 4 * (nc + 1));
@@ -1750,9 +1717,8 @@ round_props(const struct Coll * C, const struct CoreOut * core, struct RoundProp
     }
     myfree(G2);
     myfree(MX);
-    /* inside the virial aperture (crossing particle included, D4; deferred_distributed takes
-     * Rockstar's apertures, decision 44): JVir in the CoreVel frame, the mean
-     * offsets (properties.c:417-458) */
+    /* inside the virial aperture (crossing particle included, D4): JVir in the CoreVel frame and the
+     * mean offsets (Rockstar properties.c:417-458) */
     {
         double * jl = (double *) mymalloc("SubCollJvLoc", sizeof(double) * 9 * (nc + 1));
         memset(jl, 0, sizeof(double) * 9 * (nc + 1));
@@ -1777,7 +1743,7 @@ round_props(const struct Coll * C, const struct CoreOut * core, struct RoundProp
         MPI_Allreduce(jl, rp->jv, 9 * nc, MPI_DOUBLE, MPI_SUM, C->Comm);
         myfree(jl);
     }
-    /* the Phase 5 recipes: Rs fit, RockstarCoreVel, BulkVel, Vrms */
+    /* the deferred recipes: Rs fit, RockstarCoreVel, BulkVel, Vrms */
     deferred_distributed(C, core, rr, nb, pos, Mc, rp);
     /* shapes at Rvir and R500c over the particles up to each crossing */
     {
@@ -1841,12 +1807,9 @@ member_ancestor(const struct SubhaloMember * M, int64_t j, int64_t a, int64_t nm
     return 0;
 }
 
-/* HBT MergeRecursively for every alive candidate X of the round against its whole processing
- * subtree (serial members and in-place candidates of earlier rounds): the resolved descendants
- * alive or dead this call with a core whose core falls in X's (subhalo_sink_test) sink into X;
- * a sunk survivor's bound set joins X's source (serial: BoundTrackId == S, a local test;
- * in place: its bound particles). Returns the number of candidates that absorbed a survivor
- * (identical on every rank). */
+/* HBT MergeRecursively for every alive candidate X of the round over its processing subtree: a
+ * resolved descendant (alive or dead this call) whose core passes subhalo_sink_test sinks into X, a
+ * sunk survivor's bound set joins X's source. Returns the number of absorbing candidates (all ranks). */
 static int64_t
 round_sinking(struct Coll * C)
 {
@@ -1954,10 +1917,8 @@ uposrec_radix(const void * a, void * radix, void * arg)
     memcpy(radix, ((const struct UPosRec *) a)->key, 24);
 }
 
-/* The unbound particles of every alive candidate of the round that lie inside its relaxed
- * source (list positions Nbound .. keep - 1 in the energy order of their removal, ties by ID):
- * a global sort on (label, E, ID), the positions by a vector Exscan, the answers back to the
- * holders (CF_WITHIN). Collective. */
+/* CF_WITHIN for the unbound particles of each alive candidate inside its relaxed source (list
+ * positions Nbound .. keep - 1 in (E, ID) order), by a global sort on (label, E, ID). Collective. */
 static void
 round_within(struct Coll * C)
 {
@@ -2233,7 +2194,7 @@ fill_alive_record(const struct Coll * C, int64_t c, const struct CoreOut * fin, 
             rec->RsKlypin = (float) rs;
         }
     }
-    /* Phase 5 (subhalo_props_deferred) */
+    /* the deferred columns (subhalo_props_deferred) */
     {
         const double * df = rp->dfr + 8 * q;
         rec->Rs = (float) df[0];
@@ -2310,12 +2271,9 @@ cmp_member_idx_g(const void * a, const void * b)
     return (M[x].TrackId > M[y].TrackId) - (M[x].TrackId < M[y].TrackId);
 }
 
-/* UpdateTracks of process_serial_key for every oversized key over all its members: survivors
- * ranked by mass (CompareMass), the most massive promoted to the central with every other top
- * survivor nested under it, the nearest surviving ancestor as the parent; members that died or
- * sank this call get the nearest surviving ancestor (else the central). maxmerge[gidx]: the
- * largest previous Mbound of the tracks that sank into the central or arrived as its
- * satellites. Identical on every rank. */
+/* UpdateTracks of process_serial_key over every oversized key (CompareMass ranks, the most massive
+ * promoted, parents the nearest surviving ancestors). maxmerge[gidx]: the largest previous Mbound of
+ * the tracks that sank into the central or arrived as its satellites. Identical on every rank. */
 static void
 coll_hierarchy(struct Coll * C, double * maxmerge)
 {
@@ -2593,12 +2551,9 @@ tagrec_radix(const void * a, void * radix, void * arg)
     memcpy(radix, ((const struct TagRec *) a)->key, 24);
 }
 
-/* The decision for one particle of an oversized key (no side effects; design 7.2 step 9, D10):
- * a reserved tracer to its candidate; else a valid serial claim (an alive member's tail or a
- * root's relaxed remainder) keeps its tag; else the in-place claim of the deepest alive candidate
- * whose relaxed source holds it; a claim whose binding owner is not the claimant or one of its
- * ancestors in the final tree goes to the binding owner (J2); a serial tail whose claimant sank
- * into an in-place candidate while its serial binder survives goes to the binder. */
+/* The final tag of one particle of an oversized key (design 7.2 step 9, D10): a reserved tracer, else a
+ * valid serial claim, else the deepest alive in-place claim; a claim across the final tree goes to the
+ * binder (J2); a serial tail whose claimant sank goes to its surviving serial binder. */
 struct TagDec {
     int64_t tag;             /* the final TrackId, SUBHALO_NOTRACK */
     int64_t bT;              /* the final BoundTrackId */
@@ -2685,8 +2640,8 @@ decide_tag(const struct Coll * C, int64_t i, struct TagDec * d)
     d->bT = d->tag == SUBHALO_NOTRACK ? SUBHALO_NOTRACK : bT;
 }
 
-/* ---- the serial repair (audit Q2): a change of a serial sub-tree track's own-tag sequence,
- *      routed to the rank holding the track's result, which owns its ranks and counts ---- */
+/* ---- the serial repair: a change of a serial sub-tree track's own-tag sequence, routed to the
+ *      rank holding the track's result, which owns its ranks and counts ---- */
 struct SerChg {
     int64_t T;               /* the serial track */
     int64_t key;             /* removal: the old BindRank; addition: g, set by the owner from its binder ordinals */
@@ -2782,13 +2737,9 @@ rep_new_rank(const struct SerChg * c, const struct RepTrack * t, int64_t r)
     return r - nrem + nadd;
 }
 
-/* The serial ranks and counts closed over the changes of the final pass (audit Q2, Q3): every
- * change goes to the rank holding its track's result; there the additions get their binder
- * ordinals (struct SubhaloBindOrd, by ID), the removed ranks and the additions are sorted per
- * track, the records' counts corrected, and every affected track's remaining particles ask
- * their new rank (binary searches over the track's sorted changes). Nothing is replicated but
- * the list of the affected TrackIds (at most the member table). chg is the local change list
- * (bottom, the caller frees it). Collective. */
+/* The serial ranks and counts repaired: each change goes to the rank holding its track's result, which
+ * corrects the counts and answers the new ranks of the track's particles; only the affected TrackIds
+ * are replicated. chg (bottom) is freed by the caller. Collective. */
 static void
 serial_repair(struct Coll * C, struct SerChg * chg, int64_t nchg)
 {
@@ -2998,7 +2949,7 @@ serial_repair(struct Coll * C, struct SerChg * chg, int64_t nchg)
         sendcounts[qin[k].holder]++;
         nrep++;
     }
-    /* audit Q4: no rank or count beyond the int32 columns, decided on every rank before writing */
+    /* no rank or count beyond the int32 columns, decided on every rank before writing */
     if(MPIU_Any(bad, C->Comm))
         endrun(1, "Subhalo in place: a repaired serial BindRank or count is beyond the catalogue's int32 range.\n");
     qsort(rep, nrep, sizeof(struct SerReply), cmp_serreply_holder);
@@ -3025,11 +2976,9 @@ serial_repair(struct Coll * C, struct SerChg * chg, int64_t nchg)
     CollStats.RepairSeconds = MPI_Wtime() - t0;
 }
 
-/* The tags of every particle of an oversized key (decide_tag), BoundTrackId the candidate (or
- * serial member) that bound it; dense own-tag ranks of the in-place candidates in their list order
- * (bound by final-pass energy, then the relaxed tail by the energy of its removal); the exclusive
- * and tail counts of the in-place records; the serial ranks and counts closed over the changes
- * (serial_repair). Collective. */
+/* The final tags of every particle of an oversized key (decide_tag); the in-place own-tag ranks in
+ * list order (bound by final-pass energy, then the relaxed tail by removal energy) and counts; the
+ * serial ranks and counts repaired (serial_repair). Collective. */
 static void
 coll_final_tags(struct Coll * C, const int64_t * slotof)
 {
@@ -3041,7 +2990,7 @@ coll_final_tags(struct Coll * C, const int64_t * slotof)
     int t;
     int64_t nt = 0, nchg = 0, nwritten = 0, nrel = 0, nj2 = 0;
     struct TagDec dec;
-    /* the exact sizes first: the in-place own-tag records and the serial changes (audit Q1) */
+    /* the exact sizes first: the in-place own-tag records and the serial changes */
     for(i = 0; i < C->NumPart; i++) {
         if(!(C->Flag[i] & CF_UNIV) || (C->Flag[i] & CF_RELEASE))
             continue;
@@ -3107,8 +3056,8 @@ coll_final_tags(struct Coll * C, const int64_t * slotof)
         e->index = i;
         cnt[12 * dec.tc + (dec.bound ? 0 : 6) + P[i].Type]++;
     }
-    /* ---- the exclusive and tail counts of the in-place candidates, checked against the int32
-     *      columns on every rank before any rank is written (audit Q4) ---- */
+    /* ---- the in-place exclusive and tail counts, checked against the int32 columns on every rank
+     *      before any rank is written ---- */
     if(ncand > 0)
         MPI_Allreduce(cnt, g, 12 * ncand, MPI_INT64, MPI_SUM, C->Comm);
     for(c = 0; c < ncand; c++) {
@@ -3171,7 +3120,7 @@ coll_final_tags(struct Coll * C, const int64_t * slotof)
     }
     myfree(tr);
     CollStats.TagSortSeconds = MPI_Wtime() - t0;
-    /* ---- the serial ranks and counts (audit Q2, Q3) ---- */
+    /* ---- the serial ranks and counts ---- */
     serial_repair(C, chg, nchg);
     /* ---- the exclusive and tail counts of the in-place records ---- */
     for(c = 0; c < ncand; c++) {
@@ -3199,8 +3148,7 @@ coll_final_tags(struct Coll * C, const int64_t * slotof)
 
 /* ------------------------------------------------------------------ setup */
 
-/* The serial sub-tree results into the member table (every rank): state, counts, Keep, the
- * current record values, the sinking core and an in-key sink. Collective. */
+/* A serial sub-tree result as gathered on every rank. */
 struct SerialInfo {
     int64_t TrackId;
     int64_t SinkTo;
@@ -3211,12 +3159,8 @@ struct SerialInfo {
     double CorePos[3], CoreVel[3], SigmaX, SigmaV;
 };
 
-/* What every rank holds per in-place key (the plan's entry, maxmerge, the winner vectors of the
- * driver), per in-place candidate (its plan entry, its state, its result slot index, the
- * per-round vectors of the cores and their heaps, sums, profile, shapes, and the final pass's
- * count vectors) and per member of an oversized key (the member table, the gathered serial result,
- * the hierarchy arrays): the budget of the plan (subhalo_plan_default_cfg) and the admission
- * (subhalo_coll_estimate) charge these constants. */
+/* The per-key, per-candidate and per-member vectors every rank holds, as charged by the plan's
+ * budget (subhalo_plan_default_cfg) and the admission (subhalo_coll_estimate). */
 _Static_assert(sizeof(struct SubhaloInplaceKey) + 8 + 4 * 16 <= SUBHALO_INPLACE_KEY_BYTES,
                "SUBHALO_INPLACE_KEY_BYTES does not cover the per-key vectors");
 _Static_assert(sizeof(struct SubhaloInplaceCand) + sizeof(struct CandState)
@@ -3245,9 +3189,8 @@ subhalo_coll_estimate(struct SubhaloCollAdmit * a, int64_t NumPart, int64_t MaxP
     const double nc = (double) NCands + 1;
     int s, NTask;
     MPI_Comm_size(MPI_COMM_WORLD, &NTask);
-    /* through the whole call: per particle the source candidate and the claim (int32), the flags
-     * (uint8), the two energies (double); per candidate its state and vectors; per owned candidate
-     * its previous record and its slot */
+    /* through the whole call: 25 bytes per particle, per candidate its state and vectors, per owned
+     * candidate its previous record and slot */
     a->persist = 25. * N + nc * SUBHALO_INPLACE_CAND_BYTES + (double) (NOwned + 1) * (sizeof(struct SubTrack) + 8.);
     /* setup: the serial results gathered on every rank (local copy and the whole list), the
      * fetch of the owned previous records, the hierarchy arrays of the member table */
@@ -3261,10 +3204,8 @@ subhalo_coll_estimate(struct SubhaloCollAdmit * a, int64_t NumPart, int64_t MaxP
             + (double) (NOwned + 1) * (sizeof(struct SubTrack) + 16.) + fetch
             + (double) (NMembers + 1) * (2 * sizeof(float) + sizeof(MyIDType) + 2 * sizeof(int64_t) + 1);
     }
-    /* the tree: force_tree_active_moments sizes its node block by TreeAllocFactor x NumPart (NumPart
-     * raised on a nearly empty rank, coll_walk) + the top nodes before shrinking it (no Father
-     * array: alloc_father = 0); the query and tree lists; the top-leaf labels and the pseudo-data
-     * exchange; the treewalk's export headroom */
+    /* the tree: TreeAllocFactor x NumPart nodes (NumPart raised as in coll_walk) plus the top nodes,
+     * no Father array; the query and tree lists, the top-leaf labels, the walk's export reserve */
     {
         double np = (double) NumPart;
         double need = 2048. + 512. * nthreads + 4. * (double) NLocalLeaves * nthreads;
@@ -3286,10 +3227,8 @@ subhalo_coll_estimate(struct SubhaloCollAdmit * a, int64_t NumPart, int64_t MaxP
     }
     /* the radial ordered set: the records and mpsort's record-sized exchange copy */
     a->stage[SUBHALO_COLL_RADIAL] = 2. * sizeof(struct RadRec) * U;
-    /* the properties (round_props, Phase 5 audit R1): the sorted records with their positions and
-     * cumulative masses, every candidate's transient scratch (the profile's vectors and the
-     * deferred recipes' reductions; the round holds at most every candidate) and the allocator's
-     * alignment blocks of the arrays held at once */
+    /* the properties (round_props): the sorted records with positions and cumulative masses, every
+     * candidate's transient scratch and the allocator's alignment blocks */
     a->stage[SUBHALO_COLL_PROPS] = COLL_PROPS_REC_BYTES * U + nc * SUBHALO_INPLACE_CAND_PROPS_BYTES
         + COLL_PROPS_NALLOC * COLL_ALLOC_OVERHEAD;
     /* the relaxed-source positions: records and mpsort's copy */
@@ -3300,9 +3239,8 @@ subhalo_coll_estimate(struct SubhaloCollAdmit * a, int64_t NumPart, int64_t MaxP
         const double sort = 2. * sizeof(struct TagRec) * U, ans = sizeof(struct TagRec) * U + 2. * 16. * U;
         a->stage[SUBHALO_COLL_TAGS] = (sort > ans ? sort : ans) + sizeof(struct SerChg) * U;
     }
-    /* the serial repair: the changes sent (at most one per particle) and received (at most one per
-     * particle of the sub-tree keys processed here), the affected TrackIds (at most the member
-     * table), the queries and the replies, both ways */
+    /* the serial repair: changes sent (one per particle at most) and received (one per sub-tree
+     * particle processed here), the affected TrackIds, the queries and replies both ways */
     a->stage[SUBHALO_COLL_REPAIR] = sizeof(struct SerChg) * (U + S) + 8. * (double) (NMembers + 1) * 2
         + sizeof(struct SerQuery) * (U + S) + sizeof(struct SerReply) * (U + 2. * S) + sizeof(struct RepTrack) * (double) (NMembers + 1);
     double mx = 0;
@@ -3317,6 +3255,8 @@ subhalo_coll_estimate(struct SubhaloCollAdmit * a, int64_t NumPart, int64_t MaxP
     a->NSubPart = NSubPart;
 }
 
+/* The serial sub-tree results into the member table on every rank: state, counts, Keep, record
+ * values, sinking core and in-key sink. Collective. */
 static void
 gather_serial(struct Coll * C)
 {
@@ -3398,18 +3338,14 @@ gather_serial(struct Coll * C)
     myfree(all);
 }
 
-/* Every particle of an oversized key to the source of one candidate (design 7.8 candidate set):
- * the own tag of an in-place candidate; a serial sub-tree member's provisional remainder
- * (BoundTrackId -1) to the candidate above its root, with a serial claim if it is a tail of an
- * alive member or inside an alive root's relaxed source; a particle bound by a serial member is
- * excluded (and keeps its tag); an untagged or foreign-tagged group particle to the central; a
- * field particle with a stale orphan tag or the central's tag is released (HBT FeedCentrals). */
+/* Every particle of an oversized key to one candidate's source (design 7.8): own tags, serial sub-tree
+ * remainders to the candidate above the root (serially bound ones excluded), other group particles to
+ * the central; field particles tagged by the central (decision 52) or an orphan are released. */
 static void
 init_sources(struct Coll * C)
 {
     const struct SubhaloPlan * plan = C->plan;
     int64_t i;
-    int64_t nuniv = 0;
     for(i = 0; i < C->NumPart; i++) {
         C->Cand[i] = -1;
         C->Claim[i] = -1;
@@ -3425,8 +3361,8 @@ init_sources(struct Coll * C)
             u = p->GrNr;
         else if(p->GrNr < 0 && m) {
             u = m->g;
-            /* a FOF key's central: its source is the group only, as HBT's FeedCentrals swap (decision 52);
-             * its field particles are released below; a pseudo-key (u > TotNgroups) keeps them */
+            /* a FOF key only, so that its central's field particles are released below (decision 52);
+             * a pseudo-key (u > TotNgroups) keeps them (ku stays -1) */
             if(u <= plan->TotNgroups)
                 ku = subhalo_plan_inplace_index(plan, u);
         }
@@ -3435,7 +3371,6 @@ init_sources(struct Coll * C)
         if(m && m->g != u)
             m = NULL;
         C->Flag[i] = CF_UNIV;
-        nuniv++;
         const int central = ku >= 0 ? plan->Inplace[ku].central : -1;
         if(m && m->cand >= 0 && (m->kind != SUBHALO_MEM_ORPHAN || p->GrNr == u) && (m->cand != central || p->GrNr == u))
             C->Cand[i] = m->cand;
@@ -3457,10 +3392,8 @@ init_sources(struct Coll * C)
         else {
             /* a field particle tagged by an orphan member (a stale tag) or by the central */
             C->Flag[i] = CF_RELEASE;
-            nuniv--;
         }
     }
-    (void) nuniv;
 }
 
 /* ------------------------------------------------------------------ the rounds */
@@ -3517,10 +3450,10 @@ run_round(struct Coll * C, int r, const int64_t * slotof, const struct SubTrack 
             s->RefVel[d] = cd->RefVel[d];
         }
     }
-    /* e: the loop */
+    /* the unbinding loop */
     unbind_loop(C);
-    /* g: sinking of the descendants on the loop-order cores, then the absorbing candidates
-     * unbound again from their whole source (process_serial_key) */
+    /* sinking of the descendants on the loop-order cores, then the absorbing candidates unbound
+     * again from their whole source (as process_serial_key) */
     set_loop_cores(C);
     if(round_sinking(C) > 0) {
         for(c = C->c0; c < C->c1; c++) {
@@ -3530,7 +3463,7 @@ run_round(struct Coll * C, int r, const int64_t * slotof, const struct SubTrack 
         unbind_loop(C);
         set_loop_cores(C);
     }
-    /* f: the final pass on the converged sets with the final frames */
+    /* the final pass on the converged sets with the final frames */
     int64_t npos = 0;
     for(c = C->c0; c < C->c1; c++)
         C->cs[c].iterating = C->cs[c].state == SUBHALO_ST_ALIVE;
@@ -3555,14 +3488,13 @@ run_round(struct Coll * C, int r, const int64_t * slotof, const struct SubTrack 
         if(keep > s->N) keep = s->N;
         s->keep = keep;
     }
-    /* h: the final cores, the most-bound tracers, the reserved tracers; i: the properties */
+    /* the final cores, most-bound and reserved tracers, then the properties */
     struct CoreOut fin;
     round_cores(C, &fin);
     struct RoundProps rp;
     round_props(C, &fin, &rp);
-    /* audit Q4: the full bound counts (descendants' tails included) against the catalogue's int32
-     * columns before anything is narrowed or published; the sums are reduced, so every rank
-     * takes the same decision */
+    /* the full bound counts against the int32 columns before anything is narrowed; the sums are
+     * reduced, so every rank takes the same decision */
     for(c = C->c0; c < C->c1; c++) {
         if(C->cs[c].state != SUBHALO_ST_ALIVE)
             continue;
@@ -3574,7 +3506,6 @@ run_round(struct Coll * C, int r, const int64_t * slotof, const struct SubTrack 
             endrun(1, "Subhalo in place: candidate %ld has %.0f bound particles, beyond the catalogue's int32 counts.\n",
                    plan->Cands[c].TrackId, h[HS_N]);
     }
-    const double G = up->G;
     for(c = C->c0; c < C->c1; c++) {
         struct CandState * s = &C->cs[c];
         if(s->state != SUBHALO_ST_ALIVE)
@@ -3596,7 +3527,6 @@ run_round(struct Coll * C, int r, const int64_t * slotof, const struct SubTrack 
             fill_alive_record(C, c, &fin, &rp, &C->ctx->Res[slotof[c]].rec, old);
         }
     }
-    (void) G;
     free_round_props(&rp);
     /* the relaxed sources (claims) and the remainders to the parents */
     round_within(C);
@@ -3626,14 +3556,13 @@ subhalo_collective_run(struct SubhaloPlan * plan, struct SubhaloCallCtx * ctx, D
     memset(&CollStats, 0, sizeof(CollStats));
     if(plan->NCands == 0)
         return;
-    /* the measured high water of the call against the plan's admission (audit Q1) */
+    /* the measured high water of the call against the plan's admission */
     const double Free0 = (double) mymalloc_freebytes();
     allocator_reset_min_free(A_MAIN);
     struct Coll C;
     memset(&C, 0, sizeof(C));
     C.plan = plan;
     C.ctx = ctx;
-    C.tab = tab;
     C.ddecomp = ddecomp;
     C.Comm = Comm;
     MPI_Comm_size(Comm, &C.NTask);

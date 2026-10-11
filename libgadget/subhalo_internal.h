@@ -1,33 +1,19 @@
 #ifndef SUBHALO_INTERNAL_H
 #define SUBHALO_INTERNAL_H
 
-/* Private interface of the subhalo finder, included by subhalo.c, subhalo_gather.c,
- * subhalo_track.c and subhalo_io.c, by subhalo_unbind.c and subhalo_props.c through
- * subhalo_unbind.h, and by the unit tests. Not part of the public contract in subhalo.h.
- *
- * Memory discipline of one finder call (subhalo_find): everything that must survive the
- * particle exchange or the domain restore lives on the TOP of the main stack (mymalloc2),
- * because domain_exchange may grow the slot block with myrealloc, which needs SlotsBase to be
- * the last allocation on the bottom. Bottom allocations (mymalloc) are scratch that is freed
- * within the function that made it. */
+/* Private interface of the subhalo finder, shared by its sources and the unit tests (design 7.1).
+ * Memory rule of a call: what must survive the exchange or the domain restore lives on the top of
+ * the main stack (mymalloc2), since domain_exchange may myrealloc the slots, the last bottom
+ * allocation; bottom allocations are scratch freed by the function that made them. */
 
 #include <math.h>
 #include "subhalo.h"
 
-/* Per-thread scratch per particle of a key (design 7.1), Phase 2a (audit J7):
- *  - the unbinding kernel, SUBHALO_UNBIND_BYTES_PER_PART (112, subhalo_unbind.h): the Index and
- *    Energy pair of the candidate being unbound and the kernel's transient sources and nodes;
- *    the Phase 3 properties take SUBHALO_PROPS_BYTES_PER_PART (16) of that transient scratch
- *    after the final pass (static assertion in subhalo_track.c);
- *  - 8: the per-particle owner map and the grouped source list (two int32), reused by the tags;
- *  - 8: the whole lists of the completed nodes whose parent has not gathered their remainder
- *    yet (their subtrees are disjoint, so one entry per particle);
- *  - 8 R: the relaxed sources kept by the completed survivors, each at most R times its bound
- *    set (TruncateSource); the bound sets of distinct survivors are disjoint, so at most R
- *    entries per particle, R = SubhaloSourceRelaxFactor rounded up to 1/8;
- *  - per candidate node SUBHALO_ARENA_NODE_BYTES for the alignment of its lists.
- * subhalo_arena_bytes_per_part() = 128 + 8 R is computed once when the parameters are
- * validated (1 <= R <= SUBHALO_MAX_RELAX_FACTOR) and used by the planner and the key loop. */
+/* Per-thread arena bytes per particle of a key (design 7.1): the kernel's 112
+ * (SUBHALO_UNBIND_BYTES_PER_PART, whose scratch the properties reuse), 8 for the owner map and
+ * grouped sources, 8 for completed nodes' lists awaiting their parent, 8 R for the survivors'
+ * relaxed sources (R = SubhaloSourceRelaxFactor rounded up to 1/8; bound sets are disjoint), plus
+ * SUBHALO_ARENA_NODE_BYTES per candidate node: subhalo_arena_bytes_per_part() = 128 + 8 R. */
 #define SUBHALO_ARENA_FIXED_BYTES_PER_PART 128
 #define SUBHALO_ARENA_NODE_BYTES 64
 #define SUBHALO_MAX_RELAX_FACTOR 10.
@@ -35,44 +21,20 @@ size_t subhalo_arena_bytes_per_part(void);
 /* Main-stack bytes per candidate node of a serial key (struct SubNode in subhalo_track.c;
  * checked there by a static assertion), charged by the plan per member track. */
 #define SUBHALO_NODE_BYTES 512
-/* Bytes every rank holds per in-place key (the plan's in-place list, the per-key vectors of the
- * hierarchy and the winners), per in-place candidate (the candidate table, its CandState and the
- * per-candidate vectors of the rounds and the final tag pass) and per member track of an
- * oversized group (the member table that every rank holds with the gathered serial result,
- * Phase 2b); checked by static assertions in subhalo_collective.c. The plan charges them with the
- * actual numbers of candidates and members it knows (audit Q1). */
+/* Bytes every rank holds per in-place key, per in-place candidate and per member track of an
+ * oversized group (static assertions in subhalo_collective.c); the plan charges the actual counts. */
 #define SUBHALO_INPLACE_KEY_BYTES 512
 #define SUBHALO_INPLACE_CAND_BYTES 4096
 #define SUBHALO_INPLACE_MEMBER_BYTES 768
-/* Phase 5 audit R1: the transient per-candidate scratch of the round's properties (the holder-side
- * sums, the radial profile's per-label vectors, the deferred recipes' reductions, the shape fit;
- * checked by static assertions in subhalo_collective.c), on every rank for every candidate of the
- * round. The admission charges it in its properties stage; the packing allowance per in-place
- * candidate is SUBHALO_INPLACE_CAND_BYTES + SUBHALO_INPLACE_CAND_PROPS_BYTES. */
+/* Transient per-candidate scratch of a round's properties on every rank (static assertions in
+ * subhalo_collective.c); charged by the admission and, with SUBHALO_INPLACE_CAND_BYTES, the packing. */
 #define SUBHALO_INPLACE_CAND_PROPS_BYTES 6144
 
-/* Phase 5c/5d: the estimated processing cost of a serial key of N particles tagged by M member
- * tracks, in arbitrary units,
- *   cost(N, M) = SUBHALO_COST_ITER * N log2 max(N, 2) + SUBHALO_COST_MEMBER * M + SUBHALO_COST_KEY:
- * the tree builds and walks of the unbinding iterations scale as N log N, every member adds its
- * own candidate (unbinding, final pass, properties, hierarchy), the per-key constant covers the
- * per-key setup. Only the ratios matter (the planner and subhalo_run_serial_keys compare costs
- * with each other). Calibration (Phase 5d, dm-128 outputs 4-6 at 4 x 1 on r30, 10,411 keys with
- * their measured times, member counts and diagnostics): 1.0e-6 s per N log2 N (one cost unit is
- * about 1.0e-7 s on one EPYC 7713 core). Over all keys the least-squares member and per-key
- * terms are not positive (the times curve upward in N log N; small keys dominate the count); on
- * the keys that set the thread balance (N >= 1000, 142 keys, relative non-negative least squares)
- * the fit is 1.01e-6 s per N log2 N + 1.5e-4 s per member + 2.0e-3 s per key, which gives
- * SUBHALO_COST_MEMBER = 1500. The per-key constant stays 2000: the large-key fit's 20000 is the
- * curvature, not a per-key cost (it would weigh the many small keys of a rank's tail tenfold in
- * the packing). The outliers (e.g. a 2,206-particle key with 12 members taking as long as an
- * 8,000-particle one) come from the unbinding iteration count (50 iterations over 11
- * candidates), which no input of the plan predicts. M is the segment's distinct tags in
- * subhalo_run_serial_keys; the planner's packing uses M = 0, because its only member count, the
- * directory's Tags, counts a track once per rank holding it: with it the rank imbalance at a = 1
- * rose from 1.36 to 1.85 at 16 x 8 and from 1.23 to 1.42 at 8 x 16 (serial stage +0.03-0.05 s),
- * while the exact count in the thread schedule lowered the serial stage at 4 x 32 from 0.23 to
- * 0.20 s (dm-128, epyc, OpenMP threads bound; Phase 5d diag2_p5d.sh). */
+/* Estimated cost of a serial key of N particles and M member tracks (only ratios matter): N log2 N
+ * for the unbinding trees, a term per member candidate and a per-key constant, fitted to measured
+ * dm-128 key times (one unit about 1e-7 s; the per-key constant kept low so the many small keys do
+ * not dominate the packing; decision 41). The planner uses M = 0, as the directory's Tags counts a
+ * track once per holding rank; subhalo_run_serial_keys uses the segment's distinct tags. */
 #define SUBHALO_COST_ITER 10.
 #define SUBHALO_COST_MEMBER 1500.
 #define SUBHALO_COST_KEY 2000.
@@ -81,7 +43,7 @@ static inline double subhalo_key_cost(int64_t N, int64_t M) {
     return SUBHALO_COST_ITER * (double) (N > 0 ? N : 0) * log2(n) + SUBHALO_COST_MEMBER * (double) (M > 0 ? M : 0) + SUBHALO_COST_KEY;
 }
 
-/* Catalogue int32 guards (audit Q4; the schema columns are i4): a count of n particles fits if
+/* Catalogue int32 guards (the schema columns are i4): a count of n particles fits if
  * 0 <= n <= INT32_MAX; a dense 0-based rank r fits only if r < INT32_MAX (the rank INT32_MAX
  * stands for INT32_MAX + 1 particles). n * elsize bytes fit an MPI int count if <= INT_MAX. */
 static inline int subhalo_count_fits_i32(double n) { return n >= 0 && n <= (double) INT32_MAX; }
@@ -96,14 +58,9 @@ static inline int subhalo_mpi_bytes_fit(int64_t n, size_t elsize) {
  * the exponent bits of an IEEE double. */
 int subhalo_isfinite(double x);
 
-/* Compensated (Neumaier) summation, Phase 5 audit R4: s[0] is the rounded running sum, s[1] the
- * accumulated rounding errors, the value s[0] + s[1]. The serial and the distributed recipes of
- * the Rockstar profile and the deferred properties accumulate their cumulative masses and
- * velocity sums this way, the distributed one merging per-rank pairs in rank order
- * (subhalo_ksum_merge as an MPI operation). For n equal masses m every partial sum and error is
- * an exact multiple of the last bit of m, so both modes give the correctly rounded n m whatever
- * the grouping; for other inputs they agree to about one rounding. The volatile temporaries keep
- * -ffast-math (the build's default) from reassociating the error terms away. */
+/* Compensated (Neumaier) sum s[0] + s[1], used by the serial and distributed property recipes (the
+ * latter merges per-rank pairs in rank order) so that equal masses sum exactly whatever the grouping
+ * and other inputs agree to about one rounding. volatile keeps -ffast-math from dropping the errors. */
 static inline void
 subhalo_ksum_add(double s[2], double x)
 {
@@ -136,7 +93,7 @@ subhalo_ksum_value(const double s[2])
     return v;
 }
 
-/* The velocity trio of the Phase 5 recipe (subhalo_props.c) from the compensated aperture sums
+/* The velocity trio (subhalo_props.c) from the compensated aperture sums
  * about the core velocity cvel (Vel units): Mb the aperture mass, Sb and S2 its first and second
  * moments, Mc and Sc those of the Rockstar core; vkms converts Vel to km/s. One function for the
  * serial and the distributed recipe, so that equal sums give equal columns. */
@@ -147,19 +104,14 @@ void subhalo_deferred_velocities(float BulkVel[3], float CoreVel[3], float * Vrm
  * Vel * UnitVelocity_in_cm_per_s / (1e5 * atime). The units come from subhalo_set_units. */
 double subhalo_vel_to_kms(double atime);
 
-/* Collective range check before narrowing a local 64-bit count to an MPI int: if value < 0 or
- * value > INT_MAX on any rank, every rank aborts with endrun(1) naming what. Phase 1 does not
- * batch exchanges beyond the MPI int limit (except the record fetch and store, which batch by
- * bytes); it fails cleanly instead. */
+/* Collective range check before narrowing a 64-bit count to an MPI int: endrun(1) on every rank,
+ * naming what, if value < 0 or > INT_MAX on any rank (exchanges are not batched past the limit). */
 void subhalo_check_mpi_count(int64_t value, const char * what, MPI_Comm Comm);
 
-/* Keyed MPI_Alltoallv of fixed-size elements. sendbuf holds sendcounts[r] elements for rank r,
- * in rank order (64-bit counts; offsets are computed in 64 bits). Every local count and the
- * local send and receive totals are checked collectively against the MPI int limit before any
- * narrowing (endrun(1) on every rank otherwise). The receive buffer is allocated on the main
- * stack (top if top != 0, else bottom) and returned in *recvbuf; the caller frees it. If
- * recvcounts is not NULL it receives the per-source counts (NTask int64). Returns the number of
- * received elements. Collective. */
+/* Keyed MPI_Alltoallv of fixed-size elements, sendcounts[r] for rank r in rank order (64-bit counts,
+ * checked against the MPI int limit before narrowing). *recvbuf is allocated on the main stack (top
+ * if top != 0) and freed by the caller; recvcounts (NTask) if not NULL. Returns the received count.
+ * Collective. */
 int64_t subhalo_alltoallv(const void * sendbuf, const int64_t * sendcounts, size_t elsize, void ** recvbuf, int top, int64_t * recvcounts, MPI_Comm Comm);
 
 /* Bytes one batch of subhalo_table_fetch / subhalo_table_store may hold on any rank (its
@@ -190,13 +142,10 @@ void subhalo_track_carry(struct SubTrack * rec, const struct SubTrack * old, int
 /* Set the orphan state of a record that sank into winner (SinkTrackId) or died (winner = -1). */
 void subhalo_track_make_orphan(struct SubTrack * t, int64_t winner, int SnapNum);
 
-/* The tracks no key processed this call, on the home ranks (H6/H7): a resolved track without
- * live particles dies (not sunk); a resolved track with own-tag field particles but no
- * processed key keeps the Phase 1 hostless rule: Nbound = its field particles (all bound),
- * periodic centre about a common reference, MostBound* the first tracer-type particle in rank
- * order, SUBHALO_FLAG_INPLACE, every property of the previous call cleared. Since Phase 2b
- * processes an oversized pseudo-key in place, subhalo_find never leaves such a track (the
- * branch is kept for the direct unit test). Returns the global counts. Collective. */
+/* The tracks no key processed this call, on their home ranks: one without live particles dies (not
+ * sunk); one with own-tag field particles gets the hostless rule (all bound, SUBHALO_FLAG_INPLACE,
+ * properties cleared), which only the unit test reaches: every pseudo-key is processed.
+ * Returns the global counts. Collective. */
 void subhalo_update_unhosted(struct SubTrackTable * tab, int SnapNum, double atime, int64_t * nhostless, int64_t * ndead, MPI_Comm Comm);
 
 /* subhalo_read_state without the abort on a validation failure (duplicate or missing TrackIds,
@@ -218,12 +167,9 @@ struct SubhaloLocalKey {
     double ref[3];          /* FirstPos of the group, translated frame */
 };
 
-/* Global list of the oversized keys, identical on every rank, sorted by g: the FOF groups and the
- * pseudo-keys processed in place (Phase 2b). Length counts the FOF particles that stay in the
- * key g after the sub-tree keys were cut (informative). The key centre (cen, vel) is the
- * mass-weighted centre and mean Vel of the key's FOF particles (all particles of a pseudo-key),
- * periodic about ref, translated frame and internal Vel: the frame of a newborn candidate and of
- * a member without a previous-bound frame, as the serial key centre. */
+/* An oversized key processed in place (FOF group or pseudo-key), global, sorted by g. Length: its
+ * FOF particles left after the sub-tree cut (informative). cen, vel: mass-weighted centre and mean Vel
+ * of its FOF particles (a pseudo-key's all), the frame of a candidate without a previous-bound one. */
 struct SubhaloInplaceKey {
     int64_t g;
     int64_t Length;
@@ -235,7 +181,7 @@ struct SubhaloInplaceKey {
     int64_t NMembers;       /* member tracks of the key in plan->Members */
 };
 
-/* ---- Phase 2b: oversized groups (plan in subhalo_gather.c, rounds in subhalo_collective.c) ---- */
+/* ---- oversized groups, design 7.8 (plan in subhalo_gather.c, rounds in subhalo_collective.c) ---- */
 
 enum { SUBHALO_MEM_RESOLVED = 0, SUBHALO_MEM_ORPHAN = 1, SUBHALO_MEM_NEWBORN = 2 };
 /* Processing states, shared by the serial key nodes (subhalo_track.c) and the in-place
@@ -243,14 +189,10 @@ enum { SUBHALO_MEM_RESOLVED = 0, SUBHALO_MEM_ORPHAN = 1, SUBHALO_MEM_NEWBORN = 2
  * resurrected or a newborn that did not survive. */
 enum { SUBHALO_ST_NONE = 0, SUBHALO_ST_ALIVE = 1, SUBHALO_ST_DIED = 2, SUBHALO_ST_SUNK = 3, SUBHALO_ST_FAILED = 4 };
 
-/* A member track of an oversized key, identical on every rank (the member table of design 7.8,
- * the one broadcast of the call), sorted by TrackId. Members are the resolved tracks keyed to it
- * (Key == g), the orphans hosted by it (Host == g) and, for a key without any member, the newborn
- * central (provisional TrackId). The processing tree is the serial key's nest tree of the whole
- * group: Parent is the member index of the processing parent (-1 for the central); the central is
- * decided in the plan exactly as the serial key decides it. A resolved member is either an
- * in-place candidate (cand >= 0) or in a serial sub-tree key (SubKey >= 0), cut from the tree
- * below an in-place candidate; orphans are neither. */
+/* A member track of an oversized key (the design 7.8 member table), identical on every rank, sorted
+ * by TrackId: resolved tracks keyed to it, orphans hosted by it, or a newborn central. Parent spans
+ * the serial nest tree of the whole group (central decided as the serial key does); a resolved member
+ * is an in-place candidate (cand >= 0) or in a serial sub-tree key (SubKey >= 0). */
 struct SubhaloMember {
     int64_t TrackId;
     int64_t g;
@@ -339,9 +281,8 @@ struct SubhaloCollAdmit {
     double avail;            /* this rank: free bytes left for the collective call */
     double worst_short;      /* largest need - avail over the ranks (> 0: failed) */
     int64_t NumPart, NUniv, NSubPart;    /* this rank's inputs: particles, particles of oversized groups, of its sub-tree keys */
-    /* Phase 5c: the reserve admission, checked for every plan (also without in-place candidates):
-     * the free bytes at pack time must cover the plan's constant reserve and the per-MaxPart sort
-     * bytes (cfg.ReserveBytes + cfg.SortBytesPerPart * MaxPart) on every rank */
+    /* the reserve admission of every plan: the free bytes at pack time against cfg.ReserveBytes +
+     * cfg.SortBytesPerPart * MaxPart */
     int reserve_failed;      /* 1: some rank is short of the reserve */
     int reserve_rank;        /* the rank with the largest shortfall */
     double reserve_short;    /* its shortfall (bytes; <= 0 when the check passed) */
@@ -350,14 +291,11 @@ struct SubhaloCollAdmit {
 };
 struct SubhaloPlan {
     int NTask, ThisTask;
-    /* Keys: the FOF groups g in [1, TotNgroups], then the pseudo-keys of the hostless resolved
-     * tracks, g in [TotNgroups + 1, TotKeys0] (Phase 2a plan step 3), then the serial sub-tree
-     * keys of the oversized groups, g in [SubKeyBase, TotKeys] (Phase 2b). KChunk partitions
-     * [1, TotKeys] for the key directory. */
+    /* Keys: FOF groups [1, TotNgroups], pseudo-keys of hostless resolved tracks up to TotKeys0, serial
+     * sub-tree keys [SubKeyBase, TotKeys]; KChunk partitions [1, TotKeys] for the directory. */
     int64_t TotNgroups, TotKeys, KChunk;
     int64_t TotKeys0, SubKeyBase;
-    /* Phase 2b, on the top of the main stack before the four below, in this order: the member
-     * table, the candidates, the rounds and the sub-tree keys (identical on every rank) */
+    /* on the top of the main stack before the four below, in this order, identical on every rank */
     struct SubhaloMember * Members;          /* sorted by TrackId */
     int64_t NMembers;
     struct SubhaloInplaceCand * Cands;       /* sorted by (round, g, TrackId) */
@@ -377,17 +315,15 @@ struct SubhaloPlan {
     int64_t * OrphanIds;                    /* orphans hosted by a serial key processed here, sorted */
     int64_t NOrphanIds;
     struct SubhaloPlanStats Stats;
-    struct SubhaloCollAdmit Admit;          /* the admission of the collective stage (audit Q1) */
-    /* Phase 5c */
+    struct SubhaloCollAdmit Admit;          /* the admission of the collective stage */
     double PackFreeBytes;                   /* this rank: mymalloc_freebytes() at the last packing */
     int64_t ExchOut, ExchIn;                /* this rank: live particles sent and received by subhalo_plan_exchange */
 };
 
 /* ---- the packing as a particle-free function (unit-testable with synthetic inputs) ---- */
 
-/* A census message to the key directory: the particles of key g held by one rank (kind 0),
- * the FOF group record of g from the rank that holds it (kind 1), or an orphan track hosted
- * by g from its home rank (kind 2, ntags = 1, track = its TrackId; Phase 2a step 3). */
+/* A census message to the key directory: the particles of key g held by one rank (kind 0), the FOF
+ * group record of g (kind 1), or an orphan hosted by g from its home rank (kind 2, track = TrackId). */
 struct SubhaloDirMsg {
     int64_t g;
     int64_t cnt[6];
@@ -407,13 +343,13 @@ struct SubhaloDirKey {
     int64_t Tags;           /* upper bound on the distinct member tracks: the sum of the ntags */
     double ref[3];
     int64_t cstart, ccount; /* census contributions in the directory's message array, by rank */
-    int64_t NField;         /* field particles in Length (Phase 2a) */
+    int64_t NField;         /* field particles in Length */
     int64_t ostart, ocount; /* kind-2 (hosted orphan) messages in the message array */
     int target;             /* processing rank of a serial key, -1 if none */
     int oversized;          /* 1: processed in place */
     int decider;            /* lowest rank holding particles of the key */
     int has_group;
-    int forced;             /* Phase 2b: in place whatever its size (a split group, an earlier pass's in-place key) */
+    int forced;             /* in place whatever its size (a split group, an earlier pass's in-place key) */
     int pad;
 };
 
@@ -441,9 +377,8 @@ struct SubhaloPlanCfg {
     double InplaceKeyBytes;     /* per in-place key, on every rank (global vectors) */
     double InplaceCandBytes;    /* per in-place candidate, on every rank */
     double InplaceMemberBytes;  /* per member track of the in-place keys, on every rank */
-    /* the in-place structure the current plan pass knows (audit Q1): its candidates and member
-     * tracks; a key that becomes oversized during the packing adds one candidate and, for a FOF
-     * or pseudo-key, its census tags as members */
+    /* in-place candidates and members the plan pass knows; a key made oversized while packing adds
+     * one candidate and its census tags */
     int64_t NCandsKnown, NMembersKnown;
     int64_t SubKeyBase;         /* first serial sub-tree key (INT64_MAX: none) */
     double SubKeyPartBytes;     /* per particle of a sub-tree key, kept to the final tag pass (struct SubhaloBindOrd) */
@@ -455,15 +390,10 @@ struct SubhaloPlanCfg {
 /* Fill cfg from the parameters and the communicator size. */
 void subhalo_plan_default_cfg(struct SubhaloPlanCfg * cfg, int64_t TotNgroups, int NTask);
 
-/* Classification and packing (design 7.3): passes of (budgets, keys that fit no rank in place,
- * head greedy + proportional tail, unplaced keys in place) until a pass moves nothing in place
- * (or MaxIter passes), then census rounds that check every destination's assigned particles,
- * per-type particles and bytes against the budgets of the final staying particles and move
- * keys of over-budget destinations in place, smallest first, until the census passes. On
- * return every key of dk has oversized set or a target and the plan fits (except with
- * ForceRankZero, which is deliberately unchecked). dk is this rank's directory slice and in its
- * census messages (sorted by g, then kind, then rank; cstart/ccount index into it). Uses no
- * particle data: res describes the rank. Collective. */
+/* Classification and packing (design 7.3): passes of budgets, head greedy and proportional tail until
+ * none moves a key in place (at most MaxIter), then census rounds moving keys of over-budget
+ * destinations in place until all fit (ForceRankZero unchecked). dk: this rank's directory slice; in:
+ * its census messages sorted by (g, kind, rank). Particle-free (res describes the rank). Collective. */
 void subhalo_plan_pack(struct SubhaloDirKey * dk, int64_t ndir, const struct SubhaloDirMsg * in,
                        const struct SubhaloPlanRes * res, const struct SubhaloPlanCfg * cfg,
                        struct SubhaloPlanStats * stats, MPI_Comm Comm);
@@ -490,44 +420,29 @@ struct SubhaloKeySeg {
  * SubhaloNumTracerHostFinding by (BindRank, ID) as TracerIDs and sets Host to the GrNr (-1: no
  * group) with the largest weight sum 1 / (1 + sqrt(i)), ties to the smaller GrNr. Collective. */
 void subhalo_host_vote(struct SubTrackTable * tab, MPI_Comm Comm);
-/* Step 3, previous-bound frames: the sums over the live particles with BoundTrackId == T,
- * positions as nearest-image displacements from one common reference per track (the
- * lowest-(own tag, BindRank, ID) such particle, found through the home rank, H7), reduced on
- * the home rank in rank order into RefPos, RefVel, NPrev, MPrev. Collective. */
+/* Step 3, previous-bound frames: sums over the live particles with BoundTrackId == T, as
+ * nearest-image displacements from one common reference per track (the lowest (own tag, BindRank,
+ * ID)), reduced on the home rank in rank order into RefPos, RefVel, NPrev, MPrev. Collective. */
 void subhalo_previous_frames(struct SubTrackTable * tab, MPI_Comm Comm);
 /* Step 3, keys of the tracks on the home ranks: Key = Host for a hosted resolved track, the
  * pseudo-key TotNgroups + 1 + ordinal for a hostless resolved track (ordinals in TrackId order
  * by an exclusive scan), -1 otherwise. Returns the global number of pseudo-keys. Collective. */
 int64_t subhalo_assign_keys(struct SubTrackTable * tab, int64_t TotNgroups, MPI_Comm Comm);
-/* Step 3: plan. The keys of the field particles come from their tracks' Key (request/reply
- * to the home ranks); the census, budgets and packing cover FOF and pseudo-keys; the orphans
- * hosted by a serial key are routed to its processing rank (plan->OrphanIds). Allocates
- * plan->LocalKeys, Assigned, Inplace, OrphanIds on the top of the stack, sets P[i].TopLeaf to
- * the target rank of every particle and encodes the key of every field particle that travels
- * with a serial key as GrNr = -(2 + key) (subhalo_restore_field_grnr undoes it). ddecomp (may be
- * NULL in tests) sizes the collective tree in the admission. Returns 0, or 1 on every rank when
- * the collective stage cannot fit (plan->Admit; nothing in P has been modified then: the caller
- * frees the plan and fails the call). Collective. */
+/* Step 3, the plan: census, budgets and packing of the FOF, pseudo- and sub-tree keys; hosted orphans
+ * routed to their serial key's rank (OrphanIds). Allocates the tables on the top, sets P[i].TopLeaf
+ * to each particle's target and encodes a travelling particle's key in GrNr (undone by
+ * subhalo_restore_field_grnr). ddecomp (NULL in tests) sizes the admission's tree. Returns 0, or 1 on
+ * every rank if the admission fails (P untouched; the caller frees the plan). Collective. */
 int subhalo_plan_build(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubTrackTable * tab, int64_t NHostless,
                        const DomainDecomp * ddecomp, MPI_Comm Comm);
 /* The kinematic constants of the plan-step central decision (the serial key's kinetic distance):
  * set by the driver before subhalo_plan_build (a, H(a) in internal units). */
 void subhalo_plan_set_frame(double atime, double Hubble);
 
-/* Admission of the collective stage (audit Q1): before the exchange, every rank estimates the
- * peak of each stage of subhalo_collective_run for the plan it is about to commit, from the
- * actual numbers of candidates and members, its restored-domain particle count, its particles
- * of the oversized groups and of the sub-tree keys it processes, and compares the persistent
- * scratch plus the largest stage with the memory left once the serial stage has released its
- * arenas. A rank that cannot fit makes subhalo_plan_build return 1 (collectively): the driver
- * then fails the call before the exchange. */
-/* The estimate itself (particle-free, unit-testable; subhalo_collective.c). Inputs: this rank's
- * restored-domain particle count NumPart and MaxPart, NUniv its particles of the oversized groups,
- * NSubPart the particles of the sub-tree keys it processes, NOwned the candidates it owns and
- * OwnedRecv the core records those can receive (sum over its candidates of 2 K x the ranks
- * holding their group), the global NCands, NMembers and NSubResults (sub-tree members), the
- * domain's NTopNodes, NTopLeaves and this rank's top leaves, the tree allocation factor and the
- * thread count; fills a->persist, stage[] and need. */
+/* Admission estimate of subhalo_collective_run (particle-free; subhalo_collective.c), made before the
+ * exchange: this rank's persistent bytes and per-stage peaks from its particle counts (NUniv in
+ * oversized groups, NSubPart in its sub-tree keys), owned candidates and their core records
+ * (OwnedRecv), the global counts and the top tree; fills a->persist, stage[] and need. */
 void subhalo_coll_estimate(struct SubhaloCollAdmit * a, int64_t NumPart, int64_t MaxPart, int64_t NUniv, int64_t NSubPart,
                            int64_t NOwned, int64_t OwnedRecv, int64_t NCands, int64_t NMembers, int64_t NSubResults,
                            int64_t NTopNodes, int64_t NTopLeaves, int64_t NLocalLeaves, double TreeAllocFactor, int nthreads);
@@ -569,7 +484,7 @@ int subhalo_plan_exchange(struct SubhaloPlan * plan, MPI_Comm Comm);
 void subhalo_plan_free(struct SubhaloPlan * plan);
 /* Local sort of P by (garbage last, processing key, TrackId, BindRank, ID). */
 void subhalo_local_sort(void);
-/* Phase 5d: an order-preserving threaded selection over P[0 .. N): COUNT_CHUNKS fills off[c + 1]
+/* An order-preserving threaded selection over P[0 .. N): COUNT_CHUNKS fills off[c + 1]
  * with the number of selected particles of chunk c and turns off into offsets, FILL_CHUNKS runs
  * BODY(i, m) for the m-th selected particle i in P order. The result does not depend on the
  * thread count. */
@@ -595,7 +510,7 @@ void subhalo_local_sort(void);
                 if(PRED) { BODY; m++; } \
         } \
     } while(0)
-/* Phase 5d test knob: 0 the record sort when it fits (default), 1 always the indirect sort of P. */
+/* Test knob: 0 the record sort when it fits (default), 1 always the indirect sort of P. */
 void subhalo_local_sort_set_mode(int mode);
 /* Chunks of an order-preserving threaded pass over n items (about four per thread, at least 4096
  * items each); the results of such passes do not depend on it. */
@@ -632,16 +547,10 @@ static inline void * subhalo_arena_get(struct SubhaloArena * a, size_t bytes) {
 
 /* Callback processing serial key k with one arena; nthreads > 1 only for a key processed alone. */
 typedef void (*subhalo_key_fn)(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloArena * arena, int nthreads, void * userdata);
-/* Static cost-ordered schedule of the serial segments over the OpenMP threads (Phase 5c): the
- * keys sorted by decreasing subhalo_key_cost(n, Tracks) (ties by g), those whose
- * cost exceeds the total cost / nthreads processed alone first with every thread inside the key,
- * the rest assigned longest-processing-time first on cost to the least loaded thread and processed
- * by each thread in that order; one arena per thread (mymalloc2 in thread order, freed in
- * reverse). Key k needs an arena of bytes_per_part * segs[k].n + extra[k] + 64 bytes (extra may
- * be NULL), and its fn() call sees an arena of exactly that logical size, whatever the size of the
- * shared buffer (so a key's results do not depend on the keys it shares a thread with). Every
- * fn() call is timed into the statistics below. Returns the largest arena high-water mark of a
- * key as a fraction of its arena (diagnostic). */
+/* Static cost-ordered schedule of the serial segments: keys costing more than total / nthreads run
+ * alone first with every thread inside, the rest go longest-first to the least loaded thread (one
+ * arena each). fn() sees exactly its key's allowance, bytes_per_part * n + extra[k] + 64 (extra may be
+ * NULL), so results do not depend on the thread sharing. Returns the largest arena high-water fraction. */
 double subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t bytes_per_part, const int64_t * extra,
                                subhalo_key_fn fn, void * userdata);
 /* This rank's measured key times, summed over the subhalo_run_serial_keys calls since the last
@@ -654,9 +563,7 @@ struct SubhaloSerialStats {
     int64_t KeyTimeMaxN;      /* its particles */
     double AloneWall;         /* wall time of the keys processed alone (s) */
     double ThreadedWall;      /* wall time of the threaded part (s) */
-    /* the threaded part, per actual worker of the OpenMP team (Phase 5 audit R2: a team smaller
-     * than the queues, from dynamic adjustment, a thread limit or an enclosing parallel region,
-     * runs several queues per worker) */
+    /* the threaded part, per actual worker (a team smaller than the queues runs several per worker) */
     double ThreadMax;         /* sum over calls of the largest per-worker summed key time */
     double ThreadSum;         /* sum over calls and workers of the per-worker summed key times */
     double ThreadMeanSum;     /* sum over calls of the mean per-worker summed key time */
@@ -687,7 +594,7 @@ struct SubhaloIdHit {
  * out[i].found = 0 for a miss. Collective. */
 void subhalo_lookup_ids(const MyIDType * ids, int64_t n, struct SubhaloIdHit * out, MPI_Comm Comm);
 /* Bytes the batch buffers of one subhalo_lookup_ids batch can hold on any rank (gathered ids,
- * outgoing and returning replies; J4): at most SubhaloLookupBatchBytes, or the one-id-per-rank
+ * outgoing and returning replies): at most SubhaloLookupBatchBytes, or the one-id-per-rank
  * floor NTask * (8 + 80) + 80 bytes when that is larger. */
 double subhalo_lookup_batch_peak_bytes(int NTask);
 /* Bytes of the sorted (ID, index) index and its sort scratch for NumPart particles. */
@@ -696,7 +603,7 @@ double subhalo_lookup_index_bytes(int64_t NumPart);
 double subhalo_lookup_last_peak_bytes(void);
 /* Test knob: at most maxbatch ids per rank and batch (0 restores the byte cap alone). */
 void subhalo_lookup_set_max_batch(int64_t maxbatch);
-/* Phase 5d test knob: 0 auto (scan when all queries of the call are at most 1/16 of the rank's
+/* Test knob: 0 auto (scan when all queries of the call are at most 1/16 of the rank's
  * live particles, else the sorted index), 1 always the index, 2 always the scan. */
 void subhalo_lookup_set_mode(int mode);
 /* Step 1: every orphan record homed here (Nbound == 0, SnapTracerLost < 0) looks up its
@@ -719,7 +626,7 @@ struct SubhaloResult {
     int64_t DescOwner[SUBHALO_MAXTRACERS];  /* per tracer: its BoundTrackId, -1 if unbound or lost, SUBHALO_DESC_PENDING still to be looked up (step 11) */
     int64_t ipk;             /* the central of an oversized key (in place or a sub-tree survivor promoted to
                               * Rank 0): index of its key in plan->Inplace, else -1 */
-    /* Phase 2b: the node's state for the rounds (serial sub-tree keys) */
+    /* the node's state for the rounds (serial sub-tree keys) */
     int64_t subkey;          /* the sub-tree key it was processed in, -1 */
     int32_t state;           /* SUBHALO_ST_* */
     int32_t Keep;            /* a sub-tree root: own-tag remainder particles inside its relaxed source */
@@ -729,8 +636,8 @@ struct SubhaloResult {
     int64_t SinkTo;          /* the node it sank into in the key (TrackId), -1 */
 };
 
-/* Phase 5c: the stages of one call, timed by the driver (wall time and the main-allocator used
- * high water of each stage); SubhaloStageName in subhalo.c. */
+/* The stages of one call, timed by the driver (wall time and allocator high water of each);
+ * SubhaloStageName in subhalo.c. */
 enum { SUBHALO_STAGE_SETUP = 0, SUBHALO_STAGE_VOTE, SUBHALO_STAGE_FRAMES, SUBHALO_STAGE_LOOKUP, SUBHALO_STAGE_PLAN,
        SUBHALO_STAGE_EXCHANGE, SUBHALO_STAGE_SORT, SUBHALO_STAGE_FETCH, SUBHALO_STAGE_SERIAL, SUBHALO_STAGE_RESTORE,
        SUBHALO_STAGE_ROUNDS, SUBHALO_STAGE_NUMBER, SUBHALO_STAGE_DESCENDANTS, SUBHALO_STAGE_HISTORY, SUBHALO_STAGE_STORE,
@@ -745,13 +652,12 @@ struct SubhaloCallStats {
     int64_t WorstTrackId;    /* its TrackId (-1 if none; provisional for a newborn) */
     int64_t NFinalPositive;  /* final-pass bound particles with E >= 0, summed over the survivors */
     int64_t NFinalBound;     /* bound particles of the final passes */
-    int64_t NTailRejected;   /* tail claims crossing the binding owner's final branch (J2) */
-    int64_t NFallbackField;  /* Phase 2b: particles of the oversized keys whose tags the final pass of the rounds wrote */
+    int64_t NTailRejected;   /* tail claims crossing the binding owner's final branch */
+    int64_t NFallbackField;  /* particles of the oversized keys whose tags the final pass of the rounds wrote */
     int64_t NFallbackReleased; /* field particles of the oversized keys untagged instead (stale orphan tags, the central's); not in NFallbackField */
     double ArenaPeakFrac;    /* largest arena high-water mark of a key / its arena size */
-    /* ---- Phase 5c instrumentation (global, set by subhalo_find on every return path; on a
-     * failed call the counters above and below are zero, the wall times and memory peaks of the
-     * stages that ran are kept and Complete is 0) ---- */
+    /* ---- instrumentation (global, set on every return path; a failed call keeps the wall times
+     * and peaks of the stages that ran, zero counters and Complete 0) ---- */
     int Complete;            /* 1: the call completed */
     int PeakRank, PeakStage; /* where the used high water was reached (-1 if not measured) */
     double WallTime;         /* wall time of the call, max over the ranks (s) */
@@ -760,9 +666,8 @@ struct SubhaloCallStats {
     double StageMax[SUBHALO_NSTAGE];        /* wall time per stage (s), max over the ranks */
     double StageMean[SUBHALO_NSTAGE];       /* mean over the ranks */
     double StagePeakBytes[SUBHALO_NSTAGE];  /* used high water within the stage, max over the ranks */
-    /* Phase 5d: the finder's own increment: per stage the used high water within the stage
-     * without the field SO walks' elastic export tables, minus the usage at the call's entry
-     * (max over the ranks); the call's increment is the largest over the stages and ranks */
+    /* the finder's own increment per stage: its high water without the field SO's elastic export
+     * tables, minus the usage at entry (max over the ranks); the call's is the largest */
     double StageIncrBytes[SUBHALO_NSTAGE];
     int64_t PeakIncrementBytes;
     int PeakIncrementRank, PeakIncrementStage;
@@ -797,7 +702,7 @@ struct SubhaloCallCtx {
     int TracerTypes;
     int ThisTask;
     int64_t TotNgroups;      /* keys above are pseudo-keys */
-    const struct SubhaloPlan * plan;   /* Phase 2b: keys above plan->TotKeys0 are serial sub-tree keys */
+    const struct SubhaloPlan * plan;   /* keys above plan->TotKeys0 are serial sub-tree keys */
     int64_t IpResStart;      /* first result slot of the in-place candidates owned by this rank */
     int64_t NIpRes;
     const struct SubhaloUnbindParams * up;
@@ -808,21 +713,19 @@ struct SubhaloCallCtx {
     int64_t * ResStart;          /* [nsegs]: first result slot of each segment */
     int64_t * Hosted;            /* member indices grouped by segment (serial: the members hosted by the key) */
     int64_t * HostedStart;       /* [nsegs + 1] */
-    /* Phase 3 */
+    /* properties */
     double rho[SUBHALO_NSO];     /* subhalo_so_thresholds at atime */
     int MetalReturnOn;           /* All.MetalReturnOn: metal columns of subhalo_props_baryons */
     struct SubhaloCallStats Stats;   /* this rank's diagnostics (threads add atomically) */
-    /* Phase 2b audit Q3: the binder ordinals of the sub-tree keys processed here, sorted by ID
-     * (top of the stack, from subhalo_process_serial to subhalo_free_bind_ord) */
+    /* the binder ordinals of the sub-tree keys processed here, sorted by ID (top of the stack,
+     * from subhalo_process_serial to subhalo_free_bind_ord) */
     struct SubhaloBindOrd * BindOrd;
     int64_t NBindOrd;
 };
 
-/* A particle bound by a member B of a serial sub-tree key while another member of the key holds
- * its tag (a tail claim): its place in B's own-tag sequence, needed when that claim becomes void
- * in the rounds (the claimant sinks into an in-place candidate while B survives) and the particle
- * returns to B (audit Q3, decision 19): g = B's own exclusive particles before it in B's
- * final-pass energy order, f = its position in that order. */
+/* A tail claim in a serial sub-tree key (bound by member B, tagged by another): its place in B's
+ * final-pass energy order (f) and B's exclusive particles before it (g), to return it to B if the
+ * claim becomes void in the rounds (decision 19). */
 struct SubhaloBindOrd {
     MyIDType ID;
     int64_t g;
@@ -840,13 +743,10 @@ struct SubTrack * subhalo_find_member(const struct SubhaloCallCtx * ctx, int64_t
  * (freed by subhalo_free_slots) and returns the number of result slots. */
 int64_t subhalo_result_slots(const struct SubhaloKeySeg * segs, int64_t nsegs, struct SubhaloCallCtx * ctx);
 void subhalo_free_slots(struct SubhaloCallCtx * ctx);
-/* Steps 7a-7h and 8 for every serial segment (OpenMP through subhalo_run_serial_keys). A serial
- * sub-tree key of an oversized group (g > plan->TotKeys0, Phase 2b plan steps 7 and 8) is
- * processed with its root as the top of the hierarchy (no central decision, no FeedCentrals,
- * the group's key centre) and provisional tags: the root's whole list keeps the root's tag
- * (untruncated, BoundTrackId -1 for its unbound part, ranks after its exclusive bound set) and
- * the result carries Keep, the state and the sinking core for the rounds; every descendant vote
- * is left to the remote lookup; the hierarchy columns are written by the rounds. */
+/* Steps 7a-7h and 8 for every serial segment (threaded by subhalo_run_serial_keys). A sub-tree key
+ * (g > plan->TotKeys0) has its root on top (no central decision, no FeedCentrals, the group's key
+ * centre) and provisional tags: the root keeps its whole untruncated list; the result carries Keep,
+ * state and core for the rounds, which write the hierarchy; descendant votes go to the remote lookup. */
 void subhalo_process_serial(const struct SubhaloKeySeg * segs, int64_t nsegs, struct SubhaloCallCtx * ctx);
 
 #endif

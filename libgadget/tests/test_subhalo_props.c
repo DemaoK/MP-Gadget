@@ -1,42 +1,18 @@
-/* Unit tests of the Phase 3 subhalo properties (subhalo_props.c): Phase 3 plan section 5,
- * tests 1 to 4, plus the group-C baryonic sums.
- *
- *  1. A sampled NFW sphere (c200c = 10, 50000 particles, truncated at 3 R200c): bound SO masses
- *     and radii of all five definitions, VmaxVir, RsKlypin and Rhalf against the analytic
- *     profile (the expected values are computed in the test from the NFW formulas).
- *  2. A triaxial Gaussian (axis ratios 0.7 and 0.5, rotated axes, 20000 particles): the Allgood
- *     shapes at Rvir and R500c and the inertia tensor against the input ratios and major axis.
- *  3. A thin disc in solid-body rotation in a tilted plane with a dense non-rotating central clump
- *     (the core): J and JVir against Omega R^2 / 2 M_disc / M_total along the normal, both spins
- *     finite and positive (SpinBullock against the formula with the analytic j, SpinPeebles
- *     against the HBT energies), Xoff/Voff near zero; then with the clump displaced in position
- *     and velocity: Xoff and Voff equal to the known shift times M_disc / M_total.
- *  4. subhalo_so_thresholds at a = 1 and a = 0.1 against the formulas of design 7.10.
- *  5. subhalo_props_baryons on a handful of gas, star and BH particles.
- *  7. Units (Phase 3 audit P4): the disc of test 3 at a = 0.5 with H(a) set, in kpc/h and km/s
- *     and again in Mpc/h with a 2 km/s velocity unit (the same physical system): J and JVir in
- *     physical kpc/h km/s, the spins, Vmax and the SO masses identical.
- *  6. The HBT Vmax / Rmax of subhalo_props_hbt against a sorted cumulative-mass oracle: the
- *     multi-peak profile of the Phase 2a audit (J9; the former bounded histogram search lost
- *     its maximum), a flat profile of equal-radius pairs (Rmax is the smallest radius attaining
- *     the maximum, as HBT's max_element), and random masses on a few shared radii.
- *
- *  8. The Phase 5 deferred columns (subhalo_props_deferred): the fitted NFW Rs of the sampled
- *     sphere of test 1 within 15 % of its scale radius; on the disc of test 3 BulkVel against the
- *     sample mean and Bulk, Vrms against the sample dispersion and sqrt(frac / 2) DISC_VEDGE,
- *     RockstarCoreVel against the mean inside 0.1 Rvir about CorePos (centred and displaced
- *     clump); -1 without a crossing (test_absent); unit invariance (test_units).
- *  9. Phase 5 audit fixes: R6, subhalo_nfw_fit returns -1 on repeated edges at the start radius
- *     (zero probe step), nonfinite edges (test_nfw_fit); R5, the bin edge's interpolation in the
- *     run's length unit (the audit's 0.01/0.02/0.03 Mpc/h example: 20 kpc/h, not Rockstar's
- *     literal 24.995) and an overshooting-bin oracle for Rs (test_nfw_bin_edges).
- *
- * Every candidate goes through subhalo_final_pass first (energies and order as in production),
- * then subhalo_props_hbt, subhalo_props_rockstar (which also fills the Phase 5 columns) and
- * subhalo_props_deferred (the standalone entry, bit-identical), all with an arena of exactly
- * SUBHALO_PROPS_BYTES_PER_PART per particle, which checks their scratch budget. Internal units
- * kpc/h, 1e10 Msun/h, km/s, a = 1, H = 0 (the Hubble term does not enter these properties
- * beyond the energies). Haloes are placed across a periodic boundary. Serial: mpirun -np 1. */
+/* Serial tests of the subhalo properties (subhalo_props.c; design D4, 7.5, section 8).
+ * Each candidate goes through subhalo_final_pass, then subhalo_props_hbt, _rockstar and _deferred
+ * with an arena of exactly SUBHALO_PROPS_BYTES_PER_PART per particle (checks the scratch budget).
+ *  thresholds          subhalo_so_thresholds at a = 1 and 0.1 against design 7.10.
+ *  nfw, nfw_fit        NFW sphere: bound SO, VmaxVir, RsKlypin, Rhalf, fitted Rs; fit edge cases.
+ *  triaxial            Allgood shapes and inertia tensor of a rotated triaxial Gaussian.
+ *  disc                rotating disc with a core: J, spins, Xoff/Voff, the velocity trio.
+ *  baryons, absent     baryonic sums; crossing-dependent columns -1 without a crossing, all
+ *                      Rockstar columns -1 for an empty bound set.
+ *  vmax                HBT Vmax/Rmax against a cumulative-mass oracle (multi-peak, flat, ties).
+ *  units               the disc in kpc/h and Mpc/h with two velocity units: same physics.
+ *  nfw_bin_edges       Rs bin edges in the run's length unit, an overshooting-bin oracle.
+ *  aperture_boundaries Rockstar's velocity aperture at its edges (decision 47.1).
+ * Internal units kpc/h, 1e10 Msun/h, km/s, a = 1, H = 0; haloes across a periodic boundary.
+ * Run as: mpirun -np 1 .objs/test_subhalo_props. */
 
 #include <stdarg.h>
 #include <stddef.h>

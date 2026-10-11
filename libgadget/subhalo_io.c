@@ -1,11 +1,6 @@
-/* Runtime subhalo finder: output of the PIG tables and particle tags, completion marker,
- * restart state search, table read and tag join.
- *
- * Design: halofinder_design.md sections 9 (output), 11 (restart), D7 (marker), Appendix B
- * (schema). Phase 1 plan: halofinder_phase1_plan.md section 3.
- *
- * Every function here that takes a communicator is collective over it. Scratch memory comes
- * from the mymalloc stack and is freed in reverse order before each function returns. */
+/* Subhalo finder I/O: the PIG tables, particle tags and slices, header and completion marker,
+ * and the restart state search, table read and tag join (design 9, 11, D7, Appendix B).
+ * Functions taking a communicator are collective over it. */
 #include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -261,8 +256,8 @@ subhalo_register_links_and_history(int ptype, struct IOTable * T)
     SUBREG(GeomUpParentTrackId, "i8", 1, ptype, T);
 }
 
-/* The two column lists of Appendix B: PTYPE_SUBHALO entries for Subhalo/, PTYPE_ORPHAN
- * entries for Orphan/. Allocated on the top of the stack; free with destroy_io_blocks. */
+/* The two column lists of Appendix B: PTYPE_SUBHALO for Subhalo/, PTYPE_ORPHAN for Orphan/.
+ * Free with destroy_io_blocks. */
 static void
 subhalo_register_table_blocks(struct IOTable * T)
 {
@@ -369,9 +364,8 @@ subhalo_table_nlocal(const struct SubTrackTable * tab)
 
 /* ------------------------------------------------------------------ slices (design 9) */
 
-/* One piece of a (TrackId, section, type) run as seen by one rank. A run that straddles rank
- * boundaries arrives at the home rank as several pieces with the same (TrackId, type,
- * section, GrNr); the home rank merges them (min start, summed length and nbound). */
+/* One rank's piece of a (TrackId, section, type) run; the home rank merges the pieces of a run
+ * that straddles rank boundaries. */
 struct SlicePiece {
     int64_t TrackId;
     int64_t GrNr;       /* -1 for section 1 */
@@ -498,8 +492,7 @@ subhalo_record_slices(const struct part_manager_type * pman, const int * selecti
         if(pieces[i].TrackId >= NTotal || tab == NULL || tab->Chunk <= 0)
             endrun(5, "Particle tag %ld in the PIG write is not a track of the table (NTotal %ld)\n", pieces[i].TrackId, NTotal);
     }
-    /* Home ranks are monotonic in TrackId, so a sort by TrackId groups the pieces by target.
-     * Counts in 64 bits, checked against the MPI int limit inside subhalo_alltoallv (H3). */
+    /* Home ranks are monotonic in TrackId, so a sort by TrackId groups the pieces by target. */
     qsort_openmp(pieces, npieces, sizeof(struct SlicePiece), slice_piece_cmp_track);
     int64_t * sendcounts = ta_malloc("SliceSendCounts", int64_t, NTask);
     memset(sendcounts, 0, sizeof(int64_t) * NTask);
@@ -614,8 +607,8 @@ subhalo_write_tables(BigFile * bf, MPI_Comm Comm)
         petaio_alloc_buffer(&array, ent, n);
         char * p = (char *) array.data;
         int64_t j;
-        /* the IOTable getters take an int index: call them on the record itself (index 0 of a
-         * rebased base pointer), so no local row count is narrowed (H4) */
+        /* the getters take an int index: call them at index 0 of the record itself, so no
+         * local row count is narrowed */
         for(j = 0; j < n; j++) {
             ent->getter(0, p, &tab->Track[idx[j]], NULL, &conv);
             p += array.strides[0];
@@ -633,8 +626,7 @@ subhalo_write_tables(BigFile * bf, MPI_Comm Comm)
 
 /* ------------------------------------------------------------------ header and marker */
 
-/* Provenance only: restart continuation uses the supplied parameter file, never this string.
- * Every parameter, doubles with round-trip precision (%.17g). */
+/* Provenance only (a restart uses the supplied parameter file): every parameter, doubles %.17g. */
 void
 subhalo_format_params(char * buf, size_t size)
 {
@@ -729,13 +721,13 @@ subhalo_write_header_attrs(BigBlock * bh, const struct part_manager_type * pman,
     /* the comoving thresholds (vir, 200b, 200c, 500c, 2500c) of the call the records describe */
     double SOThresholds[SUBHALO_NSO];
     subhalo_state_so_thresholds(SOThresholds);
-    /* Phase 5c: the cost of the last finder call (wall time, max over the ranks, in seconds; the
-     * main-allocator used high water, max over the ranks, in bytes; 0 under use_malloc) */
+    /* cost of the last call: wall time (s) and main-allocator used high water (bytes; 0 under
+     * use_malloc), max over the ranks */
     const struct SubhaloCallStats * cs = subhalo_last_call_stats();
     double SubhaloWallTime = cs->WallTime;
     uint64_t SubhaloPeakBytes = cs->PeakBytes > 0 ? (uint64_t) cs->PeakBytes : 0;
-    /* Phase 5d: the finder's own increment (bytes, max over the ranks and stages): the used high
-     * water without the field SO walks' elastic export tables minus the usage at the call's entry */
+    /* the finder's own increment (max over ranks and stages): high water without the field SO
+     * export tables, minus the usage at entry */
     uint64_t SubhaloPeakIncrementBytes = cs->PeakIncrementBytes > 0 ? (uint64_t) cs->PeakIncrementBytes : 0;
 
     if(
@@ -796,11 +788,8 @@ subhalo_finalize_output(BigFile * bf, int complete, MPI_Comm Comm)
 
 /* ------------------------------------------------------------------ restart: state search */
 
-/* Serial check (H8) that a block exists with the given number of rows and members, that its
- * dtype is the schema's (kind and width; BigFile converts the byte order on read, but not
- * precision), and that every payload file its header declares exists with the declared size
- * (fsize rows x nmemb x itemsize bytes): a block header surviving a missing or truncated
- * payload is not a readable state. Returns the number of problems (0 if the block is good). */
+/* Serial check of one block: row and member counts, the schema's dtype (BigFile converts byte
+ * order, not precision) and every payload file at its declared size. Returns the problem count. */
 static int
 subhalo_probe_block(BigFile * bf, const char * blockname, int64_t size, int nmemb, const char * dtype)
 {
@@ -972,8 +961,7 @@ subhalo_split_rows(int64_t N, int ThisTask, int NTask, int64_t * start, int64_t 
     *n = e - s;
 }
 
-/* A restart-state read failure after the state was probed complete is fatal (H8): the message
- * names the PIG and the two ways out. */
+/* A read failure of a state probed complete is fatal, naming the PIG and the two ways out. */
 #define SUBHALO_STATE_FATAL(pigname, ...) do { \
         message(1, __VA_ARGS__); \
         endrun(1, "Subhalo restart state %s is unreadable or inconsistent (see above). Clear its marker " \
@@ -981,10 +969,8 @@ subhalo_split_rows(int64_t N, int ThisTask, int NTask, int64_t * start, int64_t 
                   "or set SubhaloRestartFresh = 1 to restart with an empty track table.\n", (pigname)); \
     } while(0)
 
-/* Read this rank's rows of a block (rank order = the balanced split) into buf, which holds
- * nlocal x nmemb items of dtype. big_block_mpi_read reads each rank's dims[0] rows in rank
- * order from ptr, so every rank seeks to 0. Concurrency is the number of ranks (petaio's
- * IO.NumWriters is private to petaio.c). Collective; any failure is fatal (H8). */
+/* Read this rank's rows (the balanced split, in rank order) of a block into buf. Every rank
+ * seeks to 0: big_block_mpi_read places each rank's rows in rank order. Collective; failure is fatal. */
 static void
 subhalo_read_rows(BigFile * bf, const char * pigname, const char * blockname, const char * dtype, int nmemb, int64_t ntotal, int64_t nlocal, void * buf, MPI_Comm Comm)
 {
@@ -1082,7 +1068,7 @@ subhalo_read_state_checked(const char * pigname, struct SubTrackTable * tab, dou
         subhalo_read_rows(&bf, pigname, blockname, ent->dtype, ent->items, issub ? NumSubhalosTotal : NumOrphansTotal, n, array.data, Comm);
         char * p = (char *) array.data;
         int64_t j;
-        /* int setters on rebased single records (H4) */
+        /* int setters on single records, as the writer */
         for(j = 0; j < n; j++) {
             ent->setter(0, p, &base[j], NULL, &conv);
             p += array.strides[0];
@@ -1103,8 +1089,7 @@ subhalo_read_state_checked(const char * pigname, struct SubTrackTable * tab, dou
             recs[i].MboundType[k] = 0;
         }
     }
-    /* Identity and classification (H9): every TrackId in range; a Subhalo row is resolved
-     * (Nbound > 0, not dead), an Orphan row is dead or sunk (SnapDeath set). */
+    /* Every TrackId in range; a Subhalo row is resolved (Nbound > 0, alive), an Orphan row dead or sunk. */
     int64_t badrange = 0, badclass = 0;
     for(i = 0; i < nsub + norph; i++) {
         if(recs[i].TrackId < 0 || recs[i].TrackId >= NumTracksTotal)
@@ -1121,8 +1106,8 @@ subhalo_read_state_checked(const char * pigname, struct SubTrackTable * tab, dou
         return 1;
     }
 
-    /* Route every row to its home and require exactly one row per homed TrackId (H9): no
-     * duplicate, no hole. subhalo_table_store is not used here because it accepts duplicates. */
+    /* Route every row home, exactly one row per homed TrackId (subhalo_table_store would accept
+     * duplicates). */
     tab->NTotal = NumTracksTotal;
     subhalo_table_redistribute(tab, Comm);
     int64_t * sendcounts = ta_malloc("SubReadCounts", int64_t, NTask);
@@ -1258,7 +1243,7 @@ subhalo_join_tags(const char * pigname, struct part_manager_type * pman, MPI_Com
     BigFile bf = {0};
     if(0 != big_file_mpi_open(&bf, pigname, Comm))
         SUBHALO_STATE_FATAL(pigname, "Failed to open %s for the tag join: %s\n", pigname, big_file_get_error_message());
-    /* the number of tracks of the state, for the range checks of the saved tags (H9) */
+    /* the number of tracks of the state, for the range checks of the saved tags */
     int64_t NumTracksTotal = -1;
     {
         BigBlock bh;
@@ -1316,12 +1301,11 @@ subhalo_join_tags(const char * pigname, struct part_manager_type * pman, MPI_Com
         subhalo_read_rows(&bf, pigname, blockname, "i8", 1, Nsaved[t], nrow, boundtrackid, Comm);
         int64_t j;
         for(j = 0; j < nrow; j++) {
-            /* the saved tags must name tracks of the state, and a tagged row a rank (H9) */
+            /* the saved tags must name tracks of the state, and a tagged row a rank */
             if(trackid[j] < -1 || trackid[j] >= NumTracksTotal || boundtrackid[j] < -1 || boundtrackid[j] >= NumTracksTotal
                     || (trackid[j] >= 0 && bindrank[j] < 0))
                 badtags++;
-            /* Every saved row takes part, untagged ones included (H11): an exact match to a row
-             * saved untagged gives -1 instead of the generation-0 parent's tag. */
+            /* Untagged rows take part too: an exact match to one gives -1, not the parent's tag. */
             if(trackid[j] >= 0)
                 nsavedrecs++;
             struct JoinRec * r = &recs[n++];
@@ -1362,10 +1346,8 @@ subhalo_join_tags(const char * pigname, struct part_manager_type * pman, MPI_Com
 
     mpsort_mpi(recs, n, sizeof(struct JoinRec), join_radix, 16, NULL, Comm);
 
-    /* Boundary reconciliation: every rank publishes a summary of its sorted records; a rank
-     * looks back through its nearest non-empty predecessors (a run of equal base may span
-     * several ranks, and ranks may be empty) for the record just before its first one and
-     * for the saved generation-0 (parent) record of its first base. */
+    /* Boundary reconciliation: from the nearest non-empty predecessors (a base run may span
+     * ranks), the record before this rank's first one and the saved parent of its first base. */
     struct JoinBoundary mine = {0};
     mine.n = n;
     mine.lastTrackId = mine.lastBoundTrackId = mine.lowTrackId = mine.lowBoundTrackId = -1;
@@ -1459,9 +1441,7 @@ subhalo_join_tags(const char * pigname, struct part_manager_type * pman, MPI_Com
                 r->BindRank = prevBindRank;
             }
         }
-        /* Inheritance: only a spawned child (generation > 0) without its own saved record, and
-         * only from the saved record of its lineage base, which is always the spawning parent.
-         * A parent never inherits from a child. */
+        /* Only a spawned child without its own saved record inherits, from its generation-0 parent. */
         if(!exact && haveLow && join_generation(r) > 0) {
             r->TrackId = lowTrackId;
             r->BoundTrackId = lowBoundTrackId;
@@ -1470,7 +1450,7 @@ subhalo_join_tags(const char * pigname, struct part_manager_type * pman, MPI_Com
         }
     }
 
-    /* Return the results to the owners (64-bit counts, checked in subhalo_alltoallv, H3). */
+    /* Return the results to the owners. */
     int64_t * sendcounts = ta_malloc("JoinCounts", int64_t, NTask);
     memset(sendcounts, 0, sizeof(int64_t) * NTask);
     for(i = 0; i < n; i++)

@@ -1,71 +1,16 @@
-/* Field spherical overdensity of the subhalo finder's centrals (design 7.6, Phase 3 plan
- * section 4). The algorithm and its resolution are described in subhalo_so.h.
- *
- * Mechanics.
- *  - Anchored queries: treewalk_init_query copies P[i].Pos (and, with DEBUG, P[i].ID) of the
- *    query's particle and then calls fill, so every query is issued from a local particle. The
- *    s-th query of a walk is anchored to the s-th local particle that is neither garbage nor
- *    swallowed (the anchors are therefore distinct and ascending); fill overwrites Pos with the
- *    central's core in the translated frame and sets the radii; fill and reduce map the anchor
- *    index back to the query slot by a binary search in the anchor list. The anchor list is the
- *    active set of treewalk_run with haswork NULL, so the treewalk uses it as its queue as is.
- *    A rank with more queries than live particles (or than the batch cap) issues them in
- *    batches; every rank runs the same number of walks (global maximum of the batch counts).
- *  - Ranks without a live particle: their centrals are routed (whole records) to the lowest
- *    rank with a live particle, which walks them as its own and sends them back (subhalo_so.h).
- *  - Visits: treewalk_visit_nolist_ngbiter with NoNgblist = 1, accumulating directly in
- *    ngbiter; garbage (skipped by the visit already) and swallowed particles are excluded.
- *  - Types: the results carry the masses of the particle types present among the live
- *    particles of the whole run only (NT <= 6 slots; one for a DM-only run), which loses nothing.
- *  - Doubling: a manual redo loop. Each round walks every central still pending (in batches),
- *    then each central either is final or has its radius doubled and stays pending; the rounds
- *    end when no rank has a pending central. At most SubhaloSOMaxDoublings + 1 rounds.
- *  - Pass 2 classifies a particle into the crossing bin with the same function and the same
- *    (Rlo, Scale) as pass 1, so the pass-2 particle set of a crossing bin is exactly the pass-1
- *    one, and the cumulative mass at the outer edge agrees.
- *  - Accumulation: both passes add particle masses in double, in the walk's results, their
- *    merges and the analysis; only the record's f4 fields round. For vir and 200c pass 2
- *    carries the per-type sub-bins only and the total sub-bins are their sums, so the refined
- *    total and the per-type masses come from the same additions. Accuracy bound: a refined
- *    (or pass-1) mass of N particles carries a relative summation error of at most about
- *    N 2^-53 (in practice ~sqrt(N) 2^-53), which depends on the particle partition and the
- *    traversal order only at that level, far below the f4 rounding of the output (2^-24);
- *    the per-type masses sum to MSO within the f4 roundings. This is not bitwise
- *    reproducibility across partitions for arbitrary masses (it is for dyadic masses, whose
- *    sums are exact); test_subhalo_so.c checks both. The SO columns of the catalogues compare
- *    bitwise across layouts in practice because these double errors almost never move an f4
- *    rounding.
- *  - Pass 3 (decision 44) does not add its own rounding to that: its masses are 128-bit
- *    fixed-point integers (subhalo_so.h, exact for every particle mass in practice), its count an
- *    integer and its largest mass a max, so its profile is bitwise independent of the partition,
- *    the traversal, the threads and the merge order for any masses, GIVEN its inputs: the centre,
- *    the published f4 MSO[vir] / RSO[vir] and the live particle data; the analysis is a serial
- *    function of that profile and of those f4 values. Its NFW fit, a Newton iteration with
- *    comparisons, would not be robust against the last-bit differences that passes 1 and 2
- *    tolerate. Those passes' double sums do set its inputs, though: where their layout-dependent
- *    rounding moves a published f4 MSO[vir] or RSO[vir] (rare, as above; never for dyadic
- *    masses), the pass-3 sphere and its four columns move with it (audit 5e R3).
- *
- * Memory (per rank): 456 bytes per central for the whole call (struct so_row) plus 8 for the
- * pending list, and per query slot of a batch 4 + 8 + 4 NThreads bytes of index (the last for the
- * treewalk's queue copy when black holes exist) and max(NB NT 8, (3 + 2 NT) 64 x 8, 1936) bytes of
- * accumulator (each term only for the passes that run; 1936 = pass 3's 16 + 16 SUBHALO_SO_NPROF),
- * the batch capped at 1/8 of the free bytes after the tree build and at what leaves the treewalk
- * its reserve. Results: pass 1 NB NT 8 bytes, pass 2 (3 + 2 NT) 512 bytes (+ 8 each with DEBUG),
- * pass 3 1936 bytes (1944 with DEBUG); queries 64 / 168 / 64 bytes. treewalk.c's ev_begin wants
- * (40960 + max(4097, 100 NThreads)) x (24 + (1 + ImportBufferBoost) (query + result)) free bytes
- * (subhalo_so_walk_bytes): with the defaults (64 bins, boost 2, <= 40 threads) and NT = 1,
- * 75 MiB for pass 1 and 353 MiB for pass 2; with NT = 6, 405 MiB and 1013 MiB (before the type
- * compaction pass 1 always needed the NT = 6 figure; the float pass 2 needed 254 and 584 MiB);
- * pass 3, 6024 bytes per buffer whatever NB and NT, 259 MiB (271,423,368 bytes; 135 MiB with the
- * former 64-bit masses, audit 5e R1), below pass 2's 353 MiB. Pass 3 is admitted on its own
- * (its columns -1 if it does not fit) and the batch cap keeps the largest reserve of the passes
- * that run.
- * Before the walks the call checks that requirement against the free memory after the tree
- * build (all ranks): pass 1 halves its bins down to 16 until it fits, pass 2 is skipped (pass-1
- * interpolation for every central) if it does not fit, and the whole call is skipped (records
- * at -1) if pass 1 does not fit at 16 bins.
- */
+/* Field spherical overdensity of the centrals (design 7.6; the algorithm and its contracts are in
+ * subhalo_so.h).
+ *  - Anchored queries: the s-th query of a walk is anchored on the s-th local live particle (the
+ *    treewalk copies its Pos, fill overwrites it with the core); fill and reduce find the slot by a
+ *    binary search in the anchor list. Queries beyond the anchors or the cap run in batches, the
+ *    same number on every rank.
+ *  - The results carry only the particle types present in the run (NT <= 6 slots).
+ *  - Passes 1 and 2 sum masses in double: layout dependent only at ~N 2^-53, far below the f4
+ *    rounding of the output (exact for dyadic masses). Pass 3 sums 128-bit integers: bitwise for
+ *    any masses, given the published f4 MSO[vir] / RSO[vir] that passes 1-2 set.
+ *  - Memory per rank: 456 bytes per central (struct so_row) and, per batch slot, an index and the
+ *    accumulator. The treewalk reserve (subhalo_so_walk_bytes) at the defaults is 75 / 353 / 259 MiB
+ *    for passes 1 / 2 / 3 with one particle type, 405 / 1013 / 259 MiB with six. */
 
 #include <mpi.h>
 #include <math.h>
@@ -146,7 +91,6 @@ struct so_row {
 struct so_types {
     int NT;                        /* number of slots */
     int slot[SO_NT];               /* slot of each type, -1 absent */
-    int type[SO_NT];               /* type of each slot */
 };
 
 /* Private data of the walks. */
@@ -159,8 +103,7 @@ struct so_priv {
     size_t accsize;
     int NB;
     struct so_types ty;
-    /* pass 3 (decision 44): the fixed-point mass scale (a power of two), the profile's bins per
-     * unit ln r, and the constants of the analysis */
+    /* pass 3: the fixed-point mass scale (a power of two), profile bins per unit ln r, constants */
     double qscale, pscale;
     double G, atime, vu, soft, rhovir;
     int64_t nprofile;              /* pass-3 rows with >= SUBHALO_NFW_MINPART particles (this rank) */
@@ -186,11 +129,8 @@ typedef struct {
     int pad;
 } TreeWalkQuerySO2;
 
-/* Pass 2 accumulates in double, and a definition with per-type masses (vir, 200c) carries only
- * its per-type sub-bins: its total sub-bins are their sums (so_run_batches), so the refined total
- * and the per-type masses come from the same additions and sum to each other up to the double
- * rounding of the final sum over types. The definitions without per-type masses carry their
- * total sub-bins. */
+/* Pass 2 carries only per-type sub-bins for vir and 200c (their totals are the sums, so the total
+ * and per-type masses come from the same additions) and total sub-bins for the other three. */
 #define SO_NUNTYPED (SUBHALO_NSO - 2)
 
 typedef struct {
@@ -199,12 +139,8 @@ typedef struct {
     double S[];
 } TreeWalkResultSO2;
 
-/* Pass 3 (decision 44): the total-mass profile of the virial sphere r <= RSO[vir], in
- * SUBHALO_SO_NPROF logarithmic bins between Rin = SUBHALO_SO_PROF_RIN RSO[vir] and RSO[vir]
- * (r <= Rin in bin 0), the masses as 128-bit fixed-point integers (qscale = 2^s units per mass
- * unit, subhalo_so_prof_unit), so that every sum is exact and associative: for the same sphere
- * and particles the profile is the same integer vector whatever the particle partition, the
- * traversal and the merge order. */
+/* Pass 3: the mass profile of the sphere r <= RSO[vir] in SUBHALO_SO_NPROF log bins from
+ * SUBHALO_SO_PROF_RIN RSO[vir] (r <= Rin in bin 0), as fixed-point integers: exact, order-free sums. */
 struct so3_acc {
     int64_t N;                     /* particles inside RSO[vir] */
     double mmax;                   /* their largest mass (merged by max) */
@@ -515,25 +451,10 @@ so3_ngbiter(TreeWalkQuerySO3 * I, TreeWalkResultSO3 * O, TreeWalkNgbIterBase * i
         O->A.mmax = m;
 }
 
-/* The pass-3 columns of a row from its profile (decision 44): RsSO, RsKlypinSO, VmaxSO, RmaxSO,
- * all -1 first and -1 with fewer than SUBHALO_NFW_MINPART particles inside RSO[vir]. Returns 1
- * when the row has at least SUBHALO_NFW_MINPART particles (the diagnostic count), 0 otherwise.
- *  - Edges e[j], j = 1..NPROF: Rin exp(j / pscale), the last one RSO[vir]; e[0] = 0. Cumulative
- *    mass C[j] = M(<= e[j]) (the exact integer prefix sum, converted once to double). The
- *    columns are a function of this profile and of the f4 MSO[vir] / RSO[vir] only, so bitwise
- *    layout independent given those (audit 5e R3).
- *  - VmaxSO / RmaxSO: the largest C[j] / r over the edges with r = max(e[j], softening) whose
- *    enclosed density C[j] / (4/3 pi r^3) exceeds rho[vir] (Rockstar's vmax rule at the edges;
- *    the first edge attaining it); VmaxSO = sqrt(G C / (a r)) in km/s. Resolution: one bin,
- *    ln(1000) / NPROF in ln r. No such edge leaves all four columns -1 although the sphere has
- *    enough particles (audit 5e R2; subhalo_so.h): the mass is in the last bin, just inside
- *    RSO[vir], and the f4 RSO[vir] is at or above the density crossing.
- *  - RsKlypinSO: subhalo_klypin_rs(RSO[vir], MSO[vir], that maximum, RmaxSO).
- *  - RsSO: subhalo_nfw_fit from RsKlypinSO on the equal-mass bins of subhalo_nfw_bin_plan (N
- *    particles, the mass inside RSO[vir], the largest mass): bin b closes where M(<r) reaches
- *    b mpbin (subhalo_nfw_threshold picks the profile bin), its edge interpolated inside that
- *    profile bin linearly in ln r (in r^3 in bin 0, which reaches r = 0): the histogram form of
- *    nfw.c's excess-mass edge interpolation. */
+/* Pass-3 columns of a row (-1 unless set); returns 1 when the sphere has >= SUBHALO_NFW_MINPART
+ * particles. VmaxSO/RmaxSO: the largest M(<= e) / e over the profile edges (floored at the softening)
+ * above rho[vir], Rockstar's vmax rule; no such edge leaves all four -1. RsSO: the NFW fit on the
+ * equal-mass bins, each edge interpolated in ln r inside its profile bin (in r^3 in bin 0). */
 static int
 so_profile_finish(const struct so_row * row, const struct so3_acc * A, const struct so_priv * pv)
 {
@@ -592,13 +513,9 @@ so_profile_finish(const struct so_row * row, const struct so3_acc * A, const str
 
 /* ------------------------------------------------------------------ the walks */
 
-/* Phase 5d: the export tables the treewalk sizes from the free memory (NThread x BunchSize
- * data_index entries) are elastic, not a requirement of the field SO. Every walk replaces them
- * in the main allocator's low-water mark by the free bytes it would have had without them, so
- * that the finder's per-stage high water measures its own needs; the true low-water mark of the
- * walks (the absolute high water, SubhaloPeakBytes) and the largest tables are kept here. A
- * table counts with its whole allocator charge (payload rounded up to the allocator's alignment,
- * plus the block header), so nothing of it stays in the increment (audit 5d R2). */
+/* The treewalk's export tables are sized from the free memory, not a need of the field SO: each
+ * walk takes their whole allocator charge out of the main low-water mark, so the stage's high water
+ * is its own; the true low point (SubhaloPeakBytes) and the largest tables are kept here. */
 static size_t SOWalkMinFree = (size_t) -1;
 static double SOWalkElastic = 0;
 
@@ -887,11 +804,9 @@ so_is_central(const struct SubTrack * r)
     return r->Rank == 0 && r->HostGroup >= 0 && r->Nbound > 0;
 }
 
-/* Run the walks of one pass over the rows in list[0..nlist) in batches of at most bcap
- * (collective: every rank runs the global maximum number of batches). After each batch the
- * batch's rows are analysed: pass 1 sets row->redo (and doubles R) or the pass-1 outcome,
- * pass 2 writes the final values into the records, pass 3 the profile columns. Returns the number
- * of walks. */
+/* One pass over the rows list[0..nlist) in batches of at most bcap, each batch then analysed (pass 1:
+ * outcome or redo with a doubled R; pass 2: final values; pass 3: profile columns). Collective:
+ * every rank runs the global maximum number of batches. Returns the number of walks. */
 static int
 so_run_batches(int pass, struct so_priv * pv, int64_t * batchbuf, const int64_t * list, int64_t nlist, int64_t bcap,
                ForceTree * tree, const double rho[SUBHALO_NSO], double rhomin, const struct SubhaloParams * par,
@@ -1043,8 +958,8 @@ so_route_out(struct so_route * rt, struct SubTrack * recs, int64_t n, int64_t nc
     MPI_Alltoallv(nsend > 0 ? rt->buf : NULL, scnt, soff, MPI_BYTE, nrecv > 0 ? rt->buf : NULL, rcnt, roff, MPI_BYTE, Comm);
 }
 
-/* Collective. The host sends the routed records back; the origins copy the SO fields, the SO
- * flag bits and the search radius into their records. Frees the routing buffers. */
+/* Collective. The host returns the routed records; the origins copy back the SO and pass-3 columns,
+ * the SO flag bits and the search radius. Frees the routing buffers. */
 static void
 so_route_back(struct so_route * rt, struct SubTrack * recs, double * Rsearch, MPI_Comm Comm)
 {
@@ -1122,12 +1037,8 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
         tmask |= 1 << P[i].Type;
     }
     MPI_Allreduce(MPI_IN_PLACE, &tmask, 1, MPI_INT, MPI_BOR, Comm);
-    /* pass 3's fixed-point unit (subhalo_so_prof_unit, audit 5e R1): qscale = 2^s with
-     * N_live m_max qscale <= 2^126, so that no 128-bit sum of quantised masses can overflow (N_live
-     * and the largest mass are exact global reductions, so every rank and every layout picks the
-     * same s). A mass m is rounded by at most 0.5 / (qscale m) relative, and not at all for
-     * m >= 2^(bits(N_live) - 102) m_max (subhalo_so.h); the smallest positive mass is checked
-     * against 1e-9 */
+    /* pass 3's fixed-point unit from the global live count and largest mass; a warning if the
+     * smallest positive mass is rounded by more than 1e-9 relative */
     double mmmg[2] = {0, -DBL_MAX};                /* the largest mass, minus the smallest positive */
     int64_t nliveg = 0;
     for(i = 0; i < PartManager->NumPart; i++) {
@@ -1149,10 +1060,8 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
     struct so_types ty = {0};
     for(t = 0; t < SO_NT; t++) {
         ty.slot[t] = -1;
-        if(tmask & (1 << t)) {
-            ty.type[ty.NT] = t;
+        if(tmask & (1 << t))
             ty.slot[t] = ty.NT++;
-        }
     }
 
     int64_t ncen = 0;
@@ -1219,10 +1128,8 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
         list[c] = c;
     }
 
-    /* the walltime clocks (decision 47.5): the rows and the guest records as /Subhalo/FieldSO/Setup,
-     * the whole tree build as /Subhalo/FieldSO/Tree (not forcetree.c's own /Misc and
-     * /Tree/Build/{Nodes,Moments}); the finder's end of the stage books the rest (the walks) as
-     * /Subhalo/FieldSO/Walks, so that the /Subhalo/FieldSO children cover the stage */
+    /* clocks (decision 47.5): /Subhalo/FieldSO/Setup, then the whole tree build as .../Tree; the
+     * caller books the walks as .../Walks */
     walltime_measure("/Subhalo/FieldSO/Setup");
     ForceTree tree = {0};
     walltime_redirect_begin("/Subhalo/FieldSO/Tree");
@@ -1255,8 +1162,7 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
     else if(!dopass2)
         message(0, "WARNING: subhalo field SO: pass 2 needs %ld free bytes for the treewalk, the least free on a rank is %ld: "
                    "no refinement this call (pass-1 interpolation for every central).\n", need2, freemin);
-    /* pass 3 (the virial-sphere profile, decision 44) runs only if it fits; otherwise its four
-     * columns stay -1 for this call and nothing else changes */
+    /* pass 3 runs only if it fits; otherwise its four columns stay -1, nothing else changes */
     const int64_t need3 = (int64_t) subhalo_so_walk_bytes(3, NB, ty.NT) + slotfix
                         + (int64_t) so_imax(so_acc_bytes(1, NB, ty.NT), so_acc_bytes(3, NB, ty.NT)) + SO_SLACK;
     const int dopass3 = !skip && !MPIU_Any(need3 > freeb, Comm);
@@ -1313,7 +1219,7 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
     pv.soft = soft;
     pv.rhovir = rho[SO_DEF_VIR];
 
-    /* pass 1 with the doubling rounds */
+    /* pass 1, rerun for the rows whose radius doubled (at most SubhaloSOMaxDoublings + 1 rounds) */
     int npass1 = 0, npass2 = 0, npass3 = 0;
     int64_t npend = skip ? 0 : nrows;
     pv.accsize = acc1;
@@ -1359,8 +1265,7 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
     pv.accsize = acc3;
     if(dopass3)
         npass3 = so_run_batches(3, &pv, batchbuf, list, nprof, bcap, &tree, rho, rhomin, par, BoxSize, soft, Comm);
-    /* the rows with an edge above rho[vir] (VmaxSO set); pv.nprofile counts those with enough
-     * particles, some of which may have none (audit 5e R2) */
+    /* rows with an edge above rho[vir] (VmaxSO set); pv.nprofile counts those with enough particles */
     int64_t nprofdef = 0;
     for(c = 0; c < nprof; c++)
         nprofdef += rows[list[c]].rec->VmaxSO > 0;
@@ -1393,8 +1298,8 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
     so_route_back(&rt, recs, Rsearch, Comm);
 
     int64_t tot[9];
-    int64_t cnt6[9] = {cnt[0], cnt[1], cnt[2], cnt[3], cnt[4], nguest, nprof, pv.nprofile, nprofdef};
-    MPI_Allreduce(cnt6, tot, 9, MPI_INT64, MPI_SUM, Comm);
+    int64_t cnt9[9] = {cnt[0], cnt[1], cnt[2], cnt[3], cnt[4], nguest, nprof, pv.nprofile, nprofdef};
+    MPI_Allreduce(cnt9, tot, 9, MPI_INT64, MPI_SUM, Comm);
     message(0, "Subhalo field SO: %ld centrals (%ld routed from ranks without particles), %ld refined, %ld doubled, "
                "%ld cut off at the cap, %ld without a crossing; %d bins, %d types; %d + %d walks, %.3g s.\n",
                tot[0], tot[5], tot[1], tot[2], tot[3], tot[4], NB, ty.NT, npass1, npass2, MPI_Wtime() - tstart);

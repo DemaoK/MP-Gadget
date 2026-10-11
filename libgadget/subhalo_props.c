@@ -1,12 +1,7 @@
-/* HBT-level subhalo properties (design 7.5, Phase 2a plan section 4 and step 7g).
- *
- * Input: a candidate after subhalo_final_pass, i.e. Index[0, Nbound) in ascending final-pass
- * energy, Energy the final-pass energies in the frame (RefPos, RefVel); with the sampled final
- * pass (SubhaloFinalPass = 0, Nbound > SampleSize) Index is in the loop's refined order and
- * Energy holds subsampled estimates, unsorted: only the energy sums (Epot, SpinPeebles) read
- * them, which do not depend on the order. The HBT set (Phase 2a)
- * first, then the Rockstar set and the baryonic sums of Phase 3 (below). Declared in
- * subhalo_unbind.h. */
+/* Subhalo properties of a bound set (design 7.5, D4, section 8; declared in subhalo_unbind.h): the
+ * HBT set, Rockstar's recipes, the deferred NFW fit and velocities, and the baryonic sums.
+ * Input: a candidate after subhalo_final_pass, Index[0, Nbound) in final-pass binding order (with the
+ * sampled final pass: the loop's order, energies unsorted estimates read only by order-free sums). */
 
 #include <math.h>
 #include <string.h>
@@ -134,11 +129,8 @@ subhalo_props_hbt(struct SubTrack * rec, const struct SubCandidate * c, const st
         rec->MostBoundVel[d] = (float) (P[mb].Vel[d] / a);
     }
 
-    /* Vmax, Rmax: the whole bound profile from CorePos, radii floored at GravitySoftening =
-     * h / 2.8 (CalculateProfileProperties, subhalo.cpp:200-231: sort, cumulative mass, max of
-     * M / r; physical radius a r). M / r is evaluated at the last particle of each run of equal
-     * radii, i.e. M(<= r); the first (smallest) radius attaining the maximum is Rmax, as HBT's
-     * max_element. */
+    /* Vmax, Rmax over the whole bound profile from CorePos, radii floored at the softening (HBT's
+     * CalculateProfileProperties): M(<= r) / r at the last of equal radii, Rmax the first maximum. */
     {
         const size_t mark = arena ? arena->used : 0;
         double Mtot, Mc = 0, best = -1, Rmax = 0;
@@ -181,14 +173,9 @@ subhalo_props_hbt(struct SubTrack * rec, const struct SubCandidate * c, const st
     rec->KinToPot = rec->Epot != 0 ? (float) (K / M / fabs(0.5 * U / M)) : -1;
 }
 
-/* ================================================================== Phase 3: Rockstar recipes
- *
- * Rockstar's property recipes on the HBT bound set (design D4, 4.3, 7.5, 7.10; Phase 3 plan
- * sections 1A and 3): bound SO masses and radii, VmaxVir/RmaxVir, Rhalf, Renclose, J/JVir, the
- * Peebles and Bullock spins, Xoff/Voff, the Klypin Rs, the Allgood iterative shapes at Rvir and
- * R500c and the mass-normalised inertia tensor; then the group-C baryonic sums. Sources:
- * Rockstar-BigFile properties.c:246-314 (calc_shape), 383-480 (_calc_additional_halo_props),
- * nfw.c:14-45 (f_to_c, estimate_scale_radius), groupies.c:63-103 (thresholds). */
+/* ================================================================== Rockstar recipes
+ * Rockstar's properties on the HBT bound set (D4, 4.3, 7.10), after Rockstar-BigFile properties.c,
+ * nfw.c and groupies.c: bound SO, VmaxVir, Rhalf, J, spins, Xoff/Voff, Klypin Rs, shapes, inertia. */
 
 void
 subhalo_so_thresholds(const Cosmology * CP, double atime, double rho[SUBHALO_NSO])
@@ -210,9 +197,8 @@ subhalo_so_thresholds(const Cosmology * CP, double atime, double rho[SUBHALO_NSO
     rho[4] = 2500 * rhocrit;
 }
 
-/* Allocation-free introsort (the algorithm of subhalo_unbind.c's SUBHALO_DEFINE_SORT, which is
- * private to that file): quicksort with median of three, heapsort below the depth limit,
- * insertion sort below 16. The order is a strict total order, so the result is unique. */
+/* Allocation-free introsort, the algorithm of subhalo_unbind.c's private SUBHALO_DEFINE_SORT; the
+ * order is strict and total, so the result is unique. */
 static void
 rpair_isort(struct RPair * a, int64_t n)
 {
@@ -308,20 +294,14 @@ eigen3(double mat[9], double eval[3], double evec[9], gsl_eigen_symmv_workspace 
     gsl_eigen_symmv_sort(&ev.vector, &em.matrix, GSL_EIGEN_SORT_VAL_DESC);
 }
 
-/* Smallest aperture for which a shape is reported (plan section 3). */
+/* Smallest aperture for which a shape is reported. */
 #define SHAPE_MINPART 20
 #define SHAPE_ITERATIONS 10
 
-/* Allgood et al. (2006) iterative reduced inertia tensor, Rockstar calc_shape
- * (properties.c:246-314, WEIGHTED_SHAPES = 1): over the radially sorted bound particles
- * pr[0, np) (Rockstar's aperture, the particles up to the SO crossing), those inside the
- * ellipsoid whose major axis is R contribute m x_i x_j / q2, q2 = sum_k (e_k . x)^2 / ax_k^2
- * (the ellipsoid in units of R, floored at (rfloor / R)^2), normalised by sum m / q2; the axes
- * are rescaled from the eigenvalues so the major axis stays R; at most SHAPE_ITERATIONS, stop
- * when both ratios change by less than 1 %. Positions about cen (translated comoving). Leaves
- * the outputs untouched (-1) when np or the first ellipsoid holds fewer than SHAPE_MINPART
- * particles; if a later iteration does, the previous iteration's result is kept. The major
- * axis is a unit vector with its largest component positive. */
+/* Allgood et al. (2006) reduced inertia tensor, Rockstar calc_shape (WEIGHTED_SHAPES): weights
+ * m / q2 over pr[0, np) inside the ellipsoid of major axis R, at most SHAPE_ITERATIONS, until both
+ * ratios change by < 1 %. Outputs untouched below SHAPE_MINPART particles (a later short iteration
+ * keeps the previous result); AxisA is a unit vector with its largest component positive. */
 static void
 allgood_shape(const struct RPair * pr, int64_t np, const double cen[3], double R, double rfloor, double BoxSize,
               gsl_eigen_symmv_workspace * ws, float * BtoA, float * CtoA, float AxisA[3])
@@ -393,9 +373,7 @@ allgood_shape(const struct RPair * pr, int64_t np, const double cen[3], double R
     }
 }
 
-/* Concentration from f = c / (ln(1 + c) - c / (1 + c)), Rockstar f_to_c (nfw.c:19-32): Newton
- * with a forward-difference slope from c = f, halving c on a negative step. Rockstar iterates
- * without a cap; here at most 200 iterations, returning -1 on failure. */
+/* f(c) = c / (ln(1 + c) - c / (1 + c)), the NFW function Rockstar's f_to_c inverts. */
 static double
 klypin_c_to_f(double c)
 {
@@ -403,6 +381,8 @@ klypin_c_to_f(double c)
     return c * cp1 / (log1p(c) * cp1 - c);
 }
 
+/* Rockstar's f_to_c (nfw.c:19-32): Newton from c = f with a forward-difference slope, halving c on
+ * a negative step; at most 200 iterations (Rockstar has no cap), -1 on failure. */
 double
 subhalo_klypin_f_to_c(double f)
 {
@@ -441,8 +421,8 @@ subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c, con
     const double rfloor = up->h / 2.8;               /* GravitySoftening, Plummer-equivalent */
     const double vu = subhalo_vel_to_kms(1.0);       /* internal velocity unit -> km/s */
     const double vkms = subhalo_vel_to_kms(a);       /* internal Vel -> physical peculiar km/s */
-    /* J and JVir are exported in physical kpc/h km/s whatever the run's length unit (design 7.10,
-     * Phase 3 audit P4); the spins use the internal sums */
+    /* J and JVir in physical kpc/h km/s whatever the run's length unit (design 7.10); the spins use
+     * the internal sums */
     double ULen, UMass, UVel;
     subhalo_get_units(&ULen, &UMass, &UVel);
     const double lenfac = ULen / 3.085678e21;
@@ -463,18 +443,17 @@ subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c, con
     for(d = 0; d < 6; d++)
         rec->InertiaTensor[d] = -1;
     if(n <= 0) {
-        deferred_on_order(rec, NULL, 0, NULL, rho, rfloor, vkms);   /* the Phase 5 columns: -1 */
+        deferred_on_order(rec, NULL, 0, NULL, rho, rfloor, vkms);   /* the deferred columns: -1 */
         return;
     }
 
-    /* the core, recomputed in the translated frame and internal units so that the result does
-     * not depend on whether the caller has converted rec->CorePos/CoreVel yet (it is the
-     * subhalo_props_hbt core: same function, same order of Index) */
+    /* the core in the translated frame and internal units, independent of the caller's conversion
+     * of rec->CorePos/CoreVel (the subhalo_props_hbt core: same function, same Index order) */
     double cpos[3], cvel[3], sx, sv;
     subhalo_core(c, up, CoreSize, cpos, cvel, &sx, &sv);
 
-    /* radial order from the core, radii floored at the softening (the order subhalo_props_hbt
-     * builds for Vmax; rebuilt here, an O(N log N) sort, so the two calls stay independent) */
+    /* radial order from the core, radii floored at the softening (as subhalo_props_hbt's; rebuilt so
+     * the two calls stay independent) */
     const size_t mark = arena->used;
     double Mtot;
     struct RPair * pr = radial_order(c, cpos, rfloor, BoxSize, arena, &Mtot);
@@ -487,8 +466,8 @@ subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c, con
         kc[s] = -1;
         Mso[s] = 0;
     }
-    /* M(<= r) as a compensated sum (Phase 5 audit R4): the same value as the distributed profile
-     * of subhalo_collective.c for the same radial order, exactly so for equal masses */
+    /* M(<= r) as a compensated sum: the value of the distributed profile of subhalo_collective.c
+     * for the same radial order, exactly so for equal masses */
     double Mk[2] = {0, 0}, best = 0, rbest = -1, rhalf = -1;
     for(k = 0; k < n; k++) {
         const double r = pr[k].r;
@@ -521,11 +500,9 @@ subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c, con
         rec->RmaxVir = (float) rbest;
     }
 
-    /* J (full set, bound-CoM velocity frame), the inertia tensor (full set), and inside the
-     * virial aperture (crossing particle included, D4; only the Phase 5 recipes of deferred_on_order
-     * take Rockstar's apertures, decision 44) JVir in the CoreVel frame and the mass
-     * weighted mean position and velocity for Xoff/Voff (properties.c:417-458). Positions about
-     * the core; dx x (Vel - V) is a dx x (v - V / a), the physical specific angular momentum. */
+    /* J and the inertia tensor over the full set (J in the bound-CoM velocity frame); JVir and the
+     * Xoff/Voff means inside the virial aperture, crossing particle included (D4), in the core frame.
+     * Positions about the core; dx x (Vel - V) = a dx x (v - V / a), the physical specific J. */
     double J[3] = {0, 0, 0}, Jv[3] = {0, 0, 0}, xs[3] = {0, 0, 0}, vs[3] = {0, 0, 0}, I[6] = {0, 0, 0, 0, 0, 0};
     for(k = 0; k < n; k++) {
         const int64_t p = pr[k].p;
@@ -615,8 +592,7 @@ subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c, con
         }
     }
 
-    /* the Phase 5 recipes (Rs fit, RockstarCoreVel, BulkVel, Vrms) on the same radial order and
-     * core: what subhalo_props_deferred computes, without a second sort */
+    /* the deferred recipes (Rs fit, RockstarCoreVel, BulkVel, Vrms) on the same order and core */
     deferred_on_order(rec, pr, n, cvel, rho, rfloor, vkms);
 
     /* shapes at Rvir and R500c over the particles up to each crossing */
@@ -633,11 +609,9 @@ subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c, con
     arena->used = mark;
 }
 
-/* ================================================================== Phase 5: deferred recipes
- *
- * Rockstar's NFW shape fit (nfw.c:51-144) and the core/bulk velocities and Vrms (properties.c:
- * 199-244, 417-458) on the bound virial aperture (Phase 5 plan section 1 item 1). The bin and
- * fit helpers are shared with the distributed version in subhalo_collective.c. */
+/* ================================================================== deferred recipes
+ * Rockstar's NFW fit (nfw.c:51-144), core/bulk velocities and Vrms (properties.c) on the bound virial
+ * aperture; the bin and fit helpers are shared with the distributed version in subhalo_collective.c. */
 
 double
 subhalo_klypin_rs(double Rvir, double Mvir, double best, double rbest)
@@ -680,13 +654,8 @@ subhalo_nfw_threshold(int b, double mpbin)
     return b * mpbin * (1 - 1e-9);
 }
 
-/* nfw.c:126-132 computes the midpoint in kpc/h (1e3 x the Mpc/h radii) but subtracts the
- * interpolation diff (r1 - r0) with the radii still in Mpc/h, so its correction is a thousand times
- * too small and the edge is effectively the midpoint (for radii 0.01, 0.02, 0.03 Mpc/h and an
- * excess of half the closing particle's mass: 24.995 kpc/h instead of 20 kpc/h). This is an
- * upstream unit bug; here both terms are in the run's length unit, so the intended linear
- * interpolation of the bin edge is applied (Phase 5 audit R5; the deviation list of
- * subhalo_unbind.h). */
+/* nfw.c:126-132's bin edge without its unit bug (the correction subtracted in Mpc/h from a midpoint
+ * in kpc/h, so in effect the midpoint): both terms in the run's unit (deviations in subhalo_unbind.h). */
 double
 subhalo_nfw_edge(int b, double mpbin, double rprev, int has_prev, double r, double rnext, double Mc, double m)
 {
@@ -727,7 +696,7 @@ subhalo_nfw_fit(double rs0, const double * edge, int nb, double wcut)
     int i;
     if(nb < 3 || nb > SUBHALO_NFW_MAXBINS)
         return -1;
-    /* degenerate input (Phase 5 audit R6): every edge finite, a positive extent */
+    /* degenerate input: every edge finite, a positive extent */
     for(i = 0; i <= nb; i++)
         if(!subhalo_isfinite(edge[i]))
             return -1;
@@ -747,9 +716,8 @@ subhalo_nfw_fit(double rs0, const double * edge, int nb, double wcut)
         return -1;
     double drs = rs / 10.0, last = 1e30;
     int iter = 0;
-    /* Rockstar's finite stopping rule; a nonfinite objective, a zero or nonfinite probe step or a
-     * nonfinite derivative is a failed fit (-1) rather than the radius reached so far (audit R6:
-     * repeated edges at the start radius give drs = 0 and 0 / 0 derivatives) */
+    /* Rockstar's stopping rule; a nonfinite objective, step or derivative fails the fit (-1) rather
+     * than returning the radius reached (repeated edges at the start radius give drs = 0) */
     while(fabs(chi2 - last) > 0.005 * chi2 && iter < SUBHALO_NFW_MINPERBIN) {
         last = chi2;
         if(rs + drs > rmax)
@@ -818,15 +786,10 @@ subhalo_deferred_velocities(float BulkVel[3], float CoreVel[3], float * Vrms, co
     *Vrms = (float) (sqrt(var > 0 ? var : 0) * vkms);
 }
 
-/* The recipe of subhalo_props_deferred on a radial order pr[0, n) of the bound set (radii from the
- * core, floored at rfloor, ties by ID) with the core velocity cvel: shared by subhalo_props_deferred
- * and subhalo_props_rockstar, which already holds this order (one radial sort per subhalo). The
- * four columns are set to -1 first. Rockstar's aperture (decision 44, reversing 36a): with kc
- * the outermost virial crossing (Mvir = M(<= r_kc), Rvir from it, as MBoundSO / RBoundSO), the
- * velocities and the NFW fit both use pr[0, kc) (properties.c's j < dens_tot: the crossing
- * particle excluded), the fit of mass Mfit = M(<= r_(kc-1)). nfw.c's i < total_p - 1 would also
- * drop the particle before the crossing; one consistent off-by-one is kept instead (decision
- * 47.1). The last fit bin's outer neighbour may be the crossing particle (pr[kc]). */
+/* subhalo_props_deferred's recipe on a built radial order pr[0, n) and core velocity (shared with
+ * subhalo_props_rockstar: one sort per subhalo); the four columns are -1 first. Rockstar's aperture
+ * (decisions 44, 47.1): with kc the outermost virial crossing, the velocities and the fit use
+ * pr[0, kc), the crossing particle excluded, of mass Mfit = M(<= r_(kc-1)). */
 static void
 deferred_on_order(struct SubTrack * rec, const struct RPair * pr, int64_t n, const double cvel[3], const double rho[SUBHALO_NSO],
                   double rfloor, double vkms)
@@ -860,17 +823,16 @@ deferred_on_order(struct SubTrack * rec, const struct RPair * pr, int64_t n, con
         }
         Mkm1 = M;
     }
-    /* an empty aperture (the crossing is the innermost particle): nothing defined */
+    /* no crossing, or the crossing is the innermost particle (an empty aperture): nothing defined */
     if(kc < 1 || !(Mvir > 0))
         return;
     const int64_t nap = kc, nfit = kc;
     const double Rvir = cbrt(3 * Mvir / (4 * M_PI * rho[0]));
     const double rcore = 0.1 * Rvir;
 
-    /* velocities about the core velocity (the shift keeps the one-pass variance accurate); the
-     * core: r < 0.1 Rvir, at least the innermost SUBHALO_ROCKSTAR_CORE_MINPART of the aperture.
-     * Every sum is compensated (audit R4), as the distributed recipe's per-rank pairs. The
-     * largest mass is that of the aperture (nfw.c's max_mass). */
+    /* velocities about the core velocity (keeps the one-pass variance accurate), compensated sums as
+     * the distributed recipe's; the core is r < 0.1 Rvir, at least SUBHALO_ROCKSTAR_CORE_MINPART
+     * particles. mmax: the aperture's largest mass (nfw.c's max_mass). */
     int64_t ncore = 0;
     double mmax = 0;
     for(k = 0; k < nap; k++) {
@@ -901,9 +863,8 @@ deferred_on_order(struct SubTrack * rec, const struct RPair * pr, int64_t n, con
     subhalo_deferred_velocities(rec->BulkVel, rec->RockstarCoreVel, &rec->Vrms, cvel, subhalo_ksum_value(Mb), subhalo_ksum_value(Mc),
                         Sb, S2, Sc, vkms);
 
-    /* Rs: the equal-mass bins of the fit's aperture (calc_scale_radius, nfw.c:101-144), the bins
-     * closed by the compensated cumulative mass against the thresholds of the aperture's mass
-     * Mfit (the quantities the distributed recipe reduces) */
+    /* Rs: equal-mass bins of the aperture (calc_scale_radius, nfw.c:101-144), closed by the
+     * compensated cumulative mass against Mfit's thresholds, as the distributed recipe */
     double mpbin;
     const int nb = subhalo_nfw_bin_plan(nfit, Mfit, mmax, &mpbin);
     if(nb > 0) {

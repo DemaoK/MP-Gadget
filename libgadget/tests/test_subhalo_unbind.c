@@ -1,24 +1,10 @@
-/* Unit tests of the serial unbinding kernel (subhalo_unbind.c, subhalo_props.c):
- * Phase 2a plan section 5, tests 1 to 4, plus checks of the tree potential against direct
- * summation, of the k-nearest tracer search against brute force and of the death path, and the
- * adversarial oracles of the Phase 2a audit (J5 periodic gravity and neighbours across the
- * frame's unwrap cut, J6 one neighbour tree per key, J10 exact ties with scrambled IDs, J11 the
- * cap diagnostics; item 6: core fill, sinking forms, an absent type in a subsample, the always
- * included BH type, mixed masses). Phase 5b: bit-identical results at 1, 3 and 8 threads
- * (test_threads_bitwise) and, Phase 5 audit R7, inside the scheduler's worker region at sizes
- * around SUBHALO_UNBIND_CHUNK_MIN (test_threads_worker_region). The sampled final pass
- * (test_final_pass_sampled, decision 42.4); decision 42.5: the threading threshold
- * SUBHALO_UNBIND_PAR_MIN (16384, its default 512 and 1) changes no result below
- * SUBHALO_UNBIND_CHUNK_MIN at 1, 2 and 8 threads (test_threads_par_min). The timing table
- * (test_timing) can take sizes, thresholds, thread counts and the final-pass mode from the
- * environment.
- *
- * Haloes are Hernquist (1990) spheres sampled from the exact isotropic distribution function
- * (eq. 17), positions from the inverse cumulative mass profile truncated at 100 scale radii, so
- * every particle is bound to the analytic potential; the only losses are the truncation, the
- * softening and the Monte Carlo noise of the N-body potential. a = 1, H = 0, internal units
- * kpc/h, 1e10 Msun/h, km/s (G = CP->GravInternal for those units). The halo is placed across a
- * periodic boundary to exercise the minimum-image arithmetic. Serial: mpirun -np 1. */
+/* Serial tests of the unbinding kernel (subhalo_unbind.c; design 7.4) and the k-nearest tracer
+ * search: Hernquist haloes, unbound shells, subsampling, satellites, scale factor, thermal energy,
+ * periodic gravity, ties, tree order, core fill, sinking, death; bitwise results at 1 to 8
+ * threads and inside a worker region (decisions 37, 42.5); the sampled final pass (42.4).
+ * test_timing takes sizes, thresholds, threads and the final-pass mode from SUBHALO_UNBIND_TIMING*.
+ * Haloes sample the exact Hernquist distribution function (truncated at 100 scale radii) across a
+ * periodic boundary; a = 1, H = 0, units kpc/h, 1e10 Msun/h, km/s. Run as: mpirun -np 1. */
 
 #define _GNU_SOURCE      /* sched_getaffinity (the timing table's binding warning) */
 #include <sched.h>

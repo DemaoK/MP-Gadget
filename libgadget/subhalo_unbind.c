@@ -1,9 +1,7 @@
-/* Serial unbinding kernel of the subhalo finder (design 7.4, Phase 2a plan section 3).
- *
- * Ported from HBT-HERONS (HBT-BF tree): src/gravity_tree.cpp (monopole octree, geometric
- * opening), src/subhalo_unbind.cpp:463-808 (the loop), src/subhalo_merge.cpp (core and sinking)
- * and src/subhalo_reassign_gas.cpp (k-nearest tracers). The algorithms are ported, not the
- * classes; see subhalo_unbind.h for the contract and the conventions. */
+/* Unbinding kernel of the subhalo finder (design 7.4): the octree, energies, the HBT-HERONS
+ * unbinding loop, the final pass, core, sinking test and k-nearest tracers, ported from HBT's
+ * gravity_tree.cpp, subhalo_unbind.cpp, subhalo_merge.cpp and subhalo_reassign_gas.cpp.
+ * Contract and conventions in subhalo_unbind.h. */
 
 #include <math.h>
 #include <string.h>
@@ -44,16 +42,9 @@ arena_left(const struct SubhaloArena * a)
 
 /* ------------------------------------------------------------------ intra-key threading */
 
-/* Parallel mode (Phase 5 plan section 4 item 6, subhalo_unbind.h "Phase 5b"): an operation on
- * more than par_min (default SUBHALO_UNBIND_PAR_MIN) elements, called outside a parallel region
- * (a key processed alone) with more than one thread available, splits over the OpenMP threads.
- * Every result is defined independently of the thread count and of par_min: the algorithm of
- * each step depends on the size only (sorts produce the unique order of a strict total order,
- * the tree is the unique tree of its sorted keys, floating sums are taken in fixed chunks of
- * chunk_len(n) combined in chunk order, chunk_len and the partition's switch fixed by
- * SUBHALO_UNBIND_CHUNK_MIN), the threads only share out the work. An operation on at most
- * SUBHALO_UNBIND_CHUNK_MIN elements is one chunk, i.e. the serial loop of HEAD 9e60f168, bit for
- * bit. */
+/* Parallel mode (subhalo_unbind.h): an operation on more than par_min elements, outside a
+ * parallel region with several threads available, splits over the threads. The algorithm of each
+ * step depends on the size only, so no result depends on the thread count or on par_min. */
 static int64_t par_min = SUBHALO_UNBIND_PAR_MIN;
 
 void
@@ -83,10 +74,8 @@ loop_par(int64_t n)
     return n > (par_min < SUBHALO_LOOP_PAR_MIN ? par_min : SUBHALO_LOOP_PAR_MIN) && !omp_in_parallel();
 }
 
-/* The dynamic chunk of those loops: n / (4 threads) clamped to [16, 256] (a candidate of a few
- * thousand elements then feeds every thread of a 32-thread team instead of n / 256 of them), or
- * 256 with loop_chunk_adaptive cleared (the Phase 5b chunk). Scheduling only: no result depends
- * on it. */
+/* The dynamic chunk of those loops: n / (4 threads) clamped to [16, 256], so a few thousand
+ * elements still feed every thread; 256 with loop_chunk_adaptive cleared. Scheduling only. */
 static int loop_chunk_adaptive = 1;
 
 void
@@ -104,10 +93,8 @@ loop_chunk(int64_t n)
     return c < 16 ? 16 : c > 256 ? 256 : (int) c;
 }
 
-/* The fixed chunks of the reductions and of the order-preserving gathers: max(CHUNK_MIN,
- * ceil(n / CHUNK_MAX)) elements, so at most SUBHALO_CHUNK_MAX chunks (per-chunk partials on the
- * stack) and a single chunk for n <= CHUNK_MIN. Independent of par_min: the chunks define the
- * rounding of the sums. */
+/* The fixed chunks of the reductions and order-preserving gathers: max(CHUNK_MIN, ceil(n /
+ * CHUNK_MAX)) elements, one chunk for n <= CHUNK_MIN. They define the rounding of the sums. */
 #define SUBHALO_CHUNK_MAX 256
 static inline int64_t
 chunk_len(int64_t n)
@@ -122,9 +109,8 @@ chunk_count(int64_t n, int64_t C)
     return n > 0 ? (int) ((n + C - 1) / C) : 0;
 }
 
-/* for(I = 0; I < N; I++) BODY, split statically over the threads when PAR. Written out as two
- * loops rather than with an if() clause, so that the serial path (every small candidate, many
- * per thread) opens no parallel region at all. */
+/* for(I = 0; I < N; I++) BODY, split statically over the threads when PAR. Two loops rather than
+ * an if() clause, so that the serial path opens no parallel region at all. */
 #define SUBHALO_PAR_FOR(PAR, I, N, ...)                                                 \
     do {                                                                                \
         if(PAR) {                                                                       \
@@ -135,9 +121,8 @@ chunk_count(int64_t n, int64_t C)
             for(I = 0; I < (N); I++) { __VA_ARGS__ }                                    \
     } while(0)
 
-/* splitmix64 (Steele, Lea & Flood 2014): the seeded generator of design D3 item 3, replacing
- * HBT's std::random_shuffle (subhalo_unbind.cpp:442), so results do not depend on the thread
- * or rank count. */
+/* splitmix64: the seeded generator of design D3 item 3, in place of HBT's std::random_shuffle,
+ * so results do not depend on the thread or rank count. */
 static inline uint64_t
 splitmix64(uint64_t * s)
 {
@@ -168,19 +153,15 @@ wrap_box(double x, double BoxSize)
     return x;
 }
 
-/* The tie order of design 7.10: particle ID, then (defensively, IDs being unique in a valid
- * snapshot) the P index. Comparators call it only on exact ties of their primary key, so the
- * P access is rare. */
+/* The tie order of design 7.10: particle ID, then (defensively) the P index. */
 static inline int
 id_less(int64_t a, int64_t b)
 {
     return P[a].ID < P[b].ID || (P[a].ID == P[b].ID && a < b);
 }
 
-/* In-place introsort (quicksort, median of three, heapsort fallback, insertion sort below 16),
- * allocation-free and thread-safe, unlike qsort. Every comparator below is a strict total order
- * on distinct elements (ties broken by particle ID and P index), so the result is unique and
- * does not depend on the algorithm or on the order of P. */
+/* In-place introsort, allocation-free and thread-safe. Every comparator below is a strict total
+ * order (ties by ID and P index), so the result is unique whatever the algorithm or order of P. */
 #define SUBHALO_DEFINE_SORT(NAME, T, LESS)                                              \
 static void NAME##_isort(T * a, int64_t n) {                                            \
     int64_t i, j;                                                                       \
@@ -238,11 +219,8 @@ static void NAME(T * a, int64_t n) {                                            
     NAME##_intro(a, n, depth);                                                          \
 }
 
-/* Parallel merge sort with the same unique output as NAME (the order is a strict total order on
- * distinct elements): one block per thread introsorted, then log2(threads) rounds of pairwise
- * merges in which every thread writes an equal share of the output, located in each pair by a
- * merge-path co-rank search. The merge buffer (n elements) comes from the arena and is released
- * on return; without room for it, or outside parallel mode, NAME runs serially (same output). */
+/* Parallel merge sort with NAME's unique output: one introsorted block per thread, then pairwise
+ * merge-path merges. The merge buffer comes from the arena; without room, NAME runs serially. */
 #define SUBHALO_DEFINE_PSORT(NAME, T, LESS)                                             \
 static int64_t NAME##_corank(const T * A, int64_t m, const T * B, int64_t nb, int64_t k) { \
     /* the number i of A elements among the first k outputs of the merge that takes A first \
@@ -358,13 +336,9 @@ sort_energy_index(double * Energy, int64_t * Index, int64_t n, struct SubhaloAre
 
 /* ------------------------------------------------------------------ octree */
 
-/* The tree is a Morton-ordered octree laid out in pre-order: the first child of node n is
- * n + 1, the next sibling of a node is its skip, and a node is a leaf iff skip == n + 1. Every
- * node covers the contiguous source range [first, first + count). Single-child chains are
- * collapsed (a node's cell is the smallest Morton cell holding its sources), so a node has
- * either >= 2 children or is a leaf of at most leafsize sources (or one Morton cell at the
- * finest level). Port of the tree of HBT's GravityTree_t (gravity_tree.cpp, oct_tree.cpp),
- * built from sorted keys instead of insertion. */
+/* Morton-ordered octree in pre-order: the first child of node n is n + 1, the next sibling its
+ * skip, a leaf has skip == n + 1; a node covers sources [first, first + count). Single-child
+ * chains are collapsed. HBT's GravityTree_t, built from sorted keys instead of insertion. */
 #define MORTON_LEVELS 21
 
 struct SubSkel {
@@ -409,8 +383,8 @@ morton_digit(uint64_t key, int level)
     return (int) ((key >> (3 * (MORTON_LEVELS - 1 - level))) & 7);
 }
 
-/* Recursive build over src[lo, hi) whose keys share the top 3 * level bits. sk == NULL counts
- * nodes only. Returns nothing; *nn is the running node count. Depth <= MORTON_LEVELS + 1. */
+/* Recursive build over src[lo, hi) whose keys share the top 3 * level bits; sk == NULL counts
+ * nodes only (*nn is the running count). */
 static void
 tree_build_rec(const struct SubSrc * src, struct SubSkel * sk, int64_t * nn, int64_t lo, int64_t hi,
                int level, int64_t leafsize, double rootlen)
@@ -440,13 +414,9 @@ tree_build_rec(const struct SubSrc * src, struct SubSkel * sk, int64_t * nn, int
         sk[node].skip = (int32_t) *nn;
 }
 
-/* Parallel build (parallel mode): the tree is split into "top" nodes, built serially, and
- * subtree tasks, built by tree_build_rec in parallel. The serial recursion below mirrors
- * tree_build_rec (same collapse, same children) down to the ranges of at most T sources (or the
- * finest Morton level), which become tasks, and lists top nodes and tasks in pre-order. The
- * node indices follow from the per-task node counts by a prefix sum, so every node lands at the
- * index of the serial build with the same content: the tree is bit-identical, whatever T and
- * the thread count. */
+/* Parallel build: "top" nodes built serially, subtree tasks of at most T sources by
+ * tree_build_rec in parallel, placed by a prefix sum of their node counts, so every node lands
+ * where the serial build puts it: the tree is bit-identical whatever T and the thread count. */
 struct TopItem {
     int64_t lo, hi;          /* source range */
     int64_t nodes;           /* nodes of a task's subtree; 1 for a top node */
@@ -605,11 +575,9 @@ src_extent(const struct SubSrc * src, int64_t ns, int par, double lo[3], double 
     }
 }
 
-/* Build the skeleton over t->src[0, t->ns) (positions already relative to the origin):
- * Morton keys, sort, then as many nodes as fit in the arena (each needs node_bytes in all,
- * skeleton included), widening the leaves until the tree fits. plan != NULL (parallel mode
- * only): build in parallel and leave the decomposition in plan for the moments; the tree is
- * the same. */
+/* Skeleton over t->src[0, t->ns) (positions relative to the origin): Morton keys, sort, then the
+ * nodes, the leaves widened until they fit in the arena. plan != NULL: built in parallel, the
+ * decomposition left in plan for the moments; the same tree. */
 static void
 tree_build_skeleton(struct SubTree * t, size_t node_extra, struct SubhaloArena * arena, struct TopPlan * plan)
 {
@@ -687,10 +655,8 @@ tree_build_skeleton(struct SubTree * t, size_t node_extra, struct SubhaloArena *
     }
 }
 
-/* Children first over a tree built with a plan: node_fn on every node, each task's node range
- * in reverse in parallel, then the top nodes serially in reverse plan order. Each node's
- * computation reads only its children, so the results are those of the serial reverse
- * pre-order pass. */
+/* Children first over a tree built with a plan: each task's nodes in reverse in parallel, then
+ * the top nodes serially; each node reads only its children, so the serial pass's results. */
 #define SUBHALO_TREE_UPWARD_PAR(t, plan, node_fn)                                       \
     do {                                                                                \
         int k_;                                                                         \
@@ -761,10 +727,8 @@ tree_build_gravity(struct SubTree * t, struct SubhaloArena * arena)
         grav_moment_node(t, n);
 }
 
-/* |NEAREST(x - y)|^2: the squared periodic separation of two points whose coordinates differ
- * by less than 1.5 BoxSize per axis (tree coordinates are within BoxSize / 2 of their origin,
- * absolute ones in [0, BoxSize)). wrap == 0 when the caller knows every |x - y| per axis is
- * below BoxSize / 2, where NEAREST is the identity: the same value, faster. */
+/* |NEAREST(x - y)|^2 for coordinates differing by less than 1.5 BoxSize per axis; wrap == 0 when
+ * every separation is known to be below BoxSize / 2 (NEAREST is then the identity). */
 static inline __attribute__((always_inline)) double
 pair_r2(const double x[3], const double y[3], double BoxSize, const int wrap)
 {
@@ -783,16 +747,9 @@ periodic_r2(const double x[3], const double y[3], double BoxSize)
     return pair_r2(x, y, BoxSize, 1);
 }
 
-/* sum_j m_j W(|x_j - y|, h) over the tree, excluding the source with P index self
- * (EvaluatePotential, gravity_tree.cpp:92-171: geometric opening len^2 > r^2 theta^2 against
- * the node centre of mass, monopole otherwise), every displacement a nearest image as in
- * gravity_tree.cpp:110-135. theta2 is capped below 1/3 so that a node containing the target is
- * always opened (true for HBT's 0.45): the node's sources and its centre of mass lie in its
- * Morton cell of side len, which then holds the target too, so their Euclidean separation in
- * the tree coordinates is at most sqrt(3) len and the periodic one, never larger, gives
- * r^2 theta2 < len^2. A monopole is used only for a node with len < theta r; its sources lie in
- * its cell and |NEAREST(a)| is 1-Lipschitz, so each source's periodic distance differs from the
- * centre's by at most its offset from the centre, as without periodicity. */
+/* sum_j m_j W(|x_j - y|, h) over the tree, excluding the source self (HBT EvaluatePotential:
+ * open when len^2 > r^2 theta^2 against the node's centre of mass). theta2 < 1/3 guarantees that
+ * a node containing the target is always opened (its cell diagonal is sqrt(3) len). */
 static inline __attribute__((always_inline)) double
 tree_potential_impl(const struct SubTree * t, const double y[3], int64_t self, double theta2, double h, const int wrap)
 {
@@ -947,14 +904,11 @@ source_gather_chunk(const int64_t * srcidx, int64_t i0, int64_t i1, int Potentia
     }
 }
 
-/* Energies of tgt[0, nt) in the frame (RefPos, RefVel). The potential is sourced by the
- * potential-type particles of srcidx[0, nsrc). If sample > 0 and more than sample of them can
- * be subsampled, only the never-subsampled ones plus the first `sample` subsampleable ones (in
- * list order: the caller shuffled the list) source it, with masses scaled per type so each
- * type keeps its full mass and the total is conserved
- * (HBT GetMassUpscaleFactorPerParticleType, subhalo_unbind.cpp:345-390). Direct sum if the
- * source count is <= direct_max and the potential is not subsampled, the octree otherwise
- * (HBT always uses its tree). Returns 1 if subsampled. Arena rewound on return. */
+/* Energies of tgt[0, nt) in the frame (RefPos, RefVel), sourced by the potential types of
+ * srcidx[0, nsrc). If sample > 0 and more can be subsampled, only the never-subsampled ones and
+ * the first `sample` others (the caller shuffled the list) source it, masses scaled per type to
+ * conserve each type's mass (HBT). Direct sum up to direct_max unsampled sources, else the
+ * tree. Returns 1 if subsampled. */
 static int
 potential_energies(const int64_t * tgt, int64_t nt, double * E, const int64_t * srcidx, int64_t nsrc, int64_t sample,
                    int64_t direct_max, const double RefPos[3], const double RefVel[3],
@@ -964,8 +918,7 @@ potential_energies(const int64_t * tgt, int64_t nt, double * E, const int64_t * 
     const double BoxSize = up->BoxSize;
     int64_t i;
     int d, t;
-    /* pass 1: what can be subsampled, per fixed chunk of the list (the per-type masses summed
-     * within a chunk in list order, the chunk partials in chunk order) */
+    /* pass 1: what can be subsampled, per fixed chunk of the list, partials in chunk order */
     const int64_t C = chunk_len(nsrc);
     const int nch = chunk_count(nsrc, C);
     const int gpar = par_mode(nsrc) && nch > 1;
@@ -1019,8 +972,7 @@ potential_energies(const int64_t * tgt, int64_t nt, double * E, const int64_t * 
         ns = npot - nsubable + sample;
     }
 
-    /* the gather keeps the list order: each chunk's output offset and its first subsampleable
-     * rank from the counts of the chunks before it */
+    /* the gather keeps the list order: each chunk's output offset and first subsampleable rank */
     {
         int64_t off = 0, rank = 0;
         for(ch = 0; ch < nch; ch++) {
@@ -1051,9 +1003,8 @@ potential_energies(const int64_t * tgt, int64_t nt, double * E, const int64_t * 
             source_gather_chunk(srcidx, ch * C, (ch + 1) * C < nsrc ? (ch + 1) * C : nsrc, up->PotentialTypes,
                                 sampled, sample, fac, RefPos, BoxSize, crank[ch], src + cout[ch]);
     tree.ns = ns;
-    /* the extent of sources and targets together in the frame coordinates: below BoxSize / 2
-     * (with a margin for rounding) along every axis, no displacement needs wrapping (min and
-     * max: exact in any order) */
+    /* sources and targets spanning less than BoxSize / 2 (with a margin) on every axis need no
+     * wrapping */
     {
         double lo[3], hi[3];
         src_extent(tree.src, tree.ns, par_mode(tree.ns), lo, hi);
@@ -1128,10 +1079,8 @@ bound_frame_chunk(const int64_t * Index, int64_t i0, int64_t i1, const double re
     }
 }
 
-/* Mass-weighted centre and velocity of P[Index[0, n)] (HBT CentreOfMassReferenceFrame,
- * subhalo_unbind.cpp:150-195: positions relative to the first particle, NEAREST). Pos wrapped
- * into [0, BoxSize). Returns the mass; leaves Pos/Vel untouched if n == 0. The sums run over
- * the fixed chunks of chunk_len(n) (one chunk, HEAD's loop, for n <= CHUNK_MIN). */
+/* Mass-weighted centre (relative to the first particle, wrapped) and velocity of P[Index[0, n)]
+ * (HBT CentreOfMassReferenceFrame), over the fixed chunks. Returns the mass; n == 0: untouched. */
 static double
 bound_frame(const int64_t * Index, int64_t n, double Pos[3], double Vel[3], double BoxSize)
 {
@@ -1193,12 +1142,9 @@ count_tracers_all(const int64_t * Index, int64_t n, int TracerTypes)
     return nt;
 }
 
-/* Bound (Energy < 0) to the front of (Index, Energy)[0, n), returning their number.
- * n <= CHUNK_MIN: HEAD's swap loop (the bound keep their relative order, the unbound are left in
- * the order of its swaps), whatever par_min. n > CHUNK_MIN: the stable partition (bound and
- * unbound keep their relative order) by per-chunk counts and prefix offsets through a 16 byte per
- * particle arena buffer (decision 34: the swap loop's unbound order cannot be parallelised; it is
- * visible only in a candidate that dies, whose list seeds the parent's subsample). */
+/* Bound (Energy < 0) to the front of (Index, Energy)[0, n), returning their number; the bound
+ * keep their order. n <= CHUNK_MIN: the swap loop; above, a stable partition (decision 34: the
+ * swap loop's unbound order cannot be parallelised, and only a dead candidate's list shows it). */
 static int64_t
 partition_bound(int64_t * Index, double * Energy, int64_t n, struct SubhaloArena * arena)
 {
@@ -1259,9 +1205,8 @@ partition_bound(int64_t * Index, double * Energy, int64_t n, struct SubhaloArena
 
 /* ------------------------------------------------------------------ the unbinding loop */
 
-/* HBT RefineBindingEnergyOrder (subhalo_unbind.cpp:398-428): reorder Index[0, nref) by the
- * self-binding energy of that subset with exact masses; the loop energies travel with their
- * particles (HBT does not update them either, :709-733). */
+/* HBT RefineBindingEnergyOrder: reorder Index[0, nref) by that subset's exact-mass self-binding
+ * energy; the loop energies travel with their particles, as in HBT. */
 static void
 refine_most_bound(struct SubCandidate * c, int64_t nref, const struct SubhaloUnbindParams * up, struct SubhaloArena * arena)
 {
@@ -1301,9 +1246,8 @@ subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * up, s
     if(N < up->MinNumPart || N <= 0 || count_tracers(Index, N, up->TracerTypes, up->MinNumTracerPart) < up->MinNumTracerPart)
         return 0;
 
-    /* Shuffle once: the random subsample of every iteration is the first SampleSize
-     * subsampleable particles of the bound prefix, which the stable partition keeps in
-     * shuffled order (HBT PrepareParticlesForSubsampling, subhalo_unbind.cpp:433-445). */
+    /* Shuffle once: each iteration's subsample is the first SampleSize subsampleable particles
+     * of the bound prefix, which keeps its shuffled order (HBT PrepareParticlesForSubsampling). */
     const int64_t sample = up->SampleSize > 0 ? up->SampleSize : 0;
     if(sample > 0 && N > sample) {
         uint64_t s = c->Seed;
@@ -1331,8 +1275,7 @@ subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * up, s
          * set every iteration (no correction tree: design D3 item 5) */
         sampled_last = potential_energies(Index, Nlast, Energy, Index, Nlast, sample, sample, RefPos, RefVel, up, arena);
 
-        /* bound to the front, keeping their relative (shuffled) order (stable_partition,
-         * subhalo_unbind.cpp:35-44); the unbound are sorted at the end */
+        /* bound to the front in their (shuffled) order; the unbound are sorted at the end */
         Nbound = partition_bound(Index, Energy, Nlast, arena);
         c->ConvergenceRatio = (double) Nbound / (double) Nlast;
 
@@ -1385,12 +1328,9 @@ subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * up, s
     return 1;
 }
 
-/* The head of the sampled final pass: the shortest prefix Index[0, K) that holds the first
- * T = SUBHALO_FINAL_REFINE_MARGIN * Kt tracers of the prefix (all of them if fewer), Kt =
- * max(SUBHALO_FINAL_REFINE_MIN, up->FinalRefineTracers), and, when there are fewer than T
- * tracers, the first T - (tracer count) non-tracers (subhalo_core's fill), and at least T
- * particles; at most n. The margin lets the first Kt tracers after the exact sort be the exact
- * pass's even when the loop's order misplaces some of them by a few ranks. Serial scan. */
+/* The head K of the sampled final pass: the shortest prefix with T = MARGIN * Kt tracers (all if
+ * fewer, then subhalo_core's non-tracer fill up to T) and at least T particles. The margin
+ * absorbs the loop order misplacing tracers by a few ranks. */
 static int64_t
 final_refine_count(const int64_t * Index, int64_t n, const struct SubhaloUnbindParams * up)
 {
@@ -1426,15 +1366,12 @@ subhalo_final_pass(struct SubCandidate * c, const struct SubhaloUnbindParams * u
     if(up->SampledFinalPass && up->SampleSize > 0 && n > up->SampleSize) {
         /* the sampled pass: the order of subhalo_unbind kept, except its head. */
         const int64_t K = final_refine_count(c->Index, n, up);
-        /* 1. the head: exact energies over the whole prefix (the exact pass's call, made with
-         *    the arena in the same state, hence the same tree and bitwise the same energies)
-         *    for Index[0, K), which is then sorted by them */
+        /* 1. the head: the exact pass's call (same arena state, so bitwise the same energies),
+         *    then sorted by them */
         potential_energies(c->Index, K, c->Energy, c->Index, n, 0, up->SampleSize, c->RefPos, c->RefVel, up, arena);
         sort_energy_index(c->Energy, c->Index, K, arena);
-        /* 2. energies in the final frame from the SampleSize-particle subsample of a seeded
-         *    shuffle of the prefix (the loop's estimator, subhalo_unbind.cpp:599-617), for the
-         *    energy sums of the properties; the head's exact energies are replaced by them too,
-         *    so the sums use one estimator */
+        /* 2. all energies again with the loop's subsampled estimator on a seeded shuffle, for the
+         *    property sums (the head's too, so the sums use one estimator) */
         int64_t * sh = (int64_t *) arena_need(arena, sizeof(int64_t) * n, "final-pass subsample");
         const int64_t * Index = c->Index;
         SUBHALO_PAR_FOR(par_mode(n), i, n, sh[i] = Index[i];);
@@ -1559,11 +1496,9 @@ subhalo_sink_test(const double sPos[3], const double sVel[3], const double aPos[
 
 /* ------------------------------------------------------------------ k nearest tracers */
 
-/* The read-only neighbour tree of subhalo_knn_build. The skeleton and the boxes are laid out in
- * the coordinates NEAREST(Pos - origin); after the build the sources hold their absolute
- * positions, from which every point distance is taken as a nearest image. The boxes give
- * periodic lower bounds (knn_axis_gap), reduced by slack so that the rounding of the layout
- * coordinates can never prune a node holding an exact tie. */
+/* The read-only neighbour tree: boxes in coordinates NEAREST(Pos - origin), sources holding
+ * absolute positions after the build. slack lowers the box bounds so that the rounding of the
+ * layout coordinates never prunes a node holding an exact tie. */
 struct SubhaloKnnTree {
     struct SubTree t;
     double origin[3];
@@ -1609,9 +1544,8 @@ knn_insert(struct KnnList * L, double d2, int64_t p)
     L->p[j] = p;
 }
 
-/* Lower bound along one axis of the periodic distance from q to any point of [lo, hi], all
- * three in layout coordinates, i.e. within BoxSize / 2 of the origin: the gap to the nearer of
- * the images q and q -+ BoxSize (the third image is farther), less the slack. */
+/* Lower bound on one axis of the periodic distance from q to [lo, hi] (layout coordinates): the
+ * gap to the nearer image, less the slack. */
 static inline double
 knn_axis_gap(double q, double lo, double hi, double BoxSize, double slack)
 {
@@ -1645,9 +1579,8 @@ knn_box_dist2(const struct SubhaloKnnTree * kt, int64_t n, const double q[3])
     return r2;
 }
 
-/* Depth-first, nearest child first, pruned by the current k-th distance (the search of
- * HBT's GeoTree_t::NearestNeighbours used by subhalo_reassign_gas.cpp:140-150). q is the query
- * in layout coordinates (for the boxes), qa its absolute position (for the point distances). */
+/* Depth-first, nearest child first, pruned by the k-th distance (HBT's NearestNeighbours); q in
+ * layout coordinates for the boxes, qa absolute for the point distances. */
 static void
 knn_rec(const struct SubhaloKnnTree * kt, int64_t n, const double q[3], const double qa[3], struct KnnList * L)
 {

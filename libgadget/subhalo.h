@@ -1,25 +1,11 @@
 #ifndef SUBHALO_H
 #define SUBHALO_H
 
-/* Runtime subhalo finder: public interface.
- *
- * Design: halofinder_design.md (sections referenced below as "design 7.2" etc).
- * Phase 1 plan: halofinder_phase1_plan.md.
- *
- * Phase 1 implemented the plumbing and a "FOF-as-subhalo" membership rule. Phase 2a
- * (halofinder_phase2a_plan.md) replaces the rule for every serial key by the HBT-HERONS recipe:
- * tracer host vote, orphan lookup, previous-bound frames, pseudo-keys for hostless tracks, the
- * post-order unbinding with sinking, the D10 tag rule, descendants and the HBT properties.
- * Phase 2b (halofinder_phase2b_plan.md) processes the oversized keys with the same recipe in
- * place: the satellites' sub-trees as serial keys, the oversized candidates unbound with the
- * global tree in rounds (subhalo_collective.c).
- *
- * Conventions:
- *  - every communicating function takes the communicator explicitly;
- *  - scratch comes from mymalloc/mymalloc2 and is freed in reverse order within the function;
- *  - the track table alone lives in its own allocator (SubTrackTable.alloc);
- *  - endrun() on broken invariants, message() for diagnostics.
- */
+/* Runtime subhalo finder (HBT-HERONS membership, Rockstar properties): public interface.
+ * Parameters (design 10), the track record (Appendix B), the track table (7.1), the driver
+ * (7.2, 11), PIG output (9) and restart (11). "design X" refers to halofinder_design.md.
+ * Conventions: communicating functions take the communicator; scratch is mymalloc'd and freed
+ * in reverse order; the track table has its own allocator; endrun() on broken invariants. */
 
 #include <mpi.h>
 #include <stdint.h>
@@ -40,8 +26,8 @@
 struct SubhaloParams {
     int    SubhaloFinderOn;              /* master switch; requires SnapshotWithFOF=1 and FOFSaveParticles=1 */
     double SubhaloMaxGatherFraction;     /* 0.5: fraction of (MaxPart - staying) a rank may receive */
-    int64_t SubhaloCollectiveMinPart;    /* 0 = off; keys above this are processed in place (testing) */
-    int    SubhaloMaxUnbindIterations;   /* 50 (Phase 2a) */
+    int64_t SubhaloCollectiveMinPart;    /* 0 = off; testing: keys above this are processed in place */
+    int    SubhaloMaxUnbindIterations;   /* 50 */
     int    SubhaloRestartFresh;          /* 1 allows an empty table when no complete state is found */
     int    SubhaloTracerTypes;           /* bitmask, default 2+16 */
     int    SubhaloPotentialTypes;        /* bitmask, default 1+2+16+32 */
@@ -53,7 +39,7 @@ struct SubhaloParams {
     double SubhaloBoundMassPrecision;    /* 0.995 */
     double SubhaloSourceRelaxFactor;     /* 3 */
     int    SubhaloPotentialSampleSize;   /* 1000 */
-    int    SubhaloFinalPass;             /* 0 = sampled final pass with an exact head (HBT's rule, the default, decision 42.4); 1 = exact */
+    int    SubhaloFinalPass;             /* 0 (default) = sampled with an exact head, as HBT (decision 42.4); 1 = exact */
     double SubhaloTreeOpenAngle;         /* 0.45 */
     int    SubhaloMergeTrapped;          /* 1 */
     int    SubhaloSinkSymmetric;         /* 0 */
@@ -68,21 +54,17 @@ struct SubhaloParams {
     int    SubhaloSORefineMinPart;       /* 1000 */
     double SubhaloMajorMergerRatio;      /* 0.3 */
     int    SubhaloGeometricParents;      /* 0 */
-    /* Debug knob (not in the design doc): 1 sends every serial key to rank 0 so that the
-     * exchange over-commits and the failure path of design 7.3 can be exercised. */
+    /* Debug: 1 sends every serial key to rank 0, to exercise the exchange failure path (design 7.3). */
     int    SubhaloDebugForceExchangeFailure;
 };
 
-/* Read the parameters on rank 0 and broadcast. Validates SubhaloFinderOn against
- * SnapshotWithFOF and FOFSaveParticles (endrun on an invalid combination). */
+/* Read the parameters on rank 0 and broadcast; endrun if SubhaloFinderOn lacks SnapshotWithFOF
+ * or FOFSaveParticles. */
 void set_subhalo_params(ParameterSet * ps);
-/* Test helper: set the parameters without a ParameterSet (validated like the parameter file;
- * endrun(1) on an invalid value). */
+/* Test helper: set the parameters without a ParameterSet, validated like the parameter file. */
 void subhalo_set_testpar(struct SubhaloParams params);
-/* The run's unit system (the snapshot header values, design 7.10): catalogue velocities are
- * Vel * UnitVelocity_in_cm_per_s / (1e5 * a) km/s; positions stay in the run's length unit.
- * The three values are also written to the PIG Header. Called from begrun; the defaults are
- * MP-Gadget's (kpc/h, 1e10 Msun/h, km/s). endrun(1) on a non-finite or non-positive value. */
+/* The run's units (design 7.10), set from begrun and written to the PIG Header: catalogue
+ * velocities are Vel * UnitVelocity_in_cm_per_s / (1e5 a) km/s. Defaults: kpc/h, 1e10 Msun/h, km/s. */
 void subhalo_set_units(double UnitLength_in_cm, double UnitMass_in_g, double UnitVelocity_in_cm_per_s);
 void subhalo_get_units(double * UnitLength_in_cm, double * UnitMass_in_g, double * UnitVelocity_in_cm_per_s);
 int subhalo_finder_on(void);
@@ -95,14 +77,13 @@ const struct SubhaloParams * subhalo_get_params(void);
 #define SUBHALO_NOTRACK (-1L)
 /* Upper bound on SubhaloNumTracerHostFinding: the tracer IDs of step 0 live in the record. */
 #define SUBHALO_MAXTRACERS 16
-/* Provisional TrackId of a newborn candidate with global ordinal g (design 7.2 step 3). The
- * ordinals are FOF keys, g >= 1, so a provisional id is <= -3: -1 is "no track" and -2 is
- * reserved for SUBHALO_DESC_PENDING (audit J1), which is never provisional. */
+/* Provisional TrackId of a newborn candidate with FOF ordinal g >= 1 (design 7.2 step 3): <= -3,
+ * since -1 is "no track" and -2 is SUBHALO_DESC_PENDING. */
 #define SUBHALO_PROVISIONAL(g) (-(2L + (int64_t)(g)))
 #define SUBHALO_IS_PROVISIONAL(t) ((t) <= -3L)
 #define SUBHALO_PROVISIONAL_ORDINAL(t) (-(t) - 2L)
-/* A descendant vote whose tracer is not in the dead track's key: looked up after the domain
- * restore (step 11). Distinct from every TrackId, -1 and every provisional id. */
+/* A descendant vote whose tracer is outside the dead track's key, looked up after the domain
+ * restore (step 11). */
 #define SUBHALO_DESC_PENDING (-2L)
 
 /* Flags bits (design 8) */
@@ -119,18 +100,15 @@ const struct SubhaloParams * subhalo_get_params(void);
 /* ------------------------------------------------------------------ track record (Appendix B) */
 
 /* One record per track ever created. Field widths equal the on-disk dtypes so the restart
- * round trip is exact. Columns marked (later) are written as -1 until their phase lands.
- * Group F (orphan) columns are a subset of these; see subhalo_io.c for the two column lists. */
+ * round trip is exact; subhalo_io.c lists the Subhalo and Orphan columns. */
 struct SubTrack {
     /* group A: identity and links */
     int64_t TrackId;
-    int64_t HostGroup;               /* FOF GroupID at this call, -1 field/hostless; for an orphan the group of
-                                      * its tracer at this call (-1 in the field or lost, J8) */
+    int64_t HostGroup;               /* FOF GroupID at this call, -1 field/hostless; for an orphan its
+                                      * tracer's group (-1 in the field or lost) */
     int64_t NestedParentTrackId;     /* pid, -1 for a central */
-    int64_t CentralTrackId;          /* upid; a central's own TrackId; for an orphan the central of its current
-                                      * host group (-1 when its tracer is in the field or lost); an orphan's
-                                      * NestedParentTrackId, SinkTrackId and DescendantTrackId stay those
-                                      * set at its death (historical) */
+    int64_t CentralTrackId;          /* upid; a central's own TrackId; for an orphan the central of its
+                                      * current host group, -1 if none (its other links stay as at death) */
     int64_t SinkTrackId;             /* -1 unless sunk */
     int64_t DescendantTrackId;       /* itself while alive; -1 or the descendant when dead/sunk */
     int32_t Rank, Depth;
@@ -157,7 +135,7 @@ struct SubTrack {
     float   BtoA, CtoA, BtoA500, CtoA500;
     float   AxisA[3], AxisA500[3];
     float   InertiaTensor[6];
-    float   Rs, RockstarCoreVel[3], BulkVel[3], Vrms;   /* (later) */
+    float   Rs, RockstarCoreVel[3], BulkVel[3], Vrms;
     /* group C: baryonic sums */
     float   StarFormationRate, GasMetalMass, StellarMetalMass, BlackholeMass, BlackholeAccretionRate, MassHeIonized;
     float   GasMetalElemMass[NMETALS], StellarMetalElemMass[NMETALS];
@@ -179,8 +157,8 @@ struct SubTrack {
     int64_t Host;                    /* host vote result this call (GrNr or -1); an orphan's tracer GrNr */
     int32_t NboundPrev;              /* Nbound at the previous call, frozen for the central choice */
     int32_t Alive;                   /* 1 if this track won a key or is hostless-resolved this call */
-    /* Phase 2a (plan section 1, steps 0-3): previous-bound frame from the BoundTrackId sums, in the
-     * translated comoving frame and internal Vel units (the unbinding kernel's frame) */
+    /* previous-bound frame from the BoundTrackId sums, in the kernel's frame (translated comoving,
+     * internal Vel units) */
     double RefPos[3], RefVel[3];
     int64_t NPrev;                   /* live particles with BoundTrackId == TrackId */
     double MPrev;                    /* and their mass */
@@ -197,11 +175,8 @@ void subhalo_track_clear(struct SubTrack * t, int64_t TrackId);
 
 /* ------------------------------------------------------------------ track table (design 7.1) */
 
-/* Distributed with a static home: record T lives on rank T / Chunk at local index T % Chunk
- * (every rank holds the same Chunk; the last rank may hold fewer records). Chunk is
- * ceil(NTotal / NTask), recomputed after every call; when it changes the table is
- * redistributed so the rule holds exactly. The table is a single block in its own allocator,
- * grown by doubling with a copy. */
+/* Static home: record T lives on rank T / Chunk at local index T % Chunk, Chunk = ceil(NTotal /
+ * NTask), redistributed when Chunk changes. One block in its own allocator, grown by doubling. */
 struct SubTrackTable {
     Allocator alloc[1];
     struct SubTrack * Track;
@@ -226,43 +201,29 @@ static inline int64_t subhalo_table_local_index(const struct SubTrackTable * tab
 struct SubTrack * subhalo_table_get(struct SubTrackTable * tab, int64_t TrackId);
 /* Grow the local block to hold at least n records (collective-free). */
 void subhalo_table_reserve(struct SubTrackTable * tab, int64_t n);
-/* After NTotal changed: recompute Chunk = ceil(NTotal / NTask) and, if any record is not at its
- * home under it, move every record to its new home (collective; one MPI_Alltoallv, skipped when
- * nothing moves). After return every rank holds exactly the records homed on it for TrackIds in
- * [0, NTotal), in local-index order (NLocal = their count), cleared (subhalo_track_clear) where
- * new; fill them through subhalo_table_get. There is no append: a record exists iff its TrackId
- * is below NTotal. */
+/* After NTotal changed: recompute Chunk and move records to their homes (one Alltoallv, skipped
+ * when nothing moves); new records are cleared. No append: a record exists iff TrackId < NTotal. Collective. */
 void subhalo_table_redistribute(struct SubTrackTable * tab, MPI_Comm Comm);
-/* Fetch copies of records for the requested TrackIds (any ranks, duplicates allowed) from their
- * home ranks: out[i] is the record of ids[i]. Collective (request/reply MPI_Alltoallv pairs,
- * batched by SubhaloLookupBatchBytes so that one batch holds a bounded number of records on
- * every rank; the batches loop while any rank has requests left). */
+/* Fetch copies of the records of ids[] (duplicates allowed) from their home ranks into out[].
+ * Collective; batched by SubhaloLookupBatchBytes until no rank has requests left. */
 void subhalo_table_fetch(struct SubTrackTable * tab, const int64_t * ids, int64_t n, struct SubTrack * out, MPI_Comm Comm);
-/* Write modified records back to their home ranks (collective; batched like the fetch). The
- * transient fields are copied too. Duplicate stores of one TrackId are allowed (the last one
- * received wins; the driver only stores identical duplicates). */
+/* Write records back to their home ranks, transient fields included (collective, batched like
+ * the fetch). Duplicates allowed: the last received wins (the driver stores identical ones only). */
 void subhalo_table_store(struct SubTrackTable * tab, const struct SubTrack * recs, int64_t n, MPI_Comm Comm);
 /* The global table of the running finder (subhalo.c). */
 struct SubTrackTable * subhalo_get_table(void);
 
 /* ------------------------------------------------------------------ driver (design 7.2, 11) */
 
-/* Called once after init() has read the particles, at the start of run() and runfof().
- * Sets every particle's tags to -1; if the finder is on, finds the latest complete state in
- * PIG_m with m <= MaxStateSnapNum (design 11 step 1), reads the tables, joins the tags onto
- * the particles by lineage base ID, and sets the global counters. Aborts if no state exists
- * and SubhaloRestartFresh is 0, unless RestartSnapNum < 0 (a fresh run from ICs).
- * runfof passes MaxStateSnapNum = RestartSnapNum - 1 (offline mode). Collective. */
+/* After init(), in run() and runfof(): clear the tags, then, finder on, load the latest complete
+ * state in PIG_m, m <= MaxStateSnapNum (design 11), and join its tags. No state is fatal unless
+ * SubhaloRestartFresh or RestartSnapNum < 0 (fresh run). runfof passes RestartSnapNum - 1. Collective. */
 void subhalo_init(int RestartSnapNum, int MaxStateSnapNum, const char * OutputDir, MPI_Comm Comm);
 
-/* One finder call, between write_checkpoint and fof_save_groups. fof->Group[] and P[i].GrNr
- * are those of fof_fof(ddecomp, 1, Comm). On return the domain is restored (the function does
- * its own slots_gc_sorted + domain_maintain), the tags describe this call, and the table
- * holds the new records, including the field SO of the centrals (step 12, SubhaloFieldSO).
- * MetalReturnOn (All.MetalReturnOn, as fof_save_groups takes it) enables the metal columns of
- * the baryonic sums. Returns 1 if the call completed, 0 if the exchange failed or the orphan
- * lookup did not fit in memory (tags and table untouched; the orphans' tracer state is the
- * documented exception). Collective over MPI_COMM_WORLD (the field SO's treewalk). */
+/* One finder call (design 7.2), between write_checkpoint and fof_save_groups, on the groups of
+ * fof_fof. On return the domain is restored and the tags and table describe this call. Returns 0,
+ * tags and table untouched (orphan tracer state excepted), if the exchange or orphan lookup did
+ * not fit. Collective over MPI_COMM_WORLD (the field SO's treewalk). */
 int subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime, Cosmology * CP, int MetalReturnOn, MPI_Comm Comm);
 
 /* Status accessors used by the writer. */
@@ -271,9 +232,8 @@ int subhalo_last_call_snapshot(void);     /* snapshot number of the most recent 
 int subhalo_state_snapshot(void);         /* snapshot whose state the tags currently describe */
 double subhalo_state_time(void);          /* and its time */
 double subhalo_time_since_previous_call(void);
-/* The comoving SO thresholds (vir, 200b, 200c, 500c, 2500c; internal mass / length^3, those of
- * subhalo_so_thresholds) of the call whose records the table holds: the last completed call, or
- * the loaded state's Header SOThresholds; -1 if unknown. */
+/* Comoving SO thresholds (internal units) of the call whose records the table holds, or of the
+ * loaded state's Header; -1 if unknown. */
 void subhalo_state_so_thresholds(double rho[SUBHALO_NSO]);
 void subhalo_set_state_so_thresholds(const double rho[SUBHALO_NSO]);
 /* Count tagged particles per type on this rank (debug/diagnostic). */
@@ -281,25 +241,13 @@ void subhalo_count_tagged(const struct part_manager_type * pman, int64_t ntagged
 
 /* ------------------------------------------------------------------ IO (design 9, subhalo_io.c) */
 
-/* Selection predicate for the PIG particle write: in a group or tagged, and not swallowed.
- * With the finder off this reduces to GrNr >= 0 && !Swallowed.
- * Size limit: the host IO path (petaio_build_selection's int selection, the int index of the
- * IOTable getters) indexes local particles with int, so the PIG writer with the finder on
- * checks collectively that every rank holds at most INT_MAX particles (endrun(1) otherwise).
- * The finder's own table IO calls the int getters/setters on rebased single rows and has no
- * such limit; the int32 count columns (Nbound, NboundType, slice lengths) are range-checked
- * before they are stored (endrun(1) rather than wrap). */
+/* PIG particle selection: in a group or tagged, and not swallowed (finder off: GrNr >= 0).
+ * The host IO indexes particles with int, so the writer checks every rank holds <= INT_MAX. */
 int subhalo_save_select(int64_t i, const struct particle_data * Parts);
 
-/* The 16-byte radix key of design 9 for the PIG exchange sort, 112 bits used:
- * section (1) | key (39) | TrackId + 1 (40) | BindRank (32), most significant first.
- * mpsort compares a radix as a little-endian integer (fof.c's 24-byte keys put the primary
- * key in u[2]), so out[1] is the HIGH word and out[0] the LOW word:
- *   out[1] = (section << 63) | (key << 24) | ((TrackId + 1) >> 16)        (key: bits 24..62)
- *   out[0] = (((TrackId + 1) & 0xFFFF) << 48) | ((uint64_t) BindRank << 16)
- * Section 0 and key = GrNr for GrNr >= 0; section 1 and key = 0 for a tagged particle with
- * GrNr < 0. TrackId + 1 and BindRank are 0 for an untagged particle. endrun on a range
- * overflow (GrNr >= 2^39, TrackId + 1 >= 2^40, BindRank < 0). */
+/* 16-byte radix key of the PIG exchange sort (design 9): section (1) | GrNr or 0 (39) |
+ * TrackId + 1 (40) | BindRank (32); out[1] is the high word (mpsort compares little-endian).
+ * Untagged: TrackId + 1 = BindRank = 0. endrun on a range overflow. */
 void subhalo_sort_key(const struct particle_data * p, uint64_t out[2]);
 /* qsort comparator on the same key (Type first, then the 16-byte key). */
 int subhalo_order_by_type_and_key(const void * a, const void * b);
@@ -307,61 +255,38 @@ int subhalo_order_by_type_and_key(const void * a, const void * b);
 /* Register TrackId (i8), BindRank (i4), BoundTrackId (i8) for all six types in a PIG IOTable. */
 void subhalo_register_particle_blocks(struct IOTable * IOTable);
 
-/* After the PIG exchange and local sort: compute the in-group and field slices of every track
- * on this rank (global offsets via MPI_Exscan of the per-type selected counts; runs straddling
- * rank boundaries reconciled with the nearest non-empty neighbours) and store them into the
- * home-rank records. selection/ptype_offset/ptype_count are those of petaio_build_selection on
- * the (possibly temporary) particle table pman. Collective. */
+/* After the PIG exchange and local sort: the in-group and field slices of every track, runs
+ * across rank boundaries joined, stored to the home records. Arguments as petaio_build_selection's. Collective. */
 void subhalo_record_slices(const struct part_manager_type * pman, const int * selection, const int64_t * ptype_offset, const int64_t * ptype_count, MPI_Comm Comm);
 
-/* Header attributes of design 9 / Appendix B, with SubhaloStateComplete = 0. Called inside
- * fof_write_header while the Header block is open. Collective (reductions for the totals). */
+/* Header attributes (design 9, Appendix B) with SubhaloStateComplete = 0, inside fof_write_header. Collective. */
 void subhalo_write_header_attrs(BigBlock * bh, const struct part_manager_type * pman, double atime, MPI_Comm Comm);
-/* The header's SubhaloParameters string ("Name = value" lines, all parameters, doubles %.17g).
- * Provenance only: a restart uses the supplied parameter file. */
+/* The header's SubhaloParameters string ("Name = value", doubles %.17g); provenance only. */
 void subhalo_format_params(char * buf, size_t size);
 
-/* Write PIG_xxx/Subhalo/<column> (Nbound > 0) and PIG_xxx/Orphan/<column> (Nbound == 0) from the home-rank
- * records, each in TrackId order (globally sorted by the static partition). Collective. */
+/* Write Subhalo/<column> (Nbound > 0) and Orphan/<column> (Nbound == 0) in TrackId order. Collective. */
 void subhalo_write_tables(BigFile * bf, MPI_Comm Comm);
 
-/* Reopen Header, set SubhaloStateComplete = complete, SubhaloStateSnapshot and
- * SubhaloStateTime, close. Called after the last particle block. Collective. */
+/* After the last particle block: set SubhaloStateComplete, StateSnapshot and StateTime. Collective. */
 void subhalo_finalize_output(BigFile * bf, int complete, MPI_Comm Comm);
 
-/* Record the snapshot number of the PIG being written (SnapshotIndex, and the check that a
- * complete state describes this snapshot). Called by fof_save_particles before the header is
- * written, with the number parsed from the PIG name; -1 if unknown. Not collective. */
+/* The snapshot number of the PIG being written (-1 if unknown), set by fof_save_particles
+ * before the header; a complete state must describe it. Not collective. */
 void subhalo_set_output_snapshot(int SnapNum);
 
 /* ------------------------------------------------------------------ restart (design 11, subhalo_io.c) */
 
-/* Search PIG_m, m = MaxStateSnapNum down to 0, for a complete, readable state (marker,
- * schema, SubhaloStateSnapshot == m, finite state time equal to the file's, counts match row
- * counts, every required block present with the schema's dtype and with every payload file its
- * header declares present at the declared size). Returns m or -1. Collective (rank 0 probes,
- * broadcasts). FOFFileBase is All.FOFFileBase. */
+/* Search PIG_m, m = MaxStateSnapNum down to 0, for a complete and readable state (marker, schema,
+ * snapshot, time, row counts, every block and payload file). Returns m or -1. Collective (rank 0 probes). */
 int subhalo_find_state(const char * OutputDir, const char * FOFFileBase, int MaxStateSnapNum, MPI_Comm Comm);
 
-/* Read Subhalo/<column> and Orphan/<column> of that PIG into the table (contiguous row slices per rank, then
- * routed to the home ranks), set NTotal from NumTracksTotal, return the state time. Requires
- * exactly one row per TrackId in [0, NumTracksTotal) (no duplicate, no hole), Subhalo rows
- * resolved (Nbound > 0, SnapDeath < 0) and Orphan rows dead or sunk (SnapDeath >= 0). Any read
- * failure or violation is fatal (endrun(1)) with a message naming the PIG and the remedies
- * (clear its SubhaloStateComplete marker, or SubhaloRestartFresh = 1). Collective. */
+/* Read the Subhalo and Orphan tables into the track table and return the state time. Requires one
+ * row per TrackId in [0, NumTracksTotal), Subhalo rows alive and Orphan rows dead; else endrun(1). Collective. */
 double subhalo_read_state(const char * pigname, struct SubTrackTable * tab, MPI_Comm Comm);
 
-/* Join the saved per-particle tags onto pman by lineage base ID (low 56 bits of the ID), the
- * joint mpsort_mpi of saved and local records with nearest-non-empty-rank boundary
- * reconciliation. Every saved row takes part, untagged rows included, and the saved tags are
- * validated first (TrackId and BoundTrackId in [-1, NumTracksTotal), BindRank >= 0 for a tagged
- * row; fatal otherwise, like a read failure). A local particle with an exact saved ID match
- * takes its tag, -1 if it was saved untagged; otherwise, if
- * its own generation byte (ID >> 56) is > 0, it inherits the tag of the saved record whose ID
- * equals its lineage base (generation 0, always the spawning parent in MP-Gadget:
- * slots_split_particle gives children base + (g << 56) and stars never spawn), if there is
- * one; everything else gets -1 (in particular a generation-0 particle never inherits from a
- * saved child). Returns the number of inherited (non-exact) tags on this rank. Collective. */
+/* Join the saved particle tags onto pman (joint sort of saved and local records by ID): an exact
+ * ID match takes its tag; a spawned particle (ID >> 56 > 0) inherits its generation-0 parent's;
+ * else -1. Saved tags are validated (fatal). Returns the inherited count on this rank. Collective. */
 int64_t subhalo_join_tags(const char * pigname, struct part_manager_type * pman, MPI_Comm Comm);
 
 #endif

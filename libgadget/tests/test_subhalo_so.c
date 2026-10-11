@@ -1,67 +1,16 @@
-/* Unit test of the field spherical overdensity (subhalo_so.c; Phase 3 plan section 5, test 5).
- *
- * Run as: mpirun -np 4 .objs/test_subhalo_so   (also -np 1, 2, 3)
- *
- * A periodic box of 1000 kpc/h with a uniform background (type 2) and three clumps:
- *   A  a Hernquist clump (type 1) with a live black hole at its centre; refined by pass 2;
- *   B  a Hernquist clump, half gas (type 0), with a compact second concentration 100 kpc/h
- *      from its centre, inside the search sphere, which moves the outermost 200b crossing
- *      outwards; refined;
- *   C  a small clump straddling the periodic boundary in x and z; pass-1 interpolation only;
- * plus a central in the most empty point of the box (no crossing), a satellite, a hostless
- * track and a dead track (not queried), a swallowed black hole of mass 1024 at B's centre and
- * a garbage particle of mass 1024 at A's centre (both must be ignored), and a non-zero
- * CurrentParticleOffset (CorePos is in the output frame, P[].Pos in the translated one).
- * Particle masses are dyadic, so every mass sum is exact whatever its order.
- *
- * Checks:
- *  1. Against a brute-force particle-level count on the gathered particles inside the final
- *     search radius (Rockstar's rule: the outermost particle k with M(<=r_k) / (4/3 pi r_k^3)
- *     > rho): MSO within the mass of one pass-1 bin around the crossing (log width
- *     ln(R / Rlo) / SubhaloSOBins on either side) for unrefined centrals and within that of two
- *     pass-2 sub-bins for refined ones; RSO = (3 MSO / (4 pi rho))^(1/3); the per-type masses
- *     sum to MSO and match the brute-force per-type masses within the same tolerance; the
- *     flags; the relative errors are logged.
- *  2. Identical results (bit for bit) with the records spread over the ranks, all on one rank,
- *     and with batches of 1 and 2 queries per walk; a checksum is logged ("SO test checksum")
- *     that must be identical with any number of ranks.
- *  3. The doubling cap: SubhaloSOSearchFactor = 0.02 and SubhaloSOMaxDoublings = 0 set
- *     SUBHALO_FLAG_SOCUTOFF on A and B with MSO the exact mass inside the search radius; with
- *     SubhaloSOSearchFactor = 0.3 the radius is doubled and the results again match the brute
- *     force.
- *  4. subhalo_field_so (thresholds from subhalo_so_thresholds) equals the explicit-threshold
- *     call when the thresholds agree with this test's formulas.
- *  5. The memory check: with a large mymalloc block leaving just the treewalk reserve of pass 1
- *     at 16 bins free after the tree build, the call halves its bins to 16, skips pass 2 and
- *     still matches the brute force (with the tolerance of 16 pass-1 bins); with half of that
- *     free it skips the field SO (every central at -1, SO flags clear, others untouched).
- *  6. A rank without particles (an interior rank emptied after the domain decomposition, as in
- *     test_subhalo.c): its centrals are routed to another rank and the results are identical,
- *     with the records spread over the ranks and with all of them on the empty rank.
- *  7. Non-dyadic, mixed-mass and mixed-type refined shells (test_subhalo_field_so_mixed):
- *     refined masses within one f4 ulp of the long-double particle sums, the per-type sum
- *     invariant, and agreement between particle partitions (see the comment before that test).
- *     The dyadic fixture above keeps the exact, bit-for-bit mapping checks.
- *  8. Pass 3 (decision 44, test_subhalo_field_so_profile): a stratified analytic NFW sphere
- *     (rs = 25 kpc/h, truncated at 16 rs, 40000 particles of a non-dyadic mass, across the
- *     periodic boundary) with the virial threshold placed at 8 rs: RsSO within 3 % and RsKlypinSO
- *     within 5 % of rs, VmaxSO within 0.2 % of the analytic maximum of sqrt(G M(<r) / (a r)) (and
- *     not above it by more than the 1 / N sampling), RmaxSO within one profile bin (ln(1000) / 120)
- *     of 2.1626 rs; the four columns -1 for a satellite at the same centre, a central whose sphere
- *     holds fewer than 100 particles (a 60-particle clump, MSO[vir] > 0) and a central without a
- *     crossing; bitwise identical columns with the records spread, all on one rank, batches of one
- *     query, the local particle order reversed and a rank emptied (a checksum is logged, "SO
- *     profile checksum", identical with any number of ranks: fixed-point sums); the memory rule:
- *     with only pass 1's reserve free the four columns are -1 (MSO still set), with pass 3's but
- *     not pass 2's they are set. The bitwise identity holds because these layouts give the same
- *     f4 MSO[vir] / RSO[vir] (pass 3's guarantee is conditional on its inputs, audit 5e R3).
- *  9. Audit 5e R1 (test_subhalo_so_prof_unit): pass 3's 128-bit fixed-point unit for a synthetic
- *     2^31 particles, no particle allocated: overflow bound, maximality, exact quantisation of
- *     masses down to 2^-70 of the largest (1e-6 included), sums of 2^31 copies.
- * 10. Audit 5e R2 (test_subhalo_field_so_shell): thin shells of 100 particles at 0.99 RSO[vir]: the
- *     four columns -1 with >= 100 particles where the f4 RSO[vir] rounded at or above the density
- *     crossing, set where below, and the diagnostics count the particles, not VmaxSO; the call's
- *     unit is subhalo_so_prof_unit of the global live count and largest mass. */
+/* Tests of the field spherical overdensity (subhalo_so.c, design 7.6), MPI.
+ * Run as: mpirun -np 4 .objs/test_subhalo_so (also 1, 2, 3 ranks).
+ * Fixture: a periodic 1000 kpc/h box, a uniform background and three clumps (one refined with a
+ * live BH, one half gas with a second concentration, one across the boundary), plus centrals with
+ * no crossing, ignored tracks and particles; dyadic masses, so every mass sum is exact.
+ *  field_so         MSO/RSO and per-type masses against a brute-force count; bitwise across rank
+ *                   layouts and batch sizes ("SO test checksum"); the doubling cap; the memory
+ *                   fallbacks (fewer bins, pass 2 skipped, SO off); an emptied rank routed.
+ *  field_so_mixed   non-dyadic, mixed-type refined shells: one-ulp sums, partition agreement.
+ *  field_so_profile pass 3 (decision 44) on an NFW sphere: RsSO, RsKlypinSO, VmaxSO, RmaxSO, the
+ *                   -1 cases, bitwise across layouts ("SO profile checksum"), the memory rule.
+ *  so_prof_unit     pass 3's 128-bit fixed-point unit: overflow bound and exact quantisation.
+ *  field_so_shell   thin shells at 0.99 RSO[vir]: the 100-particle rule and its diagnostics. */
 
 #include <stdarg.h>
 #include <stddef.h>

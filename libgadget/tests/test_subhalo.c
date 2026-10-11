@@ -1,77 +1,28 @@
-/* Unit tests for the runtime subhalo finder: Phase 1 (halofinder_phase1_plan.md section 5) and
- * Phase 2a (halofinder_phase2a_plan.md section 5, tests 5-7 as tests 11-13 here).
+/* Driver and plumbing tests of the runtime subhalo finder (MPI).
+ * Run as: mpirun -np 4 .objs/test_subhalo with OMP_NUM_THREADS 1 or 2; above 2 threads the
+ * MP-Gadget tree build itself fails on these 125-particle-per-rank fixtures (NODECACHE_SIZE).
+ * Tests (the test_subhalo_ prefix omitted):
+ *  1. table            track table: growth, home rank and local index, redistribution, round trips.
+ *  2. sort_key         the 16-byte PIG sort key and the local comparator.
+ *  3. exchange_tags    TrackId/BindRank/BoundTrackId survive domain_exchange.
+ *  4. join             restart tag join from a synthetic PIG.
+ *  5. fof_as_subhalo   the driver over five calls on two clumps.
+ *  6. forced_failure   in-place (oversized) keys and the exchange failure path.
+ *  7. plan_pack        the head/tail packing as a particle-free function, incl. cost balance.
+ *  8. unhosted_direct  hostless centre across a periodic wrap, swallowed BHs, dead tracks, units.
+ *  9. lifecycle_pig    driver, PIG writer and restart over four calls with an empty rank;
+ *                      corrupted states rejected; header wall time and peak memory.
+ * 10. many_keys        200 keys (> 32 per rank): tail packing on real particles.
+ * Then, in registration order: twohalo, overlap, central_source, sink_orphan (persistent tracks,
+ * a satellite with a tail, decision 52: a central's FOF-less particles untagged, a satellite's
+ * kept; sinking, orphan tracer, resurrection; all but central_source log a tag/record checksum),
+ * nest_tree, deep_chain, mixed_call, nocentral, fallback (serial/in-place transitions), itercap,
+ * lookup (three modes), serial_keys (scheduler at 1-4 threads), reserve_admission,
+ * local_sort (thread-count independent), header_params, sampled_default (SubhaloFinalPass = 0).
  *
- * Run as: mpirun -np 4 .objs/test_subhalo, with OMP_NUM_THREADS 1 or 2. Above 2 threads MP-Gadget's
- * tree build fails on these fixtures (125 particles on a rank; force_tree_create_nodes reserves
- * NODECACHE_SIZE = 96 nodes per thread and TreeAllocFactor is capped at 3.0), before any finder
- * code runs. Higher thread counts are covered by test_subhalo_local_sort and
- * test_subhalo_serial_keys (which set their own thread counts), by test_subhalo_unbind and
- * test_subhalo_collective, and by the exact catalogue compares on the test boxes.
- *
- *  1. test_subhalo_table          track table: append past the initial allocation, home-rank and
- *                                 local-index arithmetic, redistribution when Chunk changes,
- *                                 fetch/store round trips, free.
- *  2. test_subhalo_sort_key       the 16-byte PIG sort key and the local comparator.
- *  3. test_subhalo_exchange_tags  TrackId/BindRank/BoundTrackId survive domain_exchange.
- *  4. test_subhalo_join           restart tag join from a synthetic PIG written in this test.
- *  5. test_subhalo_fof_as_subhalo the Phase 1 driver over five calls on two clumps.
- *  6. test_subhalo_forced_failure in-place (oversized) keys, and the exchange failure path.
- *  7. test_subhalo_plan_pack      the packing as a particle-free function on the audit's two
- *                                 inputs (the eight-pass appendix table, the tail type mix),
- *                                 checked against the budgets of the final staying particles.
- *  8. test_subhalo_unhosted_direct hostless centre with a periodic wrap under three rank
- *                                 partitions, swallowed BHs in the vote/counts/mass, dead
- *                                 tracks, non-default velocity units.
- *  9. test_subhalo_lifecycle_pig  the driver plus the PIG writer and restart over four calls
- *                                 with an empty interior rank: hostless, dead (not sunk) and
- *                                 zero-group calls, km/s velocities, the restart round trip on
- *                                 both PIG branches, and corrupted states (truncated payload,
- *                                 duplicate TrackIds, wrong dtype) rejected.
- * 10. test_subhalo_many_keys      200 keys (> 32 per rank): the tail packing on real particles.
- *
- * Phase 2a (halofinder_phase2a_plan.md) replaced the membership rule of every serial key, so
- * tests 5, 9 and 10 assert the Phase 2a outcome of their scenarios: BindRank in energy order (the
- * most bound tenth near the core) instead of distance order, CorePos near rather than equal to
- * CoMPos, field particles retagged with their track's key (decision 52: A's displaced particles
- * at stage 3 are untagged, a central's source being its FOF group only), B landing on A as a full
- * ball at stage 4 and sinking into A (the central chosen by the kinetic distance), the dispersed hostless tracks on a 40 kpc/h
- * lattice (bound, unambiguous centre), and thresholds of 5 particles for the 6..10-particle
- * clumps of test 10. Tests 6 to 8 are unchanged. Phase 2b (halofinder_phase2b_plan.md) unbinds
- * the oversized keys in place with the HBT recipe: test 6 expects the serial outcome with the
- * in-place flag, the mixed call's V and the fallback test's stages 2-4 (A and B's sub-tree key both
- * in place, two rounds; the hostless pseudo-key in place) assert the HBT outcome, and
- * p2_check_tags applies the D10 invariants to in-place records too.
- * test_subhalo_nocentral: Phase 3 audit P2 (no surviving central: CentralTrackId -1).
- * test_subhalo_central_source: decision 52 (a central's FOF-less particles are untagged, a
- * satellite's kept).
- * Phase 5c (instrumentation, cost-aware packing, reserve admission): the per-call statistics
- * (subhalo_last_call_stats) are checked after the calls of tests 11 and the mixed call, the PIG
- * header's SubhaloWallTime and SubhaloPeakBytes in test 9 (Phase 5d: also SubhaloPeakIncrementBytes, and
- * the per-stage increments in the call statistics), a cost-balance case (c) in test 7;
- * test_subhalo_serial_keys runs subhalo_run_serial_keys directly at 1 to 4 threads (cost order per
- * thread, the alone keys, LPT balance, the same outcome at every thread count; Phase 5 audit R2:
- * a team reduced to one worker for four queues reports that worker's busy time) and
- * test_subhalo_reserve_admission squeezes the free memory 2 MB below the plan's reserve (the
- * collective stage alone still fits): the call fails before the exchange with the tags unchanged.
- * Phase 5d: test_subhalo_local_sort checks that the local sort's particle table does not depend
- * on the thread count or the sort path; test_subhalo_lookup runs the three lookup modes.
- * 11. test_subhalo_twohalo        plan test 5: two Hernquist clumps over three calls: persistent
- *                                 tracks, HBT properties, unbound tails, the D10 tag invariants.
- * 12. test_subhalo_overlap        plan test 6: B falls into A: satellite (Rank 1, Depth 1, parent
- *                                 0) with a tail partly bound by the central; the next call's
- *                                 frame from the BoundTrackId sums; the restart join.
- * 13. test_subhalo_sink_orphan    plan test 7: B on A's core sinks (orphan, DescendantTrackId 0),
- *                                 its tracer is followed, then it is resurrected alone in a new
- *                                 group (no newborn).
- * Tests 11-13 log a checksum of the tags and records ("Phase 2a test checksum"): identical
- * with OMP_NUM_THREADS 1 and 2 and with 2, 3 and 4 ranks. SUBHALO_TEST_ONLY=<substring> runs
- * only the matching tests.
- *
- * The range checks of subhalo_sort_key abort through endrun (MPI_Abort), so they cannot run
- * in-process. Set SUBHALO_TEST_SORTKEY_OVERFLOW=grnr|trackid|bindrank to run only a test that
- * feeds the overflowing value: the expected outcome is an abort with the endrun message, e.g.
- *   SUBHALO_TEST_SORTKEY_OVERFLOW=grnr mpirun -np 1 .objs/test_subhalo ; echo $?   (non-zero)
- */
+ * SUBHALO_TEST_ONLY=<substring> runs only the matching tests. The sort-key range checks abort
+ * through endrun, so they run alone: SUBHALO_TEST_SORTKEY_OVERFLOW=grnr|trackid|bindrank
+ * mpirun -np 1 .objs/test_subhalo must exit non-zero. */
 
 /* nftw() for the temporary PIG cleanup */
 #define _GNU_SOURCE
