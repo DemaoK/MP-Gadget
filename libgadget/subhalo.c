@@ -778,14 +778,6 @@ subhalo_lookup_ids(const MyIDType * ids, int64_t n, struct SubhaloIdHit * out, M
         myfree(idx);
 }
 
-static double
-wrap_pos(double x, double BoxSize)
-{
-    while(x >= BoxSize) x -= BoxSize;
-    while(x < 0) x += BoxSize;
-    return x;
-}
-
 void
 subhalo_orphan_lookup(struct SubTrackTable * tab, int SnapNum, double atime, int64_t * nlook, int64_t * nfound, MPI_Comm Comm)
 {
@@ -819,7 +811,7 @@ subhalo_orphan_lookup(struct SubTrackTable * tab, int SnapNum, double atime, int
              * (subhalo_update_mostbound.cpp:20-70), physical frame and km/s */
             t->Host = hit[i].GrNr;
             for(d = 0; d < 3; d++) {
-                t->TracerPos[d] = wrap_pos(hit[i].Pos[d] - PartManager->CurrentParticleOffset[d], BoxSize);
+                t->TracerPos[d] = subhalo_wrap_box(hit[i].Pos[d] - PartManager->CurrentParticleOffset[d], BoxSize);
                 t->TracerVel[d] = hit[i].Vel[d] * vfac;
             }
             nf++;
@@ -1671,14 +1663,6 @@ cmp_tagindex(const void * a, const void * b)
     return (ix > iy) - (ix < iy);
 }
 
-static double
-wrap_box(double x, double BoxSize)
-{
-    while(x >= BoxSize) x -= BoxSize;
-    while(x < 0) x += BoxSize;
-    return x;
-}
-
 /* Stable merge sort by TrackId: contributions of one track keep the source-rank order of the
  * Alltoallv receive buffer, so the home rank sums them in rank order. */
 static void
@@ -1897,13 +1881,13 @@ subhalo_update_unhosted(struct SubTrackTable * tab, int SnapNum, double atime, i
             }
             for(k = 0; k < 3; k++) {
                 const double cen = in[a].ref[k] + (mass > 0 ? mdx[k] / mass : 0);
-                t->CorePos[k] = t->CoMPos[k] = wrap_box(cen - PartManager->CurrentParticleOffset[k], BoxSize);
+                t->CorePos[k] = t->CoMPos[k] = subhalo_wrap_box(cen - PartManager->CurrentParticleOffset[k], BoxSize);
                 t->CoreVel[k] = t->CoMVel[k] = (mass > 0 ? mv[k] / mass : 0) * vfac;
             }
             /* MostBound*: the lowest (not a tracer type, BindRank, ID) over the ranks (no energies here) */
             t->MostBoundID = in[cmb].mbID;
             for(k = 0; k < 3; k++) {
-                t->MostBoundPos[k] = wrap_box(in[cmb].mbPos[k] - PartManager->CurrentParticleOffset[k], BoxSize);
+                t->MostBoundPos[k] = subhalo_wrap_box(in[cmb].mbPos[k] - PartManager->CurrentParticleOffset[k], BoxSize);
                 t->MostBoundVel[k] = in[cmb].mbVel[k] * vfac;
             }
             t->Alive = 1;

@@ -126,14 +126,6 @@ is_tracer(int64_t i, int TracerTypes)
     return (TracerTypes >> P[i].Type) & 1;
 }
 
-static inline double
-wrap_box(double x, double BoxSize)
-{
-    while(x >= BoxSize) x -= BoxSize;
-    while(x < 0) x += BoxSize;
-    return x;
-}
-
 static inline uint64_t
 double_key(double x)
 {
@@ -651,7 +643,7 @@ unbind_loop(struct Coll * C)
             /* frame of the bound set */
             s->Mbound = v[1];
             for(d = 0; d < 3; d++) {
-                s->RefPos[d] = wrap_box(s->Ref0[d] + v[2 + d] / v[1], up->BoxSize);
+                s->RefPos[d] = subhalo_wrap_box(s->Ref0[d] + v[2 + d] / v[1], up->BoxSize);
                 s->RefVel[d] = v[5 + d] / v[1];
             }
             s->Ntracer = (int64_t) v[8];
@@ -880,7 +872,7 @@ round_cores(const struct Coll * C, struct CoreOut * out)
             pos2[k] /= msum;
             vel[k] /= msum;
             vel2[k] /= msum;
-            o[k] = wrap_box(in[a].Pos[k] + pos[k], BoxSize);
+            o[k] = subhalo_wrap_box(in[a].Pos[k] + pos[k], BoxSize);
             o[3 + k] = vel[k];
             const double vx = pos2[k] - pos[k] * pos[k], vv = vel2[k] - vel[k] * vel[k];
             sx2 += vx > 0 ? vx : 0;
@@ -2100,11 +2092,11 @@ fill_alive_record(const struct Coll * C, int64_t c, const struct CoreOut * fin, 
     }
     rec->Flags |= s->flags | SUBHALO_FLAG_INPLACE;
     for(d = 0; d < 3; d++) {
-        rec->CorePos[d] = wrap_box(cp[d] - ctx->Offset[d], BoxSize);
+        rec->CorePos[d] = subhalo_wrap_box(cp[d] - ctx->Offset[d], BoxSize);
         rec->CoreVel[d] = (float) (cp[3 + d] / a);
-        rec->CoMPos[d] = wrap_box(s->RefPos[d] - ctx->Offset[d], BoxSize);
+        rec->CoMPos[d] = subhalo_wrap_box(s->RefPos[d] - ctx->Offset[d], BoxSize);
         rec->CoMVel[d] = (float) (s->RefVel[d] / a);
-        rec->MostBoundPos[d] = wrap_box(cp[8 + d] - ctx->Offset[d], BoxSize);
+        rec->MostBoundPos[d] = subhalo_wrap_box(cp[8 + d] - ctx->Offset[d], BoxSize);
         rec->MostBoundVel[d] = (float) (cp[11 + d] / a);
     }
     rec->CoreSigmaX = (float) cp[6];
@@ -2395,7 +2387,7 @@ rec_mb(struct SubTrack * rec, MyIDType id, const double pos[3], const double vel
     int d;
     rec->MostBoundID = id;
     for(d = 0; d < 3; d++) {
-        rec->MostBoundPos[d] = wrap_box(pos[d] - ctx->Offset[d], ctx->BoxSize);
+        rec->MostBoundPos[d] = subhalo_wrap_box(pos[d] - ctx->Offset[d], ctx->BoxSize);
         rec->MostBoundVel[d] = vel[d] * vfac;
     }
 }

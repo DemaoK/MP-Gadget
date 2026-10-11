@@ -145,14 +145,6 @@ type_in(int mask, int type)
     return (mask >> type) & 1;
 }
 
-static inline double
-wrap_box(double x, double BoxSize)
-{
-    while(x >= BoxSize) x -= BoxSize;
-    while(x < 0) x += BoxSize;
-    return x;
-}
-
 /* The tie order of design 7.10: particle ID, then (defensively) the P index. */
 static inline int
 id_less(int64_t a, int64_t b)
@@ -588,19 +580,7 @@ tree_build_skeleton(struct SubTree * t, size_t node_extra, struct SubhaloArena *
     if(ns >= INT32_MAX)
         endrun(1, "Subhalo kernel: %ld sources exceed the int32 tree layout\n", (long) ns);
     double lo[3], hi[3];
-    if(par)
-        src_extent(t->src, ns, 1, lo, hi);
-    else {
-        for(d = 0; d < 3; d++) {
-            lo[d] = DBL_MAX;
-            hi[d] = -DBL_MAX;
-        }
-        for(i = 0; i < ns; i++)
-            for(d = 0; d < 3; d++) {
-                if(t->src[i].x[d] < lo[d]) lo[d] = t->src[i].x[d];
-                if(t->src[i].x[d] > hi[d]) hi[d] = t->src[i].x[d];
-            }
-    }
+    src_extent(t->src, ns, par, lo, hi);
     double ext = 0;
     for(d = 0; d < 3; d++)
         if(hi[d] - lo[d] > ext)
@@ -1111,7 +1091,7 @@ bound_frame(const int64_t * Index, int64_t n, double Pos[3], double Vel[3], doub
     if(M <= 0)
         return 0;
     for(d = 0; d < 3; d++) {
-        Pos[d] = wrap_box(ref[d] + mx[d] / M, BoxSize);
+        Pos[d] = subhalo_wrap_box(ref[d] + mx[d] / M, BoxSize);
         Vel[d] = mv[d] / M;
     }
     return M;
@@ -1451,7 +1431,7 @@ subhalo_core(const struct SubCandidate * c, const struct SubhaloUnbindParams * u
         pos2[d] /= msum;
         vel[d] /= msum;
         vel2[d] /= msum;
-        CorePos[d] = wrap_box(origin[d] + pos[d], up->BoxSize);
+        CorePos[d] = subhalo_wrap_box(origin[d] + pos[d], up->BoxSize);
         CoreVel[d] = vel[d];
         const double vx = pos2[d] - pos[d] * pos[d];
         const double vv = vel2[d] - vel[d] * vel[d];

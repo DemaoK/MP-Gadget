@@ -58,6 +58,15 @@ static inline int subhalo_mpi_bytes_fit(int64_t n, size_t elsize) {
  * the exponent bits of an IEEE double. */
 int subhalo_isfinite(double x);
 
+/* x wrapped into [0, BoxSize) by repeated whole-box shifts (the finder's one periodic wrap). */
+static inline double
+subhalo_wrap_box(double x, double BoxSize)
+{
+    while(x >= BoxSize) x -= BoxSize;
+    while(x < 0) x += BoxSize;
+    return x;
+}
+
 /* Compensated (Neumaier) sum s[0] + s[1], used by the serial and distributed property recipes (the
  * latter merges per-rank pairs in rank order) so that equal masses sum exactly whatever the grouping
  * and other inputs agree to about one rounding. volatile keeps -ffast-math from dropping the errors. */

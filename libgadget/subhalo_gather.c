@@ -3105,14 +3105,13 @@ subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t
      * thread processes its keys in the order of ord (non-increasing cost) */
     double * load = (double *) mymalloc("SubThreadLoad", sizeof(double) * nthreads);
     int64_t * maxb = (int64_t *) mymalloc("SubThreadMaxB", sizeof(int64_t) * nthreads);
-    int64_t * count = (int64_t *) mymalloc("SubThreadCount", sizeof(int64_t) * nthreads);
     double * tpeak = (double *) mymalloc("SubThreadPeak", sizeof(double) * nthreads);
     double * tbusy = (double *) mymalloc("SubThreadBusy", sizeof(double) * nthreads);   /* per actual worker */
     double * kt = (double *) mymalloc("SubKeyTime", sizeof(double) * (ns + 1));
     int * owner = (int *) mymalloc("SubKeyOwner", sizeof(int) * (ns + 1));
     for(t = 0; t < nthreads; t++) {
         load[t] = 0;
-        maxb[t] = count[t] = 0;
+        maxb[t] = 0;
         tpeak[t] = tbusy[t] = 0;
     }
     for(k = nalone; k < ns; k++) {
@@ -3122,7 +3121,6 @@ subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t
                 best = t;
         owner[k] = best;
         load[best] += ord[k].cost;
-        count[best]++;
         if((int64_t) KEY_ARENA_BYTES(ord[k].k) > maxb[best])
             maxb[best] = KEY_ARENA_BYTES(ord[k].k);
     }
@@ -3189,7 +3187,6 @@ subhalo_run_serial_keys(const struct SubhaloKeySeg * segs, int64_t nsegs, size_t
     myfree(kt);
     myfree(tbusy);
     myfree(tpeak);
-    myfree(count);
     myfree(maxb);
     myfree(load);
     myfree(ord);

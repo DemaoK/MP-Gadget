@@ -14,14 +14,6 @@
 #include "cosmology.h"
 #include "subhalo_unbind.h"
 
-static inline double
-wrap_box(double x, double BoxSize)
-{
-    while(x >= BoxSize) x -= BoxSize;
-    while(x < 0) x += BoxSize;
-    return x;
-}
-
 /* (radius, P index) pairs of the radial order, ties by particle ID then P index. 16 bytes per
  * bound particle: the only per-particle scratch of the property functions. */
 struct RPair {
@@ -112,9 +104,9 @@ subhalo_props_hbt(struct SubTrack * rec, const struct SubCandidate * c, const st
     double CorePos[3], CoreVel[3], SigmaX, SigmaV;
     subhalo_core(c, up, CoreSize, CorePos, CoreVel, &SigmaX, &SigmaV);
     for(d = 0; d < 3; d++) {
-        rec->CorePos[d] = wrap_box(CorePos[d] - Offset[d], BoxSize);
+        rec->CorePos[d] = subhalo_wrap_box(CorePos[d] - Offset[d], BoxSize);
         rec->CoreVel[d] = (float) (CoreVel[d] / a);
-        rec->CoMPos[d] = wrap_box(c->RefPos[d] - Offset[d], BoxSize);
+        rec->CoMPos[d] = subhalo_wrap_box(c->RefPos[d] - Offset[d], BoxSize);
         rec->CoMVel[d] = (float) (c->RefVel[d] / a);
     }
     rec->CoreSigmaX = (float) SigmaX;
@@ -125,7 +117,7 @@ subhalo_props_hbt(struct SubTrack * rec, const struct SubCandidate * c, const st
     const int64_t mb = mbt >= 0 ? mbt : c->Index[0];
     rec->MostBoundID = P[mb].ID;
     for(d = 0; d < 3; d++) {
-        rec->MostBoundPos[d] = wrap_box(P[mb].Pos[d] - Offset[d], BoxSize);
+        rec->MostBoundPos[d] = subhalo_wrap_box(P[mb].Pos[d] - Offset[d], BoxSize);
         rec->MostBoundVel[d] = (float) (P[mb].Vel[d] / a);
     }
 
@@ -578,18 +570,10 @@ subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c, con
         rec->SpinBullock = (float) (sqrt(jv) / sqrt(2 * G * Mvir * a * Rvir));
         rec->Xoff = (float) sqrt(xo);
         rec->Voff = (float) (sqrt(vo) * vkms);
-        /* Klypin Rs (nfw.c:34-45): f = Rvir Vmax^2 a / (G Mvir RS_CONSTANT), with
-         * Vmax^2 a / G = max M / r (comoving) */
-        if(best > 0) {
-            const double f = Rvir * best / (Mvir * KLYPIN_RS_CONSTANT);
-            double rs = rbest / KLYPIN_RMAX_TO_RS;
-            if(f >= 4.625) {
-                const double conc = subhalo_klypin_f_to_c(f);
-                if(conc > 0)
-                    rs = Rvir / conc;
-            }
-            rec->RsKlypin = (float) rs;
-        }
+        /* Klypin Rs (nfw.c:34-45), Vmax^2 a / G = max M / r (comoving); the helper's Rvir > 0 guard
+         * cannot fire here, Rvir comes from Mvir > 0 and the positive rho[vir] */
+        if(best > 0)
+            rec->RsKlypin = (float) subhalo_klypin_rs(Rvir, Mvir, best, rbest);
     }
 
     /* the deferred recipes (Rs fit, RockstarCoreVel, BulkVel, Vrms) on the same order and core */
