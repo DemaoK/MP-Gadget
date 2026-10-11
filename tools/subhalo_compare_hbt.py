@@ -40,6 +40,34 @@ SubhaloPotentialSampleSize), in place (Flags), iteration cap (Flags), few tracer
 SubhaloCoreSize bound tracers on either side, the sinking core fill-up), spawned stars (type-4
 particles in our set absent from HBT's), else unexplained.
 
+Failure classes: every matched pair that misses the criterion, and every unmatched HBT subhalo, is
+labelled by cause (counts after the acceptance line for >= --min-np and for the near-threshold
+population, the class and its numbers under --show, a fail_class column in --pairs-out). Groups are
+compared directly: HBT's HostHaloId of an MP-Gadget PIG is the FOF GroupID, as our HostGroup.
+  swap              the pair is in the same FOF group on both sides, Rank 0 on one side and Rank >= 1
+                    on the other; or both Rank 0 but different tracks (the HBT central's twin is
+                    another track of ours; twins are the pairs of the --prev output, or with
+                    --track-pairs each track's earliest pairing while that partner is resolved).
+  in-swapped-group  same group and role on both sides, in a group with a swap at this output.
+  nbound            same group and role, no swap seen there: Nbound outside --nbound-tol and/or
+                    Jaccard below --jaccard-min (the ratio and Jaccard are printed).
+  survival          the HBT subhalo is unmatched at this output (our twin may be dead, orphan,
+                    absent, unmatched or paired elsewhere; it need not have died).
+  other             anything else, with the reason (e.g. different groups on the two sides).
+  A both-Rank-0 swap is visible only through twins from before it began: with --prev alone, or one
+  that began at or before the first output of a sequence, it counts as nbound (the report says so).
+  Tie check: once per swap group, at the output where the swap first appears, which must directly
+  follow the previous supplied output (else not checked), on our previous saved Mbound of our
+  central and of the historical twin of HBT's central against the group's largest. tie-0.8 when
+  either (i) "exact 4:5": |5 M_i - 4 M_0| within the float32 rounding of two exact 4:5 masses, or
+  (ii) "float32 cut differs": HBT's float32 M_i < (float)(M_0 * 0.8f) and ours, M_i < 0.8 M_0 in
+  double, disagree; both count, --show names which. HBT re-sums its own masses in float32, so (ii)
+  on our saved values is exact only for identical bound sets; (i) covers equal-mass DM ties.
+  With --track-pairs the label persists with the swap; without a previous output the report says
+  the check was not done. A second acceptance figure leaves out the swaps labelled tie-0.8.
+  --prev must be an earlier output; with an HBT NNN/ directory or SubSnap file argument its sibling
+  snapshot is used, and every SubSnap file's SnapshotId must be the requested snapshot.
+
 Links and history, at every snapshot for the matched pairs: NestedParentTrackId (mapped through
 the pair map of that snapshot), HostGroup against HostHaloId (both FOF GroupIDs), Rank and Depth;
 MboundPeak / LastMaxMass and VmaxPeak / LastMaxVmaxPhysical (quantiles and the fractions within
@@ -60,6 +88,7 @@ Examples:
   python3 tools/subhalo_compare_hbt.py output/PIG_004 hbt/ --match jaccard --pairs-out pairs_004.txt
   python3 tools/subhalo_compare_hbt.py --track-pairs output/PIG_003 output/PIG_004 hbt/
   python3 tools/subhalo_compare_hbt.py hbt/ --track-pairs output/PIG_00?
+  python3 tools/subhalo_compare_hbt.py output/PIG_018 hbt/ --prev output/PIG_017 --show 20
 """
 
 from __future__ import print_function
@@ -179,12 +208,13 @@ class Ours(object):
         self.nfull_mismatch = mism
         self.O = cat.orphans
         self.otid = self.O["TrackId"].astype(np.int64) if cat.norphans else np.zeros(0, np.int64)
+        self._orows, self._rows = np.arange(self.otid.size), np.arange(self.tid.size)
 
     def orow(self, trackids):
-        return _lookup(self.otid, np.arange(self.otid.size), trackids)
+        return _lookup(self.otid, self._orows, trackids)
 
     def row(self, trackids):
-        return _lookup(self.tid, np.arange(self.tid.size), trackids)
+        return _lookup(self.tid, self._rows, trackids)
 
     def owner(self, ids):
         return _lookup(self.bid_sorted, self.bid_owner, ids)
@@ -195,16 +225,28 @@ class Ours(object):
 
 # ---------------------------------------------------------------------------------- HBT side
 def hbt_files(path, snap):
-    """SubSnap files of snapshot `snap` under an HBT SubhaloPath, a NNN/ directory, or a file."""
+    """SubSnap files of snapshot `snap` under an HBT SubhaloPath, a NNN/ directory, or a file; a
+    directory or file of another snapshot leads to its sibling NNN/ (checked in HBT())."""
     if os.path.isfile(path):
-        m = re.match(r"(.*SubSnap_\d+)\.\d+\.hdf5$", path)
-        return sorted(glob.glob(m.group(1) + ".*.hdf5"), key=_fileno) if m else [path]
-    cands = [path, os.path.join(path, "%03d" % snap), os.path.join(path, "%04d" % snap)]
+        m = re.match(r"(.*SubSnap_(\d+))\.\d+\.hdf5$", path) or re.match(r"(.*SubSnap_(\d+))\.hdf5$", path)
+        if not m:
+            return [path]
+        if int(m.group(2)) == snap:
+            return sorted(glob.glob(m.group(1) + ".*.hdf5"), key=_fileno) or [path]
+        path = os.path.dirname(os.path.abspath(path))
+    up = os.path.dirname(os.path.abspath(path))
+    cands = [path, os.path.join(path, "%03d" % snap), os.path.join(path, "%04d" % snap),
+             os.path.join(up, "%03d" % snap), os.path.join(up, "%04d" % snap)]
     for d in cands:
         files = glob.glob(os.path.join(d, "SubSnap_%03d.*.hdf5" % snap)) + glob.glob(os.path.join(d, "SubSnap_%03d.hdf5" % snap))
         if files:
             return sorted(files, key=_fileno)
     raise InputError("no SubSnap_%03d files under %s" % (snap, path))
+
+
+def _filesnap(f):
+    m = re.search(r"SubSnap_(\d+)(\.\d+)?\.hdf5$", f)
+    return int(m.group(1)) if m else None
 
 
 def _fileno(f):
@@ -224,11 +266,18 @@ class HBT(object):
             with h5py.File(fn, "r") as f:
                 if "Subhalos" not in f:
                     raise InputError("%s has no Subhalos dataset" % fn)
+                # the file's snapshot must be the one asked for (SnapshotId, else the name)
+                sid = int(np.atleast_1d(f["SnapshotId"][()])[0]) if "SnapshotId" in f else _filesnap(fn)
+                if sid is not None and sid != snap:
+                    raise InputError("%s is snapshot %d, not the requested %d" % (fn, sid, snap))
                 subs.append(f["Subhalos"][:])
                 parts.extend(list(f["SubhaloParticles"][:]))
                 if "Cosmology/ScaleFactor" in f:
                     self.scale_factor = float(f["Cosmology/ScaleFactor"][0])
         self.subs = np.concatenate(subs) if subs else np.zeros(0)
+        for col in ("TrackId", "Nbound", "Rank"):
+            if self.subs.dtype.names is None or col not in self.subs.dtype.names:
+                raise InputError("%s: Subhalos has no %s" % (self.files[0], col))
         self.snap = snap
         self.ntot = self.subs.shape[0]
         self.trackid = self.subs["TrackId"].astype(np.int64)
@@ -355,13 +404,255 @@ def hbt_tracers(hbt, ours, h):
     return int(hbt.subs["NboundType"][h, tt].sum())
 
 
+# ---------------------------------------------------------------------------------- failure classes
+FAIL_CLASSES = ["swap", "in-swapped-group", "nbound", "survival", "other"]
+F32_U = 2.0 ** -24
+
+
+class History(object):
+    """Earlier outputs for the failure classes: the previous catalogue and its masses, each track's
+    twin at its earliest pairing (both ways), the previous output's swaps and the first output."""
+
+    def __init__(self):
+        self.prev = self.prev_mass = self.first = None
+        self.ident, self.rident = {}, {}
+        self.swaps = {}
+
+    def advance(self, ours, hbt, M, swaps):
+        if self.first is None:
+            self.first = ours.snap
+        self.prev = ours
+        self.prev_mass = ours.S["Mbound"].astype(np.float64)
+        for t, th in zip(ours.tid[M.o].tolist(), hbt.trackid[M.h].tolist()):
+            self.ident.setdefault(t, th)
+            self.rident.setdefault(th, t)
+        first = ("not checked", "already at SnapshotIndex %d, the first output" % ours.snap)
+        self.swaps = {k: first if v == ("not checked", "no previous output") else v for k, v in swaps.items()}
+
+
+def tie08(m_i, m_0):
+    """(exact 4:5, float32 cut differs) for saved float32 masses m_i, m_0. Two exact 4:5 masses
+    rounded to float32 (relative error <= 2^-24 each) give |5 m_i - 4 m_0| <= 2^-23 4 m_0 / (1 - 2^-24)."""
+    m_i, m_0 = float(m_i), float(m_0)
+    exact45 = abs(5.0 * m_i - 4.0 * m_0) <= 2 * F32_U * 4.0 * m_0 / (1 - F32_U)
+    f = np.float32
+    hbt_drop = bool(f(m_i) < f(f(m_0) * f(0.8)))
+    return exact45, hbt_drop != (m_i < 0.8 * m_0)
+
+
+def _central_rows(host, rank, alive):
+    sel = np.nonzero(alive & (rank == 0) & (host >= 0))[0]
+    return dict(zip(host[sel].tolist(), sel.tolist()))
+
+
+def _members(host, ids, groups):
+    """{group: [ids]} for the given groups, from one sort of host."""
+    o = np.argsort(host, kind="stable")
+    hs = host[o]
+    out = {}
+    for g in groups:
+        lo, hi = np.searchsorted(hs, [g, g + 1])
+        out[g] = ids[o[lo:hi]].tolist()
+    return out
+
+
+class Failures(object):
+    """Classes of the failing pairs and unmatched HBT subhalos of one output (see the docstring).
+    ratio, unmatched and pmap are report()'s Nbound ratios, unmatched HBT rows and pair map."""
+
+    def __init__(self, ours, hbt, M, good, ratio, unmatched, pmap, hist):
+        self.hist = hist = hist if hist is not None else History()
+        self.ohost, self.hhost = ours.S["HostGroup"].astype(np.int64), hbt.subs["HostHaloId"].astype(np.int64)
+        self.pm, rpm = pmap, {v: k for k, v in pmap.items()}
+        self.oset = oset = set(ours.tid.tolist())
+        hset = set(hbt.trackid[hbt.alive].tolist())
+
+        # twins: the earliest pairing while that track is still resolved, else this output's pair
+        def twin_h(t):
+            x = hist.ident.get(t)
+            return x if x is not None and x in hset else pmap.get(t)
+
+        def twin_o(t):
+            x = hist.rident.get(t)
+            return x if x is not None and x in oset else rpm.get(t)
+
+        oc = _central_rows(self.ohost, ours.rank, np.ones(ours.tid.size, bool))
+        hc = _central_rows(self.hhost, hbt.rank, hbt.alive)
+        cand = set(oc) & set(hc)
+        # a pair with Rank 0 on one side only makes its group a swap group
+        og, hg = self.ohost[M.o], self.hhost[M.h]
+        role = (og == hg) & (og >= 0) & ((ours.rank[M.o] == 0) != (hbt.rank[M.h] == 0))
+        rgroups = set(og[role].tolist()) & cand
+        self.groups = {}
+        for g in cand:
+            A, C = int(ours.tid[oc[g]]), int(hbt.trackid[hc[g]])
+            B, Ah = twin_o(C), twin_h(A)
+            if g in rgroups or (B is not None and B != A) or (Ah is not None and Ah != C):
+                # tie candidate: the historical twin of HBT's central even if dead now
+                Bt = hist.rident.get(C, B)
+                self.groups[g] = (A, C, B, Bt)
+        self.ties = self._ties(ours)
+        self.swaps = {(A, C): self.ties[g] for g, (A, C, B, Bt) in self.groups.items()}
+
+        # pairs
+        self.ratio = ratio
+        self.cls, self.why = [None] * M.h.size, [None] * M.h.size
+        for k in np.nonzero(~good)[0].tolist():
+            o, h = M.o[k], M.h[k]
+            g, gh, ro, rh = int(og[k]), int(hg[k]), int(ours.rank[o]), int(hbt.rank[h])
+            nums = "Rank %d / %d, Nbound %d / %d (ratio %.3f), Jaccard %.3f" % (
+                ro, rh, ours.nbound[o], hbt.nbound[h], ratio[k], M.jac[k])
+            if g != gh:
+                c, w = "other", "groups differ: our HostGroup %d, HBT HostHaloId %d; %s" % (g, gh, nums)
+            elif g in self.groups and (ro == 0 or rh == 0):
+                c, w = "swap", self._swap_text(g, nums)
+            elif g >= 0 and (ro == 0) != (rh == 0):
+                c, w = "other", "Rank 0 on one side, group %d has no central on the other; %s" % (g, nums)
+            elif g in self.groups:
+                c, w = "in-swapped-group", "group %d (centrals ours %d / HBT %d); %s" % (g, self.groups[g][0], self.groups[g][1], nums)
+            else:
+                c, w = "nbound", "group %d; %s" % (g, nums)
+            self.cls[k], self.why[k] = c, w
+        self.tie_pair = np.array([c == "swap" and self.ties[int(og[k])][0] == "tie-0.8"
+                                  for k, c in enumerate(self.cls)], dtype=bool)
+        self.unmatched = unmatched
+        self.hbt_nbound_unmatched = hbt.nbound[unmatched]
+
+    def _ties(self, ours):
+        """{group: (label, text)}: tie-0.8, no tie or not checked, with the previous masses."""
+        hist, P, out = self.hist, self.hist.prev, {}
+        todo = []
+        for g, (A, C, B, Bt) in self.groups.items():
+            if P is None:
+                out[g] = ("not checked", "no previous output")
+            elif P.snap != ours.snap - 1:
+                out[g] = ("not checked", "gap: the previous supplied output is SnapshotIndex %d" % P.snap)
+            elif (A, C) in hist.swaps:
+                out[g] = hist.swaps[(A, C)]
+            elif Bt is None or Bt == A:
+                out[g] = ("not checked", "no second candidate of ours for HBT's central")
+            else:
+                todo.append(g)
+        if not todo:
+            return out
+        # candidates: the group's tracks now, resolved or sunk into it at this output, resolved before
+        mem = _members(self.ohost, ours.tid, todo)
+        if ours.otid.size:
+            d = ours.O["SnapDeath"].astype(np.int64) == ours.snap
+            dm = _members(ours.O["HostGroup"].astype(np.int64)[d], ours.otid[d], todo)
+        m = hist.prev_mass
+        for g in todo:
+            A, C, B, Bt = self.groups[g]
+            rA, rB = P.row([A, Bt]).tolist()
+            if rA < 0 or rB < 0:
+                out[g] = ("not checked", "candidate %d not resolved at SnapshotIndex %d" % (A if rA < 0 else Bt, P.snap))
+                continue
+            tr = mem[g] + (dm[g] if ours.otid.size else [])
+            rows = [r for r in P.row(tr).tolist() if r >= 0] + [rA, rB]
+            r0 = max(rows, key=lambda r: (m[r], -P.tid[r]))
+            tests = set()
+            for r in (rA, rB):
+                if r != r0:
+                    e, f = tie08(m[r], m[r0])
+                    tests |= {"exact 4:5"} if e else set()
+                    tests |= {"float32 cut differs"} if f else set()
+            txt = "checked at SnapshotIndex %d on the Mbound (Nbound) of %d: %s; max %d %.7g (%d)" % (
+                ours.snap, P.snap, ", ".join("%d %.7g (%d, ratio %.7f)" % (P.tid[r], m[r], P.nbound[r], m[r] / m[r0])
+                                             for r in (rA, rB)), P.tid[r0], m[r0], P.nbound[r0])
+            if tests:
+                txt = "%s; %s" % (" and ".join(sorted(tests)), txt)
+            out[g] = ("tie-0.8" if tests else "no tie", txt)
+        return out
+
+    def _swap_text(self, g, nums):
+        A, C, B, Bt = self.groups[g]
+        lab, txt = self.ties[g]
+        tw = "-" if B is None else str(B)
+        if Bt is not None and Bt != B:
+            tw += ", historical %d" % Bt
+        return "group %d, centrals ours %d / HBT %d (our twin %s); %s; %s: %s" % (g, A, C, tw, nums, lab, txt)
+
+    def unmatched_text(self, ours, hbt, h):
+        """One unmatched HBT subhalo and the state of its historical twin of ours (for --show)."""
+        t = self.hist.rident.get(int(hbt.trackid[h]))
+        if t is None:
+            w = "no earlier pairing"
+        elif t in self.oset:
+            r = int(ours.row([t])[0])
+            w = "our twin %d resolved (Nbound %d, Rank %d, group %d)%s" % (
+                t, ours.nbound[r], ours.rank[r], self.ohost[r],
+                ", paired with HBT %d" % self.pm[t] if t in self.pm else ", unmatched")
+        elif ours.orow([t])[0] >= 0:
+            w = "our twin %d is an orphan (sink %d)" % (t, ours.O["SinkTrackId"][ours.orow([t])[0]])
+        else:
+            w = "our twin %d is absent" % t
+        return "HBT %d (Rank %d, Nbound %d, group %d%s): %s" % (
+            hbt.trackid[h], hbt.rank[h], hbt.nbound[h], self.hhost[h],
+            ", a swap group" if int(self.hhost[h]) in self.groups else "", w)
+
+    def label(self, k):
+        c = self.cls[k]
+        if c == "swap" and self.tie_pair[k]:
+            return "swap:tie-0.8"
+        return c
+
+    def counts(self, sel_pairs, sel_unmatched):
+        cnt = {c: 0 for c in FAIL_CLASSES}
+        for k in np.nonzero(sel_pairs)[0].tolist():
+            if self.cls[k] is not None:
+                cnt[self.cls[k]] += 1
+        cnt["survival"] += int(np.count_nonzero(sel_unmatched))
+        ntie = int(np.count_nonzero(sel_pairs & self.tie_pair))
+        return cnt, ntie
+
+    def count_line(self, lab, cnt, ntie):
+        n = sum(cnt.values())
+        parts = ["%s %d%s" % (c, cnt[c], " (tie-0.8 %d)" % ntie if c == "swap" else "")
+                 for c in FAIL_CLASSES if cnt[c]]
+        return "  failing %s: %d%s" % (lab, n, " = " + " + ".join(parts) if parts else "")
+
+
 def _q(a, qs=(10, 50, 90)):
     if a.size == 0:
         return "n/a"
     return "/".join("%.3f" % np.percentile(a, q) for q in qs)
 
 
-def report(ours, hbt, M, args, out=sys.stdout):
+def class_lines(F, ours, M, args, fail_big, fail_near, nacc, nbig, out):
+    """The failure-class lines after the acceptance line."""
+    unb = F.hbt_nbound_unmatched
+    cnt, ntie = F.counts(fail_big, unb >= args.min_np)
+    print(F.count_line("HBT subhalos >= %d" % args.min_np, cnt, ntie), file=out)
+    groups = sorted(set(int(F.ohost[M.o[k]]) for k in np.nonzero(fail_big)[0].tolist() if F.cls[k] == "swap"))
+    hist = F.hist
+    if hist.prev is None:
+        print("  tie check not done: no previous output (give --prev PIG_n-1, or use --track-pairs)", file=out)
+    elif not groups:
+        print("  tie check: no swap >= %d" % args.min_np, file=out)
+    else:
+        tl = {}
+        for g in groups:
+            lab, txt = F.ties[g]
+            key = lab if lab != "not checked" else "not checked (%s)" % txt
+            tl[key] = tl.get(key, 0) + 1
+        print("  tie check of the %d group%s with a swap >= %d: %s" % (
+            len(groups), "" if len(groups) == 1 else "s", args.min_np,
+            ", ".join("%s %d" % kv for kv in sorted(tl.items()))), file=out)
+    # both-Rank-0 swaps are seen only through twins from earlier outputs
+    if hist.first is None:
+        print("  swap history: none; a swap with both sides Rank 0 on different tracks is invisible and counts "
+              "as nbound (use --prev, or a consecutive --track-pairs sequence from before its origin)", file=out)
+    else:
+        print("  swap history: twins from SnapshotIndex %d on; a swap with both sides Rank 0 that began at or "
+              "before it is invisible and counts as nbound (a consecutive sequence from before its origin "
+              "is needed)" % hist.first, file=out)
+    print("  acceptance excluding tie-level pairs (%d swap%s labelled tie-0.8): %d of %d, %.1f%%" % (
+        ntie, "" if ntie == 1 else "s", nacc, nbig - ntie, 100.0 * nacc / max(nbig - ntie, 1)), file=out)
+    cnt, ntie = F.counts(fail_near, (unb >= args.near_np) & (unb < args.min_np))
+    print(F.count_line("near threshold (%d <= HBT Nbound < %d)" % (args.near_np, args.min_np), cnt, ntie), file=out)
+
+
+def report(ours, hbt, M, args, out=sys.stdout, hist=None):
     sample = int(ours.params.get("SubhaloPotentialSampleSize", 1000))
     core = int(ours.params.get("SubhaloCoreSize", 20))
     alive = np.nonzero(hbt.alive)[0]
@@ -432,6 +723,12 @@ def report(ours, hbt, M, args, out=sys.stdout):
     print("Acceptance: %d of %d HBT subhalos with Nbound >= %d matched with Jaccard >= %.2f and Nbound within %.0f%%: "
           "%.1f%% (target %.0f%%)" % (nacc, big.size, args.min_np, args.jaccard_min, 100 * args.nbound_tol,
                                      100 * frac, 100 * args.accept_frac), file=out)
+    M.fail = F = None
+    if "HostHaloId" not in hbt.subs.dtype.names:
+        print("  failure classes not available: %s has no Subhalos/HostHaloId" % hbt.files[0], file=out)
+    else:
+        M.fail = F = Failures(ours, hbt, M, good, ratio, um_h, pair_map(ours, hbt, M), hist)
+        class_lines(F, ours, M, args, isbig & ~good, isnear & ~good, nacc, big.size, out)
     cls = {c: 0 for c in D3_CLASSES}
     for k in np.nonzero(isbig & ~good)[0].tolist():
         cls[classify_pair(ours, hbt, M.h[k], M.o[k], sample, core, spawned)] += 1
@@ -463,17 +760,25 @@ def report(ours, hbt, M, args, out=sys.stdout):
             print("                  %11d %8d %10d  %11d %8d %10d  %7.3f  %6.3f  %6s" % (
                 hbt.trackid[h], hbt.rank[h], hbt.nbound[h], ours.tid[oo], ours.rank[oo], ours.nbound[oo],
                 M.jac[k], ratio[k], "%.3f" % vr[k] if np.isfinite(vr[k]) else "-"), file=out)
+            if F is not None and F.cls[k] is not None:
+                print("                    %s: %s" % (F.label(k), F.why[k]), file=out)
+        uw = um_h[hbt.nbound[um_h] >= args.min_np] if F is not None else []
+        if len(uw):
+            print("  unmatched HBT subhalos >= %d (survival)%s:" % (
+                args.min_np, ", first %d" % args.show if len(uw) > args.show else ""), file=out)
+            for h in uw[:args.show].tolist():
+                print("                  %s" % F.unmatched_text(ours, hbt, h), file=out)
     if args.pairs_out:
         with open(args.pairs_out, "w") as f:
             f.write("# HBT_TrackId HBT_Rank HBT_Depth HBT_Nbound our_TrackId our_Rank our_Depth our_Nbound "
-                    "intersection Jaccard Nbound_ratio Vmax_ratio class\n")
+                    "intersection Jaccard Nbound_ratio Vmax_ratio class fail_class\n")
             for k in range(M.h.size):
                 h, oo = M.h[k], M.o[k]
                 c = "ok" if good[k] else classify_pair(ours, hbt, h, oo, sample, core, spawned).replace(" ", "_")
-                f.write("%d %d %d %d %d %d %d %d %d %.5f %.5f %s %s\n" % (
+                f.write("%d %d %d %d %d %d %d %d %d %.5f %.5f %s %s %s\n" % (
                     hbt.trackid[h], hbt.rank[h], hbt.subs["Depth"][h], hbt.nbound[h], ours.tid[oo], ours.rank[oo],
                     ours.S["Depth"][oo], ours.nbound[oo], M.inter[k], M.jac[k], ratio[k],
-                    "%.5f" % vr[k] if np.isfinite(vr[k]) else "nan", c))
+                    "%.5f" % vr[k] if np.isfinite(vr[k]) else "nan", c, (F.label(k) or "-") if F is not None else "n/a"))
         print("  pairs written to %s" % args.pairs_out, file=out)
     return frac
 
@@ -482,6 +787,23 @@ def load(pigdir, hbtpath, args):
     ours = Ours(pigdir, args.ntracers, phase1=args.phase1)
     hbt = HBT(hbtpath, ours.snap + args.hbt_snap_offset)
     return ours, hbt
+
+
+def prev_history(pig, hbtpath, args, snap):
+    """History holding the output before SnapshotIndex snap; swaps already there are not tie-checked."""
+    ours, hbt = load(pig, hbtpath, args)
+    if ours.snap >= snap:
+        raise InputError("--prev %s is SnapshotIndex %d, not before %d" % (pig, ours.snap, snap))
+    M = match(ours, hbt, args.match, args.ntracers)
+    swaps = {}
+    if "HostHaloId" in hbt.subs.dtype.names:
+        um = np.setdiff1d(np.nonzero(hbt.alive)[0], M.h)
+        ratio = ours.nbound[M.o] / np.maximum(hbt.nbound[M.h], 1).astype(np.float64)
+        F = Failures(ours, hbt, M, np.ones(M.h.size, bool), ratio, um, pair_map(ours, hbt, M), None)
+        swaps = {k: ("not checked", "already at SnapshotIndex %d" % ours.snap) for k in F.swaps}
+    hist = History()
+    hist.advance(ours, hbt, M, swaps)
+    return hist
 
 
 # ---------------------------------------------------------------------------------- links, history
@@ -711,11 +1033,18 @@ def orphan_block(B, HB, cum_prev, args, out=sys.stdout):
 def sequence(args, pigs, hbtpath):
     cats, matches, maps = [], [], []
     frac = 0.0
+    hist = None
     for pig in pigs:
         ours, hbt = load(pig, hbtpath, args)
+        if hist is None:
+            hist = prev_history(args.prev, hbtpath, args, ours.snap) if args.prev else History()
+        elif ours.snap <= hist.prev.snap:
+            raise InputError("--track-pairs: %s (SnapshotIndex %d) does not follow SnapshotIndex %d"
+                             % (pig, ours.snap, hist.prev.snap))
         M = match(ours, hbt, args.match, args.ntracers)
         print("== %s" % pig)
-        frac = report(ours, hbt, M, args)
+        frac = report(ours, hbt, M, args, hist=hist)
+        hist.advance(ours, hbt, M, M.fail.swaps if M.fail is not None else {})
         pm = pair_map(ours, hbt, M)
         link_block(ours, hbt, M, pm, args)
         history_block("the matched pairs", M.o, M.h, ours.S, hbt, args, nb=hbt.nbound[M.h])
@@ -804,6 +1133,9 @@ def main(argv=None):
     p.add_argument("--report-only", action="store_true", help="exit 0 whatever the figures")
     p.add_argument("--show", type=int, default=0, help="print the N pairs with the lowest Jaccard")
     p.add_argument("--pairs-out", default=None, help="write every matched pair to this text file")
+    p.add_argument("--prev", default=None, metavar="PIG",
+                   help="the output before PIG_xxx (or before the first PIG of --track-pairs), for the "
+                        "swap identities and the tie-0.8 check")
     args = p.parse_args(argv)
     try:
         if args.track_pairs:
@@ -822,8 +1154,9 @@ def main(argv=None):
         if len(args.paths) != 2:
             p.error("give PIG_xxx and the HBT path")
         ours, hbt = load(args.paths[0], args.paths[1], args)
+        hist = prev_history(args.prev, args.paths[1], args, ours.snap) if args.prev else None
         M = match(ours, hbt, args.match, args.ntracers)
-        frac = report(ours, hbt, M, args)
+        frac = report(ours, hbt, M, args, hist=hist)
         link_block(ours, hbt, M, pair_map(ours, hbt, M), args)
         history_block("the matched pairs", M.o, M.h, ours.S, hbt, args, nb=hbt.nbound[M.h])
         return 0 if (frac >= args.accept_frac or args.report_only) else 1
