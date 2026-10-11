@@ -56,6 +56,7 @@
 #include <libgadget/cosmology.h>
 #include <libgadget/subhalo.h>
 #include <libgadget/subhalo_unbind.h>
+#include <libgadget/subhalo_internal.h>
 #include <libgadget/utils/mymalloc.h>
 #include "stub.h"
 
@@ -1408,6 +1409,138 @@ test_nfw_bin_edges(void ** state)
     assert_true(r1.Rs == -1 && r1.Vrms == -1 && r1.BulkVel[0] == -1 && r1.RockstarCoreVel[0] == -1);
 }
 
+/* subhalo_props_deferred on particles at prescribed radii from particle 0, the one-particle core,
+ * with masses m and velocities v; every particle above the threshold, so kc = n - 1. */
+static struct SubTrack
+prescribed_props(int64_t n, const double * r, const double * m, const double (*v)[3])
+{
+    int64_t k;
+    int d;
+    setup_pman(n);
+    for(k = 0; k < n; k++) {
+        place(k, r[k], k, m[k], 1 + k);
+        for(d = 0; d < 3; d++)
+            P[k].Vel[d] = v ? v[k][d] : 0;
+    }
+    struct SubhaloUnbindParams up = default_params();
+    struct SubCandidate c;
+    memset(&c, 0, sizeof(c));
+    int64_t * Index = (int64_t *) mymalloc("TestIndex", sizeof(int64_t) * n);
+    for(k = 0; k < n; k++)
+        Index[k] = k;
+    c.Index = Index;
+    c.N = c.Nbound = n;
+    double rho[SUBHALO_NSO];
+    for(k = 0; k < SUBHALO_NSO; k++)
+        rho[k] = 1e-12;
+    struct SubhaloArena arena;
+    arena.size = SUBHALO_PROPS_BYTES_PER_PART * n;
+    arena.used = 0;
+    arena.base = (char *) mymalloc("TestArena", arena.size);
+    struct SubTrack rec;
+    subhalo_track_clear(&rec, 0);
+    subhalo_props_deferred(&rec, &c, &up, rho, 1, &arena);
+    assert_int_equal(arena.used, 0);
+    myfree(arena.base);
+    myfree(Index);
+    teardown_pman();
+    return rec;
+}
+
+/* Hand-written bin closing of nfw.c for unequal masses (plain sums: the fixture masses are dyadic),
+ * on a given plan (nb, mpbin); returns the bins closed. */
+static int
+aper_oracle_edges(const double * r, const double * m, int64_t n, int64_t nfit, int nb, double mpbin, double * edge)
+{
+    double M = 0;
+    int64_t k;
+    int b = 1;
+    edge[0] = 0;
+    for(k = 0; k < nfit && b <= nb; k++) {
+        M += m[k];
+        while(b <= nb && M >= b * mpbin * (1 - 1e-9)) {
+            const double rnext = k + 1 < n ? r[k + 1] : r[k];
+            edge[b] = 0.5 * (r[k] + rnext) - (k > 0 ? (M - b * mpbin) / m[k] * (r[k] - r[k - 1]) : 0);
+            b++;
+        }
+    }
+    return b - 1;
+}
+
+/* Aperture boundaries (decision 47.1): (a) kc = 2, velocities of the two inner particles; (b) the
+ * largest included mass at kc - 1, a larger crossing mass at kc; plan and edges worked out here. */
+static void
+test_aperture_boundaries(void ** state)
+{
+    const struct SubhaloUnbindParams up = default_params();
+    const double rfloor = up.h / 2.8, vkms = subhalo_vel_to_kms(up.atime);
+    int d;
+    /* (a) */
+    {
+        const double r[3] = {0, 0.6, 0.7}, m[3] = {0.01, 0.03, 0.02};
+        const double v[3][3] = {{10, -20, 30}, {50, 40, -20}, {5000, 5000, 5000}};
+        const struct SubTrack rec = prescribed_props(3, r, m, v);
+        const double M = m[0] + m[1];
+        double var = 0;
+        for(d = 0; d < 3; d++) {
+            const double bulk = (m[0] * v[0][d] + m[1] * v[1][d]) / M * vkms;
+            message(0, "aperture kc = 2: BulkVel[%d] %.9g (expected %.9g), RockstarCoreVel %.9g\n", d, rec.BulkVel[d], bulk,
+                    rec.RockstarCoreVel[d]);
+            assert_true(fabs(rec.BulkVel[d] - bulk) < 1e-6 * (fabs(bulk) + 1));
+            /* the core is both particles (fewer than SUBHALO_ROCKSTAR_CORE_MINPART) */
+            assert_true(fabs(rec.RockstarCoreVel[d] - bulk) < 1e-6 * (fabs(bulk) + 1));
+            var += m[0] * m[1] * (v[0][d] - v[1][d]) * (v[0][d] - v[1][d]) / (M * M);
+        }
+        const double vrms = sqrt(var) * vkms;
+        message(0, "aperture kc = 2: Vrms %.9g (expected %.9g), Rs %g\n", rec.Vrms, vrms, rec.Rs);
+        assert_true(fabs(rec.Vrms - vrms) < 1e-6 * vrms);
+        assert_true(rec.Rs == -1);
+    }
+    /* (b) 100 masses of 1/128, 30/128 at kc - 1 = 100, 100/128 crossing at kc = 101 */
+    {
+        enum { NB = 102 };
+        const int64_t n = NB, kc = NB - 1;
+        double r[NB], m[NB], rr[NB];
+        int64_t k;
+        for(k = 0; k < n; k++) {
+            r[k] = k ? 0.5 + 0.1 * k : 0;
+            m[k] = k < kc - 1 ? 1. / 128 : (k == kc - 1 ? 30. / 128 : 100. / 128);
+            rr[k] = r[k] > rfloor ? r[k] : rfloor;
+        }
+        const struct SubTrack rec = prescribed_props(n, r, m, NULL);
+        /* the plan: nfit 101, ppbin 101 / (101 / 15) = 16, 6 bins; Mfit / 6 = 21.7 / 128 < 30 / 128 */
+        const int nb = 6;
+        const double mpbin = 30. / 128;
+        double mp;
+        assert_int_equal(subhalo_nfw_bin_plan(kc, 130. / 128, 30. / 128, &mp), nb);
+        assert_true(mp == mpbin);
+        double edge[SUBHALO_NFW_MAXBINS + 1], ewrong[SUBHALO_NFW_MAXBINS + 1];
+        /* bins 1-3 close exactly at k = 29, 59, 89; bin 4 at kc - 1 (excess 1/3, outer neighbour kc) */
+        assert_int_equal(aper_oracle_edges(rr, m, n, kc, nb, mpbin, edge), 4);
+        for(d = 1; d <= 3; d++)
+            assert_true(edge[d] == 0.5 * (rr[30 * d - 1] + rr[30 * d]));
+        assert_true(fabs(edge[4] - (0.5 * (rr[100] + rr[101]) - (rr[100] - rr[99]) / 3)) < 1e-12);
+        double Mk = 0, best = 0, rbest = -1;
+        for(k = 0; k < n; k++) {
+            Mk += m[k];
+            if(Mk / rr[k] > best) {
+                best = Mk / rr[k];
+                rbest = rr[k];
+            }
+        }
+        const double Rvir = cbrt(3 * Mk / (4 * M_PI * 1e-12));
+        const double rs0 = subhalo_klypin_rs(Rvir, Mk, best, rbest);
+        const double rs = subhalo_nfw_fit(rs0, edge, 4, 3 * rfloor);
+        /* with kc in the maximum one bin closes (fit -1); without kc - 1, mpbin = Mfit / 6 */
+        const int nw = aper_oracle_edges(rr, m, n, kc, nb, 130. / 128 / 6, ewrong);
+        const double rs_wrong = subhalo_nfw_fit(rs0, ewrong, nw, 3 * rfloor);
+        message(0, "aperture heavy kc - 1: Rs %.8g, oracle %.8g; without kc - 1 in the largest mass %.8g (%d bins)\n", rec.Rs, rs,
+                rs_wrong, nw);
+        assert_true(rs > 0 && fabs(rec.Rs / rs - 1) < 1e-6);
+        assert_true(rs_wrong > 0 && fabs(rs_wrong / rs - 1) > 1e-4);
+    }
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_thresholds),
@@ -1420,6 +1553,7 @@ int main(void) {
         cmocka_unit_test(test_vmax),
         cmocka_unit_test(test_units),
         cmocka_unit_test(test_nfw_bin_edges),
+        cmocka_unit_test(test_aperture_boundaries),
     };
     return cmocka_run_group_tests_mpi(tests, NULL, NULL);
 }

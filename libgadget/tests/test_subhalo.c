@@ -3604,12 +3604,18 @@ test_subhalo_twohalo(void ** state)
         {
             const struct SubhaloCallStats * st = subhalo_last_call_stats();
             const double fso = clock_sum("/Subhalo/FieldSO/") - fso0, ftr = clock_sum("/Subhalo/FieldSO/Tree") - ftr0;
-            message(0, "two haloes, call %d: walltime /Subhalo/FieldSO children %.5f s (tree build %.5f s), the summary's field SO "
-                       "%.5f s (max), %.5f s (mean)\n", call, fso, ftr, st->StageMax[SUBHALO_STAGE_FIELDSO], st->StageMean[SUBHALO_STAGE_FIELDSO]);
-            CHECK(ftr > 0 && fso <= st->StageMax[SUBHALO_STAGE_FIELDSO] * (1 + 1e-6) + 1e-4
-                  && fso >= 0.8 * st->StageMean[SUBHALO_STAGE_FIELDSO] - 1e-4,
-                  "two haloes, call %d: walltime field SO %g s (tree %g s), summary %g / %g s\n", call, fso, ftr,
-                  st->StageMax[SUBHALO_STAGE_FIELDSO], st->StageMean[SUBHALO_STAGE_FIELDSO]);
+            /* mean over the ranks against the mean stage time: a rank's own stage time is not exposed */
+            int NTask;
+            double fsomean = 0;
+            MPI_Comm_size(MPI_COMM_WORLD, &NTask);
+            MPI_Allreduce(&fso, &fsomean, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+            fsomean /= NTask;
+            const double smean = st->StageMean[SUBHALO_STAGE_FIELDSO];
+            message(0, "two haloes, call %d: walltime /Subhalo/FieldSO children %.5f s (tree build %.5f s; mean over the ranks %.5f s), "
+                       "the summary's field SO %.5f s (max), %.5f s (mean)\n", call, fso, ftr, fsomean, st->StageMax[SUBHALO_STAGE_FIELDSO], smean);
+            CHECK(ftr > 0, "two haloes, call %d: no time on /Subhalo/FieldSO/Tree (%g s)\n", call, ftr);
+            CHECK(fsomean <= smean * (1 + 1e-6) + 1e-4 && fsomean >= 0.8 * smean - 1e-4,
+                  "two haloes, call %d: walltime field SO %g s (mean %g s, tree %g s), summary mean %g s\n", call, fso, fsomean, ftr, smean);
         }
         {
             const struct SubhaloCallStats * st = subhalo_last_call_stats();

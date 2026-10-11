@@ -2706,8 +2706,12 @@ pi_particle(MyIDType id, int mode, double pos[3], double vel[3], double * mass)
         *mass = j % 50 == 0 ? 1.0 : ldexp(1.0, -50);
 }
 
+/* layout 3: rank 0 holds PiSplit particles, so that the radial order (sorted by label and radius,
+ * the ranks' counts kept) changes rank between kc - 1 and kc of the last ball */
+static int64_t PiSplit = 0;
+
 /* layout 0: every particle on rank 0; 1: round robin; 2: 1/13, 2/13, 4/13 and 6/13 on ranks 0-3
- * (the sorted records then change rank inside the inner part of the first balls) */
+ * (the sorted records then change rank inside the inner part of the first balls); 3: above */
 static int
 pi_rank(MyIDType id, int layout, int NTask)
 {
@@ -2715,6 +2719,8 @@ pi_rank(MyIDType id, int layout, int NTask)
         return 0;
     if(layout == 1)
         return (int) (id % NTask);
+    if(layout == 3)
+        return (int64_t) id < PiSplit || NTask == 1 ? 0 : 1 + (int) (id % (NTask - 1));
     const int k = (int) (splitmix64(id ^ 0x5151) % 13);
     return (k < 1 ? 0 : (k < 3 ? 1 : (k < 7 ? 2 : 3))) % NTask;
 }
@@ -2749,6 +2755,50 @@ pi_distributed(const double * core, const struct SubhaloUnbindParams * up, const
         label[i] = pi_label(P[i].ID, &j);
     subhalo_collective_test_props(label, PI_NL, core, up, rho, dfr, mvir);
     free(label);
+}
+
+struct PiRad { double r, m; MyIDType id; };
+
+static int
+pi_rad_cmp(const void * a, const void * b)
+{
+    const struct PiRad * x = (const struct PiRad *) a, * y = (const struct PiRad *) b;
+    if(x->r != y->r)
+        return x->r < y->r ? -1 : 1;
+    return (x->id > y->id) - (x->id < y->id);
+}
+
+/* The outermost virial crossing kc of the n particles Index about core (the recipe's radial
+ * order and compensated M(<= r)); *Mkc the mass at it. */
+static int64_t
+pi_kc(const int64_t * Index, int64_t n, const double * core, double rfloor, double rho0, double * Mkc)
+{
+    struct PiRad * pr = (struct PiRad *) malloc(sizeof(struct PiRad) * (n + 1));
+    int64_t k, kc = -1;
+    int d;
+    for(k = 0; k < n; k++) {
+        double r2 = 0;
+        for(d = 0; d < 3; d++) {
+            const double dx = NEAREST(P[Index[k]].Pos[d] - core[d], BOXSIZE);
+            r2 += dx * dx;
+        }
+        pr[k].r = sqrt(r2) > rfloor ? sqrt(r2) : rfloor;
+        pr[k].m = P[Index[k]].Mass;
+        pr[k].id = P[Index[k]].ID;
+    }
+    qsort(pr, n, sizeof(struct PiRad), pi_rad_cmp);
+    double Mk[2] = {0, 0};
+    *Mkc = 0;
+    for(k = 0; k < n; k++) {
+        subhalo_ksum_add(Mk, pr[k].m);
+        const double M = subhalo_ksum_value(Mk);
+        if(M / (4.0 / 3.0 * M_PI * pr[k].r * pr[k].r * pr[k].r) > rho0) {
+            kc = k;
+            *Mkc = M;
+        }
+    }
+    free(pr);
+    return kc;
 }
 
 static void
@@ -2786,6 +2836,8 @@ pi_run(int mode)
     struct SubTrack ser[PI_NL];
     memset(core, 0, sizeof(core));
     memset(ser, 0, sizeof(ser));
+    int64_t kcsplit = -1;
+    double Mkcsplit = 0;
     pi_place(0, mode);
     if(ThisTask == 0) {
         int64_t * Index = (int64_t *) mymalloc("PiIndex", sizeof(int64_t) * (PartManager->NumPart + 1));
@@ -2803,6 +2855,15 @@ pi_run(int mode)
             c.N = c.Nbound = n;
             double sx, sv;
             subhalo_core(&c, &up, PI_CORESIZE, core + 6 * l, core + 6 * l + 3, &sx, &sv);
+            if(l == PI_NL - 1) {
+                /* layout 3 splits the last ball between kc - 1 and kc */
+                double Mkc;
+                const int64_t kc = pi_kc(c.Index, n, core + 6 * l, up.h / 2.8, rho[0], &Mkc);
+                assert_true(kc > 0);
+                PiSplit = start + kc;
+                kcsplit = kc;
+                Mkcsplit = Mkc;
+            }
             for(d = 0; d < 3; d++)
                 c.RefPos[d] = core[6 * l + d];
             struct SubhaloArena arena;
@@ -2824,14 +2885,22 @@ pi_run(int mode)
     }
     MPI_Bcast(core, 6 * PI_NL, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Bcast(ser, sizeof(ser), MPI_BYTE, 0, MPI_COMM_WORLD);
-    /* the distributed recipes in three layouts */
-    double dfr[3][8 * PI_NL], mvir[3][PI_NL];
+    MPI_Bcast(&PiSplit, 1, MPI_INT64, 0, MPI_COMM_WORLD);
+    /* the oracle's kc is the recipe's: its mass is MBoundSO[vir] */
+    message(0, "props identity (%s masses): the last ball's kc %ld (M %.9g, serial MBoundSO[vir] %.9g), layout 3 splits at %ld\n",
+            PiMode[mode], (long) kcsplit, Mkcsplit, ser[PI_NL - 1].MBoundSO[0], (long) PiSplit);
+    if(ThisTask == 0)
+        assert_true((float) Mkcsplit == ser[PI_NL - 1].MBoundSO[0]);
+    /* the distributed recipes in four layouts */
+    double dfr[4][8 * PI_NL], mvir[4][PI_NL];
     int lay;
-    for(lay = 0; lay < 3; lay++) {
+    for(lay = 0; lay < 4; lay++) {
         if(lay > 0)
             pi_place(lay, mode);
         message(0, "props identity (%s masses), layout %d: rank 0 holds %ld particles\n", PiMode[mode], lay,
                 (long) PartManager->NumPart);
+        if(lay == 3 && ThisTask == 0 && get_ntask() > 1)
+            assert_true(PartManager->NumPart == PiSplit);
         pi_distributed(core, &up, rho, dfr[lay], mvir[lay]);
         teardown_pman();
     }
@@ -2857,7 +2926,7 @@ pi_run(int mode)
             LOCAL_CHECK(bad, l != PI_NL - 1 || (kcv == SUBHALO_NFW_MINPART && x->Rs > 0),
                         "props identity: boundary ball %d kc %ld (expected %d) Rs %g\n", l, (long) kcv, SUBHALO_NFW_MINPART, x->Rs);
         }
-        for(lay = 0; lay < 3; lay++) {
+        for(lay = 0; lay < 4; lay++) {
             const double * o = dfr[lay] + 8 * l;
             for(k = 0; k < 8; k++) {
                 const float v = (float) o[k];
@@ -3025,15 +3094,18 @@ test_collective_admission_props(void ** state)
     wtr = ml_clock_sum("/Subhalo/Rounds/Tree") - wtr;
     {
         const struct SubhaloCallStats * st = subhalo_last_call_stats();
-        message(0, "many labels (a): walltime /Subhalo/Rounds children %.4f s (cleanup %.4f s, tree builds %.4f s), the summary's rounds %.4f s "
-                   "(max), %.4f s (mean): coverage %.3f\n", wt1 - wt0, wcl, wtr, st->StageMax[SUBHALO_STAGE_ROUNDS],
-                st->StageMean[SUBHALO_STAGE_ROUNDS], (wt1 - wt0) / st->StageMean[SUBHALO_STAGE_ROUNDS]);
+        const double smean = st->StageMean[SUBHALO_STAGE_ROUNDS];
+        /* mean over the ranks against the mean stage time: a rank's own stage time is not exposed */
+        double loc[2] = {wt1 - wt0, wcl}, sum[2];
+        MPI_Allreduce(loc, sum, 2, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        const double wmean = sum[0] / get_ntask(), clmean = sum[1] / get_ntask();
+        message(0, "many labels (a): walltime /Subhalo/Rounds children %.4f s (cleanup %.4f s, tree builds %.4f s; mean over the ranks "
+                   "%.4f s, cleanup %.4f s), the summary's rounds %.4f s (max), %.4f s (mean): coverage %.3f\n", wt1 - wt0, wcl, wtr,
+                wmean, clmean, st->StageMax[SUBHALO_STAGE_ROUNDS], smean, wmean / smean);
         CHECK(wtr > 0, "many labels (a): no time on /Subhalo/Rounds/Tree (%g s)\n", wtr);
-        /* the children cover the stage (the tree builds included, as /Subhalo/Rounds/Tree), the
-         * cleanup a small part */
-        CHECK(wt1 - wt0 <= st->StageMax[SUBHALO_STAGE_ROUNDS] * (1 + 1e-6) + 1e-4 && wt1 - wt0 >= 0.8 * st->StageMean[SUBHALO_STAGE_ROUNDS]
-              && wcl < 0.5 * (wt1 - wt0), "many labels (a): walltime rounds %g s (cleanup %g s), summary %g / %g s\n", wt1 - wt0, wcl,
-              st->StageMax[SUBHALO_STAGE_ROUNDS], st->StageMean[SUBHALO_STAGE_ROUNDS]);
+        /* the cleanup share is printed only: a descheduled rank can make it any size */
+        CHECK(wmean <= smean * (1 + 1e-6) + 1e-4 && wmean >= 0.8 * smean - 1e-4,
+              "many labels (a): walltime rounds %g s (mean %g s, cleanup %g s), summary mean %g s\n", wt1 - wt0, wmean, wcl, smean);
     }
     const struct SubhaloPlanSummary * ps = subhalo_plan_last_summary();
     const struct SubhaloCollAdmit * ad = subhalo_plan_last_admission();

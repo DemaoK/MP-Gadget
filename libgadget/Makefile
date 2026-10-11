@@ -25,7 +25,8 @@ TESTED = hci \
 	gravity \
 	exchange \
 	subhalo_unbind \
-	subhalo_props
+	subhalo_props \
+	walltime
 
 MPI_TESTED = exchange fof subhalo subhalo_so subhalo_collective
 
