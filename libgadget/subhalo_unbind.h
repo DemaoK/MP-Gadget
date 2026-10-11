@@ -272,21 +272,25 @@ double subhalo_klypin_f_to_c(double f);
  * from the core of subhalo_core, floored at GravitySoftening = h / 2.8, ties by ID) and kc the
  * outermost virial crossing (the rule of subhalo_props_rockstar; Mvir = M(<= r_kc) and Rvir =
  * (3 Mvir / (4 pi rho[0]))^(1/3), as MBoundSO[vir] / RBoundSO[vir], which keep the crossing
- * particle), the velocity aperture is the Nap = kc particles inside the crossing particle
- * (properties.c's j < dens_tot) and the fit's aperture the Nfit = kc - 1 particles inside the one
- * before it (nfw.c's i < total_p - 1 with total_p = dens_tot), of mass Mfit.
+ * particle), the aperture of all four is the Nap = kc particles inside the crossing particle
+ * (properties.c's j < dens_tot), of mass Mfit = M(<= r_(kc-1)) for the fit (decision 47.1: one
+ * consistent off-by-one; nfw.c's i < total_p - 1 with total_p = dens_tot would also drop the
+ * particle before the crossing, see the deviations below).
  *  - BulkVel: the mass-weighted mean Vel of the velocity aperture; Vrms: sqrt(sum_d sum m (v_d -
  *    BulkVel_d)^2 / M) over it, M its own mass (no Hubble term, as Rockstar; Rockstar divides
  *    both sums by Mvir, the mass with the crossing particle, a 1 / Nvir bias not copied).
  *  - RockstarCoreVel: the mass-weighted mean Vel of the velocity aperture's particles with r <
  *    0.1 Rvir, or of its innermost min(SUBHALO_ROCKSTAR_CORE_MINPART, Nap) when fewer are inside.
- *  - Rs: the fit of subhalo_nfw_fit on the equal-mass bins of the fit's aperture
- *    (subhalo_nfw_bin_plan with Nfit, Mfit and its largest mass, subhalo_nfw_threshold,
- *    subhalo_nfw_edge) from the Klypin start (subhalo_klypin_rs, Mvir and Rvir); -1 when Nfit <
- *    SUBHALO_NFW_MINPART (Rockstar falls back to the Klypin value there; ours is RsKlypin) or the
- *    fit fails.
+ *  - Rs: the fit of subhalo_nfw_fit on the equal-mass bins of the aperture
+ *    (subhalo_nfw_bin_plan with Nap, Mfit and its largest mass, subhalo_nfw_threshold,
+ *    subhalo_nfw_edge; the last bin's outer neighbour rnext may be the crossing particle) from
+ *    the Klypin start (subhalo_klypin_rs, Mvir and Rvir); -1 when Nap = kc <
+ *    SUBHALO_NFW_MINPART, i.e. the crossing is among the innermost 100 bound particles, so
+ *    always below 101 bound particles (Rockstar falls back to the Klypin value there; ours is
+ *    RsKlypin) or the fit fails.
  * All four stay -1 without a virial crossing, when the crossing is the innermost bound particle
- * (an empty velocity aperture) or Nbound == 0. Velocities physical peculiar
+ * (kc = 0: an empty aperture) or Nbound == 0; with kc = 1 the velocity trio is the innermost
+ * particle's (Vrms 0) and Rs is -1. Velocities physical peculiar
  * km/s (subhalo_vel_to_kms(a) on Vel), Rs comoving in the run's length unit. The core is
  * recomputed (as subhalo_props_rockstar does), so rec's other columns are not read. Scratch:
  * SUBHALO_PROPS_BYTES_PER_PART * Nbound from the arena, rewound on return; endrun if short.
@@ -323,12 +327,16 @@ double subhalo_klypin_f_to_c(double f);
  *    instead of Rockstar's start radius or a NaN (audit R6);
  *  - the bound-set radii are floored at the softening in the bin edges (nfw.c uses the unfloored
  *    radii; the bins below 3 softenings weigh 0.1 in both, no measurable effect);
- *  - BulkVel / Vrms normalised by the velocity aperture's own mass (above).
+ *  - BulkVel / Vrms normalised by the velocity aperture's own mass (above);
+ *  - the fit's aperture excludes only the crossing particle, as the velocity aperture
+ *    (properties.c); nfw.c's i < total_p - 1 on total_p = dens_tot also drops the particle
+ *    before it (decision 47.1: one consistent off-by-one, one more fit particle than Rockstar,
+ *    so Rs is defined from kc = 100 where Rockstar needs 101 inside particles).
  * The SO-sphere versions (RsSO, RsKlypinSO, VmaxSO, RmaxSO of the field SO's pass 3, decision 44,
  * subhalo_so.h) use the same fit and Klypin functions on every particle inside RSO[vir] (Rockstar's
  * host set: satellites, unbound and non-FOF particles included) with these further deviations:
  *  - the aperture is the interpolated field-SO RSO[vir] (all particles with r <= RSO[vir]), not
- *    the particle crossing, and Rockstar's two-particle off-by-one does not apply;
+ *    the particle crossing, and Rockstar's off-by-one exclusions do not apply;
  *  - the profile is a histogram (SUBHALO_SO_NPROF log bins over 3 decades): the equal-mass bin
  *    edges are where the histogram's M(<r), interpolated linearly in ln r inside a profile bin,
  *    reaches each closing mass (the histogram form of nfw.c's excess-mass edge interpolation, in

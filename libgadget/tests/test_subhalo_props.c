@@ -1209,18 +1209,86 @@ test_vmax(void ** state)
 
 /* ------------------------------------------------------------------ 9. NFW bin edges (Phase 5 audit R5) */
 
+/* The oracle's equal-mass bin edges of nfw.c:101-144 for the innermost nfit of n equal masses m at
+ * the sorted radii r (rnext the next radius, the particle after the aperture included, r[k] at the
+ * last bound particle): literal == 0 the intended interpolation, 1 Rockstar's effective midpoint
+ * (the correction dropped). Returns the number of bins closed; *mpbin the mass per bin, *nover
+ * the bins closing with an excess above 0.1 masses. */
+static int
+nfw_oracle_edges(const double * r, int64_t n, double m, int64_t nfit, int literal, double * edge, double * mpbin, int * nover)
+{
+    const int nb = subhalo_nfw_bin_plan(nfit, nfit * m, m, mpbin);
+    int64_t k;
+    int b;
+    edge[0] = 0;
+    *nover = 0;
+    for(b = 1, k = 0; b <= nb && k < nfit; k++) {
+        const double M = (double) (k + 1) * m;
+        if(!(M >= b * *mpbin * (1 - 1e-9)))
+            continue;
+        const double excess = (M - b * *mpbin) / m;
+        const double rnext = k + 1 < n ? r[k + 1] : r[k];
+        edge[b] = 0.5 * (r[k] + rnext) - (literal ? 0 : excess * (r[k] - r[k - 1]));
+        if(excess > 0.1)
+            (*nover)++;
+        b++;
+    }
+    return b - 1;
+}
+
+/* subhalo_props_deferred on n equal masses at radii 0 and 0.5 + 0.1 k (k >= 1) from a
+ * one-particle core, every particle above the virial threshold, so that the crossing is the
+ * outermost particle, kc = n - 1, and the aperture holds n - 1 particles. */
+static struct SubTrack
+nfw_line_props(int64_t n)
+{
+    int64_t k;
+    setup_pman(n);
+    place(0, 0, 0, 0.01, 1);
+    for(k = 1; k < n; k++)
+        place(k, 0.5 + 0.1 * k, k, 0.01, 1 + k);
+    struct SubhaloUnbindParams up = default_params();
+    struct SubCandidate c;
+    memset(&c, 0, sizeof(c));
+    int64_t * Index = (int64_t *) mymalloc("TestIndex", sizeof(int64_t) * n);
+    for(k = 0; k < n; k++)
+        Index[k] = k;
+    c.Index = Index;
+    c.N = c.Nbound = n;
+    double rho[SUBHALO_NSO];
+    for(k = 0; k < SUBHALO_NSO; k++)
+        rho[k] = 1e-12;
+    struct SubhaloArena arena;
+    arena.size = SUBHALO_PROPS_BYTES_PER_PART * n;
+    arena.used = 0;
+    arena.base = (char *) mymalloc("TestArena", arena.size);
+    struct SubTrack rec;
+    subhalo_track_clear(&rec, 0);
+    subhalo_props_deferred(&rec, &c, &up, rho, 1, &arena);
+    assert_int_equal(arena.used, 0);
+    myfree(arena.base);
+    myfree(Index);
+    teardown_pman();
+    return rec;
+}
+
 /* Rockstar's bin edge (nfw.c:126-132) converts the midpoint to kpc/h and subtracts the
  * interpolation in Mpc/h (an upstream unit bug that effectively drops the correction); the recipe
  * applies the correction in the run's length unit. (a) The audit's example, radii 0.01, 0.02, 0.03
  * Mpc/h and an excess of half the closing mass: 0.020 Mpc/h = 20 kpc/h (Rockstar literally 24.995
  * kpc/h), the same edge in kpc/h units. (b) An overshooting-bin oracle: 132 equal masses at
  * distinct radii 0.5 + 0.1 k from a one-particle core, every particle above the threshold (the
- * crossing is the outermost particle), Rockstar's fit aperture (decision 44) the 130 inside the one
- * before it, 8 bins of 16.25 masses (every bin closes with an excess); Rs of subhalo_props_deferred
- * against the fit on the edges computed here with the intended interpolation, and different from
- * the fit on the former aperture (all 132, crossing included). The crossing particle carries a
- * large velocity: BulkVel and Vrms of the velocity aperture (the 131 inside it, at rest) are 0,
- * with it they would not be. */
+ * crossing is the outermost particle), the fit's aperture (decision 47.1: the crossing particle
+ * excluded, as the velocity aperture) the 131 inside it, 8 bins of 16.375 masses (seven close
+ * with an excess, the last exactly at the aperture's last particle, its outer neighbour the
+ * crossing particle); Rs of subhalo_props_deferred against the fit on the edges computed here
+ * with the intended interpolation, and different from the fit on nfw.c's literal aperture (the
+ * 130 inside the particle before the crossing, decision 44's rule) and on the former aperture
+ * (D4: all 132, crossing included). The crossing particle carries a large velocity: BulkVel and
+ * Vrms of the aperture (the 131 inside it, at rest) are 0, with it they would not be. (c) The -1
+ * rule at the boundary (decision 47.1): with the crossing outermost, kc = 100 (101 bound
+ * particles) fits, kc = 99 gives -1 (nfw.c's literal aperture would need kc = 101); kc = 1 (two
+ * particles) gives the innermost particle's velocities and Rs -1; kc = 0 (one particle) all -1. */
 static void
 test_nfw_bin_edges(void ** state)
 {
@@ -1241,7 +1309,6 @@ test_nfw_bin_edges(void ** state)
     const int64_t n = 132;
     const double m = 0.01;
     int64_t k;
-    int b;
     setup_pman(n);
     place(0, 0, 0, m, 1);
     for(k = 1; k < n; k++)
@@ -1282,29 +1349,7 @@ test_nfw_bin_edges(void ** state)
         r[k] = sqrt(r2) > rfloor ? sqrt(r2) : rfloor;
         assert_true(k == 0 || r[k] > r[k - 1]);
     }
-    double mpbin;
     const double Mvir = n * m;
-    const int64_t nfit = n - 2;                    /* nfw.c: i < total_p - 1, total_p the crossing */
-    const int nb = subhalo_nfw_bin_plan(nfit, nfit * m, m, &mpbin);
-    assert_int_equal(nb, 8);                       /* ppbin 130 / (130 / 15) = 16 */
-    assert_true(fabs(mpbin / m - 16.25) < 1e-12);
-    double edge[SUBHALO_NFW_MAXBINS + 1], lit[SUBHALO_NFW_MAXBINS + 1];
-    edge[0] = lit[0] = 0;
-    int novershoot = 0;
-    for(b = 1, k = 0; b <= nb && k < nfit; k++) {
-        const double M = (double) (k + 1) * m;
-        if(!(M >= b * mpbin * (1 - 1e-9)))
-            continue;
-        const double excess = (M - b * mpbin) / m;
-        const double rnext = k + 1 < n ? r[k + 1] : r[k];
-        edge[b] = 0.5 * (r[k] + rnext) - excess * (r[k] - r[k - 1]);
-        lit[b] = 0.5 * (r[k] + rnext);               /* Rockstar's effective edge: the correction dropped */
-        if(excess > 0.1)
-            novershoot++;
-        b++;
-    }
-    assert_int_equal(b - 1, nb);
-    assert_true(novershoot >= nb / 2);
     double best = 0, rbest = -1;
     for(k = 0; k < n; k++)
         if((double) (k + 1) * m / r[k] > best) {
@@ -1313,24 +1358,35 @@ test_nfw_bin_edges(void ** state)
         }
     const double Rvir = cbrt(3 * Mvir / (4 * M_PI * rho[0]));
     const double rs0 = subhalo_klypin_rs(Rvir, Mvir, best, rbest);
+    double edge[SUBHALO_NFW_MAXBINS + 1], lit[SUBHALO_NFW_MAXBINS + 1];
+    double e44[SUBHALO_NFW_MAXBINS + 1], eold[SUBHALO_NFW_MAXBINS + 1];
+    double mpbin, mp44, mpold;
+    int novershoot, nov44, novold;
+    /* the aperture: the n - 1 inside the crossing particle (decision 47.1) */
+    const int64_t nfit = n - 1;
+    const int nb = subhalo_nfw_bin_plan(nfit, nfit * m, m, &mpbin);
+    assert_int_equal(nb, 8);                       /* ppbin 131 / (131 / 15) = 16 */
+    assert_true(fabs(mpbin / m - 16.375) < 1e-12);
+    assert_int_equal(nfw_oracle_edges(r, n, m, nfit, 0, edge, &mpbin, &novershoot), nb);
+    assert_int_equal(nfw_oracle_edges(r, n, m, nfit, 1, lit, &mpbin, &novershoot), nb);
+    assert_int_equal(novershoot, 7);               /* excess 0.625 .. 0.375; the last bin closes exactly */
+    /* the last bin closes at the aperture's last particle, its outer neighbour the crossing */
+    assert_true(fabs(edge[nb] - 0.5 * (r[n - 2] + r[n - 1])) < 1e-12 * r[n - 1]);
     const double rs = subhalo_nfw_fit(rs0, edge, nb, 3 * rfloor);
     const double rs_lit = subhalo_nfw_fit(rs0, lit, nb, 3 * rfloor);
+    /* nfw.c's literal aperture (decision 44: the crossing and the particle before it excluded) */
+    const int nb44 = nfw_oracle_edges(r, n, m, n - 2, 0, e44, &mp44, &nov44);
+    assert_int_equal(nb44, 8);
+    assert_true(fabs(mp44 / m - 16.25) < 1e-12);
+    const double rs_44 = subhalo_nfw_fit(rs0, e44, nb44, 3 * rfloor);
     /* the former aperture (D4: every particle up to and including the crossing) */
-    double mpold, eold[SUBHALO_NFW_MAXBINS + 1];
-    const int nbold = subhalo_nfw_bin_plan(n, Mvir, m, &mpold);
-    eold[0] = 0;
-    for(b = 1, k = 0; b <= nbold && k < n; k++) {
-        const double M = (double) (k + 1) * m;
-        if(!(M >= b * mpold * (1 - 1e-9)))
-            continue;
-        const double rnext = k + 1 < n ? r[k + 1] : r[k];
-        eold[b] = 0.5 * (r[k] + rnext) - (M - b * mpold) / m * (r[k] - r[k - 1]);
-        b++;
-    }
-    const double rs_old = subhalo_nfw_fit(rs0, eold, b - 1, 3 * rfloor);
-    message(0, "NFW bin oracle: Rockstar's aperture Rs %.8g, the former aperture (crossing included) %.8g (%d bins of %.4g masses); "
-               "BulkVel (%g %g %g) Vrms %g RockstarCoreVel.x %g with the crossing particle at 5000\n", rs, rs_old, nbold, mpold / m,
+    const int nbold = nfw_oracle_edges(r, n, m, n, 0, eold, &mpold, &novold);
+    const double rs_old = subhalo_nfw_fit(rs0, eold, nbold, 3 * rfloor);
+    message(0, "NFW bin oracle: the aperture inside the crossing Rs %.8g, nfw.c's literal aperture (two excluded) %.8g, the former "
+               "aperture (crossing included) %.8g (%d bins of %.4g masses); BulkVel (%g %g %g) Vrms %g RockstarCoreVel.x %g with "
+               "the crossing particle at 5000\n", rs, rs_44, rs_old, nbold, mpold / m,
             rec.BulkVel[0], rec.BulkVel[1], rec.BulkVel[2], rec.Vrms, rec.RockstarCoreVel[0]);
+    assert_true(rs_44 > 0 && fabs(rs_44 / rs - 1) > 1e-4);
     assert_true(rs_old > 0 && fabs(rs_old / rs - 1) > 1e-4);
     assert_true(rec.BulkVel[0] == 0 && rec.BulkVel[1] == 0 && rec.BulkVel[2] == 0 && rec.Vrms == 0 && rec.RockstarCoreVel[0] == 0);
     message(0, "NFW bin oracle: %d bins of %.4g masses, %d with an excess > 0.1; Rs %.8g, oracle %.8g (Rockstar's effective midpoint "
@@ -1339,6 +1395,17 @@ test_nfw_bin_edges(void ** state)
     assert_true(edge[1] < lit[1]);
     myfree(Index);
     teardown_pman();
+
+    /* (c) */
+    const struct SubTrack r101 = nfw_line_props(101), r100 = nfw_line_props(100);
+    const struct SubTrack r2 = nfw_line_props(2), r1 = nfw_line_props(1);
+    message(0, "NFW aperture boundary: Rs %g with 101 bound particles (kc 100), %g with 100 (kc 99); kc 1: Rs %g Vrms %g "
+               "BulkVel.x %g; kc 0: Rs %g Vrms %g BulkVel.x %g\n", r101.Rs, r100.Rs, r2.Rs, r2.Vrms, r2.BulkVel[0], r1.Rs, r1.Vrms,
+            r1.BulkVel[0]);
+    assert_true(r101.Rs > 0 && r101.Vrms >= 0);
+    assert_true(r100.Rs == -1 && r100.Vrms >= 0);
+    assert_true(r2.Rs == -1 && r2.Vrms >= 0 && r2.Vrms < 1e-3 && r2.BulkVel[0] != -1);
+    assert_true(r1.Rs == -1 && r1.Vrms == -1 && r1.BulkVel[0] == -1 && r1.RockstarCoreVel[0] == -1);
 }
 
 int main(void) {

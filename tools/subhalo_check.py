@@ -63,7 +63,7 @@ input could not be read.
                               RBoundSO[vir] (Vrms >= 0); Vrms -1 with it where MBoundSO[vir] exceeds
                               1.5 mean particle masses a warning (Rockstar's aperture excludes the
                               crossing particle; the per-type mean is no bound on one particle's mass);
-                              Rs -1 below 102 bound particles, else > 0 and below 1.5 RBoundSO[vir]
+                              Rs -1 below 101 bound particles, else > 0 and below 1.5 RBoundSO[vir]
                               (-1 there is a warning); |RockstarCoreVel - CoreVel| > Vrms a warning;
                               skipped when all -1. Decision 44 (RsSO, RsKlypinSO, VmaxSO, RmaxSO, the
                               field-SO virial sphere's profile): -1 off centrals and without MSO/RSO[vir];
@@ -1745,10 +1745,11 @@ def _check_props_deferred(ck, tag, S, tid, corevel_warn=1.0):
     ck.check(not np.any(bad), "%s: %d subhalos with a negative Vrms other than -1 (e.g. TrackId %s)"
              % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
     drs = _defined(rs)
-    # the fit's aperture holds the bound particles inside the one before the crossing (nfw.c)
-    bad = drs & (nb < NFW_MINPART + 2)
+    # the fit's aperture holds the bound particles inside the crossing particle, as the velocity
+    # aperture (decision 47.1; nfw.c would also drop the particle before it)
+    bad = drs & (nb < NFW_MINPART + 1)
     ck.check(not np.any(bad), "%s: %d subhalos with Rs defined below %d bound particles (e.g. TrackId %s)"
-             % (tag, np.count_nonzero(bad), NFW_MINPART + 2, tid[bad][:5].tolist()))
+             % (tag, np.count_nonzero(bad), NFW_MINPART + 1, tid[bad][:5].tolist()))
     bad = drs & ~hasr
     ck.check(not np.any(bad), "%s: %d subhalos with Rs but no RBoundSO[vir] (e.g. TrackId %s)"
              % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))

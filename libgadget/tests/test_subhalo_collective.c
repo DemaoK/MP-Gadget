@@ -2623,8 +2623,10 @@ test_collective_walk_theta(void ** state)
 }
 
 /* ---- test 16: the deferred recipes of the two modes on identical inputs (Phase 5 audit R4) ----
- * Six power-law balls (density ~ r^-2, every particle bound, one across the periodic boundary,
- * one below the NFW fit's 100 particles), large bulk velocities, prescribed cores (subhalo_core of
+ * Seven power-law balls (density ~ r^-2, every particle bound, one across the periodic boundary,
+ * one below the NFW fit's 100 particles, one of 137 whose equal-mass virial crossing is at kc =
+ * 100, the fit's boundary of decision 47.1: Rs defined with the kc particles inside the crossing,
+ * -1 on nfw.c's literal kc - 1), large bulk velocities, prescribed cores (subhalo_core of
  * the ID order) and thresholds with crossings inside every ball. The serial recipes
  * (subhalo_props_rockstar and subhalo_props_deferred on rank 0, which holds every particle) against
  * the distributed ones (round_props through subhalo_collective_test_props) with the particles on
@@ -2635,8 +2637,8 @@ test_collective_walk_theta(void ** state)
  * exact multiples of 2^-50, whose plain sums lose the light masses in an order-dependent way, so
  * that the plain prefix sums of the uneven layout differ from the others) bitwise again, the
  * virial masses included. Also the compensated sum itself survives -ffast-math. */
-#define PI_NL 6
-static const int64_t PiN[PI_NL] = {3000, 1200, 450, 260, 99, 2500};
+#define PI_NL 7
+static const int64_t PiN[PI_NL] = {3000, 1200, 450, 260, 99, 2500, 137};
 #define PI_CORESIZE 20
 
 static int64_t
@@ -2675,7 +2677,7 @@ pi_particle(MyIDType id, int mode, double pos[3], double vel[3], double * mass)
 {
     int64_t j;
     const int l = pi_label(id, &j);
-    const double cen[PI_NL][3] = {{500, 500, 500}, {0.5, 300, 700}, {800, 150, 220}, {250, 820, 400}, {650, 650, 90}, {120, 480, 930}};
+    const double cen[PI_NL][3] = {{500, 500, 500}, {0.5, 300, 700}, {800, 150, 220}, {250, 820, 400}, {650, 650, 90}, {120, 480, 930}, {380, 100, 600}};
     const double bulk[3] = {3000. - 1000 * l, -2000. + 700 * l, 50. * l};
     const double R = 20. * cbrt((double) PiN[l] / 3000.);
     double u[3];
@@ -2842,9 +2844,19 @@ pi_run(int mode)
         message(0, "props identity (%s masses), ball %d (%ld particles): serial Rs %.9g Vrms %.9g BulkVel (%.9g %.9g %.9g) "
                    "RockstarCoreVel (%.9g %.9g %.9g) MBoundSO[vir] %.9g\n", PiMode[mode], l, (long) PiN[l],
                 sv[0], sv[7], sv[4], sv[5], sv[6], sv[1], sv[2], sv[3], x->MBoundSO[0]);
-        /* every ball crosses; the fit runs with at least 100 particles in the aperture (about half of each ball) */
-        LOCAL_CHECK(bad, mode == PI_WIDE || (x->Vrms > 0 && x->MBoundSO[0] > 0 && ((PiN[l] >= 200) == (x->Rs > 0))),
+        /* every ball crosses; the fit runs in the balls of 200 or more particles (aperture about 0.8 N), never below 100 */
+        LOCAL_CHECK(bad, mode == PI_WIDE || (x->Vrms > 0 && x->MBoundSO[0] > 0 && (PiN[l] < 100 ? x->Rs == -1 : (PiN[l] < 200 || x->Rs > 0))),
                     "props identity: ball %d Vrms %g MBoundSO %g Rs %g\n", l, x->Vrms, x->MBoundSO[0], x->Rs);
+        /* the fit's aperture (decision 47.1): the kc particles inside the crossing particle, Rs
+         * defined iff kc >= 100; with equal masses kc = MBoundSO[vir] / m - 1 */
+        if(mode == PI_EQUAL) {
+            const int64_t kcv = llround(x->MBoundSO[0] / SYN_M) - 1;
+            message(0, "props identity: ball %d kc %ld\n", l, (long) kcv);
+            LOCAL_CHECK(bad, (kcv >= SUBHALO_NFW_MINPART) == (x->Rs > 0), "props identity: ball %d kc %ld Rs %g\n", l, (long) kcv, x->Rs);
+            /* the last ball sits on the boundary: kc = 100 fits (nfw.c's literal aperture would not) */
+            LOCAL_CHECK(bad, l != PI_NL - 1 || (kcv == SUBHALO_NFW_MINPART && x->Rs > 0),
+                        "props identity: boundary ball %d kc %ld (expected %d) Rs %g\n", l, (long) kcv, SUBHALO_NFW_MINPART, x->Rs);
+        }
         for(lay = 0; lay < 3; lay++) {
             const double * o = dfr[lay] + 8 * l;
             for(k = 0; k < 8; k++) {

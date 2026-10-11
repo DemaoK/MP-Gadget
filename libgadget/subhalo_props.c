@@ -821,11 +821,12 @@ subhalo_deferred_velocities(float BulkVel[3], float CoreVel[3], float * Vrms, co
 /* The recipe of subhalo_props_deferred on a radial order pr[0, n) of the bound set (radii from the
  * core, floored at rfloor, ties by ID) with the core velocity cvel: shared by subhalo_props_deferred
  * and subhalo_props_rockstar, which already holds this order (one radial sort per subhalo). The
- * four columns are set to -1 first. Rockstar's apertures (decision 44, reversing 36a): with kc
+ * four columns are set to -1 first. Rockstar's aperture (decision 44, reversing 36a): with kc
  * the outermost virial crossing (Mvir = M(<= r_kc), Rvir from it, as MBoundSO / RBoundSO), the
- * velocities use pr[0, kc) (properties.c's j < dens_tot: the crossing particle excluded) and
- * the NFW fit pr[0, kc - 1) (nfw.c's i < total_p - 1 on that: the crossing particle and the
- * one before it excluded), of mass Mfit = M(<= r_(kc-2)). */
+ * velocities and the NFW fit both use pr[0, kc) (properties.c's j < dens_tot: the crossing
+ * particle excluded), the fit of mass Mfit = M(<= r_(kc-1)). nfw.c's i < total_p - 1 would also
+ * drop the particle before the crossing; one consistent off-by-one is kept instead (decision
+ * 47.1). The last fit bin's outer neighbour may be the crossing particle (pr[kc]). */
 static void
 deferred_on_order(struct SubTrack * rec, const struct RPair * pr, int64_t n, const double cvel[3], const double rho[SUBHALO_NSO],
                   double rfloor, double vkms)
@@ -840,9 +841,9 @@ deferred_on_order(struct SubTrack * rec, const struct RPair * pr, int64_t n, con
         return;
 
     /* the virial crossing and the VmaxVir pair (the profile rule of subhalo_props_rockstar, its
-     * compensated cumulative mass); Mfit the cumulative mass two particles inside the crossing */
+     * compensated cumulative mass); Mfit the cumulative mass one particle inside the crossing */
     int64_t kc = -1;
-    double Mk[2] = {0, 0}, Mvir = 0, Mfit = 0, best = 0, rbest = -1, Mkm1 = 0, Mkm2 = 0;
+    double Mk[2] = {0, 0}, Mvir = 0, Mfit = 0, best = 0, rbest = -1, Mkm1 = 0;
     for(k = 0; k < n; k++) {
         const double r = pr[k].r;
         subhalo_ksum_add(Mk, P[pr[k].p].Mass);
@@ -851,32 +852,31 @@ deferred_on_order(struct SubTrack * rec, const struct RPair * pr, int64_t n, con
         if(dens > rho[0]) {
             kc = k;
             Mvir = M;
-            Mfit = Mkm2;
+            Mfit = Mkm1;
             if(M / r > best) {
                 best = M / r;
                 rbest = r;
             }
         }
-        Mkm2 = Mkm1;
         Mkm1 = M;
     }
-    /* an empty velocity aperture (the crossing is the innermost particle): nothing defined */
+    /* an empty aperture (the crossing is the innermost particle): nothing defined */
     if(kc < 1 || !(Mvir > 0))
         return;
-    const int64_t nap = kc, nfit = kc - 1;
+    const int64_t nap = kc, nfit = kc;
     const double Rvir = cbrt(3 * Mvir / (4 * M_PI * rho[0]));
     const double rcore = 0.1 * Rvir;
 
     /* velocities about the core velocity (the shift keeps the one-pass variance accurate); the
      * core: r < 0.1 Rvir, at least the innermost SUBHALO_ROCKSTAR_CORE_MINPART of the aperture.
      * Every sum is compensated (audit R4), as the distributed recipe's per-rank pairs. The
-     * largest mass is that of the fit's aperture (nfw.c's max_mass). */
+     * largest mass is that of the aperture (nfw.c's max_mass). */
     int64_t ncore = 0;
     double mmax = 0;
     for(k = 0; k < nap; k++) {
         if(pr[k].r < rcore)
             ncore++;
-        if(k < nfit && P[pr[k].p].Mass > mmax)
+        if(P[pr[k].p].Mass > mmax)
             mmax = P[pr[k].p].Mass;
     }
     if(ncore < SUBHALO_ROCKSTAR_CORE_MINPART)

@@ -1254,9 +1254,10 @@ _Static_assert(COLL_PROPS_CAND_BYTES <= SUBHALO_INPLACE_CAND_PROPS_BYTES,
 
 /* The Phase 5 recipes of subhalo_props_deferred on the radial ordered set of the round (rr[0, nr)
  * sorted by (label, r, ID), pos the global positions within each label, Mc the cumulative masses
- * M(<= r)), after the profile (rp->kc, Mso, prof, hs) is known: Rockstar's apertures (decision 44,
- * as the serial deferred_on_order), pos < kc[vir] for the velocities and pos < kc[vir] - 1 for the
- * NFW fit, of mass Mfit = Mc at pos kc[vir] - 2.
+ * M(<= r)), after the profile (rp->kc, Mso, prof, hs) is known: Rockstar's aperture (decision 44,
+ * as the serial deferred_on_order), pos < kc[vir] for the velocities and the NFW fit alike
+ * (decision 47.1: the crossing particle excluded, not the one before it), the fit of mass Mfit =
+ * Mc at pos kc[vir] - 1.
  * Four reductions over the labels: (1) the aperture velocity sums about the core velocity and the
  * count inside 0.1 Rvir, (2) the largest particle mass and Mfit, (3) the position closing each equal-mass
  * bin (the first with Mc >= subhalo_nfw_threshold), (4) the radii around each closing position
@@ -1293,10 +1294,10 @@ deferred_distributed(const struct Coll * C, const struct CoreOut * core, const s
         Rv[2 * c] = kc[3 * c] >= 0 ? cbrt(3 * rp->Mso[SUBHALO_NSO * c] / (4 * M_PI * rho[0])) : -1;
     }
 
-    /* (1) the velocity aperture pos < kc: velocity sums about the core velocity, the count inside
-     * 0.1 Rvir, as compensated pairs merged in rank order (audit R4); (2) over the fit's aperture
-     * pos < kc - 1 the largest particle mass (X[c * (NB + 1)]) and the profile's M(<= r) at its
-     * last position kc - 2 (X[c * (NB + 1) + 1], held by one record: a MAX of it and zeros) */
+    /* (1) the aperture pos < kc: velocity sums about the core velocity, the count inside 0.1
+     * Rvir, as compensated pairs merged in rank order (audit R4); (2) over the same aperture
+     * the largest particle mass (X[c * (NB + 1)]) and the profile's M(<= r) at its last position
+     * kc - 1 (X[c * (NB + 1) + 1], held by one record: a MAX of it and zeros) */
     memset(A, 0, sizeof(double) * NA * nc);
     for(c = 0; c < nc; c++)
         X[(NB + 1) * c] = X[(NB + 1) * c + 1] = 0;
@@ -1315,9 +1316,9 @@ deferred_distributed(const struct Coll * C, const struct CoreOut * core, const s
             subhalo_ksum_add(a + 4 + 2 * d, m * dv);
             subhalo_ksum_add(a + 10 + 2 * d, m * dv * dv);
         }
-        if(pos[k] < kc[3 * c] - 1 && m > X[(NB + 1) * c])
+        if(m > X[(NB + 1) * c])
             X[(NB + 1) * c] = m;
-        if(pos[k] == kc[3 * c] - 2)
+        if(pos[k] == kc[3 * c] - 1)
             X[(NB + 1) * c + 1] = Mc[k];
     }
     MPI_Allreduce(A, AG, COLL_DFR_NA * nc, KsumType, KsumOp, C->Comm);
@@ -1332,7 +1333,7 @@ deferred_distributed(const struct Coll * C, const struct CoreOut * core, const s
         Rv[2 * c + 1] = 0;
         if(kc[3 * c] < 1)
             continue;
-        const int64_t nap = kc[3 * c], nfit = kc[3 * c] - 1;
+        const int64_t nap = kc[3 * c], nfit = kc[3 * c];
         const double * a = AG + NA * c;
         int64_t ncore = (int64_t) subhalo_ksum_value(a);
         if(ncore < SUBHALO_ROCKSTAR_CORE_MINPART)
@@ -1356,7 +1357,7 @@ deferred_distributed(const struct Coll * C, const struct CoreOut * core, const s
                 lab = c;
                 nextb = 1;
             }
-            if(pos[k] >= kc[3 * c] - 1)
+            if(pos[k] >= kc[3 * c])
                 continue;
             while(nextb <= kc[3 * c + 2] && Mc[k] >= subhalo_nfw_threshold(nextb, Rv[2 * c + 1])) {
                 X[(NB + 1) * c + nextb] = -(double) pos[k];
