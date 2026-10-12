@@ -28,9 +28,10 @@ if options.is_symlink():
     raise SystemExit('Options.mk must be a local file')
 manifest = {}
 commands = []
+base_config = (root / 'Options.mk.example').read_text()
 for mode, defines in (('without-sidm', ''), ('debug', '-DSIDM -DSIDMDEBUG'),
                       ('release', '-DSIDM')):
-    config = f'OPTIMIZE = -fopenmp -O2 -g -Wall\nLOW_PRECISION = double\nOPT = {defines}\n'
+    config = base_config + f'\nOPT += {defines}\n'
     options.write_text(config)
     (output / f'Options-{mode}.mk').write_text(config)
     with (output / f'build-{mode}.log').open('w') as log:

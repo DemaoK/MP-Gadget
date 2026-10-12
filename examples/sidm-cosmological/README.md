@@ -43,15 +43,11 @@ python3 examples/sidm-cosmological/validate.py \
 ```
 
 The build helper copies installed dependency outputs so it cannot rebuild into
-the source checkout. It uses double particle arithmetic, OpenMP and ordinary
-IEEE math. SIDM builds also override any upstream `-ffast-math` option because
-the solver relies on finite checks and conservative bounds.
-This affects all objects of a SIDM-enabled binary, including runs with
-`SIDMOn=0`. Disabled/compiled-out comparisons here use matching IEEE math flags;
-identical results against a separately built upstream fast-math binary are not
-guaranteed. The helper leaves
-the local build configured for release SIDM; generated artifacts live under
-ignored `build/sidm-cosmological`.
+the source checkout. It uses the normal `Options.mk.example` settings, including
+`-O3 -ffast-math`. Release adds only `-DSIDM`; debug adds
+`-DSIDM -DSIDMDEBUG`. SIDM does not override the compiler's floating-point options.
+The helper leaves the local build configured for release SIDM; generated
+artifacts live under ignored `build/sidm-cosmological`.
 
 The harness generates 4,096 DM particles, then 4,096 DM plus 4,096 gas, with
 native MP-GenIC and the included tabulated spectrum. The smoke uses the cubic
@@ -124,7 +120,31 @@ elastic collision, and the highest legal gravity bin with empty ranks. The
 standalone direct test additionally compares the full MPI stochastic collision
 schedule against an independent serial oracle.
 
-## Validation on 2026-10-12
+## Normal compiler validation on 2026-10-12
+
+All three binaries were rebuilt from `Options.mk.example` with its normal
+`-O3 -ffast-math` settings. Only the SIDM feature macros differ between variants.
+The full current harness passed for DM and gas/DM, including restarts,
+release/debug agreement, disabled/compiled-out agreement and zero scattering.
+It recorded 248 source-only epochs and 85,490 collisions for DM, and 159 epochs
+and 65,583 collisions for gas/DM. Existing comparison tolerances were unchanged.
+
+Focused rate, direct-collision, distributed, empty-owner, transport, hierarchy
+and native timeline/tree tests passed. The rate test checks NaN/infinity behavior
+only when `__FINITE_MATH_ONLY__` is disabled; all finite-input quadrature and
+normalization checks run with the selected compiler settings.
+
+Current evidence: [full smoke](../../build/sidm-cosmological/normal-smoke/validation.json),
+[focused tests](../../build/sidm-cosmological/normal-tests/tests.json),
+[debug direct oracle](../../build/sidm-cosmological/normal-tests/direct-debug.json),
+[binary hashes](../../build/sidm-cosmological/binaries.json), and
+[build record](../../build/sidm-cosmological/build-record.json).
+
+## Initial integration validation on 2026-10-12
+
+These results and the two audit reports describe the original `-O2` builds
+without fast math, before the compiler override was removed. They are retained
+as historical evidence; the normal-compiler validation is recorded separately.
 
 The focused suite passed with two MPI ranks and two OpenMP threads. The native
 force-tree unit test used its intended single-rank fixture, also with two threads.
@@ -149,19 +169,20 @@ comparison bounds are recorded in
 [`zero-cross-section/validation.json`](../../build/sidm-cosmological/zero-cross-section/validation.json)
 and [`zero-cross-section.log`](../../build/sidm-cosmological/zero-cross-section.log).
 
-The full smoke above used the harness before this extra comparison was added.
+The initial smoke above used the harness before this extra comparison was added.
 The follow-up ran through `--zero-only`, reusing the saved native-disabled outputs
-and unchanged binaries. The current combined default harness path has not been
-rerun end to end. `build-record.json` preserves the original build hashes and
-records the later invocation separately under `post_build_validation`.
+and unchanged binaries. At that stage the combined default harness path had not
+been rerun end to end; the normal-compiler validation above now covers it.
+The archived build record preserves the original build hashes and records that
+follow-up invocation separately under `post_build_validation`.
 
 Generated evidence is in
 [`build/sidm-cosmological/validated/validation.json`](../../build/sidm-cosmological/validated/validation.json),
 [`validated.log`](../../build/sidm-cosmological/validated.log),
 [`tests.json`](../../build/sidm-cosmological/tests.json),
 [`transport-followup.json`](../../build/sidm-cosmological/transport-followup.json),
-[`binaries.json`](../../build/sidm-cosmological/binaries.json), and
-[`build-record.json`](../../build/sidm-cosmological/build-record.json).
+[`initial-build/binaries.json`](../../build/sidm-cosmological/initial-build/binaries.json), and
+[`initial-build/build-record.json`](../../build/sidm-cosmological/initial-build/build-record.json).
 The independent integral checks are recorded in
 [`timefactor-check.log`](../../build/sidm-cosmological/timefactor-check.log).
 Read-only audit reports are in

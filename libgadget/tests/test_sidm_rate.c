@@ -1,4 +1,4 @@
-/* Standalone: cc -std=c99 -O2 -Wall -Wextra test_sidm_rate.c -lm. */
+/* Kernel normalization and cross sections against independent quadrature. */
 #include <assert.h>
 #include <float.h>
 #include <math.h>
@@ -38,7 +38,10 @@ static void test_normalized_kernel_and_pair_counting(void)
     /* Both directed halves integrate to the uniform-bath rate, including
      * unequal support radii. This requires no overlap kernel or rate bound. */
     close_enough(kernel_integral(1,.25,1),1,2e-12);
+#if !__FINITE_MATH_ONLY__
+    /* Nonfinite behavior is outside the fast-math compiler contract. */
     assert(isnan(sidm_rate_cubic_kernel(-1,1)));
+#endif
 }
 
 /* Independent integral of the angular kernel, rather than its closed form. */
@@ -59,8 +62,10 @@ static void test_stable_viscosity_shape(void)
     for(unsigned int i = 0; i < sizeof(y)/sizeof(*y); i++)
         close_enough(sidm_rate_viscosity_shape(y[i]), shape_by_quadrature(y[i]), 2e-12);
     assert(sidm_rate_viscosity_shape(0) == 1);
+#if !__FINITE_MATH_ONLY__
     assert(sidm_rate_viscosity_shape(INFINITY) == 0);
     assert(isnan(sidm_rate_viscosity_shape(-1)));
+#endif
     double last = 1;
     for(int i = -120; i <= 120; i++) {
         const double argument = pow(10.0, i/10.0), f = sidm_rate_viscosity_shape(argument);

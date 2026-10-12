@@ -134,13 +134,13 @@ all: libgadget.a libgadget-utils.a
 .objs/test_sidm_hierarchical: tests/test_sidm_hierarchical.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
 	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
 
-.objs/test_sidm_rate: tests/test_sidm_rate.c sidm-rate.h
+.objs/test_sidm_rate: tests/test_sidm_rate.c sidm-rate.h $(CONFIG)
 	mkdir -p .objs
-	$(CC) -std=c99 -O2 -Wall -Wextra $< -lm -o $@
+	$(CC) $(TCFLAGS) -std=c99 -Wextra $< -lm -o $@
 
-.objs/test_sidm_direct: tests/test_sidm_direct.c sidm-direct.c sidm-direct.h sidm-rate.h sidm-random.h
+.objs/test_sidm_direct: tests/test_sidm_direct.c sidm-direct.c sidm-direct.h sidm-rate.h sidm-random.h $(CONFIG)
 	mkdir -p .objs
-	$(MPICC) -std=c99 -O2 -fopenmp -DSIDMDEBUG -Wall -Wextra tests/test_sidm_direct.c sidm-direct.c -lm -o $@
+	$(MPICC) $(TCFLAGS) -std=c99 -Wextra tests/test_sidm_direct.c sidm-direct.c -lm -o $@
 
 build-tests: $(TESTBIN)
 
