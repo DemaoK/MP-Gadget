@@ -10,7 +10,7 @@
 
 static struct {
     int enabled;
-    double transport, support_change, max_dloga;
+    double transport, max_dloga;
     double bulk[3], max_speed; /* Common canonical-velocity frame and speed bound. */
     inttime_t commit_epoch;
     double travel; /* Cumulative comoving separation bound. */
@@ -31,34 +31,32 @@ static struct {
 /* Scratch only: no particle identities or clock state survive an event. */
 static struct sidm_local_visit VisitStorage;
 static size_t VisitCapacity;
-static int VisitInUse;
 
 static void release_visit_storage(void)
 {
-    if(VisitInUse) endrun(1,"Cannot reset local SIDM storage during a visit.\n");
     free(VisitStorage.sources.ActiveParticle);
     free(VisitStorage.intervals);
     free(VisitStorage.limits);
+#ifdef SIDMDEBUG
     free(VisitStorage.old_support);
+#endif
     memset(&VisitStorage,0,sizeof(VisitStorage));
     VisitCapacity=0;
 }
 
-void sidm_local_configure(int enabled, double transport, double support_change, double max_dloga)
+void sidm_local_configure(int enabled, double transport, double max_dloga)
 {
     release_visit_storage();
     memset(&Local, 0, sizeof(Local));
     Local.enabled=enabled;
     Local.transport=transport;
-    Local.support_change=support_change;
     Local.max_dloga=max_dloga;
 #ifdef SIDMDEBUG
     Local.min_rate=Local.min_transport=DBL_MAX;
 #endif
     if(enabled && (!(transport>0 && transport<=.25) ||
-       !(support_change>transport && support_change<1) ||
        !isfinite(max_dloga) || max_dloga<=0))
-        endrun(1,"Invalid local SIDM transport/support-change/time cap.\n");
+        endrun(1,"Invalid local SIDM transport fraction or maximum timestep.\n");
 #ifndef SIDM
     if(enabled) endrun(1,"Local SIDM needs an SIDM build.\n");
 #endif
@@ -203,8 +201,6 @@ void sidm_local_kick_phase(DriftKickTimes *times, int opening)
 struct sidm_local_visit sidm_local_begin_active(const DriftKickTimes *times, Cosmology *CP,
     int flush, const ActiveParticles *active)
 {
-    if(VisitInUse) endrun(1,"Overlapping local SIDM visits.\n");
-    if(times->Ti_Current<Local.travel_epoch) endrun(1,"Local SIDM travel clock went backwards.\n");
     Local.travel+=2*Local.max_speed*sidm_drift_factor(CP,Local.travel_epoch,times->Ti_Current);
     if(!isfinite(Local.travel) || Local.travel<0)
         endrun(1,"Invalid accumulated local SIDM displacement.\n");
@@ -216,36 +212,45 @@ struct sidm_local_visit sidm_local_begin_active(const DriftKickTimes *times, Cos
         VisitStorage.sources.ActiveParticle=malloc(VisitCapacity*sizeof(int));
         VisitStorage.intervals=malloc(VisitCapacity*sizeof(double));
         VisitStorage.limits=malloc(VisitCapacity*sizeof(double));
-        VisitStorage.old_support=malloc(VisitCapacity*sizeof(double));
-        if(!VisitStorage.sources.ActiveParticle || !VisitStorage.intervals || !VisitStorage.limits ||
-           !VisitStorage.old_support)
+        if(!VisitStorage.sources.ActiveParticle || !VisitStorage.intervals || !VisitStorage.limits)
             endrun(1,"Cannot allocate local SIDM visit.\n");
+#ifdef SIDMDEBUG
+        VisitStorage.old_support=malloc(VisitCapacity*sizeof(double));
+        if(!VisitStorage.old_support) endrun(1,"Cannot allocate local SIDM support diagnostics.\n");
+#endif
     }
-    VisitInUse=1;
     struct sidm_local_visit out=VisitStorage;
     out.sources.Particles=P;
     out.sources.NumActiveParticle=0;
     /* The native split-gravity list includes SIDM-only sources. PM flushes
      * inspect every DM clock regardless of the native activity list. */
     const int indexed=active && !flush;
+#ifdef SIDMDEBUG
     if(indexed && (active->NumActiveParticle<0 || active->NumActiveParticle>n))
         endrun(1,"Invalid local SIDM active list.\n");
+    int previous=-1;
+#endif
     const int candidates=indexed?active->NumActiveParticle:n;
     const double tol=128*DBL_EPSILON*fmax(1,fabs(Local.travel));
-    int previous=-1;
     for(int a=0;a<candidates;a++) {
         const int i=indexed && active->ActiveParticle?active->ActiveParticle[a]:a;
+#ifdef SIDMDEBUG
         if(i<0 || i>=n) endrun(1,"Invalid local SIDM active particle index.\n");
+#endif
         if(!live_dm(i)) continue;
+#ifdef SIDMDEBUG
         if(i<=previous) endrun(1,"Local SIDM requires ordered unique DM indices.\n");
         previous=i;
+#endif
         if(P[i].TiSIDMLast>times->Ti_Current || P[i].TiSIDMNext<times->Ti_Current)
             endrun(1,"SIDM source interval missed for ID %lu.\n",P[i].ID);
         if(!flush && P[i].TiSIDMNext!=times->Ti_Current) continue;
         out.sources.ActiveParticle[out.sources.NumActiveParticle++]=i;
         out.limits[i]=DBL_MAX;
         out.intervals[i]=sidm_scatter_factor(CP,P[i].TiSIDMLast,times->Ti_Current);
+#ifdef SIDMDEBUG
         out.old_support[i]=P[i].Hsml;
+#endif
         if(out.intervals[i]>0 && P[i].Hsml>0) {
             const double used=Local.travel-P[i].SIDMTravelLast;
             if(!isfinite(used) || used<0)
@@ -254,8 +259,10 @@ struct sidm_local_visit sidm_local_begin_active(const DriftKickTimes *times, Cos
                 endrun(1,"SIDM source exceeded relative-displacement budget for ID %lu.\n",P[i].ID);
         }
     }
+#ifdef SIDMDEBUG
     if(indexed && out.sources.NumActiveParticle!=active->NumActiveSIDM)
         endrun(1,"Local SIDM source count disagrees with native activity.\n");
+#endif
     out.sources.NumActiveSIDM=out.sources.NumActiveParticle;
     return out;
 }
@@ -362,20 +369,23 @@ void sidm_local_commit(struct sidm_local_visit *visit, DriftKickTimes *times, Co
 #endif
     for(int a=0;a<visit->sources.NumActiveParticle;a++) {
         int i=visit->sources.ActiveParticle[a];
+#ifdef SIDMDEBUG
         const double h=P[i].Hsml, old=visit->old_support[i];
-        if(!isfinite(h) || h<=0 || !isfinite(visit->limits[i]) || visit->limits[i]<=0)
-            endrun(1,"Invalid local SIDM source support or forward bound.\n");
-#ifdef SIDMDEBUG
         record_source_limit(visit->limits[i],h);
-#endif
         if(old>0 && visit->intervals[i]>0) {
-            double change=fabs(h-old)/old;
-#ifdef SIDMDEBUG
-            maxchange=fmax(maxchange,change);
-#endif
-            if(change>Local.support_change)
-                endrun(1,"SIDM support changed by %.8g for ID %lu, above %.8g. Restart last synchronized checkpoint with a smaller SIDMTransportFraction; endpoint subcycling cannot recover skipped geometry.\n",change,P[i].ID,Local.support_change);
+            const double change=fabs(h-old);
+            const double used=Local.travel-P[i].SIDMTravelLast;
+            /* The Kth-neighbor radius changes by at most the largest relative
+             * displacement, even when neighbor identities change. Allow for
+             * rounded positions/ledger and the native drift quadrature's
+             * requested relative accuracy versus the tabulated integral. */
+            const double tol=128*DBL_EPSILON*fmax(PartManager->BoxSize,fabs(Local.travel))+
+                1e-8*used;
+            maxchange=fmax(maxchange,change/old);
+            if(change>used+tol)
+                endrun(1,"SIDM support change exceeds the displacement bound for ID %lu.\n",P[i].ID);
         }
+#endif
         P[i].TiSIDMLast=times->Ti_Current;
         P[i].SIDMTravelLast=Local.travel;
         P[i].TimeBinSIDM=terminal?0:interval_bin(visit->limits[i]);
@@ -389,7 +399,11 @@ void sidm_local_commit(struct sidm_local_visit *visit, DriftKickTimes *times, Co
 double sidm_local_gravity_limit(int i, const DriftKickTimes *times)
 {
     if(!Local.enabled || !live_dm(i)) return DBL_MAX;
+#ifdef SIDMDEBUG
     if(Local.commit_epoch!=times->Ti_Current) endrun(1,"SIDM gravity limit requested before source commit.\n");
+#else
+    (void)times;
+#endif
     const double speed=sqrt(bulk_speed2(i));
     /* The scattering support follows local particle spacing. Using the fixed
      * gravity support alone would impose a tiny step on the entire outer halo. */
@@ -397,13 +411,6 @@ double sidm_local_gravity_limit(int i, const DriftKickTimes *times)
     return speed>0 ? Local.transport*scale/speed:DBL_MAX;
 }
 
-void sidm_local_end(struct sidm_local_visit *visit)
-{
-    if(!VisitInUse || visit->intervals!=VisitStorage.intervals)
-        endrun(1,"Invalid local SIDM visit release.\n");
-    VisitInUse=0;
-    memset(visit,0,sizeof(*visit));
-}
 #else
 void sidm_local_initialize(const DriftKickTimes *t,Cosmology *c) { (void)t;(void)c; }
 inttime_t sidm_local_next_event(const DriftKickTimes *t,Cosmology *c,int first) { (void)c;(void)first; return find_next_kick(t->Ti_Current,t->mintimebin); }

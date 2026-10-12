@@ -30,7 +30,7 @@ static void test_collision_activity_and_drift(void **state)
     const double velocity[]={.5,-.25,.125};
     const int fine=TIMEBINS-4,coarse=TIMEBINS-2;
     const inttime_t collision=(TIMEBASE/3)&~(inttime_t)1;
-    sidm_local_configure(1,.2,.25,.1);
+    sidm_local_configure(1,.2,.1);
     DriftKickTimes times=init_driftkicktime(0);
     times.PM_length=TIMEBASE;times.mintimebin=times.mingravtimebin=fine;
     times.maxtimebin=coarse;
@@ -62,7 +62,7 @@ static void test_collision_activity_and_drift(void **state)
         near(P[i].Vel[0],velocity[swapped]);
     }
     myfree(P);PartManager->Base=NULL;PartManager->NumPart=PartManager->MaxPart=0;
-    sidm_local_configure(0,.2,.25,.1);
+    sidm_local_configure(0,.2,.1);
 }
 static void test_sparse_top_bin(void **state)
 {

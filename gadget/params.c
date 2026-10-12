@@ -386,7 +386,6 @@ create_gadget_parameter_set()
     param_set_action(ps, "StarformationCriterion", StarformationCriterionAction, NULL);
 
     param_declare_double(ps, "SIDMTransportFraction", OPTIONAL, 0.1, "SIDM relative-transport step fraction (0,0.25].");
-    param_declare_double(ps, "SIDMMaxSupportChange", OPTIONAL, 0.25, "Abort if a finite source interval changes support by more than this fraction; must exceed SIDMTransportFraction and be below one.");
 #ifdef SIDM
     /* Parameters for the SIDM module */
     param_declare_int(ps, "SIDMOn", OPTIONAL, 0, "Enables self-interacting dark matter.");
@@ -450,7 +449,7 @@ void read_parameter_file(char *fname, int * ShowBacktrace, double * MaxMemSizePe
     const int sidm_local = 0;
 #endif
     sidm_local_configure(sidm_local, param_get_double(ps, "SIDMTransportFraction"),
-        param_get_double(ps, "SIDMMaxSupportChange"), param_get_double(ps, "MaxSizeTimestep"));
+        param_get_double(ps, "MaxSizeTimestep"));
     if(sidm_local && (!param_get_int(ps, "SplitGravityTimestepsOn") ||
        !param_get_int(ps, "TreeGravOn") || param_get_int(ps, "ForceEqualTimesteps")))
         endrun(1, "SIDM requires SplitGravityTimestepsOn=TreeGravOn=1 and ForceEqualTimesteps=0.\n");

@@ -186,8 +186,12 @@ static double sidm_interval_width(inttime_t ti0,inttime_t ti1)
 static double sidm_time_factor(const Cosmology *CP,inttime_t ti0,inttime_t ti1,int kind)
 {
     if(ti0==ti1) return 0;
+#ifdef SIDMDEBUG
     if(SIDMFactors.cosmology!=CP || ti0<0 || ti1<ti0 || ti1>SIDMFactors.final_ti)
         endrun(1,"Invalid or uninitialized SIDM cosmological interval [%ld,%ld].\n",ti0,ti1);
+#else
+    (void)CP;
+#endif
     const double x=loga_from_ti(ti0), width=sidm_interval_width(ti0,ti1);
     double coordinate=(x-SIDMFactors.begin)/SIDMFactors.width;
     int first=(int)floor(coordinate);

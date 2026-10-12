@@ -132,7 +132,7 @@ static void test_direct_hierarchy(void **state)
     param_declare_double(ps,"ImportBufferBoost",OPTIONAL,2,"test");
     assert_int_equal(param_parse(ps,""),0);set_treewalk_params(ps);parameter_set_free(ps);
     int rank,ntask;MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&ntask);
-    sidm_local_configure(1,.2,.25,16);
+    sidm_local_configure(1,.2,16);
     Cosmology cp={0};cp.HubbleParam=.5;cp.Hubble=1;cp.Omega0=cp.OmegaCDM=1;cp.ONu.rhocrit=1;
     double outputs[]={.1,.2};set_sync_params_test(2,outputs);
     setup_sync_points(&cp,.1,.2,0,0);
@@ -220,7 +220,7 @@ static void test_direct_hierarchy(void **state)
         }
     }
     treewalk_set_max_export_buffer(3584*1024*1024L);
-    sidm_local_configure(0,.2,.25,16);
+    sidm_local_configure(0,.2,16);
     force_tree_free(&tree);myfree(domain.Tasks);myfree(domain.TopLeaves);myfree(domain.TopNodes);
     myfree(P);PartManager->Base=NULL;PartManager->NumPart=PartManager->MaxPart=0;
 }

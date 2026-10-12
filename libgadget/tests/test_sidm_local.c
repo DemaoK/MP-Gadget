@@ -58,7 +58,7 @@ static void clocks_for_boost(double boost,inttime_t *deadline,double *gravity)
         P[i].Hsml=1e6;P[i].TimeBinGravity=TIMEBINS-2;
         P[i].Vel[0]=i==2?1e8:boost+(i?-.5:.5);
     }
-    sidm_local_configure(1,.2,.25,.1);
+    sidm_local_configure(1,.2,.1);
     DriftKickTimes times=init_driftkicktime(0);
     times.PM_length=TIMEBASE;times.mintimebin=times.mingravtimebin=TIMEBINS-2;
     sidm_local_initialize(&times,&cp);
@@ -70,7 +70,7 @@ static void clocks_for_boost(double boost,inttime_t *deadline,double *gravity)
         assert_int_equal(P[i].Type,1);near(visit.intervals[i],0);
         visit.limits[i]=bound;
     }
-    sidm_local_commit(&visit,&times,&cp);sidm_local_end(&visit);
+    sidm_local_commit(&visit,&times,&cp);
     sidm_local_update_speed_bound();
     *deadline=sidm_local_next_event(&times,&cp,0);
     assert_true(*deadline>0 && *deadline<=TIMEBASE/16);
@@ -87,7 +87,7 @@ static void clocks_for_boost(double boost,inttime_t *deadline,double *gravity)
         near(visit.intervals[i],scatter_exact(.1,atime));
         visit.limits[i]=bound;
     }
-    sidm_local_commit(&visit,&times,&cp);sidm_local_end(&visit);
+    sidm_local_commit(&visit,&times,&cp);
     /* A PM output flushes the exposure regardless of the previous rate bin. */
     for(int i=0;i<2;i++) P[i].TiSIDMNext=TIMEBASE;
     times.Ti_Current=times.PM_kick=TIMEBASE;
@@ -98,11 +98,11 @@ static void clocks_for_boost(double boost,inttime_t *deadline,double *gravity)
         near(visit.intervals[i],scatter_exact(atime,.2));
         visit.limits[i]=bound;
     }
-    sidm_local_commit(&visit,&times,&cp);sidm_local_end(&visit);
+    sidm_local_commit(&visit,&times,&cp);
     sidm_local_assert_flushed(&times);
     for(int i=0;i<2;i++) assert_int_equal(P[i].TimeBinSIDM,0);
     myfree(P);PartManager->Base=NULL;PartManager->NumPart=PartManager->MaxPart=0;
-    sidm_local_configure(0,.2,.25,.1);
+    sidm_local_configure(0,.2,.1);
 }
 static void test_mixed_clocks_and_boost(void **state)
 {
@@ -120,7 +120,7 @@ static void transport_case(int expect_resolution_guard)
     const inttime_t initial_deadline=expect_resolution_guard?4:8;
     particle_alloc_memory(PartManager,1e9,2);
     PartManager->NumPart=2;memset(P,0,2*sizeof(*P));
-    sidm_local_configure(1,transport,.25,.1);
+    sidm_local_configure(1,transport,.1);
     DriftKickTimes times=init_driftkicktime(0);
     times.PM_length=TIMEBASE;times.mintimebin=times.mingravtimebin=TIMEBINS-2;
     const double budget=2*speed*1.1*sidm_drift_factor(&cp,0,initial_deadline);
@@ -133,7 +133,7 @@ static void transport_case(int expect_resolution_guard)
     struct sidm_local_visit visit=sidm_local_begin_active(&times,&cp,1,NULL);
     visit.limits[0]=1.1*sidm_scatter_factor(&cp,0,2);
     visit.limits[1]=DBL_MAX;
-    sidm_local_commit(&visit,&times,&cp);sidm_local_end(&visit);
+    sidm_local_commit(&visit,&times,&cp);
     sidm_local_update_speed_bound();
     assert_int_equal(sidm_local_next_event(&times,&cp,0),2);
     assert_int_equal(P[1].TiSIDMNext,initial_deadline);
@@ -143,7 +143,7 @@ static void transport_case(int expect_resolution_guard)
     assert_int_equal(visit.sources.NumActiveParticle,1);
     assert_int_equal(visit.sources.ActiveParticle[0],0);
     visit.limits[0]=1.1*sidm_scatter_factor(&cp,2,4);
-    sidm_local_commit(&visit,&times,&cp);sidm_local_end(&visit);
+    sidm_local_commit(&visit,&times,&cp);
     const double old_travel=2*speed*sidm_drift_factor(&cp,0,2);
     const double new_speed=(expect_resolution_guard?2:1.5)*speed;
     P[0].Vel[0]=new_speed;P[1].Vel[0]=-new_speed;
@@ -169,14 +169,14 @@ static void transport_case(int expect_resolution_guard)
     assert_int_equal(visit.sources.NumActiveParticle,2);
     near(visit.intervals[1]/sidm_scatter_factor(&cp,0,4),1);
     visit.limits[0]=visit.limits[1]=DBL_MAX;
-    sidm_local_commit(&visit,&times,&cp);sidm_local_end(&visit);
+    sidm_local_commit(&visit,&times,&cp);
     assert_int_equal(P[1].TiSIDMLast,4);
     assert_true(P[1].TiSIDMNext>4);
     P[0].Vel[0]=2*speed;P[1].Vel[0]=-2*speed;
     sidm_local_update_speed_bound();
     assert_true(sidm_local_next_event(&times,&cp,0)>4);
     myfree(P);PartManager->Base=NULL;PartManager->NumPart=PartManager->MaxPart=0;
-    sidm_local_configure(0,.2,.25,.1);
+    sidm_local_configure(0,.2,.1);
 }
 static void test_transport_deadline_tightening(void **state)
 { (void)state;transport_case(0); }
@@ -210,10 +210,10 @@ static void test_gravity_transport_shortening(void **state)
     }
     struct gravshort_tree_params gravity={0};gravity.FractionalGravitySoftening=.01;
     set_gravshort_treepar(gravity);gravshort_set_softenings(P[0].Hsml);
-    sidm_local_configure(1,.2,.25,.1);sidm_local_initialize(&times,&cp);
+    sidm_local_configure(1,.2,.1);sidm_local_initialize(&times,&cp);
     struct sidm_local_visit visit=sidm_local_begin_active(&times,&cp,1,NULL);
     for(int i=0;i<4;i++) visit.limits[i]=DBL_MAX;
-    sidm_local_commit(&visit,&times,&cp);sidm_local_end(&visit);
+    sidm_local_commit(&visit,&times,&cp);
     near(sidm_local_gravity_limit(0,&times)/budget,1);
     ActiveParticles active=init_empty_active_particles(PartManager);
     active.NumActiveGravity=PartManager->NumPart;
@@ -227,7 +227,7 @@ static void test_gravity_transport_shortening(void **state)
         near(P[i].Vel[0],(i&1)?-speed:speed);
     }
     myfree(P);PartManager->Base=NULL;PartManager->NumPart=PartManager->MaxPart=0;
-    sidm_local_configure(0,.2,.25,.1);
+    sidm_local_configure(0,.2,.1);
 }
 static int setup(void **state)
 {

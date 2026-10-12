@@ -61,11 +61,13 @@ Gravity tolerances and default softening are unchanged. Native
 | --- | ---: | --- |
 | `SIDMDirectedProbability` | `.1` | `(0,1]`; bounds each directed pair trial and sets the forward source exposure bound. |
 | `SIDMTransportFraction` | `.1` | `(0,.25]`; source relative-displacement budget as a fraction of support, also used in the DM gravity transport criterion. |
-| `SIDMMaxSupportChange` | `.25` | Greater than `SIDMTransportFraction` and less than `1`; maximum fractional support change over a nonzero source interval. |
 
-Exceeding the support-change limit aborts. Restart the last synchronized
-checkpoint with a smaller transport fraction; endpoint retries cannot recover
-geometry skipped during the interval.
+Remove `SIDMMaxSupportChange` from older parameter files; it is no longer a
+runtime option. The source displacement ledger enforces the transport budget
+in release and debug builds. Debug additionally checks that support changes
+fit the elapsed relative-displacement bound, with a numerical allowance for
+position, ledger and drift-integral rounding; there is no separate fractional
+support-change threshold. Endpoint retries cannot recover skipped geometry.
 
 The transport envelope uses one global DM bulk frame and twice the global
 maximum canonical speed. Distinct bulk flows or a fast population can shorten
@@ -88,7 +90,9 @@ scientific convergence or realistic computational cost.
 
 The run loop initializes the local scheduler, obtains a visit with
 `sidm_local_begin_active`, calls `sidm_distributed_force_intervals`, and commits
-and ends the visit. The distributed adapter and standalone tests call
+the visit. The visit borrows reusable scratch storage until the next
+`sidm_local_begin_active` or configure call; no separate end/release call is
+needed. The distributed adapter and standalone tests call
 `sidm_direct_scatter` with a strided particle view, avoiding a second forwarding
 interface.
 Zero-exposure visits initialize support and rates without scattering. Inactive
@@ -135,7 +139,7 @@ add `--zero-only /path/to/previous/suite` and select a new output directory.
 The full harness passed with the normal `Options.mk.example` flags. Full and
 restarted release/debug comparisons, runtime-disabled/compiled-out comparisons,
 zero-scattering comparisons and compiled-out parameter rejection all passed.
-After the API/readability cleanup, all seven run modes for both DM and mixed
+After the guard cleanup, all seven run modes for both DM and mixed
 hydro also matched the previous normal-compiler outputs within the same
 comparison tolerances. Source-only epoch and collision counts were unchanged.
 
@@ -150,12 +154,11 @@ transport and receiver deadline tightening, the minimum-step resolution guard,
 off-grid hierarchy, and native timeline/tree behavior. The tree fixture uses
 one MPI rank; other MPI regressions use two. Under `__FINITE_MATH_ONLY__`, the
 rate test skips NaN/infinity checks while retaining finite-input quadrature and
-normalization checks. All 16 direct-operator state fingerprints were identical
-across release/debug and before/after the cleanup.
+normalization checks. All 16 release direct-operator state fingerprints matched
+the existing debug oracle exactly.
 
-Current evidence: [full smoke](../../build/sidm-cosmological/maintenance-smoke/validation.json),
-[before/after comparisons](../../build/sidm-cosmological/maintenance-smoke/before-after.json),
-[focused tests](../../build/sidm-cosmological/maintenance-tests/tests.json),
-[debug direct oracle](../../build/sidm-cosmological/maintenance-tests/direct-debug.json),
+Current evidence: [full smoke](../../build/sidm-cosmological/guard-cleanup-smoke/validation.json),
+[before/after comparisons](../../build/sidm-cosmological/guard-cleanup-smoke/before-after.json),
+[focused tests](../../build/sidm-cosmological/guard-cleanup-tests/tests.json),
 [binary hashes](../../build/sidm-cosmological/binaries.json), and
 [build record](../../build/sidm-cosmological/build-record.json).

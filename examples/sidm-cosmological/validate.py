@@ -104,7 +104,7 @@ def gadget_parameters(ic, output, hydro, sidm):
                 MetalReturnOn=0, WindOn=0, SnapshotWithFOF=0,
                 OutputTimebins=1, SIDMOn=int(sidm), SIDMNeighbors=32,
                 SIDMDirectedProbability=.5, SIDMTransportFraction=.2,
-                SIDMMaxSupportChange=.25, sigma0=10000000, vdSIDMOn=0)
+                sigma0=10000000, vdSIDMOn=0)
 
 
 def endpoint(output):

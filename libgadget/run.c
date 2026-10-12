@@ -689,7 +689,6 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
             }
             /* Elastic kicks leave forces at the current positions unchanged. */
             sidm_local_commit(&visit, &times, &All.CP);
-            sidm_local_end(&visit);
             walltime_measure("/Timeline/SIDMLocal");
         }
 #endif

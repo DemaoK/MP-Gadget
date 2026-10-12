@@ -184,7 +184,11 @@ static void audit_population(const ForceTree *tree)
             endrun(1,"Nonfinite SIDM phase-space state.\n");
         mmin=fmin(mmin,P[i].Mass);mmax=fmax(mmax,P[i].Mass);count++;
     }
+#ifdef SIDMDEBUG
     if(count!=tree->NumParticles) endrun(1,"SIDM tree does not contain all live DM.\n");
+#else
+    (void)tree;
+#endif
     MPI_Allreduce(MPI_IN_PLACE,&mmin,1,MPI_DOUBLE,MPI_MIN,MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE,&mmax,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE,&count,1,MPI_INT64_T,MPI_SUM,MPI_COMM_WORLD);
