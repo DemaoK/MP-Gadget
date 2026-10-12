@@ -90,9 +90,13 @@ scientific convergence or realistic computational cost.
 
 The run loop initializes the local scheduler, obtains a visit with
 `sidm_local_begin_active`, calls `sidm_distributed_force_intervals`, and commits
-the visit. The visit borrows reusable scratch storage until the next
-`sidm_local_begin_active` or configure call; no separate end/release call is
-needed. The distributed adapter and standalone tests call
+the visit. Visit scratch uses the main memory allocator and is freed by commit;
+the distributed solve frees its search scratch before returning. Neighbor heaps
+require 24 bytes per retained neighbor per active source (912 bytes per source
+at the default 38 neighbors). They count toward `MaxMemSizePerNode` while live,
+then their space is available to other modules. This does not reduce the peak
+heap size during a PM flush, when every DM particle is a source.
+The distributed adapter and standalone tests call
 `sidm_direct_scatter` with a strided particle view, avoiding a second forwarding
 interface.
 Zero-exposure visits initialize support and rates without scattering. Inactive
@@ -139,7 +143,7 @@ add `--zero-only /path/to/previous/suite` and select a new output directory.
 The full harness passed with the normal `Options.mk.example` flags. Full and
 restarted release/debug comparisons, runtime-disabled/compiled-out comparisons,
 zero-scattering comparisons and compiled-out parameter rejection all passed.
-After the guard cleanup, all seven run modes for both DM and mixed
+After the guard and scratch-memory cleanup, all seven run modes for both DM and mixed
 hydro also matched the previous normal-compiler outputs within the same
 comparison tolerances. Source-only epoch and collision counts were unchanged.
 
@@ -149,7 +153,8 @@ comparison tolerances. Source-only epoch and collision counts were unchanged.
 | 4,096 DM + 4,096 gas | 159 | 65,583 |
 
 Focused tests passed for rate quadrature, the serial collision oracle,
-distributed neighbors/unit conversion/mixed species, empty MPI owners, local
+distributed neighbors/unit conversion/mixed species, forced export retries,
+scratch release, empty MPI owners, local
 transport and receiver deadline tightening, the minimum-step resolution guard,
 off-grid hierarchy, and native timeline/tree behavior. The tree fixture uses
 one MPI rank; other MPI regressions use two. Under `__FINITE_MATH_ONLY__`, the
@@ -157,8 +162,8 @@ rate test skips NaN/infinity checks while retaining finite-input quadrature and
 normalization checks. All 16 release direct-operator state fingerprints matched
 the existing debug oracle exactly.
 
-Current evidence: [full smoke](../../build/sidm-cosmological/guard-cleanup-smoke/validation.json),
-[before/after comparisons](../../build/sidm-cosmological/guard-cleanup-smoke/before-after.json),
-[focused tests](../../build/sidm-cosmological/guard-cleanup-tests/tests.json),
+Current evidence: [full smoke](../../build/sidm-cosmological/claude-cleanup-smoke/validation.json),
+[before/after comparisons](../../build/sidm-cosmological/claude-cleanup-smoke/before-after.json),
+[focused tests](../../build/sidm-cosmological/claude-cleanup-tests/tests.json),
 [binary hashes](../../build/sidm-cosmological/binaries.json), and
 [build record](../../build/sidm-cosmological/build-record.json).

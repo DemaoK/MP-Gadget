@@ -166,7 +166,9 @@ static void test_direct_hierarchy(void **state)
         treewalk_set_max_export_buffer(tiny?slots*sizeof(struct dist_query)*omp_get_max_threads():4*1024*1024);
         double intervals[2*TEST_N]={0},limits[2*TEST_N];
         for(int i=0;i<PartManager->NumPart;i++) limits[i]=NAN;
+        const size_t memory_before=mymalloc_usedbytes();
         sidm_distributed_force_intervals(&sources,&cp,units,&times,&tree,intervals,limits,123);
+        assert_int_equal(mymalloc_usedbytes(),memory_before);
         /* Zero exposure still measures the exact initial neighbor rate; it
          * must neither collide nor reset inactive receivers' support. */
         for(int a=0;a<ns;a++) {
@@ -196,6 +198,7 @@ static void test_direct_hierarchy(void **state)
         }
         long double before[4],after[4];moments(before);
         sidm_distributed_force_intervals(&sources,&cp,units,&times,&tree,intervals,limits,123);
+        assert_int_equal(mymalloc_usedbytes(),memory_before);
         moments(after);
         for(int d=0;d<4;d++) assert_true(fabsl(after[d]-before[d])<1e-11*(1+fabsl(before[d])));
         double current[TEST_N][3];collect(current);

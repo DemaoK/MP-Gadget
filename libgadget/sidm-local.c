@@ -2,10 +2,10 @@
 #include "gravity.h"
 #include "timefac.h"
 #include "utils/endrun.h"
+#include "utils/mymalloc.h"
 #include <float.h>
 #include <math.h>
 #include <mpi.h>
-#include <stdlib.h>
 #include <string.h>
 
 static struct {
@@ -28,25 +28,8 @@ static struct {
 #endif
 } Local;
 
-/* Scratch only: no particle identities or clock state survive an event. */
-static struct sidm_local_visit VisitStorage;
-static size_t VisitCapacity;
-
-static void release_visit_storage(void)
-{
-    free(VisitStorage.sources.ActiveParticle);
-    free(VisitStorage.intervals);
-    free(VisitStorage.limits);
-#ifdef SIDMDEBUG
-    free(VisitStorage.old_support);
-#endif
-    memset(&VisitStorage,0,sizeof(VisitStorage));
-    VisitCapacity=0;
-}
-
 void sidm_local_configure(int enabled, double transport, double max_dloga)
 {
-    release_visit_storage();
     memset(&Local, 0, sizeof(Local));
     Local.enabled=enabled;
     Local.transport=transport;
@@ -206,22 +189,14 @@ struct sidm_local_visit sidm_local_begin_active(const DriftKickTimes *times, Cos
         endrun(1,"Invalid accumulated local SIDM displacement.\n");
     Local.travel_epoch=times->Ti_Current;
     const int n=PartManager->NumPart;
-    if((size_t)n+1>VisitCapacity) {
-        release_visit_storage();
-        VisitCapacity=(size_t)n+1;
-        VisitStorage.sources.ActiveParticle=malloc(VisitCapacity*sizeof(int));
-        VisitStorage.intervals=malloc(VisitCapacity*sizeof(double));
-        VisitStorage.limits=malloc(VisitCapacity*sizeof(double));
-        if(!VisitStorage.sources.ActiveParticle || !VisitStorage.intervals || !VisitStorage.limits)
-            endrun(1,"Cannot allocate local SIDM visit.\n");
+    struct sidm_local_visit out={0};
+    out.sources.ActiveParticle=mymalloc("SIDM active sources",((size_t)n+1)*sizeof(int));
+    out.intervals=mymalloc("SIDM intervals",((size_t)n+1)*sizeof(double));
+    out.limits=mymalloc("SIDM limits",((size_t)n+1)*sizeof(double));
 #ifdef SIDMDEBUG
-        VisitStorage.old_support=malloc(VisitCapacity*sizeof(double));
-        if(!VisitStorage.old_support) endrun(1,"Cannot allocate local SIDM support diagnostics.\n");
+    out.old_support=mymalloc("SIDM previous support",((size_t)n+1)*sizeof(double));
 #endif
-    }
-    struct sidm_local_visit out=VisitStorage;
     out.sources.Particles=P;
-    out.sources.NumActiveParticle=0;
     /* The native split-gravity list includes SIDM-only sources. PM flushes
      * inspect every DM clock regardless of the native activity list. */
     const int indexed=active && !flush;
@@ -246,7 +221,6 @@ struct sidm_local_visit sidm_local_begin_active(const DriftKickTimes *times, Cos
             endrun(1,"SIDM source interval missed for ID %lu.\n",P[i].ID);
         if(!flush && P[i].TiSIDMNext!=times->Ti_Current) continue;
         out.sources.ActiveParticle[out.sources.NumActiveParticle++]=i;
-        out.limits[i]=DBL_MAX;
         out.intervals[i]=sidm_scatter_factor(CP,P[i].TiSIDMLast,times->Ti_Current);
 #ifdef SIDMDEBUG
         out.old_support[i]=P[i].Hsml;
@@ -393,7 +367,11 @@ void sidm_local_commit(struct sidm_local_visit *visit, DriftKickTimes *times, Co
     }
 #ifdef SIDMDEBUG
     report_sources(visit->sources.NumActiveParticle,maxchange,times);
+    myfree(visit->old_support);
 #endif
+    myfree(visit->limits);
+    myfree(visit->intervals);
+    myfree(visit->sources.ActiveParticle);
 }
 
 double sidm_local_gravity_limit(int i, const DriftKickTimes *times)

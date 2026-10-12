@@ -22,9 +22,9 @@ struct sidm_local_visit {
     double *old_support; /* Comoving support at the previous source visit. */
 #endif
 };
-/* Borrow reusable storage for this event, until the next begin or configure
- * call; do not retain it across particle migration. Only source entries of
- * the arrays are initialized. The native active list must
+/* Allocate event scratch, released by commit; do not migrate particles or
+ * retain nested allocations across commit. Only source entries of intervals
+ * are initialized; the distributed solve fills limits. The native active list must
  * include SIDM-only sources; its live DM indices must be strictly increasing. */
 struct sidm_local_visit sidm_local_begin_active(const DriftKickTimes *times, Cosmology *CP,
     int flush, const ActiveParticles *active);

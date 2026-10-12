@@ -4,6 +4,7 @@
 #include "sidm-random.h"
 #include "treewalk.h"
 #include "utils/endrun.h"
+#include "utils/mymalloc.h"
 #include "walltime.h"
 #include <float.h>
 #include <math.h>
@@ -11,7 +12,6 @@
 #include <omp.h>
 #include <stddef.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 static struct {
@@ -19,12 +19,13 @@ static struct {
     double probability, sigma0, w;
 } DistParams;
 #ifdef SIDM
-static void release_work_storage(void);
+/* Fixed equal-mass DM; ownership changes do not change these invariants. */
+static struct { double mass; int64_t count; } Population;
 #endif
 void set_sidm_distributed_params(ParameterSet *ps)
 {
 #ifdef SIDM
-    release_work_storage();
+    memset(&Population,0,sizeof(Population));
 #endif
     int rank; MPI_Comm_rank(MPI_COMM_WORLD,&rank);
     if(!rank) {
@@ -49,42 +50,13 @@ void set_sidm_distributed_params(ParameterSet *ps)
 #define SUPPORT_MAX_ITERATIONS 64
 
 struct support_result { TreeWalkResultBase base; int n; struct sidm_direct_neighbor heap[]; };
-struct support_work { double radius, h; int done, n; };
+struct support_work { double radius; int done, n; };
 struct dist_query { TreeWalkQueryBase base; double h; uint64_t id; };
 struct dist_work {
     struct support_work *support;
     struct sidm_direct_neighbor *heaps;
     int *source_index, rank, neighbors;
 };
-struct dist_scratch { void *data; size_t capacity; };
-static struct {
-    struct dist_scratch support, source_index, heaps, direct_sources;
-#ifdef SIDMDEBUG
-    struct dist_scratch entries, marked;
-#endif
-    /* Fixed equal-mass DM; ownership changes do not change these invariants. */
-    double mass;
-    int64_t count;
-} Scratch;
-static void *reserve_scratch(struct dist_scratch *s,size_t count,size_t width)
-{
-    if(count>SIZE_MAX/width) endrun(1,"SIDM scratch size overflow.\n");
-    if(count>s->capacity) {
-        void *next=realloc(s->data,count*width);
-        if(!next) endrun(1,"SIDM scratch allocation failed.\n");
-        s->data=next; s->capacity=count;
-    }
-    return s->data;
-}
-static void release_work_storage(void)
-{
-    free(Scratch.support.data); free(Scratch.source_index.data);
-    free(Scratch.heaps.data); free(Scratch.direct_sources.data);
-#ifdef SIDMDEBUG
-    free(Scratch.entries.data); free(Scratch.marked.data);
-#endif
-    memset(&Scratch,0,sizeof(Scratch));
-}
 static int farther(struct sidm_direct_neighbor a, struct sidm_direct_neighbor b)
 { return a.r2 > b.r2 || (a.r2 == b.r2 && a.id > b.id); }
 
@@ -193,7 +165,7 @@ static void audit_population(const ForceTree *tree)
     MPI_Allreduce(MPI_IN_PLACE,&mmax,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE,&count,1,MPI_INT64_T,MPI_SUM,MPI_COMM_WORLD);
     if(mmin!=mmax || count<=DistParams.neighbors) endrun(1,"SIDM needs equal masses and enough neighbors.\n");
-    Scratch.mass=mmin;Scratch.count=count;
+    Population.mass=mmin;Population.count=count;
 }
 
 #ifdef SIDMDEBUG
@@ -231,7 +203,7 @@ static void report_scatter(const struct sidm_direct_stats *stats,int nactive,
     MPI_Allreduce(MPI_IN_PLACE,&hmin,1,MPI_DOUBLE,MPI_MIN,MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE,&hmax,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
     message(0,"SIDMDirectIntervals: N=%ld sources=%ld min_source_limit=%.17g h=[%.17g,%.17g] support_iterations=%d directed_pairs=%llu trials=%llu events=%llu subdivided_pairs=%llu source_packets=%llu bytes=%llu journaled=%llu threaded_pairs=%llu recomputed_pairs=%llu maxP=%.17g maxTrialP=%.17g sumP=%.17g deltaK=%.17Lg deltaP=%.17Lg\n",
-        (long)Scratch.count,(long)nsources,limit,nsources?hmin:0,hmax,iterations,
+        (long)Population.count,(long)nsources,limit,nsources?hmin:0,hmax,iterations,
         (unsigned long long)stats->pairs,(unsigned long long)stats->trials,(unsigned long long)stats->events,
         (unsigned long long)stats->subdivided_pairs,(unsigned long long)stats->source_packets,(unsigned long long)stats->bytes,
         (unsigned long long)stats->journaled_particles,(unsigned long long)stats->threaded_pairs,
@@ -247,22 +219,22 @@ void sidm_distributed_force_intervals(const ActiveParticles *act,Cosmology *CP,
     const int npart=PartManager->NumPart, nactive=act->NumActiveParticle;
     struct dist_work work={0};MPI_Comm_rank(MPI_COMM_WORLD,&work.rank);
     work.neighbors=DistParams.neighbors;
-    work.support=reserve_scratch(&Scratch.support,(size_t)npart+1,sizeof(*work.support));
-    work.source_index=reserve_scratch(&Scratch.source_index,(size_t)npart+1,sizeof(*work.source_index));
-    work.heaps=reserve_scratch(&Scratch.heaps,((size_t)nactive+1)*work.neighbors,sizeof(*work.heaps));
-    struct sidm_journal journal={.validated_mass=Scratch.mass};
-    int audit=Scratch.mass<=0;
+    work.support=mymalloc("SIDM support",((size_t)npart+1)*sizeof(*work.support));
+    work.source_index=mymalloc("SIDM source index",((size_t)npart+1)*sizeof(*work.source_index));
+    work.heaps=mymalloc("SIDM neighbor heaps",((size_t)nactive+1)*work.neighbors*sizeof(*work.heaps));
+    struct sidm_journal journal={0};
+    int audit=Population.mass<=0;
 #ifdef SIDMDEBUG
     audit=1;
     journal.capacity=npart;
-    journal.entries=reserve_scratch(&Scratch.entries,(size_t)npart+1,sizeof(*journal.entries));
-    journal.marked=reserve_scratch(&Scratch.marked,(size_t)npart+1,sizeof(*journal.marked));
+    journal.entries=mymalloc("SIDM journal",((size_t)npart+1)*sizeof(*journal.entries));
+    journal.marked=mymalloc("SIDM journal marks",((size_t)npart+1)*sizeof(*journal.marked));
     memset(journal.marked,0,(size_t)npart);
     for(int i=0;i<npart;i++) work.source_index[i]=-1;
 #endif
     if(audit) audit_population(tree);
-    journal.validated_mass=Scratch.mass;
-    const double mass=Scratch.mass;
+    journal.validated_mass=Population.mass;
+    const double mass=Population.mass;
     const double sigma0=DistParams.sigma0*CP->HubbleParam*units.UnitMass_in_g/(units.UnitLength_in_cm*units.UnitLength_in_cm);
     /* Stored velocities are a times peculiar velocity. The dt/a^4 source
      * exposure already includes expansion of density and relative speed.
@@ -270,7 +242,7 @@ void sidm_distributed_force_intervals(const ActiveParticles *act,Cosmology *CP,
     const double atime=get_atime(times->Ti_Current);
     const double w=DistParams.w*1e5/units.UnitVelocity_in_cm_per_s*atime;
     const double maxradius=nextafter(.5*PartManager->BoxSize,0);
-    const double guess=PartManager->BoxSize*cbrt((double)work.neighbors/Scratch.count);
+    const double guess=PartManager->BoxSize*cbrt((double)work.neighbors/Population.count);
     for(int a=0;a<nactive;a++) {
         const int i=act->ActiveParticle?act->ActiveParticle[a]:a;
 #ifdef SIDMDEBUG
@@ -311,7 +283,7 @@ void sidm_distributed_force_intervals(const ActiveParticles *act,Cosmology *CP,
             struct support_work *s=&work.support[i];
             if(s->done) continue;
             if(s->n==work.neighbors) {
-                s->h=nextafter(sqrt(support_heap(&work,i)[0].r2),INFINITY);s->done=1;
+                s->radius=nextafter(sqrt(support_heap(&work,i)[0].r2),INFINITY);s->done=1;
             } else {
                 if(s->radius>=maxradius) endrun(1,"SIDM cannot find enough neighbors within allowed support.\n");
                 s->radius=fmin(2*s->radius,maxradius);left++;
@@ -322,13 +294,13 @@ void sidm_distributed_force_intervals(const ActiveParticles *act,Cosmology *CP,
         if(!left) break;
         if(iterations>=SUPPORT_MAX_ITERATIONS) endrun(1,"SIDM support search did not converge.\n");
     }
-    struct sidm_direct_source *sources=reserve_scratch(&Scratch.direct_sources,(size_t)nactive+1,sizeof(*sources));
+    struct sidm_direct_source *sources=mymalloc("SIDM direct sources",((size_t)nactive+1)*sizeof(*sources));
 #ifdef SIDMDEBUG
     double hmin=DBL_MAX,hmax=0;
 #endif
     for(int a=0;a<nactive;a++) {
         const int i=act->ActiveParticle?act->ActiveParticle[a]:a;
-        const double h=work.support[i].h;
+        const double h=work.support[i].radius;
         if(!isfinite(h) || h<=DBL_MIN || h>=.5*PartManager->BoxSize)
             endrun(1,"Degenerate or oversized SIDM support.\n");
         P[i].Hsml=h;
@@ -365,6 +337,14 @@ void sidm_distributed_force_intervals(const ActiveParticles *act,Cosmology *CP,
 #else
     walltime_measure("/SPH/SIDM_ExchangeScatter");
 #endif
+    myfree(sources);
+#ifdef SIDMDEBUG
+    myfree(journal.marked);
+    myfree(journal.entries);
+#endif
+    myfree(work.heaps);
+    myfree(work.source_index);
+    myfree(work.support);
     walltime_measure("/SPH/SIDM_Finalize");
 }
 #endif

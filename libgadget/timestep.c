@@ -342,8 +342,9 @@ hierarchical_gravity_and_timesteps(const ActiveParticles * act, PetaPM * pm, Dom
     int64_t * timebincounts = ta_malloc("timebincounts", int64_t, (TIMEBINS+1) * nthread);
     memset(timebincounts, 0, (TIMEBINS+1) * nthread * sizeof(int64_t));
     /* Cache cosmological drift intervals once for the gravity hierarchy. */
+    const int sidm_enabled = sidm_local_enabled();
     double sidm_drift[TIMEBINS+1] = {0};
-    if(sidm_local_enabled())
+    if(sidm_enabled)
         for(int b = 1; b <= largest_active; b++)
             sidm_drift[b] = sidm_drift_factor(CP, times->Ti_Current,
                 times->Ti_Current + dti_from_timebin(b));
@@ -376,7 +377,7 @@ hierarchical_gravity_and_timesteps(const ActiveParticles * act, PetaPM * pm, Dom
         int bin = get_timestep_bin(dti_gravity);
         if(bin > largest_active)
             bin = largest_active;
-        if(sidm_local_enabled() && P[pa].Type == 1) {
+        if(sidm_enabled && P[pa].Type == 1) {
             const double budget = sidm_local_gravity_limit(pa, times);
 #ifdef SIDMDEBUG
             const int oldbin = bin;
@@ -1365,6 +1366,7 @@ void
 build_active_particles(ActiveParticles * act, const DriftKickTimes * const times, const int NumCurrentTiStep, const double Time, const struct part_manager_type * const PartManager)
 {
     int i;
+    const int sidm_enabled = sidm_local_enabled();
 
     int * TimeBinCountType = (int *) ta_malloc2("TimeBinCountType", int, 6*(TIMEBINS+1));
     memset(TimeBinCountType, 0, 6 * (TIMEBINS+1) * sizeof(int));
@@ -1383,7 +1385,7 @@ build_active_particles(ActiveParticles * act, const DriftKickTimes * const times
             if(PartManager->Base[i].IsGarbage || PartManager->Base[i].Swallowed)
                 continue;
             const int type = PartManager->Base[i].Type;
-            nactivesidm += sidm_local_enabled() && type == 1;
+            nactivesidm += sidm_enabled && type == 1;
             /* Account gas and BHs to their hydro bin and other particles to their gravity bin*/
             int bin = PartManager->Base[i].TimeBinGravity;
             if(type == 0 || type == 5)
@@ -1430,7 +1432,7 @@ build_active_particles(ActiveParticles * act, const DriftKickTimes * const times
                     nactivegrav++;
                 int sidm_active = 0;
 #ifdef SIDM
-                sidm_active = sidm_local_enabled() && type == 1 &&
+                sidm_active = sidm_enabled && type == 1 &&
                     PartManager->Base[i].TiSIDMNext == times->Ti_Current;
 #endif
                 nactivesidm += sidm_active;
