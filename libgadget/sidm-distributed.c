@@ -1,13 +1,11 @@
 #include "sidm-distributed.h"
 #include "sidm-direct.h"
-#include "sidm-local.h"
 #include "sidm-rate.h"
 #include "sidm-random.h"
 #include "treewalk.h"
 #include "utils/endrun.h"
 #include "walltime.h"
 #include <float.h>
-#include <limits.h>
 #include <math.h>
 #include <mpi.h>
 #include <omp.h>
@@ -16,7 +14,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-static struct { int neighbors, velocity_dependent; double probability, sigma0, w; } DistParams;
+static struct {
+    int neighbors, velocity_dependent;
+    double probability, sigma0, w;
+} DistParams;
 #ifdef SIDM
 static void release_work_storage(void);
 #endif
@@ -331,7 +332,7 @@ void sidm_distributed_force_intervals(const ActiveParticles *act,Cosmology *CP,
         hmin=fmin(hmin,h);hmax=fmax(hmax,h);
 #endif
         sources[a]=(struct sidm_direct_source){.index=i,.n=work.neighbors,.neighbors=support_heap(&work,i),
-            .h=h,.dt=intervals[i],.seed=sidm_event_seed(seed,(uint64_t)times->Ti_Current)};
+            .h=h,.exposure=intervals[i],.seed=sidm_event_seed(seed,(uint64_t)times->Ti_Current)};
     }
 #ifdef SIDMDEBUG
     report_support_timers(walk_seconds);
@@ -340,7 +341,7 @@ void sidm_distributed_force_intervals(const ActiveParticles *act,Cosmology *CP,
 #endif
     struct sidm_direct_stats stats;char error[256];
     const struct sidm_direct_particles native={P,sizeof(*P),offsetof(struct particle_data,ID),offsetof(struct particle_data,Vel)};
-    if(sidm_direct_scatter_view(native,npart,sources,nactive,sigma0,w,DistParams.velocity_dependent,
+    if(sidm_direct_scatter(native,npart,sources,nactive,sigma0,w,DistParams.velocity_dependent,
         DistParams.probability,MPI_COMM_WORLD,&journal,&stats,error)) endrun(1,"SIDM: %s\n",error);
 #ifdef SIDMDEBUG
     double limit=DBL_MAX;

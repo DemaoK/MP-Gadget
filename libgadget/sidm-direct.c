@@ -200,7 +200,8 @@ static int prepare_sources(struct sidm_direct_particles p,int nlocal,
         struct sidm_direct_source *s=&src[a]; s->max_sigma_v=0;
 #ifdef SIDMDEBUG
         if(s->index<0 || s->index>=nlocal || s->n<0 || s->n>SIDM_DIRECT_MAX_NEIGHBORS ||
-           (s->n&&!s->neighbors) || !isfinite(s->h) || s->h<=0 || !isfinite(s->dt) || s->dt<0) {
+           (s->n&&!s->neighbors) || !isfinite(s->h) || s->h<=0 ||
+           !isfinite(s->exposure) || s->exposure<0) {
             fail(&failed,error,"Invalid direct SIDM source"); continue;
         }
         if(j->marked[s->index]) fail(&failed,error,"Duplicate direct SIDM source index");
@@ -228,7 +229,7 @@ static int prepare_sources(struct sidm_direct_particles p,int nlocal,
                 bad_neighbors=1; continue;
             }
 #endif
-            const double coefficient=.5*j->validated_mass*sidm_rate_cubic_kernel(sqrt(e->r2),s->h)*s->dt;
+            const double coefficient=.5*j->validated_mass*sidm_rate_cubic_kernel(sqrt(e->r2),s->h)*s->exposure;
 #ifdef SIDMDEBUG
             if(!isfinite(coefficient) || coefficient<0) bad_neighbors=1;
 #endif
@@ -288,7 +289,7 @@ static int phase_partner(int rank,int nrank,int phase)
     return other==ring?ring:(other+phase)%ring;
 }
 
-int sidm_direct_scatter_view(struct sidm_direct_particles p,int nlocal,
+int sidm_direct_scatter(struct sidm_direct_particles p,int nlocal,
     struct sidm_direct_source *src,int ns,double sigma0,double w,int vd,double pmax,
     MPI_Comm comm,struct sidm_journal *j,struct sidm_direct_stats *stats,char error[256])
 {
@@ -520,15 +521,4 @@ int sidm_direct_scatter_view(struct sidm_direct_particles p,int nlocal,
 cleanup:
     free(groups);
     return status;
-}
-
-/* Compact-array compatibility for independent operator tests. Production uses
- * the native particle view; no scratch particle array or copyback is needed. */
-int sidm_direct_scatter(struct sidm_particle *p,int nlocal,
-    struct sidm_direct_source *src,int ns,double sigma0,double w,int vd,double pmax,
-    MPI_Comm comm,struct sidm_journal *j,struct sidm_direct_stats *stats,char error[256])
-{
-    const struct sidm_direct_particles view={p,sizeof(*p),
-        offsetof(struct sidm_particle,id),offsetof(struct sidm_particle,v)};
-    return sidm_direct_scatter_view(view,nlocal,src,ns,sigma0,w,vd,pmax,comm,j,stats,error);
 }

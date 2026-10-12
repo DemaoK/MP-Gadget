@@ -114,6 +114,8 @@ static struct {
 
 static double sidm_cell_integral(const double c[5], double z, double dz, double width)
 {
+    /* z spans [-1,1] across a cell; width is this interval's log(a) span.
+     * Integrate around its midpoint without subtracting nearly equal values. */
     const double mid=z+.5*dz, dz2=dz*dz;
     const double value=c[0]+mid*(c[1]+mid*(c[2]+mid*(c[3]+mid*c[4])));
     return width*(value+dz2*(c[2]+3*mid*c[3]+6*mid*mid*c[4])/12+
@@ -148,6 +150,7 @@ void sidm_time_factors_init(const Cosmology *CP)
                 endrun(1,"Nonfinite SIDM cosmological time integrand.\n");
         }
         for(int kind=0;kind<2;kind++) {
+            /* Fit at z=-1,-1/2,0,1/2,1 using even and odd parts. */
             const double *f=samples[kind];
             double *c=SIDMFactors.polynomial[kind][cell];
             const double even_half=.5*(f[1]+f[3])-f[2], even_end=.5*(f[0]+f[4])-f[2];

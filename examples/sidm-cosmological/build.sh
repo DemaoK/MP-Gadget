@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build isolated dependencies and three reproducible executable variants.
+# Copy installed dependencies and build three executable variants locally.
 set -euo pipefail
 worktree="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 source_repo="${1:?usage: build.sh SOURCE_CHECKOUT_WITH_INSTALLED_DEPENDENCIES [JOBS]}"

@@ -1,36 +1,21 @@
-# Cosmological SIDM validation
+# Cosmological SIDM
 
-This port starts from the isolated solver at `MP-Gadget-SIDM:a5474a7f`.
-The cosmological `SIDM` branch incorporates `origin/master:4e055379` through
-merge `a45b2156`; the branches had diverged, so a fast-forward was not possible.
+SIDM scatters live type 1 particles with one fixed equal DM mass while gas and
+other species retain native gravity and hydrodynamics. Enable it at compile
+time with `OPT += -DSIDM` in `Options.mk`, then set `SIDMOn=1` in the runtime
+parameter file. Add `-DSIDMDEBUG` for ownership/conservation audits, counters
+and detailed timers. Release and debug use the same collision operator.
 
-The direct solver scatters live type 1 particles with one fixed equal DM mass.
-Gas and other species retain their native gravity and hydrodynamic evolution.
-Unequal type 1 masses in zoom initial conditions are unsupported. Start from a
-fresh IC or a synchronized, flushed checkpoint written by this implementation;
-these tests make no compatibility claim for legacy SIDM checkpoints.
+## Build and smoke test
 
-Positions and neighbor support are comoving. Stored velocities are canonical
-`u = a v_pec`. The cross section per unit mass converts as
-`sigma_code = sigma_cgs h UnitMass / UnitLength^2`. A source accumulates exposure
-`E = integral(dt/a^4)` and relative displacement uses
-`D = integral(dt/a^2)`. Velocity-dependent scattering evaluates the physical
-pair speed at the collision endpoint: `w_internal = a w_physical` in code
-velocity units. Cached cosmological integrals preserve short integer intervals.
+The normal `Options.mk.example` compiler settings apply, including
+`-fopenmp -O3 -g -Wall -ffast-math`. SIDM does not override floating-point
+options. The helper below builds compiled-out, debug and release variants;
+only `-DSIDM` and `-DSIDMDEBUG` differ between them. It copies installed
+`depends/include` and `depends/lib` from the supplied checkout and leaves the
+local `Options.mk` configured for release SIDM.
 
-Use `SplitGravityTimestepsOn=1`, `TreeGravOn=1` and `ForceEqualTimesteps=0`.
-Gravity tolerances and default softening are unchanged. The module defaults are
-directed probability `p=.1` and transport fraction `C=.1`; the smoke harness
-explicitly selects the previously tested optional `p=.5`, `C=.2` values.
-The transport envelope uses one global DM bulk frame and twice the global
-maximum canonical speed. Separate bulk flows or a fast population can therefore
-shorten source intervals in otherwise quiet regions.
-Off-grid visits also require re-alignment to short power-of-two bins before
-longer intervals become available. Deadline selection scans the DM population
-and uses global reductions; these costs remain even when few sources are due.
-
-The validation Python environment requires NumPy and bigfile. From the repository
-root, build the three variants and run the focused suite:
+From the repository root, with Python 3, NumPy and bigfile available:
 
 ```bash
 bash examples/sidm-cosmological/build.sh /path/to/checkout/with/installed/depends 4
@@ -42,149 +27,139 @@ python3 examples/sidm-cosmological/validate.py \
   --without-sidm "$PWD/build/sidm-cosmological/MP-Gadget-without-sidm"
 ```
 
-The build helper copies installed dependency outputs so it cannot rebuild into
-the source checkout. It uses the normal `Options.mk.example` settings, including
-`-O3 -ffast-math`. Release adds only `-DSIDM`; debug adds
-`-DSIDM -DSIDMDEBUG`. SIDM does not override the compiler's floating-point options.
-The helper leaves the local build configured for release SIDM; generated
-artifacts live under ignored `build/sidm-cosmological`.
+The harness uses native MP-GenIC and the included spectrum for 4,096 DM particles
+and for 4,096 DM plus 4,096 gas. Runs use two MPI ranks, two OpenMP threads per
+rank, a five-minute invocation timeout and `MaxMemSizePerNode=1000` MB. Four
+physical cores suffice; `--oversubscribe` accommodates allocations advertised
+as one MPI task. The small gas fixture uses the cubic SPH kernel so its native
+initial smoothing-length estimate fits the available population.
 
-The harness generates 4,096 DM particles, then 4,096 DM plus 4,096 gas, with
-native MP-GenIC and the included tabulated spectrum. The smoke uses the cubic
-SPH kernel so the native initial smoothing-length guess fits the small gas
-population. It uses two MPI ranks and
-two OpenMP threads, so four physical cores suffice. `--oversubscribe` accommodates
-an allocation advertised as one MPI task without increasing the requested
-thread count. Each solver invocation has a five minute timeout and allocates
-1,000 MB per node. A deliberately large `sigma0=10000000` and smoke-specific `MaxSizeTimestep=.01`
-exercise collisions and source-only events quickly; these settings are validation inputs.
+The deliberately large `sigma0=10000000`, `MaxSizeTimestep=.01`, directed
+probability `.5` and transport fraction `.2` exercise collisions and source-only
+events quickly. These are smoke inputs; production defaults remain `.1` for
+both probability and transport fraction. Generated binaries, configs, hashes
+and reports live under ignored `build/sidm-cosmological`.
 
-Checks cover finite positive physical fields, species counts and identities,
-debug collision probability bounds, release/debug agreement, a restart from the
-middle flushed snapshot, and agreement between runtime-disabled and compiled-out
-SIDM. Two binaries restarting from the same flushed checkpoint must agree;
-their initial resumed collision solve must have zero exposure. Uninterrupted
-and resumed stochastic trajectories can differ: source limits accumulated
-during sequential collisions are recomputed from the saved endpoint, and native
-velocity/thermodynamic snapshot fields also round to float. The report records
-their aggregate event counts, DM kinetic energy/momentum and maximum support
-difference without requiring particlewise trajectory agreement. These tiny cases establish integration behavior;
-they do not establish scientific convergence or realistic computational cost.
+## Units and supported configurations
 
-DM floating fields use `2e-12` relative/absolute comparison tolerances, with exact
-IDs, masses and clock integers. Repeated execution of the same two-thread hydro
-binary showed native gas differences of `1.9e-7` in position, `7.6e-6` in velocity,
-`5.6e-5` in internal energy (maximum scaled difference `3.9e-5`), and one float ULP
-in density. The harness therefore uses separate gas bounds: position
-`rtol=2e-10, atol=2e-7`, velocity `rtol=1e-5, atol=1e-6`, internal energy
-`rtol=1e-4, atol=1e-7`, and density `rtol=2e-7`. It records observed differences
-and bounds in the report; masses and clocks retain exact checks.
-The compiled-out native hydro repeat also varied (`1.3e-9` in gas position and
-`6.0e-8` in internal energy), with DM fields unchanged; its report is
-[`native-hydro-repeat.json`](../../build/sidm-cosmological/native-hydro-repeat.json).
+Positions and neighbor support are comoving; stored velocities are canonical
+`u = a v_pec`. Cross section per unit mass converts as
+`sigma_code = sigma_cgs h UnitMass / UnitLength^2`. Collision exposure is
+`E = integral(dt/a^4)` and relative displacement uses `D = integral(dt/a^2)`.
+Velocity-dependent scattering evaluates the endpoint speed using
+`w_internal = a w_physical` in code velocity units; runtime `wTurn` is in km/s.
+Cached cosmological integrals preserve short integer intervals.
 
-The harness also compares `SIDMOn=1, sigma0=0` against native disabled output.
-It requires zero collisions and integrated collision probability, and verifies debug counters
-`source_transport`, `gravity_transport` and `deadline_tightened` remain zero, so
-transport changes cannot hide native-phase sequencing errors. The zero-cross-section
-case has no source-only epochs; the collision smoke separately exercises off-grid
-phases. To run only this check
-against an existing successful suite, add `--zero-only /path/to/previous/suite`
-to the command above and select a new output directory. This reuses its ICs and
-disabled outputs without repeating the other simulations.
+Use `SplitGravityTimestepsOn=1`, `TreeGravOn=1`, and `ForceEqualTimesteps=0`.
+SIDM requires double velocities, equal positive live type 1 masses, more DM
+particles than `SIDMNeighbors` (default 38, maximum 128), and periodic neighbor
+support smaller than half the box. Unequal-mass DM zoom ICs are unsupported.
+Gravity tolerances and default softening are unchanged. Native
+`MaxSizeTimestep` is honored; SIDM adds no separate global time cap.
 
-Additional production-module regressions can be run after building SIDM:
+| Runtime parameter | Default | Allowed range and purpose |
+| --- | ---: | --- |
+| `SIDMDirectedProbability` | `.1` | `(0,1]`; bounds each directed pair trial and sets the forward source exposure bound. |
+| `SIDMTransportFraction` | `.1` | `(0,.25]`; source relative-displacement budget as a fraction of support, also used in the DM gravity transport criterion. |
+| `SIDMMaxSupportChange` | `.25` | Greater than `SIDMTransportFraction` and less than `1`; maximum fractional support change over a nonzero source interval. |
 
-```bash
-make -C libgadget -j4 .objs/test_sidm_direct .objs/test_sidm_rate \
-  .objs/test_sidm_distributed .objs/test_sidm_local .objs/test_sidm_hierarchical
-OMP_NUM_THREADS=2 SIDM_TEST_THREADS=2 mpirun --oversubscribe --bind-to none -np 2 \
-  libgadget/.objs/test_sidm_distributed
-SIDM_TEST_EMPTY_OWNER=1 OMP_NUM_THREADS=2 SIDM_TEST_THREADS=2 \
-  mpirun --oversubscribe --bind-to none -np 2 libgadget/.objs/test_sidm_distributed
-OMP_NUM_THREADS=2 mpirun --oversubscribe --bind-to none -np 2 libgadget/.objs/test_sidm_local
-OMP_NUM_THREADS=2 mpirun --oversubscribe --bind-to none -np 2 libgadget/.objs/test_sidm_hierarchical
-```
+Exceeding the support-change limit aborts. Restart the last synchronized
+checkpoint with a smaller transport fraction; endpoint retries cannot recover
+geometry skipped during the interval.
 
-Distributed tests independently check periodic nearest neighbors, nonunity
-little-h unit conversion, endpoint velocity-dependent cross sections, inactive
-receivers, conservation and export retries with interspersed gas. The empty-owner
-variant tests a genuinely empty MPI rank. Local tests compare matter-only
-cosmological integrals with analytic expressions and check mixed-species clocks,
-transport limits, common velocity boosts and PM flushes. A transport follow-up
-exercises an actual gravity-bin shortening and receiver deadline tightening,
-and an opt-in `--expect-resolution-guard` mode verifies that a genuinely
-insufficient minimum-step budget aborts. Hierarchy tests check
-native SIDM-only activity, canonical free drift around a prescribed off-grid
-elastic collision, and the highest legal gravity bin with empty ranks. The
-standalone direct test additionally compares the full MPI stochastic collision
-schedule against an independent serial oracle.
+The transport envelope uses one global DM bulk frame and twice the global
+maximum canonical speed. Distinct bulk flows or a fast population can shorten
+source intervals in unrelated quiet regions. Off-grid visits can temporarily
+require short power-of-two bins during re-alignment. Deadline selection also
+scans the DM population and uses global reductions, even when few sources are
+due. These tiny tests establish integration behavior, without establishing
+scientific convergence or realistic computational cost.
 
-## Normal compiler validation on 2026-10-12
+## Code responsibilities
 
-All three binaries were rebuilt from `Options.mk.example` with its normal
-`-O3 -ffast-math` settings. Only the SIDM feature macros differ between variants.
-The full current harness passed for DM and gas/DM, including restarts,
-release/debug agreement, disabled/compiled-out agreement and zero scattering.
-It recorded 248 source-only epochs and 85,490 collisions for DM, and 159 epochs
-and 65,583 collisions for gas/DM. Existing comparison tolerances were unchanged.
+| Module | Responsibility |
+| --- | --- |
+| `sidm-local.c` | Own source clocks, select events, accumulate exposure, limit transport, and commit or flush visits. |
+| `sidm-distributed.c` | Find periodic DM neighbors, convert physical units, and pass source intervals to the collision operator. |
+| `sidm-direct.c` | Apply ordered equal-mass elastic collisions across MPI owners, using current endpoint velocities. |
+| `sidm-rate.h`, `sidm-random.h` | Evaluate the kernel/cross section and deterministic random streams. |
+| `timefac.c` | Supply `sidm_drift_factor` and `sidm_scatter_factor` cosmological integrals. |
+| `run.c`, `timestep.c` | Integrate SIDM events with native split gravity; hydro advances on native events. |
 
-Focused rate, direct-collision, distributed, empty-owner, transport, hierarchy
-and native timeline/tree tests passed. The rate test checks NaN/infinity behavior
-only when `__FINITE_MATH_ONLY__` is disabled; all finite-input quadrature and
-normalization checks run with the selected compiler settings.
+The run loop initializes the local scheduler, obtains a visit with
+`sidm_local_begin_active`, calls `sidm_distributed_force_intervals`, and commits
+and ends the visit. The distributed adapter and standalone tests call
+`sidm_direct_scatter` with a strided particle view, avoiding a second forwarding
+interface.
+Zero-exposure visits initialize support and rates without scattering. Inactive
+receivers may change velocity while retaining their source clocks. Pairs above
+the configured probability bound use multiple Bernoulli trials; this bounds each
+trial without establishing converged interleaving with other neighbors.
 
-Current evidence: [full smoke](../../build/sidm-cosmological/normal-smoke/validation.json),
-[focused tests](../../build/sidm-cosmological/normal-tests/tests.json),
-[debug direct oracle](../../build/sidm-cosmological/normal-tests/direct-debug.json),
+## Restart and comparison contracts
+
+Start from fresh ICs or a synchronized PM checkpoint written by this
+implementation, with every source interval flushed before output. Legacy SIDM
+checkpoint compatibility is untested. Release and debug restarting from the
+same checkpoint must agree, and the first resumed solve has zero exposure.
+
+An uninterrupted trajectory can differ from its restart. Forward limits retain
+rates encountered during sequential collisions; restart recomputes rates from
+the saved endpoint. Native velocity and thermodynamic snapshot fields also
+round to float. The harness records event counts, DM kinetic energy/momentum,
+and support differences as information rather than requiring particlewise
+agreement between these trajectories.
+
+The harness checks identities, masses, finite physical fields, flushed clocks,
+debug probability bounds, release/debug agreement, and runtime-disabled versus
+compiled-out agreement. DM floating fields use `rtol=atol=2e-12`; IDs, masses
+and clock integers are exact. Repeated executions of the same threaded hydro
+binary established a native gas reproducibility floor, so gas bounds are:
+
+| Gas field | Relative tolerance | Absolute tolerance |
+| --- | ---: | ---: |
+| Position | `2e-10` | `2e-7` |
+| Velocity | `1e-5` | `1e-6` |
+| Internal energy | `1e-4` | `1e-7` |
+| Density | `2e-7` | `0` |
+
+Observed differences and bounds are saved in each report. The `sigma0=0` check
+requires zero collisions, integrated collision probability, transport limits
+and tightened deadlines. It establishes native-phase equivalence with no
+source-only epochs; the collision smoke separately exercises off-grid phases.
+To reuse an existing successful suite's ICs and disabled outputs for this check,
+add `--zero-only /path/to/previous/suite` and select a new output directory.
+
+## Validated normal compiler builds: 2026-10-12
+
+The full harness passed with the normal `Options.mk.example` flags. Full and
+restarted release/debug comparisons, runtime-disabled/compiled-out comparisons,
+zero-scattering comparisons and compiled-out parameter rejection all passed.
+After the API/readability cleanup, all seven run modes for both DM and mixed
+hydro also matched the previous normal-compiler outputs within the same
+comparison tolerances. Source-only epoch and collision counts were unchanged.
+
+| Case | Source-only epochs | Elastic collisions |
+| --- | ---: | ---: |
+| 4,096 DM | 248 | 85,490 |
+| 4,096 DM + 4,096 gas | 159 | 65,583 |
+
+Focused tests passed for rate quadrature, the serial collision oracle,
+distributed neighbors/unit conversion/mixed species, empty MPI owners, local
+transport and receiver deadline tightening, the minimum-step resolution guard,
+off-grid hierarchy, and native timeline/tree behavior. The tree fixture uses
+one MPI rank; other MPI regressions use two. Under `__FINITE_MATH_ONLY__`, the
+rate test skips NaN/infinity checks while retaining finite-input quadrature and
+normalization checks. All 16 direct-operator state fingerprints were identical
+across release/debug and before/after the cleanup.
+
+Current evidence: [full smoke](../../build/sidm-cosmological/maintenance-smoke/validation.json),
+[before/after comparisons](../../build/sidm-cosmological/maintenance-smoke/before-after.json),
+[focused tests](../../build/sidm-cosmological/maintenance-tests/tests.json),
+[debug direct oracle](../../build/sidm-cosmological/maintenance-tests/direct-debug.json),
 [binary hashes](../../build/sidm-cosmological/binaries.json), and
 [build record](../../build/sidm-cosmological/build-record.json).
-
-## Initial integration validation on 2026-10-12
-
-These results and the two audit reports describe the original `-O2` builds
-without fast math, before the compiler override was removed. They are retained
-as historical evidence; the normal-compiler validation is recorded separately.
-
-The focused suite passed with two MPI ranks and two OpenMP threads. The native
-force-tree unit test used its intended single-rank fixture, also with two threads.
-
-| Case | Source-only epochs | Elastic collisions | Full and resumed release/debug | Runtime-disabled/compiled-out |
-| --- | ---: | ---: | --- | --- |
-| 4,096 DM | 248 | 85,490 | Passed | Passed |
-| 4,096 DM + 4,096 gas | 159 | 65,583 | Passed within the documented gas bounds | Passed within the documented gas bounds |
-
-Both cases also rejected enabling SIDM in a compiled-out binary and passed
-flushed-clock, mass, identity and finite/positive-field checks. Resumed runs
-started with zero collision exposure. The DM maximum relative support
-difference between uninterrupted and restarted runs was `0.00396`; the mixed
-case was `0.00375`. These are informational differences under the restart
-contract described above.
-
-The additional zero-cross-section check passed for DM and mixed hydro using the
-same binaries, establishing native-phase equivalence. Both reported zero events, zero source-only epochs, and zero
-source/gravity transport limits or tightened deadlines. DM endpoint fields
-matched native disabled output exactly. Detailed gas differences and the
-comparison bounds are recorded in
-[`zero-cross-section/validation.json`](../../build/sidm-cosmological/zero-cross-section/validation.json)
-and [`zero-cross-section.log`](../../build/sidm-cosmological/zero-cross-section.log).
-
-The initial smoke above used the harness before this extra comparison was added.
-The follow-up ran through `--zero-only`, reusing the saved native-disabled outputs
-and unchanged binaries. At that stage the combined default harness path had not
-been rerun end to end; the normal-compiler validation above now covers it.
-The archived build record preserves the original build hashes and records that
-follow-up invocation separately under `post_build_validation`.
-
-Generated evidence is in
-[`build/sidm-cosmological/validated/validation.json`](../../build/sidm-cosmological/validated/validation.json),
-[`validated.log`](../../build/sidm-cosmological/validated.log),
-[`tests.json`](../../build/sidm-cosmological/tests.json),
-[`transport-followup.json`](../../build/sidm-cosmological/transport-followup.json),
-[`initial-build/binaries.json`](../../build/sidm-cosmological/initial-build/binaries.json), and
-[`initial-build/build-record.json`](../../build/sidm-cosmological/initial-build/build-record.json).
-The independent integral checks are recorded in
-[`timefactor-check.log`](../../build/sidm-cosmological/timefactor-check.log).
-Read-only audit reports are in
-[`audits/claude-round1.md`](../../audits/claude-round1.md) and
-[`audits/claude-round2.md`](../../audits/claude-round2.md).
+The earlier [first audit](../../audits/claude-round1.md) and
+[second audit](../../audits/claude-round2.md) are historical records of the initial
+integration, which used different compiler settings; their strict-math build
+advice does not describe the current build configuration.

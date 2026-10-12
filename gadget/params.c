@@ -394,7 +394,7 @@ create_gadget_parameter_set()
     param_declare_double(ps, "sigma0", OPTIONAL, 0, "Cross section per unit mass in cm^2/g.");
     param_declare_double(ps, "wTurn", OPTIONAL, 0, "Turnover velocity in km/s.");
     param_declare_int(ps, "SIDMNeighbors", OPTIONAL, 38, "Neighbor rank defining the full single-kernel support; excludes self.");
-    param_declare_double(ps, "SIDMDirectedProbability", OPTIONAL, 0.1, "Directed half-rate probability coefficient, 0<p<=1; 0.5 is the speed-calibration setting.");
+    param_declare_double(ps, "SIDMDirectedProbability", OPTIONAL, 0.1, "Maximum directed pair probability per trial, 0<p<=1; also sets the forward source exposure bound.");
 #endif
 
     return ps;

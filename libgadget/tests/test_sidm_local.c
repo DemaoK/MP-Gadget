@@ -71,7 +71,7 @@ static void clocks_for_boost(double boost,inttime_t *deadline,double *gravity)
         visit.limits[i]=bound;
     }
     sidm_local_commit(&visit,&times,&cp);sidm_local_end(&visit);
-    sidm_local_after_open();
+    sidm_local_update_speed_bound();
     *deadline=sidm_local_next_event(&times,&cp,0);
     assert_true(*deadline>0 && *deadline<=TIMEBASE/16);
     assert_true(sidm_scatter_factor(&cp,0,*deadline)<=bound);
@@ -134,7 +134,7 @@ static void transport_case(int expect_resolution_guard)
     visit.limits[0]=1.1*sidm_scatter_factor(&cp,0,2);
     visit.limits[1]=DBL_MAX;
     sidm_local_commit(&visit,&times,&cp);sidm_local_end(&visit);
-    sidm_local_after_open();
+    sidm_local_update_speed_bound();
     assert_int_equal(sidm_local_next_event(&times,&cp,0),2);
     assert_int_equal(P[1].TiSIDMNext,initial_deadline);
     assert_int_equal(P[1].TiSIDMLast,0);
@@ -147,7 +147,7 @@ static void transport_case(int expect_resolution_guard)
     const double old_travel=2*speed*sidm_drift_factor(&cp,0,2);
     const double new_speed=(expect_resolution_guard?2:1.5)*speed;
     P[0].Vel[0]=new_speed;P[1].Vel[0]=-new_speed;
-    sidm_local_after_open();
+    sidm_local_update_speed_bound();
     const double minimum_travel=2*new_speed*sidm_drift_factor(&cp,2,4);
     if(expect_resolution_guard) {
         /* No representable next event can honor the remaining budget. This
@@ -173,7 +173,7 @@ static void transport_case(int expect_resolution_guard)
     assert_int_equal(P[1].TiSIDMLast,4);
     assert_true(P[1].TiSIDMNext>4);
     P[0].Vel[0]=2*speed;P[1].Vel[0]=-2*speed;
-    sidm_local_after_open();
+    sidm_local_update_speed_bound();
     assert_true(sidm_local_next_event(&times,&cp,0)>4);
     myfree(P);PartManager->Base=NULL;PartManager->NumPart=PartManager->MaxPart=0;
     sidm_local_configure(0,.2,.25,.1);

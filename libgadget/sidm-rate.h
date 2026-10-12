@@ -4,7 +4,6 @@
 /* Full-support single cubic kernel and analytic velocity-dependent cross
  * section. Each source supplies its own directed half-rate; sequential
  * collision updates use the current pair-relative velocity. */
-#include <float.h>
 #include <math.h>
 
 static inline double
@@ -21,7 +20,7 @@ sidm_rate_cubic_kernel(double r, double h)
 }
 
 /* Normalized viscosity cross-section divided by its zero-speed value.
- * y=(v/w)^2, or the actual regularized argument used by the caller.
+ * y=(v/w)^2 for the current pair-relative speed v.
  * The normalized integral representation is
  *   f(y) = 6 integral_0^1 t(1-t)/(1+y*t)^2 dt.
  * It proves positivity and monotonic decrease. The series avoids cancellation

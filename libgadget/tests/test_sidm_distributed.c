@@ -17,6 +17,7 @@
 #include "stub.h"
 #ifdef SIDM
 #include "../domain.h"
+#include "../sidm-local.h"
 #include "../treewalk.h"
 #include "../walltime.h"
 static void capture_walk(TreeWalk *,int *,size_t);

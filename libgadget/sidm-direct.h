@@ -4,11 +4,12 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* Compact state for standalone operator tests; production uses a native view. */
-struct sidm_particle { uint64_t id; double mass, v[3]; };
 /* Debug-only owner journal. Release needs only validated_mass and does not
  * allocate, mark, copy, or scan endpoint audit storage. */
-struct sidm_journal_entry { int index; double before[3]; };
+struct sidm_journal_entry {
+    int index;
+    double before[3];
+};
 struct sidm_journal {
     struct sidm_journal_entry *entries;
     unsigned char *marked;
@@ -30,11 +31,16 @@ struct sidm_direct_neighbor {
  * A strided view avoids copying the full native particle population. The
  * caller validates mass/velocity and excludes garbage from source/neighbor
  * lists. Offsets and stride must preserve their C types' alignment. */
-struct sidm_direct_particles { void *base; size_t stride, id_offset, velocity_offset; };
+struct sidm_direct_particles {
+    void *base;
+    size_t stride, id_offset, velocity_offset;
+};
 struct sidm_direct_source {
     int index, n;
     struct sidm_direct_neighbor *neighbors;
-    double h, dt, max_sigma_v;
+    double h; /* Comoving support. */
+    double exposure; /* Integral dt/a^4; zero visits measure rates only. */
+    double max_sigma_v; /* Largest cross section times canonical relative speed encountered. */
     uint64_t seed;
 };
 struct sidm_direct_stats {
@@ -77,15 +83,10 @@ struct sidm_direct_stats {
  * With SIDMDEBUG, accepted updates are journaled before their first mutation.
  * The caller supplies identical parameters on all ranks and validates all
  * initial particle state and fixed equal mass, and provides a journal with
- * validated_mass > 0. All sources, including
- * dt=0, measure rates. Failure invalidates the entire (possibly partial) step.
+ * validated_mass > 0. All sources, including zero exposure, measure rates.
+ * Failure invalidates the entire (possibly partial) step.
  */
-int sidm_direct_scatter(struct sidm_particle *p, int nlocal,
-    struct sidm_direct_source *sources, int nsource,
-    double sigma0, double w, int vd, double pmax, MPI_Comm comm,
-    struct sidm_journal *journal, struct sidm_direct_stats *stats,
-    char error[256]);
-int sidm_direct_scatter_view(struct sidm_direct_particles p, int nlocal,
+int sidm_direct_scatter(struct sidm_direct_particles p, int nlocal,
     struct sidm_direct_source *sources, int nsource,
     double sigma0, double w, int vd, double pmax, MPI_Comm comm,
     struct sidm_journal *journal, struct sidm_direct_stats *stats,

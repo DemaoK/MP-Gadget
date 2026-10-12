@@ -96,16 +96,21 @@ static void close_number(double a,double b)
 }
 static void check(double pmax,int vd,int boost,int zero,int negative)
 {
-    struct sidm_particle p[N]; struct sidm_direct_source s[N];
+    /* Nontrivial native stride and gaps around the fields. All cases use the
+     * same view interface as production and preserve unrelated fields. */
+    struct native { double unused[7],v[3]; uint64_t guard,id; } p[N];
+    struct sidm_direct_source s[N];
     struct sidm_direct_neighbor ngb[N][K];
     struct sidm_journal_entry entries[N]; unsigned char marked[N]={0};
     struct sidm_journal journal={.entries=entries,.marked=marked,.capacity=N,.validated_mass=1};
     int n=0,ns=0;
     for(int id=0;id<N;id++) if(owner(id)==rank) {
-        p[n].id=id+1;p[n].mass=1;initial(id,p[n].v,boost);
+        memset(&p[n],0x5a,sizeof(p[n]));
+        p[n].id=id+1;
+        initial(id,p[n].v,boost);
         assert(index_of(id)==n);
         if(source(id)) {
-            s[ns]=(struct sidm_direct_source){.index=n,.n=K,.neighbors=ngb[ns],.h=1,.dt=exposure(id,zero),.seed=17};
+            s[ns]=(struct sidm_direct_source){.index=n,.n=K,.neighbors=ngb[ns],.h=1,.exposure=exposure(id,zero),.seed=17};
             /* Reverse order forces the production group sort. */
             for(int k=0;k<K;k++) {
                 int j=(id+K-k)%N;double r=separation(id,j);
@@ -116,25 +121,14 @@ static void check(double pmax,int vd,int boost,int zero,int negative)
         n++;
     }
     if(negative==1&&rank==0&&ns) s[0].neighbors[0].index=N+1;
-    if(negative==2&&rank==0&&ns) s[0].dt=-1;
+    if(negative==2&&rank==0&&ns) s[0].exposure=-1;
     if(negative==3&&rank==0&&ns) s[0].neighbors[1]=s[0].neighbors[0];
-    if(negative==4&&rank==0&&ns) s[0].dt=DBL_MAX;
+    if(negative==4&&rank==0&&ns) s[0].exposure=DBL_MAX;
     struct sidm_direct_stats actual,expected={0}; char error[256];
-    /* Nontrivial native stride and gaps around the fields. Compare every
-     * physical value to the independent oracle and preserve other bytes. */
-    struct native { double unused[7],v[3]; uint64_t guard,id; } native[N];
-    for(int i=0;i<n;i++) {
-        memset(&native[i],0x5a,sizeof(native[i]));native[i].id=p[i].id;
-        memcpy(native[i].v,p[i].v,sizeof(p[i].v));
-    }
-    const struct sidm_direct_particles view={native,sizeof(*native),
+    const struct sidm_direct_particles view={p,sizeof(*p),
         offsetof(struct native,id),offsetof(struct native,v)};
-    int code=boost?sidm_direct_scatter_view(view,n,s,ns,.3,2,vd,pmax,MPI_COMM_WORLD,&journal,&actual,error):
-        sidm_direct_scatter(p,n,s,ns,.3,2,vd,pmax,MPI_COMM_WORLD,&journal,&actual,error);
-    if(boost) for(int i=0;i<n;i++) {
-        assert(native[i].guard==UINT64_C(0x5a5a5a5a5a5a5a5a));
-        memcpy(p[i].v,native[i].v,sizeof(p[i].v));
-    }
+    int code=sidm_direct_scatter(view,n,s,ns,.3,2,vd,pmax,MPI_COMM_WORLD,&journal,&actual,error);
+    for(int i=0;i<n;i++) assert(p[i].guard==UINT64_C(0x5a5a5a5a5a5a5a5a));
     if(negative) { assert(code!=0);if(!rank)printf("PASS direct negative %d: %s\n",negative,error);return; }
     if(code) { fprintf(stderr,"%s\n",error);MPI_Abort(MPI_COMM_WORLD,1); }
     double ref[N][3],rate[N]={0}; for(int i=0;i<N;i++) initial(i,ref[i],boost);
@@ -190,7 +184,7 @@ static void check(double pmax,int vd,int boost,int zero,int negative)
         puts("");
     }
     /* No sources on ANY rank, reusing a populated journal. */
-    assert(!sidm_direct_scatter(p,n,NULL,0,.3,2,vd,pmax,MPI_COMM_WORLD,&journal,&actual,error));
+    assert(!sidm_direct_scatter(view,n,NULL,0,.3,2,vd,pmax,MPI_COMM_WORLD,&journal,&actual,error));
     assert(actual.pairs==0&&actual.events==0&&journal.count==0);
     if(!rank)printf("PASS direct ranks=%d owners=%d p=%g vd=%d boost=%d zero=%d events=%llu subdivisions=%llu\n",
         tasks,owners,pmax,vd,boost,zero,(unsigned long long)expected.events,(unsigned long long)expected.subdivided_pairs);
@@ -207,7 +201,7 @@ int main(int argc,char **argv)
         for(int vd=0;vd<2;vd++) {
             check(.1,vd,0,0,0); /* Strong subdivision. */
             check(.5,vd,0,0,0); /* Production probability setting. */
-            check(.5,vd,1,0,0); /* Bulk boost and native strided storage. */
+            check(.5,vd,1,0,0); /* Bulk boost. */
         }
         check(1,0,0,0,0); /* Allowed probability endpoint. */
         check(.5,0,0,1,0);

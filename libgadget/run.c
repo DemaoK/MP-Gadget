@@ -832,7 +832,7 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
         }
 
         /* Measure the drift envelope after all opening kicks. */
-        if(sidm_local_enabled()) sidm_local_after_open();
+        if(sidm_local_enabled()) sidm_local_update_speed_bound();
         /* We can now free the active list: the new step have new active particles*/
         free_active_particles(&Act);
 

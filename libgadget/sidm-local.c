@@ -3,7 +3,6 @@
 #include "timefac.h"
 #include "utils/endrun.h"
 #include <float.h>
-#include <limits.h>
 #include <math.h>
 #include <mpi.h>
 #include <stdlib.h>
@@ -12,9 +11,9 @@
 static struct {
     int enabled;
     double transport, support_change, max_dloga;
-    double bulk[3], max_speed;
+    double bulk[3], max_speed; /* Common canonical-velocity frame and speed bound. */
     inttime_t commit_epoch;
-    double travel;
+    double travel; /* Cumulative comoving separation bound. */
     inttime_t travel_epoch, forward_epoch;
     int forward_maxbin;
     double forward_drift[TIMEBINS+1], forward_scatter[TIMEBINS+1];
@@ -37,17 +36,22 @@ static int VisitInUse;
 static void release_visit_storage(void)
 {
     if(VisitInUse) endrun(1,"Cannot reset local SIDM storage during a visit.\n");
-    free(VisitStorage.sources.ActiveParticle); free(VisitStorage.intervals);
-    free(VisitStorage.limits); free(VisitStorage.old_support);
-    memset(&VisitStorage,0,sizeof(VisitStorage)); VisitCapacity=0;
+    free(VisitStorage.sources.ActiveParticle);
+    free(VisitStorage.intervals);
+    free(VisitStorage.limits);
+    free(VisitStorage.old_support);
+    memset(&VisitStorage,0,sizeof(VisitStorage));
+    VisitCapacity=0;
 }
 
 void sidm_local_configure(int enabled, double transport, double support_change, double max_dloga)
 {
     release_visit_storage();
     memset(&Local, 0, sizeof(Local));
-    Local.enabled=enabled; Local.transport=transport;
-    Local.support_change=support_change; Local.max_dloga=max_dloga;
+    Local.enabled=enabled;
+    Local.transport=transport;
+    Local.support_change=support_change;
+    Local.max_dloga=max_dloga;
 #ifdef SIDMDEBUG
     Local.min_rate=Local.min_transport=DBL_MAX;
 #endif
@@ -61,7 +65,6 @@ void sidm_local_configure(int enabled, double transport, double support_change, 
 }
 int sidm_local_enabled(void) { return Local.enabled; }
 #ifdef SIDMDEBUG
-double sidm_local_debug_travel(void) { return Local.travel; }
 void sidm_local_record_gravity_limits(uint64_t checked, uint64_t shortened)
 {
     Local.gravity_checked+=checked;
@@ -70,7 +73,7 @@ void sidm_local_record_gravity_limits(uint64_t checked, uint64_t shortened)
 #endif
 
 #ifdef SIDM
-static int live(int i) { return P[i].Type==1 && !P[i].IsGarbage && !P[i].Swallowed; }
+static int live_dm(int i) { return P[i].Type==1 && !P[i].IsGarbage && !P[i].Swallowed; }
 static double bulk_speed2(int i)
 {
     double norm=0;
@@ -109,9 +112,9 @@ static int bounded_bin(double limit,const double *factors,int maxbin)
     }
     return low;
 }
-static int interval_bin(double exposure,inttime_t now,Cosmology *CP)
+/* Uses the forward table already prepared for this commit epoch. */
+static int interval_bin(double exposure)
 {
-    prepare_forward(now,CP);
     int bin=bounded_bin(exposure,Local.forward_scatter,Local.forward_maxbin);
     bin=bounded_bin(Local.max_dloga,Local.forward_dloga,bin);
     if(bin<1) endrun(1,"SIDM source interval is below representable time resolution.\n");
@@ -125,7 +128,7 @@ void sidm_local_initialize(const DriftKickTimes *times,Cosmology *CP)
     sidm_time_factors_init(CP);
     Local.commit_epoch=Local.forward_epoch=-1;
     Local.travel=0; Local.travel_epoch=times->Ti_Current;
-    for(int i=0;i<PartManager->NumPart;i++) if(live(i)) {
+    for(int i=0;i<PartManager->NumPart;i++) if(live_dm(i)) {
         P[i].TiSIDMLast=P[i].TiSIDMNext=times->Ti_Current;
         P[i].TimeBinSIDM=0;
         P[i].SIDMTravelLast=0;
@@ -150,7 +153,7 @@ inttime_t sidm_local_next_event(const DriftKickTimes *times, Cosmology *CP, int 
 #else
 #pragma omp parallel for reduction(min:next)
 #endif
-    for(int i=0;i<PartManager->NumPart;i++) if(live(i)) {
+    for(int i=0;i<PartManager->NumPart;i++) if(live_dm(i)) {
 #ifdef SIDMDEBUG
         scans++;
 #endif
@@ -223,7 +226,7 @@ struct sidm_local_visit sidm_local_begin_active(const DriftKickTimes *times, Cos
     out.sources.Particles=P;
     out.sources.NumActiveParticle=0;
     /* The native split-gravity list includes SIDM-only sources. PM flushes
-     * still inspect all clocks, when no native activity list is supplied. */
+     * inspect every DM clock regardless of the native activity list. */
     const int indexed=active && !flush;
     if(indexed && (active->NumActiveParticle<0 || active->NumActiveParticle>n))
         endrun(1,"Invalid local SIDM active list.\n");
@@ -233,7 +236,7 @@ struct sidm_local_visit sidm_local_begin_active(const DriftKickTimes *times, Cos
     for(int a=0;a<candidates;a++) {
         const int i=indexed && active->ActiveParticle?active->ActiveParticle[a]:a;
         if(i<0 || i>=n) endrun(1,"Invalid local SIDM active particle index.\n");
-        if(!live(i)) continue;
+        if(!live_dm(i)) continue;
         if(i<=previous) endrun(1,"Local SIDM requires ordered unique DM indices.\n");
         previous=i;
         if(P[i].TiSIDMLast>times->Ti_Current || P[i].TiSIDMNext<times->Ti_Current)
@@ -260,10 +263,10 @@ struct sidm_local_visit sidm_local_begin_active(const DriftKickTimes *times, Cos
 static void update_bulk_frame(const DriftKickTimes *times)
 {
     /* Any common frame bounds relative motion. Refresh at initialization and
-     * PM synchronization; after_open still measures current speeds each event. */
+     * PM synchronization; speeds are measured after opening kicks each event. */
     if(Local.commit_epoch<0 || is_PM_timestep(times)) {
         double sum[4]={0};
-        for(int i=0;i<PartManager->NumPart;i++) if(live(i)) {
+        for(int i=0;i<PartManager->NumPart;i++) if(live_dm(i)) {
             for(int d=0;d<3;d++) sum[d]+=P[i].Mass*P[i].Vel[d];
             sum[3]+=P[i].Mass;
         }
@@ -278,29 +281,20 @@ static void update_bulk_frame(const DriftKickTimes *times)
 #ifdef SIDMDEBUG
     /* Pre-opening speeds classify diagnostic limits only. The next drift
      * envelope is computed independently after every opening kick. */
-    double vmax=0;
-#pragma omp parallel for reduction(max:vmax)
-    for(int i=0;i<PartManager->NumPart;i++) if(live(i)) {
-        const double norm=bulk_speed2(i);
-        if(!isfinite(norm))
-            endrun(1,"Nonfinite local SIDM endpoint speed for ID %lu.\n",P[i].ID);
-        vmax=fmax(vmax,sqrt(norm));
-    }
-    MPI_Allreduce(&vmax,&Local.max_speed,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
-    if(!isfinite(Local.max_speed)) endrun(1,"Nonfinite local SIDM velocity envelope.\n");
+    sidm_local_update_speed_bound();
 #endif
 }
 
-void sidm_local_after_open(void)
+void sidm_local_update_speed_bound(void)
 {
-    /* The next drift uses stored midpoint velocities. Include the new opening
-     * kicks before selecting transport deadlines; pair-relative displacement
-     * is bounded by twice this maximum in any common velocity frame. */
+    /* Relative speed is bounded by twice this maximum in any common frame.
+     * The caller selects the kick phase: normally the stored midpoint
+     * velocities used for the next drift, or pre-opening for diagnostics. */
     double vmax=0;
 #pragma omp parallel for reduction(max:vmax)
-    for(int i=0;i<PartManager->NumPart;i++) if(live(i)) {
+    for(int i=0;i<PartManager->NumPart;i++) if(live_dm(i)) {
         const double norm=bulk_speed2(i);
-        if(!isfinite(norm)) endrun(1,"Nonfinite local SIDM drift speed for ID %lu.\n",P[i].ID);
+        if(!isfinite(norm)) endrun(1,"Nonfinite local SIDM canonical speed for ID %lu.\n",P[i].ID);
         vmax=fmax(vmax,sqrt(norm));
     }
     MPI_Allreduce(&vmax,&Local.max_speed,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
@@ -311,7 +305,7 @@ void sidm_local_assert_flushed(const DriftKickTimes *times)
     if(!Local.enabled) return;
     if(!is_PM_timestep(times) || times->PM_kick!=times->Ti_Current)
         endrun(1,"Local SIDM checkpoints require synchronized PM state.\n");
-    for(int i=0;i<PartManager->NumPart;i++) if(live(i))
+    for(int i=0;i<PartManager->NumPart;i++) if(live_dm(i))
         if(P[i].TiSIDMLast!=times->Ti_Current || P[i].SIDMTravelLast!=Local.travel ||
            times->Ti_kick[P[i].TimeBinGravity]!=times->Ti_Current)
             endrun(1,"Local SIDM checkpoint has an unflushed source or unsynchronized velocity.\n");
@@ -384,7 +378,7 @@ void sidm_local_commit(struct sidm_local_visit *visit, DriftKickTimes *times, Co
         }
         P[i].TiSIDMLast=times->Ti_Current;
         P[i].SIDMTravelLast=Local.travel;
-        P[i].TimeBinSIDM=terminal?0:interval_bin(visit->limits[i],times->Ti_Current,CP);
+        P[i].TimeBinSIDM=terminal?0:interval_bin(visit->limits[i]);
         P[i].TiSIDMNext=times->Ti_Current+dti_from_timebin(P[i].TimeBinSIDM);
     }
 #ifdef SIDMDEBUG
@@ -394,7 +388,7 @@ void sidm_local_commit(struct sidm_local_visit *visit, DriftKickTimes *times, Co
 
 double sidm_local_gravity_limit(int i, const DriftKickTimes *times)
 {
-    if(!Local.enabled || !live(i)) return DBL_MAX;
+    if(!Local.enabled || !live_dm(i)) return DBL_MAX;
     if(Local.commit_epoch!=times->Ti_Current) endrun(1,"SIDM gravity limit requested before source commit.\n");
     const double speed=sqrt(bulk_speed2(i));
     /* The scattering support follows local particle spacing. Using the fixed
@@ -413,7 +407,7 @@ void sidm_local_end(struct sidm_local_visit *visit)
 #else
 void sidm_local_initialize(const DriftKickTimes *t,Cosmology *c) { (void)t;(void)c; }
 inttime_t sidm_local_next_event(const DriftKickTimes *t,Cosmology *c,int first) { (void)c;(void)first; return find_next_kick(t->Ti_Current,t->mintimebin); }
-void sidm_local_after_open(void) { }
+void sidm_local_update_speed_bound(void) { }
 void sidm_local_assert_flushed(const DriftKickTimes *t) { (void)t; }
 void sidm_local_kick_phase(DriftKickTimes *t,int opening) { (void)opening; update_kick_times(t); }
 double sidm_local_gravity_limit(int i,const DriftKickTimes *t) { (void)i;(void)t;return DBL_MAX; }
