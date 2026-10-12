@@ -1,4 +1,5 @@
 #include <mpi.h>
+#include "sidm-local.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -834,16 +835,9 @@ static void STVelocity(int i, float * out, void * baseptr, void * smanptr, const
 SIMPLE_PROPERTY(Mass, Mass, float, 1)
 SIMPLE_PROPERTY(ID, ID, uint64_t, 1)
 #ifdef SIDM
-SIMPLE_GETTER(GTSIDMAccel, SIDMAccel[0], double, 3, struct particle_data)
-SIMPLE_SETTER(STSIDMAccel, SIDMAccel[0], double, 3, struct particle_data)
-SIMPLE_GETTER(GTSIDMProb, SIDMProb, double, 1, struct particle_data)
-SIMPLE_SETTER(STSIDMProb, SIDMProb, double, 1, struct particle_data)
-SIMPLE_GETTER(GTSIDMPartner, Partner, uint64_t, 1, struct particle_data)
-SIMPLE_SETTER(STSIDMPartner, Partner, uint64_t, 1, struct particle_data)
-SIMPLE_GETTER(GTSIDMPartnerDist, SIDMPartnerDist, double, 1, struct particle_data)
-SIMPLE_SETTER(STSIDMPartnerDist, SIDMPartnerDist, double, 1, struct particle_data)
-SIMPLE_GETTER(GTSIDMScattered, Scattered, int, 1, struct particle_data)
-SIMPLE_SETTER(STSIDMScattered, Scattered, int, 1, struct particle_data)
+SIMPLE_PROPERTY(SIDMSupport, Hsml, double, 1)
+SIMPLE_GETTER(GTSIDMLastVisit, TiSIDMLast, int64_t, 1, struct particle_data)
+SIMPLE_GETTER(GTTimeBinSIDM, TimeBinSIDM, int, 1, struct particle_data)
 #endif
 SIMPLE_GETTER(GTPotential, Potential, float, 1, struct particle_data)
 SIMPLE_GETTER(GTTimeBinHydro, TimeBinHydro, int, 1, struct particle_data)
@@ -1031,14 +1025,12 @@ void register_io_blocks(struct IOTable * IOTable, int WriteGroupID, int MetalRet
     }
 
 #ifdef SIDM
-    /* Restart-safe serialization of unresolved SIDM scatters. These are
-     * written for DM snapshots and read back when present; older snapshots
-     * may not contain them, so the blocks are non-fatal on load. */
-    IO_REG_NONFATAL(SIDMAccel, "f8", 3, 1, IOTable);
-    IO_REG_NONFATAL(SIDMProb, "f8", 1, 1, IOTable);
-    IO_REG_NONFATAL(SIDMPartner, "u8", 1, 1, IOTable);
-    IO_REG_NONFATAL(SIDMPartnerDist, "f8", 1, 1, IOTable);
-    IO_REG_NONFATAL(SIDMScattered, "i4", 1, 1, IOTable);
+    /* Support is a restart search guess; source clocks restart flushed. */
+    IO_REG_NONFATAL(SIDMSupport, "f8", 1, 1, IOTable);
+    if(sidm_local_enabled()) {
+        IO_REG_WRONLY(SIDMLastVisit, "i8", 1, 1, IOTable);
+        IO_REG_WRONLY(TimeBinSIDM, "u4", 1, 1, IOTable);
+    }
 #endif
 
     IO_REG(Generation,       "u1", 1, 0, IOTable);

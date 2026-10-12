@@ -12,6 +12,7 @@
 
 #include "stub.h"
 #include <libgadget/timefac.h>
+#include <libgadget/timebinmgr.h>
 
 #define AMIN 0.005
 #define AMAX 1.0
@@ -52,6 +53,19 @@ double loga_from_ti(inttime_t ti)
 {
     double logDTime = (log(AMAX) - log(AMIN)) / (1 << LTIMEBINS);
     return log(AMIN) + ti * logDTime;
+}
+
+/* SIDM factor tables share this test's deliberately mocked fixed timeline. */
+double dloga_from_dti(inttime_t dti, const inttime_t current)
+{
+    (void)current;
+    return dti*(log(AMAX)-log(AMIN))/(1L << LTIMEBINS);
+}
+SyncPoint *find_next_sync_point(inttime_t current)
+{
+    static SyncPoint endpoint;
+    endpoint.ti=1L << LTIMEBINS;endpoint.loga=log(AMAX);endpoint.a=AMAX;
+    return current<endpoint.ti?&endpoint:NULL;
 }
 
 /*Get integer from real time*/

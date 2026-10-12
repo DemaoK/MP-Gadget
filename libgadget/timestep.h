@@ -33,6 +33,7 @@ typedef struct ActiveParticles
     int64_t NumActiveParticle;
     int64_t NumActiveGravity;
     int64_t NumActiveHydro;
+    int64_t NumActiveSIDM;
     int *ActiveParticle;
     struct particle_data * Particles;
 } ActiveParticles;

@@ -10,9 +10,8 @@
 #include <libgadget/blackhole.h>
 #include <libgadget/density.h>
 #include <libgadget/hydra.h>
-#ifdef SIDM
-#include <libgadget/sidm.h>
-#endif
+#include <libgadget/sidm-distributed.h>
+#include <libgadget/sidm-local.h>
 #include <libgadget/fof.h>
 #include <libgadget/init.h>
 #include <libgadget/run.h>
@@ -386,13 +385,16 @@ create_gadget_parameter_set()
     param_set_action(ps, "BlackHoleFeedbackMethod", BlackHoleFeedbackMethodAction, NULL);
     param_set_action(ps, "StarformationCriterion", StarformationCriterionAction, NULL);
 
+    param_declare_double(ps, "SIDMTransportFraction", OPTIONAL, 0.1, "SIDM relative-transport step fraction (0,0.25].");
+    param_declare_double(ps, "SIDMMaxSupportChange", OPTIONAL, 0.25, "Abort if a finite source interval changes support by more than this fraction; must exceed SIDMTransportFraction and be below one.");
 #ifdef SIDM
     /* Parameters for the SIDM module */
     param_declare_int(ps, "SIDMOn", OPTIONAL, 0, "Enables self-interacting dark matter.");
     param_declare_int(ps, "vdSIDMOn", OPTIONAL, 0, "Enables velocity-dependent self-interacting dark matter.");
     param_declare_double(ps, "sigma0", OPTIONAL, 0, "Cross section per unit mass in cm^2/g.");
     param_declare_double(ps, "wTurn", OPTIONAL, 0, "Turnover velocity in km/s.");
-    param_declare_double(ps, "MultiscatteringThreshold", OPTIONAL, -1, "If >= 0, conflicting step-2 scatters are kept with this probability; if < 0, use strict single-scatter claim mode.");
+    param_declare_int(ps, "SIDMNeighbors", OPTIONAL, 38, "Neighbor rank defining the full single-kernel support; excludes self.");
+    param_declare_double(ps, "SIDMDirectedProbability", OPTIONAL, 0.1, "Directed half-rate probability coefficient, 0<p<=1; 0.5 is the speed-calibration setting.");
 #endif
 
     return ps;
@@ -442,6 +444,16 @@ void read_parameter_file(char *fname, int * ShowBacktrace, double * MaxMemSizePe
     set_qso_lightup_params(ps);
     set_treewalk_params(ps);
     set_gravshort_tree_params(ps);
+#ifdef SIDM
+    const int sidm_local = param_get_int(ps, "SIDMOn");
+#else
+    const int sidm_local = 0;
+#endif
+    sidm_local_configure(sidm_local, param_get_double(ps, "SIDMTransportFraction"),
+        param_get_double(ps, "SIDMMaxSupportChange"), param_get_double(ps, "MaxSizeTimestep"));
+    if(sidm_local && (!param_get_int(ps, "SplitGravityTimestepsOn") ||
+       !param_get_int(ps, "TreeGravOn") || param_get_int(ps, "ForceEqualTimesteps")))
+        endrun(1, "SIDM requires SplitGravityTimestepsOn=TreeGravOn=1 and ForceEqualTimesteps=0.\n");
     set_domain_params(ps);
     set_sfr_params(ps);
     set_sync_params(ps);
@@ -452,7 +464,14 @@ void read_parameter_file(char *fname, int * ShowBacktrace, double * MaxMemSizePe
     set_metal_return_params(ps);
     set_stats_params(ps);
 #ifdef SIDM
-    set_sidm_params(ps);
+    set_sidm_distributed_params(ps);
+    if(sidm_local) {
+#ifdef SIDMDEBUG
+        message(0, "SIDM diagnostics: mode=debug solver=direct\n");
+#else
+        message(0, "SIDM diagnostics: mode=release solver=direct\n");
+#endif
+    }
 #endif
     parameter_set_free(ps);
 }

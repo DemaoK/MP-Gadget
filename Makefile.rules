@@ -20,6 +20,10 @@ CFLAGS = $(OPTIONS) $(GSL_INCL) $(FITSIO_INCL)
 CFLAGS += -I../depends/include
 CFLAGS += -I../
 CFLAGS += "-DLOW_PRECISION=$(LOW_PRECISION)"
+# SIDM rate bounds and finite-state checks require ordinary floating-point semantics.
+ifneq (,$(findstring -DSIDM,$(OPTIONS)))
+CFLAGS += -fno-fast-math
+endif
 #For tests
 TCFLAGS = $(CFLAGS) -DGADGET_TESTDATA_ROOT=\"$(GADGET_TESTDATA_ROOT)\"
 

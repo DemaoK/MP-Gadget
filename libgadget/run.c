@@ -37,9 +37,8 @@
 #include "veldisp.h"
 #include "physconst.h"
 #include "plane.h"
-#ifdef SIDM
-#include "sidm.h"
-#endif
+#include "sidm-local.h"
+#include "sidm-distributed.h"
 
 static struct ClockTable Clocks;
 /* Size of table full of random numbers generated each timestep.*/
@@ -110,12 +109,6 @@ static struct run_params
 
     int ExcursionSetReionOn; /*Flag for enabling the excursion set reionisation model*/
     int UVBGdim; /*Dimension of excursion set grids*/
-#ifdef SIDM
-    int SIDMOn; /* Flag for enabling the SIDM model */
-    int vdSIDMOn; /* Flag for enabling the velocity dependent SIDM model */
-    double sigma0; /* Cross section for SIDM */
-    double wTurn; /* Turnover velocity for SIDM */
-#endif
 
 } All;
 
@@ -193,12 +186,6 @@ set_all_global_params(ParameterSet * ps)
         }
         All.ExcursionSetReionOn = param_get_int(ps,"ExcursionSetReionOn");
         All.UVBGdim = param_get_int(ps, "UVBGdim");
-#ifdef SIDM
-        All.SIDMOn = param_get_int(ps, "SIDMOn");
-        All.vdSIDMOn = param_get_int(ps, "vdSIDMOn");
-        All.sigma0 = param_get_double(ps, "sigma0");
-        All.wTurn = param_get_double(ps, "wTurn");
-#endif
     }
     MPI_Bcast(&All, sizeof(All), MPI_BYTE, 0, MPI_COMM_WORLD);
 }
@@ -367,6 +354,7 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
     write_cpu_log(NumCurrentTiStep, header->TimeSnapshot, fds.FdCPU, Clocks.ElapsedTime); /* produce some CPU usage info */
 
     DriftKickTimes times = init_driftkicktime(ti_init);
+    sidm_local_initialize(&times, &All.CP);
 
     double atime = get_atime(times.Ti_Current);
 
@@ -378,7 +366,10 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
          * all bins except the zeroth are inactive and so we return 0 from this function.
          * This ensures we run the force calculation for the first timestep.
          */
-        inttime_t Ti_Next = find_next_kick(times.Ti_Current, times.mintimebin);
+        const inttime_t native_next = find_next_kick(times.Ti_Current, times.mintimebin);
+        inttime_t Ti_Next = sidm_local_enabled() ?
+            sidm_local_next_event(&times, &All.CP, NumCurrentTiStep == 0) : native_next;
+        const int native_event = Ti_Next == native_next;
         inttime_t Ti_Last = times.Ti_Current;
 
         times.Ti_Current = Ti_Next;
@@ -461,7 +452,7 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
         int HybridNuTracer = hybrid_nu_tracer(&All.CP, atime);
 
         MyFloat * GradRho_mag = NULL;
-        if(sfr_need_to_compute_sph_grad_rho())
+        if(native_event && sfr_need_to_compute_sph_grad_rho())
             GradRho_mag = (MyFloat *) mymalloc2("SPH_GradRho", sizeof(MyFloat) * SlotsManager->info[0].size);
 
         ForceTree gasTree = {0};
@@ -472,7 +463,7 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
         *
         * Doing it first also means the density is up to date for
         * adaptive gravitational softenings. */
-        if(GasEnabled)
+        if(GasEnabled && native_event)
         {
             /* Just gas. Note that the density() code computes hsml for black holes and gas.
              * However, hsml is the length that encloses NumNgb gas particles, so for density the tree needs only gas.
@@ -574,7 +565,8 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
         }
 
         /* Sets Ti_Kick in the times structure.*/
-        update_kick_times(&times);
+        if(sidm_local_enabled()) sidm_local_kick_phase(&times, 0);
+        else update_kick_times(&times);
 
         if(is_PM) {
             apply_PM_half_kick(&All.CP, &times);
@@ -595,7 +587,7 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
         }
 
         RandTable rnd = {0};
-        if(GasEnabled || All.LightconeOn)
+        if((GasEnabled && native_event) || All.LightconeOn)
             rnd = set_random_numbers(seed, RNDTABLE);
 
         /* Cooling and extra physics show up as a source term in the evolution equations.
@@ -617,7 +609,7 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
          * used to treat effectively instantaneous injections of energy (like from BHs), which is again hard to properly incorporate in the
          * time-integration approach where you want to have a "full" dU/dt all times. (Volker Springel 2020).
          */
-        if(GasEnabled)
+        if(GasEnabled && native_event)
         {
             if(!gasTree.tree_allocated_flag)
                 force_tree_rebuild_mask(&gasTree, ddecomp, GASMASK | BHMASK, All.OutputDir);
@@ -682,32 +674,24 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
         force_tree_free(&gasTree);
 
 #ifdef SIDM
-        /* Run the comoving SIDM scatter solve after the gravity/hydro work for
-         * this step. sidm_force() stores step-local velocity kicks that are
-         * consumed later by the gravity kick paths. */
-        RandTable rnd_sidm = {0};
-        ForceTree sidmTree = {0};
-        if(All.SIDMOn) {
-            int64_t local_active_dm = 0;
-#pragma omp parallel for reduction(+ : local_active_dm)
-            for(int i = 0; i < Act.NumActiveParticle; i++) {
-                int p = Act.ActiveParticle ? Act.ActiveParticle[i] : i;
-                if(P[p].Type == 1 && !P[p].IsGarbage && !P[p].Swallowed)
-                    local_active_dm++;
-            }
-            int64_t global_active_dm = local_active_dm;
-            MPI_Allreduce(MPI_IN_PLACE, &global_active_dm, 1, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
-
-            if(global_active_dm > 0) {
-                rnd_sidm = set_random_numbers(seed, RNDTABLE);
-                force_tree_rebuild_mask(&sidmTree, ddecomp, DMMASK, All.OutputDir);
+        if(sidm_local_enabled()) {
+            struct sidm_local_visit visit = sidm_local_begin_active(&times, &All.CP, is_PM, &Act);
+            int64_t due = visit.sources.NumActiveParticle;
+            MPI_Allreduce(MPI_IN_PLACE, &due, 1, MPI_INT64_T, MPI_SUM, MPI_COMM_WORLD);
+            if(due) {
+                ForceTree sourceTree = {0};
+                force_tree_rebuild_mask(&sourceTree, ddecomp, DMMASK, All.OutputDir);
                 walltime_measure("/SPH/SIDM_Build");
-                sidm_force(&Act, atime, hubble_function(&All.CP, atime), &All.CP, &rnd_sidm, units, &times, &sidmTree);
-                force_tree_free(&sidmTree);
+                sidm_distributed_force_intervals(&visit.sources, &All.CP, units, &times,
+                    &sourceTree, visit.intervals, visit.limits, All.RandomSeed);
+                force_tree_free(&sourceTree);
+                walltime_measure("/SPH/SIDM_Free");
             }
+            /* Elastic kicks leave forces at the current positions unchanged. */
+            sidm_local_commit(&visit, &times, &All.CP);
+            sidm_local_end(&visit);
+            walltime_measure("/Timeline/SIDMLocal");
         }
-        if(rnd_sidm.Table)
-            free_random_numbers(&rnd_sidm);
 #endif
 
         /* Compute the list of particles that cross a lightcone and write it to disc.
@@ -744,8 +728,10 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
         }
 
         /* WriteFOF just reminds the checkpoint code to save GroupID*/
-        if(WriteSnapshot)
+        if(WriteSnapshot) {
+            sidm_local_assert_flushed(&times);
             write_checkpoint(SnapshotFileCount, WriteFOF, All.MetalReturnOn, atime, &All.CP, All.OutputDir, All.OutputDebugFields);
+        }
 
         /* Save FOF tables after checkpoint so that if there is a FOF save bug we have particle tables available to debug it*/
         if(WriteFOF) {
@@ -778,7 +764,13 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
 #ifdef DEBUG
         check_kick_drift_times(PartManager, times.Ti_Current);
 #endif
-        write_cpu_log(NumCurrentTiStep, atime, fds.FdCPU, Clocks.ElapsedTime);    /* produce some CPU usage info */
+        /* Sample the collective timing report between PM boundaries. */
+        int report_cpu = 1;
+#ifndef SIDMDEBUG
+        report_cpu = !sidm_local_enabled() || is_PM || !next_sync || stop || NumCurrentTiStep % 256 == 0;
+#endif
+        if(report_cpu)
+            write_cpu_log(NumCurrentTiStep, atime, fds.FdCPU, Clocks.ElapsedTime);
 
         report_memory_usage("RUN");
 
@@ -809,7 +801,7 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
              * This does mean we double the cost of the force evaluations.*/
             if(totgravactive)
                 badtimestep = hierarchical_gravity_and_timesteps(&Act, &pm, ddecomp, GravAccel, &times, atime, HybridNuTracer, All.FastParticleType, &All.CP, All.OutputDir);
-            if(GasEnabled) {
+            if(GasEnabled && native_event) {
                 /* Find hydro timesteps and apply the hydro kick, unsyncing the drift and kick times. */
                 badtimestep += find_hydro_timesteps(&Act, &times, atime, &All.CP, NumCurrentTiStep == 0);
                 /* If there is no hydro kick to do we still need to update the kick times.*/
@@ -832,12 +824,15 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
         }
 
         /* Set ti_kick in the time structure*/
-        update_kick_times(&times);
+        if(sidm_local_enabled()) sidm_local_kick_phase(&times, 1);
+        else update_kick_times(&times);
 
         if(is_PM) {
             apply_PM_half_kick(&All.CP, &times);
         }
 
+        /* Measure the drift envelope after all opening kicks. */
+        if(sidm_local_enabled()) sidm_local_after_open();
         /* We can now free the active list: the new step have new active particles*/
         free_active_particles(&Act);
 

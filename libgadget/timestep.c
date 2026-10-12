@@ -10,6 +10,7 @@
 #include "utils/system.h"
 #include "physconst.h"
 #include "timebinmgr.h"
+#include "sidm-local.h"
 #include "domain.h"
 #include "timefac.h"
 #include "cosmology.h"
@@ -102,9 +103,6 @@ static inttime_t convert_timestep_to_ti(double dloga, const int p, const inttime
 static int get_timestep_bin(inttime_t dti);
 static void do_grav_short_range_kick(struct particle_data * part, const MyFloat * const GravAccel, const double Fgravkick);
 static void do_hydro_kick(int i, double dt_entr, double Fgravkick, double Fhydrokick, const double atime);
-#ifdef SIDM
-static void do_sidm_kick(struct particle_data * part);
-#endif
 
 static void print_bad_timebin(const double dloga, const inttime_t dti, const int p, const double * const GravAccel, const inttime_t dti_max, enum TimeStepType titype);
 
@@ -266,10 +264,6 @@ apply_hierarchical_grav_kick(const ActiveParticles * subact, Cosmology * CP, Dri
             do_grav_short_range_kick(&P[pa], AccelStore[pa], gravkick);
         else
             do_grav_short_range_kick(&P[pa], P[pa].FullTreeGravAccel, gravkick);
-#ifdef SIDM
-        if(P[pa].Type == 1 && P[pa].Scattered)
-            do_sidm_kick(&P[pa]);
-#endif
 #ifdef DEBUG
 //         message(4, "KICK ID %ld bin %d kick time: %ld + %ld - %ld now %ld hydro %ld kick ti: %ld ti %ld largest %d\n", P[pa].ID, P[pa].TimeBinGravity, P[pa].Ti_kick_grav, dti/2, lowerdti/2,
 //                 P[pa].Ti_kick_grav + dti/2 -lowerdti/2,
@@ -347,9 +341,20 @@ hierarchical_gravity_and_timesteps(const ActiveParticles * act, PetaPM * pm, Dom
     /* TIMEBINS+1 because largest_active may be TIMEBINS*/
     int64_t * timebincounts = ta_malloc("timebincounts", int64_t, (TIMEBINS+1) * nthread);
     memset(timebincounts, 0, (TIMEBINS+1) * nthread * sizeof(int64_t));
+    /* Cache cosmological drift intervals once for the gravity hierarchy. */
+    double sidm_drift[TIMEBINS+1] = {0};
+    if(sidm_local_enabled())
+        for(int b = 1; b <= largest_active; b++)
+            sidm_drift[b] = sidm_drift_factor(CP, times->Ti_Current,
+                times->Ti_Current + dti_from_timebin(b));
     /* Find the timesteps for all active particles.*/
     int i;
+#ifdef SIDMDEBUG
+    uint64_t sidm_gravity_checked = 0, sidm_gravity_shortened = 0;
+    #pragma omp parallel for reduction(+: sidm_gravity_checked, sidm_gravity_shortened)
+#else
     #pragma omp parallel for
+#endif
     for(i = 0; i < subact->NumActiveParticle; i++) {
         const int pa = get_active_particle(subact, i);
         if(P[pa].Swallowed || P[pa].IsGarbage)
@@ -371,10 +376,26 @@ hierarchical_gravity_and_timesteps(const ActiveParticles * act, PetaPM * pm, Dom
         int bin = get_timestep_bin(dti_gravity);
         if(bin > largest_active)
             bin = largest_active;
+        if(sidm_local_enabled() && P[pa].Type == 1) {
+            const double budget = sidm_local_gravity_limit(pa, times);
+#ifdef SIDMDEBUG
+            const int oldbin = bin;
+            sidm_gravity_checked++;
+#endif
+            while(bin > 0 && sidm_drift[bin] > budget) bin--;
+            if(bin < 1)
+                endrun(1, "SIDM gravity transport interval below two integer ticks.\n");
+#ifdef SIDMDEBUG
+            sidm_gravity_shortened += bin < oldbin;
+#endif
+        }
         int tid = omp_get_thread_num();
         timebincounts[tid * (TIMEBINS+1) + bin] ++;
         P[pa].TimeBinGravity = bin;
     }
+#ifdef SIDMDEBUG
+    sidm_local_record_gravity_limits(sidm_gravity_checked, sidm_gravity_shortened);
+#endif
     /* Count particles in timebins and find largest timestep with particles.*/
     for(ti = largest_active; ti >= 1; ti--) {
         for(i = 1; i < nthread; i++)
@@ -915,11 +936,6 @@ apply_half_kick(const ActiveParticles * act, Cosmology * CP, DriftKickTimes * ti
             P[i].Ti_kick_grav = times->Ti_kick[bin_gravity] + dti_from_timebin(bin_gravity)/2;
 #endif
         }
-#ifdef SIDM
-        /* Apply the resolved SIDM impulse in the non-hierarchical kick path. */
-        if(P[i].Type == 1 && P[i].Scattered == 1)
-            do_sidm_kick(&P[i]);
-#endif
         /* Hydro kick for hydro particles*/
         if(P[i].Type == 0 || P[i].Type == 5) {
             int bin_hydro = P[i].TimeBinHydro;
@@ -1055,23 +1071,6 @@ do_hydro_kick(int i, double dt_entr, double Fgravkick, double Fhydrokick, const 
 #endif
 }
 
-#ifdef SIDM
-/* Apply the resolved SIDM velocity impulse and clear step-local SIDM state. */
-static void
-do_sidm_kick(struct particle_data * part)
-{
-    int j;
-    for(j = 0; j < 3; j++) {
-        part->Vel[j] += part->SIDMAccel[j];
-        part->SIDMAccel[j] = 0;
-    }
-    /* Consume the SIDM kick once so later gravity kicks do not re-apply it. */
-    part->Scattered = 0;
-    part->SIDMProb = -1;
-    part->Partner = (MyIDType)-1;
-    part->SIDMPartnerDist = 0;
-}
-#endif
 
 static double grav_acceleration2(const int p, const MyFloat * const GravAccel, const double atime)
 {
@@ -1353,8 +1352,10 @@ int get_timestep_bin(inttime_t dti)
  */
 inttime_t find_next_kick(inttime_t Ti_Current, int minTimeBin)
 {
-    /* Current value plus the increment for the smallest active bin. */
-    return Ti_Current + dti_from_timebin(minTimeBin);
+    /* Independent source events can lie between native bin boundaries. */
+    if(minTimeBin == 0) return Ti_Current;
+    const inttime_t step = dti_from_timebin(minTimeBin);
+    return Ti_Current + step - Ti_Current % step;
 }
 
 static void print_timebin_statistics(const DriftKickTimes * const times, const int NumCurrentTiStep, int * TimeBinCountType, const double Time, const int64_t ActiveGravityCount);
@@ -1375,18 +1376,21 @@ build_active_particles(ActiveParticles * act, const DriftKickTimes * const times
         act->NumActiveGravity = PartManager->NumPart;
         act->Particles = PartManager->Base;
         act->NumActiveHydro = SlotsManager->info[0].size + SlotsManager->info[5].size;
-        #pragma omp parallel for reduction(+: TimeBinCountType[: 6 * (TIMEBINS+1)])
+        int64_t nactivesidm = 0;
+        #pragma omp parallel for reduction(+: nactivesidm, TimeBinCountType[: 6 * (TIMEBINS+1)])
         for(i = 0; i < PartManager->NumPart; i++)
         {
             if(PartManager->Base[i].IsGarbage || PartManager->Base[i].Swallowed)
                 continue;
             const int type = PartManager->Base[i].Type;
+            nactivesidm += sidm_local_enabled() && type == 1;
             /* Account gas and BHs to their hydro bin and other particles to their gravity bin*/
             int bin = PartManager->Base[i].TimeBinGravity;
             if(type == 0 || type == 5)
                 bin = PartManager->Base[i].TimeBinHydro;
             TimeBinCountType[(TIMEBINS + 1) * type + bin] ++;
         }
+        act->NumActiveSIDM = nactivesidm;
     }
     else {
         /*We want a lockless algorithm which preserves the ordering of the particle list.*/
@@ -1396,12 +1400,13 @@ build_active_particles(ActiveParticles * act, const DriftKickTimes * const times
         * and ensure no thread gets more than narr particles.*/
         int64_t nactivegrav = 0;
         int64_t nactivehydro = 0;
+        int64_t nactivesidm = 0;
         #pragma omp parallel
         {
             const int tid = omp_get_thread_num();
             size_t nthreadlocal = 0;
             int * activepartthread = gthread.srcs[tid];
-            #pragma omp for schedule(static, gthread.schedsz) reduction(+: nactivegrav) reduction(+: nactivehydro) reduction(+: TimeBinCountType[: 6 * (TIMEBINS+1)])
+            #pragma omp for schedule(static, gthread.schedsz) reduction(+: nactivegrav, nactivehydro, nactivesidm) reduction(+: TimeBinCountType[: 6 * (TIMEBINS+1)])
             for(i = 0; i < PartManager->NumPart; i++)
             {
                 const int bin_hydro = PartManager->Base[i].TimeBinHydro;
@@ -1423,7 +1428,14 @@ build_active_particles(ActiveParticles * act, const DriftKickTimes * const times
                 const int gravity_active = is_timebin_active(bin_gravity, times->Ti_Current);
                 if(gravity_active)
                     nactivegrav++;
-                if((hydro_active || gravity_active)) {
+                int sidm_active = 0;
+#ifdef SIDM
+                sidm_active = sidm_local_enabled() && type == 1 &&
+                    PartManager->Base[i].TiSIDMNext == times->Ti_Current;
+#endif
+                nactivesidm += sidm_active;
+                nactivehydro += hydro_active;
+                if(hydro_active || gravity_active || sidm_active) {
                     /* Store this particle in the ActiveSet for this thread*/
                     activepartthread[nthreadlocal] = i;
                     nthreadlocal++;
@@ -1431,7 +1443,6 @@ build_active_particles(ActiveParticles * act, const DriftKickTimes * const times
                     if(nthreadlocal > gthread.total_size)
                         endrun(2, "Not enough thread storage (%ld) for %ld active particles\n", gthread.total_size, nthreadlocal);
     #endif
-                    nactivehydro++;
                 }
                 /* Account gas and BHs to their hydro bin and other particles to their gravity bin*/
                 int bin = bin_gravity;
@@ -1445,6 +1456,7 @@ build_active_particles(ActiveParticles * act, const DriftKickTimes * const times
         act->NumActiveParticle = gadget_compact_thread_arrays(&act->ActiveParticle, &gthread);
         act->NumActiveGravity = nactivegrav;
         act->NumActiveHydro = nactivehydro;
+        act->NumActiveSIDM = nactivesidm;
         act->Particles = PartManager->Base;
         /* Shrink the ActiveParticle array. We still need extra space for star formation,
          * but we do not need space for the known-inactive particles*/

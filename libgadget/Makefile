@@ -23,9 +23,10 @@ TESTED = hci \
 	cooling_rates \
 	density \
 	gravity \
+	sidm_rate \
 	exchange
 
-MPI_TESTED = exchange fof
+MPI_TESTED = exchange fof sidm_direct sidm_distributed sidm_local sidm_hierarchical
 
 TESTBIN :=$(UTILS_TESTED:%=.objs/utils/test_%) $(UTILS_MPI_TESTED:%=.objs/utils/test_%) $(TESTED:%=.objs/test_%) $(MPI_TESTED:%=.objs/test_%)
 MPISUITE = $(MPI_TESTED:%=test_%) $(UTILS_MPI_TESTED:%=utils/test_%)
@@ -37,12 +38,6 @@ FILES = $(shell git ls-files)
 # define the version
 # (easier to extract from other utils, e.g. python)
 include ../Makefile.version
-
-SIDM_OBJS =
-SIDM_DEFINES := $(OPT) $(CFLAGS) $(CPPFLAGS)
-ifneq (,$(findstring -DSIDM,$(SIDM_DEFINES)))
-SIDM_OBJS += sidm.o
-endif
 
 # Main Rules
 #
@@ -62,7 +57,7 @@ GADGET_OBJS =  \
 	 treewalk.o cosmology.o \
 	 gravshort-tree.o gravshort-pair.o hydra.o  timefac.o \
 	 gravpm.o powerspectrum.o \
-	 forcetree.o $(SIDM_OBJS) \
+	 forcetree.o sidm-direct.o sidm-distributed.o sidm-local.o \
 	 petapm.o gravity.o \
 	 densitykernel.o lightcone.o walltime.o\
 	 runtests.o \
@@ -130,6 +125,23 @@ all: libgadget.a libgadget-utils.a
 .objs/test_forcetree: tests/test_forcetree.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
 	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
 
+.objs/test_sidm_distributed: tests/test_sidm_distributed.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
+	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
+
+.objs/test_sidm_local: tests/test_sidm_local.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
+	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
+
+.objs/test_sidm_hierarchical: tests/test_sidm_hierarchical.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
+	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
+
+.objs/test_sidm_rate: tests/test_sidm_rate.c sidm-rate.h
+	mkdir -p .objs
+	$(CC) -std=c99 -O2 -Wall -Wextra $< -lm -o $@
+
+.objs/test_sidm_direct: tests/test_sidm_direct.c sidm-direct.c sidm-direct.h sidm-rate.h sidm-random.h
+	mkdir -p .objs
+	$(MPICC) -std=c99 -O2 -fopenmp -DSIDMDEBUG -Wall -Wextra tests/test_sidm_direct.c sidm-direct.c -lm -o $@
+
 build-tests: $(TESTBIN)
 
 test : build-tests
@@ -146,6 +158,7 @@ libgadget-utils.a: $(GADGET_UTILS_OBJS)
 	$(AR) r $@ $(GADGET_UTILS_OBJS)
 
 libgadget.a: $(GADGET_OBJS)
+	rm -f $@
 	$(AR) r $@ $(GADGET_OBJS)
 
 clean:

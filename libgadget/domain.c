@@ -9,6 +9,7 @@
 
 #include "domain.h"
 #include "forcetree.h"
+#include "sidm-local.h"
 #include "timestep.h"
 #include "exchange.h"
 #include "slotsmanager.h"
@@ -296,6 +297,8 @@ int domain_maintain(DomainDecomp * ddecomp, struct DriftData * drift)
     gadget_thread_arrays gthread = gadget_setup_thread_arrays("exchangelist", 1, PartManager->NumPart);
 
     ForceTree tree = force_tree_top_build(ddecomp, 1);
+    const int all_dm_sources = sidm_local_enabled() ||
+        (blackhole_dynfric_treemask() & DMMASK);
     /* flag the particles that need to be exported */
 #pragma omp parallel
     {
@@ -313,10 +316,9 @@ int domain_maintain(DomainDecomp * ddecomp, struct DriftData * drift)
             ngarbage++;
             continue;
         }
-        /* If we aren't using DM for the dynamic friction, we don't need to build a tree with inactive DM particles.
-         * Velocity dispersions are computed on a PM step only.
-         * In this case, keep the particles on this processor.*/
-        if(!(blackhole_dynfric_treemask() & DMMASK))
+        /* SIDM and dynamical friction also search inactive DM. Keep those
+         * sources on the owner of their current top leaf. */
+        if(!all_dm_sources)
             if(PartManager->Base[i].Type == 1 && !is_timebin_active(PartManager->Base[i].TimeBinGravity, PartManager->Base[i].Ti_drift))
                 continue;
         if(!inside_topleaf(PartManager->Base[i].TopLeaf, PartManager->Base[i].Pos, &tree)) {

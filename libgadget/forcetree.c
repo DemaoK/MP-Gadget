@@ -197,7 +197,8 @@ ForceTree
 force_tree_build(int mask, DomainDecomp * ddecomp, const ActiveParticles *act, const int DoMoments, const int alloc_father, const char * EmergencyOutputDir)
 {
     ForceTree tree;
-    int64_t maxnodes = ForceTreeParams.TreeAllocFactor * PartManager->NumPart + ddecomp->NTopNodes;
+    /* Top-node construction needs a spare sentinel even on an empty rank. */
+    int64_t maxnodes = ForceTreeParams.TreeAllocFactor * PartManager->NumPart + ddecomp->NTopNodes + 2;
     /* int64_t maxmaxnodes;
      MPI_Reduce(&maxnodes, &maxmaxnodes, 1, MPI_INT64, MPI_MAX,0, MPI_COMM_WORLD);
     message(0, "Treebuild: Largest is %g MByte for %ld tree nodes. firstnode %ld. (presently allocated %g MB)\n",
@@ -224,7 +225,7 @@ force_tree_build(int mask, DomainDecomp * ddecomp, const ActiveParticles *act, c
                 break;
 #endif
             }
-            maxnodes = ForceTreeParams.TreeAllocFactor * PartManager->NumPart + ddecomp->NTopNodes;
+            maxnodes = ForceTreeParams.TreeAllocFactor * PartManager->NumPart + ddecomp->NTopNodes + 2;
             message(1, "TreeAllocFactor from %g to %g now %ld tree nodes\n", ForceTreeParams.TreeAllocFactor, ForceTreeParams.TreeAllocFactor*1.15, maxnodes);
         }
     }
@@ -728,6 +729,14 @@ void
 force_tree_create_nodes(ForceTree * tree, const ActiveParticles * act, int mask, DomainDecomp * ddecomp)
 {
     int nnext = force_tree_create_topnodes(tree, ddecomp);
+
+    /* Empty owners still need the top tree for remote searches and moments,
+     * but cannot reserve insertion caches from a zero particle budget. */
+    if(PartManager->NumPart == 0) {
+        tree->NumParticles = 0;
+        tree->numnodes = nnext - tree->firstnode;
+        return;
+    }
 
     /* Set up thread-local copies of the topnodes to anchor the subtrees. */
     int ThisTask, j, t;
