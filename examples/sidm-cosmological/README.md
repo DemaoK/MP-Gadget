@@ -159,7 +159,3 @@ Current evidence: [full smoke](../../build/sidm-cosmological/maintenance-smoke/v
 [debug direct oracle](../../build/sidm-cosmological/maintenance-tests/direct-debug.json),
 [binary hashes](../../build/sidm-cosmological/binaries.json), and
 [build record](../../build/sidm-cosmological/build-record.json).
-The earlier [first audit](../../audits/claude-round1.md) and
-[second audit](../../audits/claude-round2.md) are historical records of the initial
-integration, which used different compiler settings; their strict-math build
-advice does not describe the current build configuration.

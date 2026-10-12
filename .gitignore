@@ -25,6 +25,7 @@ examples/*/slurm-*.txt
 maintainer/html
 latex/
 build/
+/audits/
 __pycache__/
 genic/MP-GenIC
 gadget/MP-Gadget
