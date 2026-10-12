@@ -146,7 +146,7 @@ metal_return_reduce(const int place, TreeWalkResultMetals * remote, const enum T
 static double chabrier_imf(double mass)
 {
     if(mass <= 1) {
-        return 0.852464 / mass * exp(- pow(log(mass / 0.079)/ 0.69, 2)/2);
+        return 0.852464 / mass * exp(- pow(log10(mass / 0.079)/ 0.69, 2)/2);
     }
     else {
         return 0.237912 * pow(mass, -2.3);
@@ -168,7 +168,7 @@ static double atime_to_myr(Cosmology *CP, double atime1, double atime2, gsl_inte
     gsl_function ff = {atime_integ, CP};
     double tmyr, abserr;
     gsl_integration_qag(&ff, atime1, atime2, 1e-4, 0, GSL_WORKSPACE, GSL_INTEG_GAUSS61, gsl_work, &tmyr, &abserr);
-    return tmyr * CP->UnitTime_in_s / SEC_PER_MEGAYEAR;
+    return tmyr * CP->UnitTime_in_s / (CP->HubbleParam * SEC_PER_MEGAYEAR);
 }
 
 /* Functions for the root finder*/

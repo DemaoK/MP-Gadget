@@ -52,6 +52,7 @@ int fof_save_particles(FOFGroups * fof, char * fname, int SaveParticles, Cosmolo
     struct conversions conv = {0};
     conv.atime = atime;
     conv.hubble = hubble_function(CP, atime);
+    conv.hubbleparam = CP->HubbleParam;
 
     fof_write_header(&bf, fof->TotNgroups, atime, MassTable, CP, Comm);
 

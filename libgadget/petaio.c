@@ -176,6 +176,7 @@ petaio_save_snapshot(const char * fname, struct IOTable * IOTable, int verbose, 
     struct conversions conv = {0};
     conv.atime = atime;
     conv.hubble = hubble_function(CP, atime);
+    conv.hubbleparam = CP->HubbleParam;
 
     petaio_write_header(&bf, atime, NTotal, CP, &Header);
 
@@ -191,7 +192,7 @@ petaio_save_snapshot(const char * fname, struct IOTable * IOTable, int verbose, 
         }
         /* No need to write empty folders for particle types we don't have.
          * But do still write them for stars and BHs as someone might expect them.*/
-        if(ptype_count[ptype] == 0 && ptype < 4)
+        if(NTotal[ptype] == 0 && ptype < 4)
             continue;
         sprintf(blockname, "%d/%s", ptype, IOTable->ent[i].name);
         petaio_build_buffer(&array, &IOTable->ent[i], selection + ptype_offset[ptype], ptype_count[ptype], P, SlotsManager, &conv);
@@ -290,8 +291,10 @@ petaio_read_snapshot(int num, const char * OutputDir, Cosmology * CP, struct hea
     struct conversions conv = {0};
     conv.atime = header->TimeSnapshot;
     conv.hubble = hubble_function(CP, header->TimeSnapshot);
+    conv.hubbleparam = CP->HubbleParam;
 
     struct IOTable IOTable[1] = {0};
+    int missing_mass_from_header[6] = {0};
     /* Always try to read the metal tables.
      * This lets us turn it off for a short period and then re-enable it.
      * Note the metal fields are non-fatal so this does not break resuming without metals.*/
@@ -317,8 +320,8 @@ petaio_read_snapshot(int num, const char * OutputDir, Cosmology * CP, struct hea
                 keep |= (0 == strcmp(IOTable->ent[i].name, "BlackholeMass"));
                 keep |= (0 == strcmp(IOTable->ent[i].name, "MinPotPos"));
             }
-            /* Some IC codes may set the gas particle mass directly, rather than in the header*/
-            if(ptype == 0 && header->MassTable[ptype] <= 0)
+            /* Some IC codes may set the particle mass directly, rather than in the header*/
+            if(header->MassTable[ptype] <= 0)
                 keep |= (0 == strcmp(IOTable->ent[i].name, "Mass"));
             if(!keep) continue;
         }
@@ -329,8 +332,14 @@ petaio_read_snapshot(int num, const char * OutputDir, Cosmology * CP, struct hea
         }
         sprintf(blockname, "%d/%s", ptype, IOTable->ent[i].name);
         petaio_alloc_buffer(&array, &IOTable->ent[i], header->NLocal[ptype]);
-        if(0 == petaio_read_block(&bf, blockname, &array, IOTable->ent[i].required))
+        int required = IOTable->ent[i].required;
+        if(0 == strcmp(IOTable->ent[i].name, "Mass") && header->MassTable[ptype] > 0)
+            required = 0;
+        int read_status = petaio_read_block(&bf, blockname, &array, required);
+        if(0 == read_status)
             petaio_readout_buffer(&array, &IOTable->ent[i], &conv, PartManager, SlotsManager);
+        else if(0 == strcmp(IOTable->ent[i].name, "Mass") && header->MassTable[ptype] > 0)
+            missing_mass_from_header[ptype] = 1;
         petaio_destroy_buffer(&array);
     }
     destroy_io_blocks(IOTable);
@@ -342,6 +351,24 @@ petaio_read_snapshot(int num, const char * OutputDir, Cosmology * CP, struct hea
     /* now we have IDs, set up the ID consistency between slots. */
     slots_setup_id(PartManager, SlotsManager);
     myfree(fname);
+
+    if(!ic) {
+        struct particle_data * parts = PartManager->Base;
+        int ptype;
+        int any_missing_mass = 0;
+        for(ptype = 0; ptype < 6; ptype++)
+            any_missing_mass |= missing_mass_from_header[ptype];
+        if(any_missing_mass) {
+            message(0, "Recovering missing Mass blocks from Header/MassTable.\n");
+            #pragma omp parallel for
+            for(i = 0; i < PartManager->NumPart; i++)
+            {
+                int ptype = parts[i].Type;
+                if(missing_mass_from_header[ptype])
+                    parts[i].Mass = header->MassTable[ptype] * (1. - (double)parts[i].Generation/get_generations());
+            }
+        }
+    }
 
     if(ic) {
         /*
@@ -355,7 +382,8 @@ petaio_read_snapshot(int num, const char * OutputDir, Cosmology * CP, struct hea
         #pragma omp parallel for
         for(i = 0; i < PartManager->NumPart; i++)
         {
-            parts[i].Mass = header->MassTable[parts[i].Type];
+            if(header->MassTable[parts[i].Type] > 0)
+                parts[i].Mass = header->MassTable[parts[i].Type];
         }
 
         if (!IO.UsePeculiarVelocity ) {
@@ -828,7 +856,18 @@ SIMPLE_PROPERTY_PI(DelayTime, DelayTime, float, 1, struct sph_particle_data)
 SIMPLE_PROPERTY_TYPE_PI(StarFormationTime, 4, FormationTime, float, 1, struct star_particle_data)
 SIMPLE_PROPERTY_PI(BirthDensity, BirthDensity, float, 1, struct star_particle_data)
 SIMPLE_PROPERTY_TYPE_PI(Metallicity, 4, Metallicity, float, 1, struct star_particle_data)
-SIMPLE_PROPERTY_TYPE_PI(LastEnrichmentMyr, 4, LastEnrichmentMyr, float, 1, struct star_particle_data)
+/* Save LastEnrichmentMyr in Myr/h; the in-memory value is in physical Myr. */
+static void GT4LastEnrichmentMyr(int i, float * out, void * baseptr, void * smanptr, const struct conversions * params) {
+    int PI = ((struct particle_data *) baseptr)[i].PI;
+    struct star_particle_data * stars = (struct star_particle_data *) ((struct slots_manager_type *) smanptr)->info[4].ptr;
+    out[0] = stars[PI].LastEnrichmentMyr * params->hubbleparam;
+}
+
+static void ST4LastEnrichmentMyr(int i, float * out, void * baseptr, void * smanptr, const struct conversions * params) {
+    int PI = ((struct particle_data *) baseptr)[i].PI;
+    struct star_particle_data * stars = (struct star_particle_data *) ((struct slots_manager_type *) smanptr)->info[4].ptr;
+    stars[PI].LastEnrichmentMyr = out[0] / params->hubbleparam;
+}
 SIMPLE_PROPERTY_TYPE_PI(TotalMassReturned, 4, TotalMassReturned, float, 1, struct star_particle_data)
 SIMPLE_PROPERTY_TYPE_PI(Metallicity, 0, Metallicity, float, 1, struct sph_particle_data)
 SIMPLE_PROPERTY_TYPE_PI(Metals, 4, Metals[0], float, NMETALS, struct star_particle_data)
