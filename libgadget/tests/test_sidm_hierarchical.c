@@ -64,6 +64,57 @@ static void test_collision_activity_and_drift(void **state)
     myfree(P);PartManager->Base=NULL;PartManager->NumPart=PartManager->MaxPart=0;
     sidm_local_configure(0,.2,.1);
 }
+static void test_source_bin_recount_and_ownership(void **state)
+{
+    (void)state;
+    int ntask;MPI_Comm_size(MPI_COMM_WORLD,&ntask);
+    particle_alloc_memory(PartManager,8,4);
+    PartManager->NumPart=rank?0:4;
+    memset(P,0,4*sizeof(*P));
+    sidm_local_configure(1,.2,.1);
+    DriftKickTimes times=init_driftkicktime(2);
+    times.PM_start=0;times.PM_length=TIMEBASE;
+    times.mintimebin=times.mingravtimebin=TIMEBINS;
+    sidm_local_initialize(&times,&cp);
+    /* Every rank holds the same fixture, but only one owns it. This lets the
+     * second native activity scan simulate a domain ownership change. */
+    for(int i=0;i<4;i++) {
+        P[i].ID=i+1;P[i].Type=i==2?0:1;P[i].Mass=1;
+        P[i].TimeBinGravity=TIMEBINS;P[i].TimeBinHydro=1;
+        P[i].Ti_drift=2;P[i].TiSIDMLast=0;
+        P[i].TimeBinSIDM=i<2?3+i:1;
+        P[i].TiSIDMNext=dti_from_timebin(P[i].TimeBinSIDM);
+    }
+    P[3].IsGarbage=1;
+    int64_t empty[TIMEBINS+1]={0};sidm_local_set_bin_counts(empty);
+    ActiveParticles act=init_empty_active_particles(PartManager);
+    build_active_particles(&act,&times,1,get_atime(2),PartManager);
+    assert_int_equal(act.NumActiveGravity,0);
+    assert_int_equal(act.NumActiveSIDM,0);
+    assert_int_equal(act.NumActiveHydro,rank?0:1);
+    free_active_particles(&act);
+    /* Gas and garbage occupy smaller artificial SIDM bins. Neither may
+     * affect the earliest live DM deadline. Empty MPI ranks also contribute. */
+    assert_int_equal(sidm_local_next_event(&times,0),8);
+    PartManager->NumPart=rank==ntask-1?4:0;
+    /* Repartitioning preserves global occupancy before local recount. */
+    assert_int_equal(sidm_local_next_event(&times,0),8);
+    act=init_empty_active_particles(PartManager);
+    build_active_particles(&act,&times,2,get_atime(2),PartManager);
+    free_active_particles(&act);
+    assert_int_equal(sidm_local_next_event(&times,0),8);
+    /* The next activity scan replaces stale owner-local counts. */
+    for(int i=0;i<2;i++) {
+        P[i].TimeBinSIDM++;
+        P[i].TiSIDMNext=dti_from_timebin(P[i].TimeBinSIDM);
+    }
+    act=init_empty_active_particles(PartManager);
+    build_active_particles(&act,&times,3,get_atime(2),PartManager);
+    free_active_particles(&act);
+    assert_int_equal(sidm_local_next_event(&times,0),16);
+    myfree(P);PartManager->Base=NULL;PartManager->NumPart=PartManager->MaxPart=0;
+    sidm_local_configure(0,.2,.1);
+}
 static void test_sparse_top_bin(void **state)
 {
     (void)state;
@@ -75,6 +126,7 @@ static void test_sparse_top_bin(void **state)
     memset(P,0,2*sizeof(*P));
     for(int i=0;i<PartManager->NumPart;i++) {
         P[i].ID=i+1;P[i].Type=1;P[i].Mass=1;
+        P[i].Hsml=1e-20;P[i].Vel[0]=i?1e20:-1e20;
     }
     struct gravshort_tree_params gravity={0};
     gravity.FractionalGravitySoftening=.1;
@@ -90,6 +142,9 @@ static void test_sparse_top_bin(void **state)
     assert_int_equal(param_parse(ps,""),0);set_timestep_params(ps);
     parameter_set_free(ps);
     DriftKickTimes times=init_driftkicktime(0);times.PM_length=TIMEBASE;
+    /* SIDM Courant clocks must leave native gravity criteria unchanged,
+     * including particles with tiny support and large canonical velocity. */
+    sidm_local_configure(1,.2,.1);sidm_local_initialize(&times,&cp);
     ActiveParticles act=init_empty_active_particles(PartManager);
     act.NumActiveGravity=PartManager->NumPart;
     PetaPM pm={0};pm.Asmth=1;pm.Nmesh=1;
@@ -101,9 +156,10 @@ static void test_sparse_top_bin(void **state)
     assert_int_equal(times.maxtimebin,TIMEBINS);
     for(int i=0;i<PartManager->NumPart;i++) {
         assert_int_equal(P[i].TimeBinGravity,TIMEBINS);
-        near(P[i].Vel[0],0);
+        near(P[i].Vel[0],i?1e20:-1e20);
     }
     myfree(P);PartManager->Base=NULL;PartManager->NumPart=PartManager->MaxPart=0;
+    sidm_local_configure(0,.2,.1);
 }
 static int setup(void **state)
 {
@@ -120,6 +176,7 @@ int main(void)
 {
     omp_set_dynamic(0);omp_set_num_threads(2);
     const struct CMUnitTest tests[]={cmocka_unit_test(test_collision_activity_and_drift),
+        cmocka_unit_test(test_source_bin_recount_and_ownership),
         cmocka_unit_test(test_sparse_top_bin)};
     return cmocka_run_group_tests_mpi(tests,setup,NULL);
 }

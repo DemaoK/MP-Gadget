@@ -48,6 +48,10 @@ void set_sidm_distributed_params(ParameterSet *ps)
 #define SUPPORT_REUSE_FACTOR 1.25
 #define SUPPORT_LEAF_FACTOR .75
 #define SUPPORT_MAX_ITERATIONS 64
+/* Only this many native sources retain neighbors at once. */
+#ifndef SIDM_SOURCE_BATCH_SIZE
+#define SIDM_SOURCE_BATCH_SIZE 65536
+#endif
 
 struct support_result { TreeWalkResultBase base; int n; struct sidm_direct_neighbor heap[]; };
 struct support_work { double radius; int done, n; };
@@ -55,14 +59,19 @@ struct dist_query { TreeWalkQueryBase base; double h; uint64_t id; };
 struct dist_work {
     struct support_work *support;
     struct sidm_direct_neighbor *heaps;
-    int *source_index, rank, neighbors;
+    int *source_index, source_start, rank, neighbors;
 };
 static int farther(struct sidm_direct_neighbor a, struct sidm_direct_neighbor b)
 { return a.r2 > b.r2 || (a.r2 == b.r2 && a.id > b.id); }
 
+static int support_slot(const struct dist_work *work, int i)
+{
+    return (work->source_index ? work->source_index[i] : i) - work->source_start;
+}
+
 static struct sidm_direct_neighbor *support_heap(struct dist_work *work, int i)
 {
-    const int slot = work->source_index[i];
+    const int slot = support_slot(work,i);
     return work->heaps + (size_t)slot*work->neighbors;
 }
 
@@ -91,18 +100,18 @@ static void retain(int *n, struct sidm_direct_neighbor *heap, struct sidm_direct
 static int support_haswork(int i, TreeWalk *tw)
 {
     struct dist_work *work = tw->priv;
-    return P[i].Type == 1 && !P[i].IsGarbage && !P[i].Swallowed && !work->support[i].done;
+    return P[i].Type == 1 && !P[i].IsGarbage && !P[i].Swallowed && !work->support[support_slot(work,i)].done;
 }
 static void support_fill(int i, TreeWalkQueryBase *query, TreeWalk *tw)
 {
     struct dist_work *work = tw->priv;
     struct dist_query *q = (struct dist_query *)query;
-    q->id = P[i].ID; q->h = work->support[i].radius;
+    q->id = P[i].ID; q->h = work->support[support_slot(work,i)].radius;
 }
 static void support_reduce(int i, TreeWalkResultBase *result, enum TreeWalkReduceMode mode, TreeWalk *tw)
 {
     struct dist_work *work = tw->priv;
-    struct support_work *out = &work->support[i];
+    struct support_work *out = &work->support[support_slot(work,i)];
     struct sidm_direct_neighbor *heap = support_heap(work,i);
     struct support_result *incoming = (struct support_result *)result;
     if(mode == TREEWALK_PRIMARY) {
@@ -169,12 +178,12 @@ static void audit_population(const ForceTree *tree)
 }
 
 #ifdef SIDMDEBUG
-static void report_support_timers(const double walk_seconds[6])
+static void report_support_timers(const double walk_seconds[6],double support_seconds)
 {
     /* Exclusive TreeWalk stages. TopExport and Results include communication;
      * Secondary includes arrival waits, so these are not network-only timers. */
     const char *walk_labels[]={"TopExport","Primary","Secondary","Wait","Results","Setup"};
-    double support_other=walltime_measure(".");
+    double support_other=support_seconds;
     for(int k=0;k<6;k++) {
         char label[80];snprintf(label,sizeof(label),"/SPH/SIDM_Support/%s",walk_labels[k]);
         walltime_add_internal(label,walk_seconds[k]); support_other-=walk_seconds[k];
@@ -183,11 +192,10 @@ static void report_support_timers(const double walk_seconds[6])
 }
 
 static void report_scatter(const struct sidm_direct_stats *stats,int nactive,
-    double limit,double hmin,double hmax,int iterations)
+    double limit,double hmin,double hmax,int iterations,int batches,double elapsed)
 {
     /* Exclusive leaves: recording the whole stage beside its children would
      * count the stage twice in the SPH/root totals. Release keeps one timer. */
-    const double elapsed=walltime_measure(".");
     walltime_add("/SPH/SIDM_ExchangeScatter/Other",elapsed-stats->prepare_seconds-stats->route_seconds-
         stats->pack_seconds-stats->mpi_seconds-stats->pair_seconds-stats->audit_seconds);
     walltime_add("/SPH/SIDM_ExchangeScatter/Prepare",stats->prepare_seconds);
@@ -202,8 +210,8 @@ static void report_scatter(const struct sidm_direct_stats *stats,int nactive,
     MPI_Allreduce(MPI_IN_PLACE,&nsources,1,MPI_INT64_T,MPI_SUM,MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE,&hmin,1,MPI_DOUBLE,MPI_MIN,MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE,&hmax,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
-    message(0,"SIDMDirectIntervals: N=%ld sources=%ld min_source_limit=%.17g h=[%.17g,%.17g] support_iterations=%d directed_pairs=%llu trials=%llu events=%llu subdivided_pairs=%llu source_packets=%llu bytes=%llu journaled=%llu threaded_pairs=%llu recomputed_pairs=%llu maxP=%.17g maxTrialP=%.17g sumP=%.17g deltaK=%.17Lg deltaP=%.17Lg\n",
-        (long)Population.count,(long)nsources,limit,nsources?hmin:0,hmax,iterations,
+    message(0,"SIDMDirectIntervals: N=%ld sources=%ld min_source_limit=%.17g h=[%.17g,%.17g] support_iterations=%d source_batches=%d directed_pairs=%llu trials=%llu events=%llu subdivided_pairs=%llu source_packets=%llu bytes=%llu journaled_batch_entries=%llu threaded_pairs=%llu recomputed_pairs=%llu maxP=%.17g maxTrialP=%.17g sumP=%.17g deltaK=%.17Lg deltaP=%.17Lg\n",
+        (long)Population.count,(long)nsources,limit,nsources?hmin:0,hmax,iterations,batches,
         (unsigned long long)stats->pairs,(unsigned long long)stats->trials,(unsigned long long)stats->events,
         (unsigned long long)stats->subdivided_pairs,(unsigned long long)stats->source_packets,(unsigned long long)stats->bytes,
         (unsigned long long)stats->journaled_particles,(unsigned long long)stats->threaded_pairs,
@@ -214,14 +222,28 @@ static void report_scatter(const struct sidm_direct_stats *stats,int nactive,
 
 void sidm_distributed_force_intervals(const ActiveParticles *act,Cosmology *CP,
     struct UnitSystem units,DriftKickTimes *times,const ForceTree *tree,
-    const double *intervals,double *limits,uint64_t seed)
+    const double *intervals,double *limits,double *motion_limits,uint64_t seed)
 {
     const int npart=PartManager->NumPart, nactive=act->NumActiveParticle;
+    const int batch_size=SIDM_SOURCE_BATCH_SIZE;
+    if(batch_size<1) endrun(1,"Invalid SIDM source batch size.\n");
+    const int capacity=nactive<batch_size?nactive:batch_size;
+    int maxactive=nactive;
+    MPI_Allreduce(MPI_IN_PLACE,&maxactive,1,MPI_INT,MPI_MAX,MPI_COMM_WORLD);
+    /* Empty ranks must enter every support walk and collision exchange. */
+    const int nbatches=maxactive ? maxactive/batch_size+(maxactive%batch_size!=0) : 1;
     struct dist_work work={0};MPI_Comm_rank(MPI_COMM_WORLD,&work.rank);
     work.neighbors=DistParams.neighbors;
-    work.support=mymalloc("SIDM support",((size_t)npart+1)*sizeof(*work.support));
-    work.source_index=mymalloc("SIDM source index",((size_t)npart+1)*sizeof(*work.source_index));
-    work.heaps=mymalloc("SIDM neighbor heaps",((size_t)nactive+1)*work.neighbors*sizeof(*work.heaps));
+    work.support=mymalloc("SIDM support",((size_t)capacity+1)*sizeof(*work.support));
+    /* The callbacks receive native particle indices. Contiguous PM lists
+     * need no mapping; explicit lists map to their source-list positions. */
+    if(act->ActiveParticle)
+        work.source_index=mymalloc("SIDM source index",((size_t)npart+1)*sizeof(*work.source_index));
+    work.heaps=mymalloc("SIDM neighbor heaps",((size_t)capacity+1)*work.neighbors*sizeof(*work.heaps));
+    int *implicit_sources=NULL;
+    if(!act->ActiveParticle)
+        implicit_sources=mymalloc("SIDM implicit sources",((size_t)capacity+1)*sizeof(*implicit_sources));
+    struct sidm_direct_source *sources=mymalloc("SIDM direct sources",((size_t)capacity+1)*sizeof(*sources));
     struct sidm_journal journal={0};
     int audit=Population.mass<=0;
 #ifdef SIDMDEBUG
@@ -230,10 +252,19 @@ void sidm_distributed_force_intervals(const ActiveParticles *act,Cosmology *CP,
     journal.entries=mymalloc("SIDM journal",((size_t)npart+1)*sizeof(*journal.entries));
     journal.marked=mymalloc("SIDM journal marks",((size_t)npart+1)*sizeof(*journal.marked));
     memset(journal.marked,0,(size_t)npart);
-    for(int i=0;i<npart;i++) work.source_index[i]=-1;
+    if(work.source_index) for(int i=0;i<npart;i++) work.source_index[i]=-1;
 #endif
     if(audit) audit_population(tree);
     journal.validated_mass=Population.mass;
+    for(int a=0;a<nactive;a++) {
+        const int i=act->ActiveParticle?act->ActiveParticle[a]:a;
+#ifdef SIDMDEBUG
+        if(i<0 || i>=npart || (work.source_index && work.source_index[i]>=0) ||
+           P[i].Ti_drift!=times->Ti_Current || P[i].Type!=1 || P[i].IsGarbage || P[i].Swallowed)
+            endrun(1,"Invalid SIDM source list or drift epoch.\n");
+#endif
+        if(work.source_index) work.source_index[i]=a;
+    }
     const double mass=Population.mass;
     const double sigma0=DistParams.sigma0*CP->HubbleParam*units.UnitMass_in_g/(units.UnitLength_in_cm*units.UnitLength_in_cm);
     /* Stored velocities are a times peculiar velocity. The dt/a^4 source
@@ -243,107 +274,138 @@ void sidm_distributed_force_intervals(const ActiveParticles *act,Cosmology *CP,
     const double w=DistParams.w*1e5/units.UnitVelocity_in_cm_per_s*atime;
     const double maxradius=nextafter(.5*PartManager->BoxSize,0);
     const double guess=PartManager->BoxSize*cbrt((double)work.neighbors/Population.count);
-    for(int a=0;a<nactive;a++) {
-        const int i=act->ActiveParticle?act->ActiveParticle[a]:a;
+    const uint64_t event_seed=sidm_event_seed(seed,(uint64_t)times->Ti_Current);
+    const struct sidm_direct_particles native={P,sizeof(*P),offsetof(struct particle_data,ID),offsetof(struct particle_data,Vel)};
 #ifdef SIDMDEBUG
-        if(i<0 || i>=npart || work.source_index[i]>=0 || P[i].Ti_drift!=times->Ti_Current)
-            endrun(1,"Invalid SIDM source list or drift epoch.\n");
+    double walk_seconds[6]={0},support_seconds=0,scatter_seconds=0;
+    double hmin=DBL_MAX,hmax=0,limit=DBL_MAX;
+    int iterations=0;
+    struct sidm_direct_stats total_stats={0};
 #endif
-        work.source_index[i]=a;
-        memset(&work.support[i],0,sizeof(work.support[i]));
-        const int cached=isfinite(P[i].Hsml) && P[i].Hsml>0;
-        double h=cached?SUPPORT_REUSE_FACTOR*P[i].Hsml:guess;
-        if(!cached && tree->Father) {
-            const int no=tree->Father[i];
-            if(no>=tree->firstnode && no<tree->firstnode+tree->numnodes) {
-                const struct NODE *node=&tree->Nodes[no];
-                if(node->f.ChildType==PARTICLE_NODE_TYPE && node->s.noccupied>0) {
-                    const double local=SUPPORT_LEAF_FACTOR*node->len*cbrt((double)work.neighbors/node->s.noccupied);
-                    if(isfinite(local) && local>0) h=local;
+    for(int batch=0;batch<nbatches;batch++) {
+        const int offset=batch*batch_size;
+        work.source_start=offset<nactive?offset:nactive;
+        const int remaining=nactive-work.source_start;
+        const int count=remaining<batch_size?remaining:batch_size;
+        int *batch_sources=act->ActiveParticle?act->ActiveParticle+work.source_start:implicit_sources;
+#pragma omp parallel for
+        for(int a=0;a<count;a++) {
+            const int i=act->ActiveParticle?batch_sources[a]:work.source_start+a;
+            if(implicit_sources) implicit_sources[a]=i;
+            memset(&work.support[a],0,sizeof(work.support[a]));
+            const int cached=isfinite(P[i].Hsml) && P[i].Hsml>0;
+            double h=cached?SUPPORT_REUSE_FACTOR*P[i].Hsml:guess;
+            if(!cached && tree->Father) {
+                const int no=tree->Father[i];
+                if(no>=tree->firstnode && no<tree->firstnode+tree->numnodes) {
+                    const struct NODE *node=&tree->Nodes[no];
+                    if(node->f.ChildType==PARTICLE_NODE_TYPE && node->s.noccupied>0) {
+                        const double local=SUPPORT_LEAF_FACTOR*node->len*cbrt((double)work.neighbors/node->s.noccupied);
+                        if(isfinite(local) && local>0) h=local;
+                    }
                 }
             }
+            work.support[a].radius=fmin(h,maxradius);
         }
-        work.support[i].radius=fmin(h,maxradius);
-    }
-    int iterations=0;
+        int batch_iterations=0;
+        for(;;) {
+            TreeWalk tw=make_walk(tree,&work);
+            treewalk_run(&tw,batch_sources,count);
 #ifdef SIDMDEBUG
-    double walk_seconds[6]={0};
+            walk_seconds[0]+=tw.timecomp0; walk_seconds[1]+=tw.timecomp1;
+            walk_seconds[2]+=tw.timecomp2; walk_seconds[3]+=tw.timewait1;
+            walk_seconds[4]+=tw.timecommsumm; walk_seconds[5]+=tw.timecomp3;
 #endif
-    for(;;) {
-        TreeWalk tw=make_walk(tree,&work);
-        treewalk_run(&tw,act->ActiveParticle,nactive);
-#ifdef SIDMDEBUG
-        walk_seconds[0]+=tw.timecomp0; walk_seconds[1]+=tw.timecomp1;
-        walk_seconds[2]+=tw.timecomp2; walk_seconds[3]+=tw.timewait1;
-        walk_seconds[4]+=tw.timecommsumm; walk_seconds[5]+=tw.timecomp3;
-#endif
-        int64_t left=0;
-        for(int a=0;a<nactive;a++) {
-            const int i=act->ActiveParticle?act->ActiveParticle[a]:a;
-            struct support_work *s=&work.support[i];
-            if(s->done) continue;
-            if(s->n==work.neighbors) {
-                s->radius=nextafter(sqrt(support_heap(&work,i)[0].r2),INFINITY);s->done=1;
-            } else {
-                if(s->radius>=maxradius) endrun(1,"SIDM cannot find enough neighbors within allowed support.\n");
-                s->radius=fmin(2*s->radius,maxradius);left++;
+            int64_t left=0;
+#pragma omp parallel for reduction(+:left)
+            for(int a=0;a<count;a++) {
+                struct support_work *s=&work.support[a];
+                if(s->done) continue;
+                if(s->n==work.neighbors) {
+                    s->radius=nextafter(sqrt(support_heap(&work,batch_sources[a])[0].r2),INFINITY);s->done=1;
+                } else {
+                    if(s->radius>=maxradius) endrun(1,"SIDM cannot find enough neighbors within allowed support.\n");
+                    s->radius=fmin(2*s->radius,maxradius);left++;
+                }
             }
+            MPI_Allreduce(MPI_IN_PLACE,&left,1,MPI_INT64_T,MPI_SUM,MPI_COMM_WORLD);
+            batch_iterations++;
+            if(!left) break;
+            if(batch_iterations>=SUPPORT_MAX_ITERATIONS) endrun(1,"SIDM support search did not converge.\n");
         }
-        MPI_Allreduce(MPI_IN_PLACE,&left,1,MPI_INT64_T,MPI_SUM,MPI_COMM_WORLD);
-        iterations++;
-        if(!left) break;
-        if(iterations>=SUPPORT_MAX_ITERATIONS) endrun(1,"SIDM support search did not converge.\n");
-    }
-    struct sidm_direct_source *sources=mymalloc("SIDM direct sources",((size_t)nactive+1)*sizeof(*sources));
 #ifdef SIDMDEBUG
-    double hmin=DBL_MAX,hmax=0;
-#endif
-    for(int a=0;a<nactive;a++) {
-        const int i=act->ActiveParticle?act->ActiveParticle[a]:a;
-        const double h=work.support[i].radius;
-        if(!isfinite(h) || h<=DBL_MIN || h>=.5*PartManager->BoxSize)
-            endrun(1,"Degenerate or oversized SIDM support.\n");
-        P[i].Hsml=h;
-#ifdef SIDMDEBUG
-        hmin=fmin(hmin,h);hmax=fmax(hmax,h);
-#endif
-        sources[a]=(struct sidm_direct_source){.index=i,.n=work.neighbors,.neighbors=support_heap(&work,i),
-            .h=h,.exposure=intervals[i],.seed=sidm_event_seed(seed,(uint64_t)times->Ti_Current)};
-    }
-#ifdef SIDMDEBUG
-    report_support_timers(walk_seconds);
+#pragma omp parallel for reduction(min:hmin) reduction(max:hmax)
 #else
-    walltime_measure("/SPH/SIDM_Support");
+#pragma omp parallel for
 #endif
-    struct sidm_direct_stats stats;char error[256];
-    const struct sidm_direct_particles native={P,sizeof(*P),offsetof(struct particle_data,ID),offsetof(struct particle_data,Vel)};
-    if(sidm_direct_scatter(native,npart,sources,nactive,sigma0,w,DistParams.velocity_dependent,
-        DistParams.probability,MPI_COMM_WORLD,&journal,&stats,error)) endrun(1,"SIDM: %s\n",error);
+        for(int a=0;a<count;a++) {
+            const int i=batch_sources[a];
+            const double h=work.support[a].radius;
+            if(!isfinite(h) || h<=DBL_MIN || h>=.5*PartManager->BoxSize)
+                endrun(1,"Degenerate or oversized SIDM support.\n");
+            P[i].Hsml=h;
 #ifdef SIDMDEBUG
-    double limit=DBL_MAX;
+            hmin=fmin(hmin,h);hmax=fmax(hmax,h);
 #endif
-    for(int a=0;a<nactive;a++) {
-        const int i=act->ActiveParticle?act->ActiveParticle[a]:a;
-        const double rate=.5*mass*sidm_rate_cubic_kernel(0,sources[a].h)*sources[a].max_sigma_v;
-        limits[i]=rate>0?DistParams.probability/rate:DBL_MAX;
-        if(!isfinite(rate) || rate<0 || !isfinite(limits[i]) || limits[i]<=0)
-            endrun(1,"Invalid SIDM measured source rate.\n");
+            sources[a]=(struct sidm_direct_source){.index=i,.n=work.neighbors,.neighbors=support_heap(&work,i),
+                .h=h,.exposure=intervals[i],.seed=event_seed};
+        }
 #ifdef SIDMDEBUG
-        limit=fmin(limit,limits[i]);
+        support_seconds+=walltime_measure(".");
+        iterations+=batch_iterations;
+#else
+        walltime_measure("/SPH/SIDM_Support");
+#endif
+        struct sidm_direct_stats stats;char error[256];
+        /* Scatter consumes the heap geometry only after all retryable walks
+         * finish. The same scratch is rebuilt for the next native batch. */
+        if(sidm_direct_scatter(native,npart,sources,count,sigma0,w,DistParams.velocity_dependent,
+            DistParams.probability,MPI_COMM_WORLD,&journal,&stats,error)) endrun(1,"SIDM: %s\n",error);
+#ifdef SIDMDEBUG
+#pragma omp parallel for reduction(min:limit)
+#else
+#pragma omp parallel for
+#endif
+        for(int a=0;a<count;a++) {
+            const int i=batch_sources[a];
+            const double rate=.5*mass*sidm_rate_cubic_kernel(0,sources[a].h)*sources[a].max_sigma_v;
+            limits[i]=rate>0?DistParams.probability/rate:DBL_MAX;
+            motion_limits[i]=sources[a].max_relative_speed>0?sources[a].h/sources[a].max_relative_speed:DBL_MAX;
+            if(!isfinite(rate) || rate<0 || !isfinite(limits[i]) || limits[i]<=0 ||
+               !isfinite(motion_limits[i]) || motion_limits[i]<=0)
+                endrun(1,"Invalid SIDM measured source rate or motion interval.\n");
+#ifdef SIDMDEBUG
+            limit=fmin(limit,limits[i]);
+#endif
+        }
+#ifdef SIDMDEBUG
+        scatter_seconds+=walltime_measure(".");
+        /* Each batch audits its own endpoint journal. The entry count is
+         * summed across batches and may count one particle more than once. */
+#define ADD_STAT(field) total_stats.field+=stats.field
+        ADD_STAT(pairs);ADD_STAT(trials);ADD_STAT(events);ADD_STAT(subdivided_pairs);
+        ADD_STAT(source_packets);ADD_STAT(bytes);ADD_STAT(journaled_particles);
+        ADD_STAT(threaded_pairs);ADD_STAT(recomputed_pairs);ADD_STAT(sum_probability);
+        ADD_STAT(prepare_seconds);ADD_STAT(route_seconds);ADD_STAT(pack_seconds);
+        ADD_STAT(mpi_seconds);ADD_STAT(pair_seconds);ADD_STAT(audit_seconds);ADD_STAT(predict_seconds);
+        ADD_STAT(delta_k);ADD_STAT(delta_p);
+#undef ADD_STAT
+        total_stats.max_probability=fmax(total_stats.max_probability,stats.max_probability);
+        total_stats.max_trial_probability=fmax(total_stats.max_trial_probability,stats.max_trial_probability);
+#else
+        walltime_measure("/SPH/SIDM_ExchangeScatter");
 #endif
     }
 #ifdef SIDMDEBUG
-    report_scatter(&stats,nactive,limit,hmin,hmax,iterations);
-#else
-    walltime_measure("/SPH/SIDM_ExchangeScatter");
-#endif
-    myfree(sources);
-#ifdef SIDMDEBUG
+    report_support_timers(walk_seconds,support_seconds);
+    report_scatter(&total_stats,nactive,limit,hmin,hmax,iterations,nbatches,scatter_seconds);
     myfree(journal.marked);
     myfree(journal.entries);
 #endif
+    myfree(sources);
+    if(implicit_sources) myfree(implicit_sources);
     myfree(work.heaps);
-    myfree(work.source_index);
+    if(work.source_index) myfree(work.source_index);
     myfree(work.support);
     walltime_measure("/SPH/SIDM_Finalize");
 }

@@ -6,6 +6,7 @@
 #include <assert.h>
 #include <float.h>
 #include <math.h>
+#include <omp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,7 @@
 #define N SIDM_DIRECT_TEST_N
 #define K 7
 static int rank,tasks,owners;
+static double exposure_scale=1;
 static int owner(int id) { return id%owners; }
 static int index_of(int id) { return id/owners; }
 static int source(int id) { return id%5!=0; }
@@ -35,7 +37,7 @@ static uint64_t mix(uint64_t x)
 static double draw(uint64_t *x) { *x=mix(*x); return (*x>>11)*0x1.0p-53; }
 static int is_target(int i,int j) { int d=(j-i+N)%N; return d>0&&d<=K; }
 static double separation(int i,int j) { return .02*((j-i+N)%N); }
-static double exposure(int id,int zero) { return zero?0:1.2*(1+id%3); }
+static double exposure(int id,int zero) { return zero?0:exposure_scale*1.2*(1+id%3); }
 static void initial(int id,double v[3],int boost)
 {
     const double shift[]={1024,-512,256};
@@ -156,8 +158,8 @@ static void check(double pmax,int vd,int boost,int zero,int negative)
         double original[3]; initial(p[entries[k].index].id-1,original,boost);
         assert(!memcmp(entries[k].before,original,sizeof(original)));
     }
-    if(!zero) assert(actual.events>0);
-    if(!zero&&!vd&&pmax<1) assert(actual.subdivided_pairs>0&&actual.max_probability>1);
+    if(!zero && exposure_scale==1) assert(actual.events>0);
+    if(!zero&&!vd&&pmax<1&&exposure_scale==1) assert(actual.subdivided_pairs>0&&actual.max_probability>1);
     if(tasks==1) assert(actual.source_packets==0&&actual.bytes==0);
     else assert(actual.source_packets<actual.pairs);
 #endif
@@ -176,10 +178,14 @@ static void check(double pmax,int vd,int boost,int zero,int negative)
      * and source rates after shared endpoints and subdivided exposures. */
     uint64_t fingerprint=0;
     for(int i=0;i<n;i++) fingerprint=hash(fingerprint,p[i].v,sizeof(p[i].v));
-    for(int a=0;a<ns;a++) fingerprint=hash(fingerprint,&s[a].max_sigma_v,sizeof(double));
+    for(int a=0;a<ns;a++) {
+        fingerprint=hash(fingerprint,&s[a].max_sigma_v,sizeof(double));
+        fingerprint=hash(fingerprint,&s[a].max_relative_speed,sizeof(double));
+    }
     uint64_t hashes[8];MPI_Gather(&fingerprint,1,MPI_UINT64_T,hashes,1,MPI_UINT64_T,0,MPI_COMM_WORLD);
     if(!rank) {
         printf("STATE owners=%d p=%g vd=%d boost=%d zero=%d",owners,pmax,vd,boost,zero);
+        if(exposure_scale!=1) printf(" exposure_scale=%g",exposure_scale);
         for(int r=0;r<tasks;r++) printf(" %016llx",(unsigned long long)hashes[r]);
         puts("");
     }
@@ -188,6 +194,70 @@ static void check(double pmax,int vd,int boost,int zero,int negative)
     assert(actual.pairs==0&&actual.events==0&&journal.count==0);
     if(!rank)printf("PASS direct ranks=%d owners=%d p=%g vd=%d boost=%d zero=%d events=%llu subdivisions=%llu\n",
         tasks,owners,pmax,vd,boost,zero,(unsigned long long)expected.events,(unsigned long long)expected.subdivided_pairs);
+}
+/* Many independent endpoint sets plus short dependency chains exercise the
+ * concurrent executor, including nonzero exposure and subdivision. Each rank
+ * sends its groups to the next rank, so both local and wire execution are used. */
+static void check_waves(void)
+{
+    enum { GROUPS=128, WIDTH=4, LOCAL=GROUPS*(WIDTH+1) };
+    struct particle { uint64_t id; double v[3]; } p[LOCAL];
+    struct sidm_direct_source s[GROUPS];
+    struct sidm_direct_neighbor neighbors[GROUPS][WIDTH];
+    struct sidm_journal_entry entries[LOCAL];unsigned char marked[LOCAL]={0};
+    struct sidm_journal journal={.entries=entries,.marked=marked,.capacity=LOCAL,.validated_mass=1};
+    double reference[LOCAL][3],reference_sv[GROUPS],reference_u[GROUPS];
+    const int threads=omp_get_max_threads();
+    uint64_t fingerprint=0;
+    for(int run=0;run<4;run++) {
+        const int threaded=run%2,zero=run>=2;
+        omp_set_num_threads(threaded?(threads>1?threads:4):1);
+        for(int i=0;i<LOCAL;i++) {
+            p[i].id=(uint64_t)rank*LOCAL+i+1;
+            initial(i,p[i].v,0);
+        }
+        for(int b=0;b<GROUPS;b++) {
+            s[b]=(struct sidm_direct_source){.index=b,.n=WIDTH,.neighbors=neighbors[b],.h=1,.exposure=zero?0:2,.seed=13};
+            for(int k=0;k<WIDTH;k++) {
+                /* Four successive groups share receivers; their dependencies
+                 * must be respected while separate families run concurrently. */
+                int target=GROUPS+(b/4)*WIDTH+k;
+                const int destination=(rank+1)%tasks;
+                neighbors[b][k]=(struct sidm_direct_neighbor){.r2=.01,.id=(uint64_t)destination*LOCAL+target+1,.owner=destination,.index=target};
+            }
+        }
+        struct sidm_direct_stats stats;char error[256];
+        const struct sidm_direct_particles view={p,sizeof(*p),offsetof(struct particle,id),offsetof(struct particle,v)};
+        assert(!sidm_direct_scatter(view,LOCAL,s,GROUPS,.3,2,0,.1,MPI_COMM_WORLD,&journal,&stats,error));
+        for(int i=0;i<LOCAL;i++) {
+            if(!threaded) memcpy(reference[i],p[i].v,sizeof(reference[i]));
+            else assert(!memcmp(reference[i],p[i].v,sizeof(reference[i])));
+        }
+        for(int b=0;b<GROUPS;b++) {
+            assert(s[b].max_relative_speed>0);
+            if(!threaded) {reference_sv[b]=s[b].max_sigma_v;reference_u[b]=s[b].max_relative_speed;}
+            else {assert(s[b].max_sigma_v==reference_sv[b]);assert(s[b].max_relative_speed==reference_u[b]);}
+        }
+#ifdef SIDMDEBUG
+        if(!zero) assert(stats.events>0 && stats.subdivided_pairs>0);
+        else assert(stats.events==0 && journal.count==0);
+        if(threaded) assert(stats.threaded_pairs==stats.pairs);
+#endif
+        if(threaded) {
+            for(int i=0;i<LOCAL;i++) fingerprint=hash(fingerprint,p[i].v,sizeof(p[i].v));
+            for(int b=0;b<GROUPS;b++) {
+                fingerprint=hash(fingerprint,&s[b].max_sigma_v,sizeof(double));
+                fingerprint=hash(fingerprint,&s[b].max_relative_speed,sizeof(double));
+            }
+        }
+    }
+    omp_set_num_threads(threads);
+    uint64_t hashes[8];MPI_Gather(&fingerprint,1,MPI_UINT64_T,hashes,1,MPI_UINT64_T,0,MPI_COMM_WORLD);
+    if(!rank) {
+        printf("STATE waves");
+        for(int r=0;r<tasks;r++) printf(" %016llx",(unsigned long long)hashes[r]);
+        puts("\nPASS direct concurrent waves");
+    }
 }
 int main(int argc,char **argv)
 {
@@ -205,11 +275,20 @@ int main(int argc,char **argv)
         }
         check(1,0,0,0,0); /* Allowed probability endpoint. */
         check(.5,0,0,1,0);
+        /* Weak exposures exercise rejecting groups before the first event,
+         * and fresh recomputation after another source changes an endpoint. */
+        const double weak[]={.0001,.01};
+        for(unsigned i=0;i<sizeof(weak)/sizeof(*weak);i++) {
+            exposure_scale=weak[i];
+            for(int vd=0;vd<2;vd++) check(.5,vd,0,0,0);
+        }
+        exposure_scale=1;
 #ifdef SIDMDEBUG
         for(int bad=1;bad<=3;bad++) check(.5,0,0,0,bad);
 #endif
         check(.5,0,0,0,4);
     }
+    check_waves();
     if(!rank) puts("PASS direct SIDM");
     MPI_Finalize();return 0;
 }

@@ -8,9 +8,9 @@
 void sidm_local_configure(int enabled, double transport_fraction, double max_dloga);
 int sidm_local_enabled(void);
 void sidm_local_initialize(const DriftKickTimes *times, Cosmology *CP);
-inttime_t sidm_local_next_event(const DriftKickTimes *times, Cosmology *CP, int first);
-/* Collective: call after opening kicks, before selecting the next event. */
-void sidm_local_update_speed_bound(void);
+inttime_t sidm_local_next_event(const DriftKickTimes *times, int first);
+/* Recounted by native activity construction after ownership changes. */
+void sidm_local_set_bin_counts(const int64_t counts[TIMEBINS+1]);
 void sidm_local_assert_flushed(const DriftKickTimes *times);
 void sidm_local_kick_phase(DriftKickTimes *times, int opening);
 
@@ -18,6 +18,8 @@ struct sidm_local_visit {
     ActiveParticles sources;
     /* Collision exposures and forward bounds are integrals dt/a^4. */
     double *intervals, *limits;
+    /* Support / sampled maximum canonical relative speed (drift integral). */
+    double *motion_limits;
 #ifdef SIDMDEBUG
     double *old_support; /* Comoving support at the previous source visit. */
 #endif
@@ -29,11 +31,5 @@ struct sidm_local_visit {
 struct sidm_local_visit sidm_local_begin_active(const DriftKickTimes *times, Cosmology *CP,
     int flush, const ActiveParticles *active);
 void sidm_local_commit(struct sidm_local_visit *visit, DriftKickTimes *times, Cosmology *CP);
-/* Maximum drift factor (integral dt/a^2); non-DM returns DBL_MAX. */
-double sidm_local_gravity_limit(int i, const DriftKickTimes *times);
-#ifdef SIDMDEBUG
-/* Aggregate diagnostic counts outside the OpenMP timestep loop. */
-void sidm_local_record_gravity_limits(uint64_t checked, uint64_t shortened);
-#endif
 
 #endif

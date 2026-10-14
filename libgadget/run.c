@@ -368,7 +368,7 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
          */
         const inttime_t native_next = find_next_kick(times.Ti_Current, times.mintimebin);
         inttime_t Ti_Next = sidm_local_enabled() ?
-            sidm_local_next_event(&times, &All.CP, NumCurrentTiStep == 0) : native_next;
+            sidm_local_next_event(&times, NumCurrentTiStep == 0) : native_next;
         const int native_event = Ti_Next == native_next;
         inttime_t Ti_Last = times.Ti_Current;
 
@@ -675,7 +675,11 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
 
 #ifdef SIDM
         if(sidm_local_enabled()) {
-            struct sidm_local_visit visit = sidm_local_begin_active(&times, &All.CP, is_PM, &Act);
+            /* Flush only when a synchronized state is saved or the run ends.
+             * Ordinary PM kicks do not reset independent source intervals. */
+            const int flush = NumCurrentTiStep == 0 || WriteSnapshot ||
+                action->write_snapshot || !next_sync || stop;
+            struct sidm_local_visit visit = sidm_local_begin_active(&times, &All.CP, flush, &Act);
             int64_t due = visit.sources.NumActiveParticle;
             MPI_Allreduce(MPI_IN_PLACE, &due, 1, MPI_INT64_T, MPI_SUM, MPI_COMM_WORLD);
             if(due) {
@@ -683,7 +687,7 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
                 force_tree_rebuild_mask(&sourceTree, ddecomp, DMMASK, All.OutputDir);
                 walltime_measure("/SPH/SIDM_Build");
                 sidm_distributed_force_intervals(&visit.sources, &All.CP, units, &times,
-                    &sourceTree, visit.intervals, visit.limits, All.RandomSeed);
+                    &sourceTree, visit.intervals, visit.limits, visit.motion_limits, All.RandomSeed);
                 force_tree_free(&sourceTree);
                 walltime_measure("/SPH/SIDM_Free");
             }
@@ -830,8 +834,6 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
             apply_PM_half_kick(&All.CP, &times);
         }
 
-        /* Measure the drift envelope after all opening kicks. */
-        if(sidm_local_enabled()) sidm_local_update_speed_bound();
         /* We can now free the active list: the new step have new active particles*/
         free_active_particles(&Act);
 

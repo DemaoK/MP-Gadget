@@ -117,7 +117,7 @@ Find examples in examples/.
 - lya : Lyman Alpha only
 - hydro : hydro
 - small : hydro with low resolution
-- `sidm-cosmological <examples/sidm-cosmological/README.md>`_ : cosmological SIDM build, units, constraints and validation
+- `sidm-cosmological <examples/sidm-cosmological/validate_dm_small.py>`_ : SIDM validation using the native dm-small example
 
 Control number of threads with `OMP_NUM_THREADS`. Generally the code is faster with more threads per rank, up to hardware limits. On Frontera we run optimally with 28 threads, the number of cpus per hardware socket.
 

@@ -35,7 +35,6 @@ struct particle_data
 #ifdef SIDM
     inttime_t TiSIDMLast, TiSIDMNext; /* Directed-source interval and deadline; migrate with owner. */
     unsigned char TimeBinSIDM; /* Aligned source interval; zero at startup/final output. */
-    double SIDMTravelLast; /* Cumulative separation bound at last source visit. */
 #endif
     MyFloat FullTreeGravAccel[3]; /* Short-range tree acceleration at the most recent timestep
                                  which included all particles (ie, PM steps). Does not include PM acceleration.

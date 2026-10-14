@@ -41,6 +41,7 @@ struct sidm_direct_source {
     double h; /* Comoving support. */
     double exposure; /* Integral dt/a^4; zero visits measure rates only. */
     double max_sigma_v; /* Largest cross section times canonical relative speed encountered. */
+    double max_relative_speed; /* Largest CURRENT canonical relative speed encountered. */
     uint64_t seed;
 };
 struct sidm_direct_stats {
@@ -65,9 +66,10 @@ struct sidm_direct_stats {
  * one fresh source state there. Disjoint rank pairs execute A->B, return, then
  * B->A. Bounded packets; no global particle gather or probability treewalk.
  * Velocities are changed immediately outside retryable treewalk callbacks.
- * Read-only rates and first random draws are prepared in threaded batches.
- * Applying updates stays ordered; any endpoint changed since preparation
- * forces a fresh pair evaluation. This preserves the serial trajectory.
+ * Bounded dependency levels apply disjoint source groups concurrently, keeping
+ * each shared endpoint in its original order. Clustered dependency chains use
+ * threaded read-only rates/draws followed by ordered updates; changed endpoints
+ * force fresh evaluation. Both paths preserve the serial trajectory.
  * Wire messages may contain several evaluation batches; a source occurs
  * only once per destination. Bounded wire storage and routing scratch are
  * retained between calls; source-group storage is released after each call.

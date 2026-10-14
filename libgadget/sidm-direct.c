@@ -11,7 +11,7 @@
 
 /* One descriptor per (source,destination), not a second full edge array. */
 struct group { int source, first, count; };
-struct packet { uint64_t seed; double v[3]; int n; };
+struct packet { uint64_t seed; double v[3]; int n, rates_only; };
 struct target {
     double coefficient;
     int index;
@@ -19,7 +19,7 @@ struct target {
     uint64_t id; /* Owner index is sufficient outside development audits. */
 #endif
 };
-struct reply { double v[3], max_sigma_v; };
+struct reply { double v[3], max_sigma_v, max_relative_speed; };
 #ifdef SIDMDEBUG
 #define PROFILE(code) do { code; } while(0)
 #else
@@ -32,7 +32,10 @@ struct reply { double v[3], max_sigma_v; };
 #define SIDM_DIRECT_WIRE_SOURCES 512
 #endif
 #ifndef SIDM_DIRECT_EVAL_SOURCES
-#define SIDM_DIRECT_EVAL_SOURCES 128
+#define SIDM_DIRECT_EVAL_SOURCES 2048
+#endif
+#ifndef SIDM_DIRECT_SCHEDULE_SOURCES
+#define SIDM_DIRECT_SCHEDULE_SOURCES 2048
 #endif
 #define WIRE_BYTES (SIDM_DIRECT_WIRE_SOURCES*(sizeof(struct packet)+SIDM_DIRECT_MAX_NEIGHBORS*sizeof(struct target)))
 static struct {
@@ -51,14 +54,24 @@ static int reserve_routing(int ntask)
     return 0;
 }
 
-/* Only read-only pair evaluation is threaded. Accepted collisions are applied
- * in the original order. A changed endpoint invalidates its cached rates for
- * the rest of this batch, including changes from another source's collision.
- * Predictions use fixed storage; only per-particle marks grow with the local
- * population. No second full edge or velocity array is needed. */
+/* The clustered-chain fallback threads read-only pair predictions, then
+ * applies collisions in the original order. A changed endpoint invalidates
+ * its cached rates for this batch, including another source's collisions.
+ * Fresh groups whose first draws all reject commit only predicted maxima.
+ * Predictions use fixed storage. Per-particle marks also build dependency
+ * levels; no second full edge or velocity array is needed. */
 struct pair_evaluation { double u, sv, draw; };
+struct group_evaluation {
+    double max_sv, max_u;
+    int hit, bad;
+#ifdef SIDMDEBUG
+    uint64_t pairs, trials;
+    double max_probability, sum_probability;
+#endif
+};
 static struct {
     struct pair_evaluation pairs[SIDM_DIRECT_EVAL_SOURCES*SIDM_DIRECT_MAX_NEIGHBORS];
+    struct group_evaluation groups[SIDM_DIRECT_EVAL_SOURCES];
     unsigned *changed, epoch;
     size_t capacity;
 } Cache;
@@ -97,6 +110,39 @@ static int neighbor_order(const void *a,const void *b)
     if(x->owner!=y->owner) return (x->owner>y->owner)-(x->owner<y->owner);
     return (x->id>y->id)-(x->id<y->id);
 }
+static void sort_neighbors(struct sidm_direct_neighbor *neighbors,int n)
+{
+    /* Insertion wins for the default support size; retain qsort for larger
+     * lists, where reverse ordering can make insertion substantially slower. */
+    if(n>38) {
+        qsort(neighbors,(size_t)n,sizeof(*neighbors),neighbor_order);
+        return;
+    }
+    for(int i=1;i<n;i++) {
+        const struct sidm_direct_neighbor value=neighbors[i];
+        int j=i;
+        while(j && (neighbors[j-1].owner>value.owner ||
+            (neighbors[j-1].owner==value.owner && neighbors[j-1].id>value.id))) {
+            neighbors[j]=neighbors[j-1];j--;
+        }
+        neighbors[j]=value;
+    }
+}
+/* Neighbor lists are sorted by owner. Most sources have only one owner;
+ * identify that run in constant time and use binary boundaries otherwise,
+ * avoiding two additional serial scans over the entire support heap. */
+static int owner_run_end(const struct sidm_direct_neighbor *neighbors,int n,int first)
+{
+    const int owner=neighbors[first].owner;
+    if(neighbors[n-1].owner==owner) return n;
+    int lo=first+1,hi=n;
+    while(lo<hi) {
+        const int mid=lo+(hi-lo)/2;
+        if(neighbors[mid].owner==owner) lo=mid+1;
+        else hi=mid;
+    }
+    return lo;
+}
 static uint64_t particle_id(struct sidm_direct_particles p,int i)
 { return *(const uint64_t *)((char *)p.base+(size_t)i*p.stride+p.id_offset); }
 static double *velocity(struct sidm_direct_particles p,int i)
@@ -107,8 +153,13 @@ static void touch(struct sidm_journal *j,struct sidm_direct_particles p,int i,
 {
     if(j->marked[i]) return;
     for(int d=0;d<3;d++) if(!isfinite(velocity(p,i)[d])) fail(failed,error,"Nonfinite direct SIDM touched velocity");
-    j->entries[j->count].index=i;
-    memcpy(j->entries[j->count++].before,velocity(p,i),3*sizeof(double)); j->marked[i]=1;
+    /* Concurrent source groups have disjoint endpoints. Only allocation of a
+     * journal slot is shared; the original velocity and marker stay private. */
+    int slot;
+#pragma omp atomic capture
+    slot=j->count++;
+    j->entries[slot].index=i;
+    memcpy(j->entries[slot].before,velocity(p,i),3*sizeof(double)); j->marked[i]=1;
 }
 
 #endif
@@ -120,10 +171,44 @@ static struct pair_evaluation evaluate_pair(const double a[3],const double b[3],
     seed=sidm_random_mix(seed^sidm_random_mix(bid+UINT64_C(0xd1b54a32d192ed03)));
     return (struct pair_evaluation){u,sv,uniform(&seed)};
 }
+/* Summaries are consumed only when every pair is valid, needs no exposure
+ * subdivision, and rejects its first draw. Otherwise the ordered pair loop
+ * retains all error handling, subdivision, and current-velocity evaluation. */
+static void summarize_prediction(struct group_evaluation *g,
+    const struct pair_evaluation *pair,double coefficient,double pmax)
+{
+    const double q=coefficient*pair->sv;
+    if(!isfinite(pair->sv) || pair->sv<0 || !isfinite(q) || q<0) {
+        g->bad=1;return;
+    }
+    if(pair->sv>g->max_sv) g->max_sv=pair->sv;
+    if(pair->u>g->max_u) g->max_u=pair->u;
+    g->hit |= q>pmax || (q>0 && pair->draw<q);
+#ifdef SIDMDEBUG
+    g->pairs++;g->trials+=q>0;
+    g->max_probability=fmax(g->max_probability,q);
+    g->sum_probability+=q;
+#endif
+}
+static void apply_rejection(const struct group_evaluation *g,double *max_sv,
+    double *max_u,struct sidm_direct_stats *stats)
+{
+    if(g->max_sv>*max_sv) *max_sv=g->max_sv;
+    if(g->max_u>*max_u) *max_u=g->max_u;
+#ifdef SIDMDEBUG
+    stats->pairs+=g->pairs;stats->trials+=g->trials;
+    stats->threaded_pairs+=g->pairs;
+    stats->max_probability=fmax(stats->max_probability,g->max_probability);
+    stats->max_trial_probability=fmax(stats->max_trial_probability,g->max_probability);
+    stats->sum_probability+=g->sum_probability;
+#else
+    (void)stats;
+#endif
+}
 static int scatter_pair(double a[3],double b[3],uint64_t bid,uint64_t seed,
     double coefficient,double sigma0,double w,int vd,double pmax,
     struct sidm_journal *j,struct sidm_direct_particles p,int ai,int bi,
-    double *max_sv,struct sidm_direct_stats *s,int *failed,char error[256],
+    double *max_sv,double *max_u,struct sidm_direct_stats *s,int *failed,char error[256],
     const struct pair_evaluation *cached)
 {
     if(*failed) return 0;
@@ -134,6 +219,7 @@ static int scatter_pair(double a[3],double b[3],uint64_t bid,uint64_t seed,
         fail(failed,error,"Invalid direct SIDM current pair rate/probability"); return 0;
     }
     if(sv>*max_sv) *max_sv=sv;
+    if(u>*max_u) *max_u=u;
 #ifdef SIDMDEBUG
     s->pairs++;
     s->max_probability=fmax(s->max_probability,q); s->sum_probability+=q;
@@ -187,6 +273,176 @@ static int scatter_pair(double a[3],double b[3],uint64_t bid,uint64_t seed,
     return changed;
 }
 
+/* Keep the original order of every pair of source groups sharing an endpoint.
+ * Groups in one level have disjoint endpoint sets and therefore commute, even
+ * when they accept collisions. The integer dependency pass is bounded and uses
+ * the same per-particle marks as the prediction cache, with distinct epochs.
+ * Spatially clustered groups can form long chains: use the prediction path
+ * below when the available concurrency does not justify this executor. */
+struct collision_plan {
+    int levels, start[SIDM_DIRECT_SCHEDULE_SOURCES+1];
+    int members[SIDM_DIRECT_SCHEDULE_SOURCES];
+    size_t offsets[SIDM_DIRECT_SCHEDULE_SOURCES];
+};
+static int plan_collisions(struct sidm_direct_source *src,const struct group *groups,
+    const unsigned char *buffer,int n,int nlocal,struct collision_plan *plan)
+{
+    if(n<16) return 0;
+    /* Zero-exposure visits measure current speeds without any mutation. Even
+     * overlapping sources can execute concurrently, and no endpoint marks or
+     * speculative random draws are needed. The flag occupies packet padding. */
+    int rates_only=1;
+    size_t packet_at=0;
+    for(int b=0;b<n;b++) {
+        if(groups) rates_only &= src[groups[b].source].exposure==0;
+        else {
+            struct packet a;plan->offsets[b]=packet_at;
+            memcpy(&a,buffer+packet_at,sizeof(a));
+            packet_at+=sizeof(a)+(size_t)a.n*sizeof(struct target);
+            rates_only &= a.rates_only;
+        }
+    }
+    if(rates_only) {
+        plan->levels=1;plan->start[0]=0;plan->start[1]=n;
+        for(int b=0;b<n;b++) plan->members[b]=b;
+        return 1;
+    }
+    if(Cache.epoch>UINT_MAX-(unsigned)n-1) {
+        memset(Cache.changed,0,Cache.capacity*sizeof(*Cache.changed));
+        Cache.epoch=0;
+    }
+    const unsigned base=Cache.epoch+1;
+    Cache.epoch+=(unsigned)n+1;
+    int level[SIDM_DIRECT_SCHEDULE_SOURCES];
+    memset(plan->start,0,((size_t)n+1)*sizeof(*plan->start));
+    plan->levels=0;
+    size_t at=0;
+    for(int b=0;b<n;b++) {
+        unsigned previous=0;
+        int count;
+        struct packet a;
+        const struct sidm_direct_source *s=NULL;
+        if(groups) {
+            s=&src[groups[b].source];count=groups[b].count;
+            if(Cache.changed[s->index]>=base) previous=Cache.changed[s->index]-base+1;
+        } else {
+            plan->offsets[b]=at;
+            memcpy(&a,buffer+at,sizeof(a));at+=sizeof(a);
+            count=a.n;
+        }
+        for(int k=0;k<count;k++) {
+            int i;
+            if(groups) i=s->neighbors[groups[b].first+k].index;
+            else { struct target e;memcpy(&e,buffer+at+(size_t)k*sizeof(e),sizeof(e));i=e.index; }
+            if(i<0 || i>=nlocal) return 0;
+            if(Cache.changed[i]>=base && Cache.changed[i]-base+1>previous)
+                previous=Cache.changed[i]-base+1;
+        }
+        level[b]=(int)previous;
+        plan->start[previous+1]++;
+        if((int)previous>=plan->levels) plan->levels=(int)previous+1;
+        /* A spatial ordering often starts with one long chain. Reject that
+         * case after a small sample rather than scan every edge twice before
+         * falling back. Missing later concurrency only selects the safe path. */
+        if(b==15 && plan->levels>4) return 0;
+        if(groups) Cache.changed[s->index]=base+previous;
+        for(int k=0;k<count;k++) {
+            int i;
+            if(groups) i=s->neighbors[groups[b].first+k].index;
+            else { struct target e;memcpy(&e,buffer+at+(size_t)k*sizeof(e),sizeof(e));i=e.index; }
+            Cache.changed[i]=base+previous;
+        }
+        if(!groups) at+=(size_t)count*sizeof(struct target);
+    }
+    /* Require at least one source per thread on average, and no fewer than
+     * four per level, so barriers do not dominate narrow waves. Other batches
+     * retain parallel prediction and exact ordered cache invalidation. */
+    const int threads=omp_get_max_threads(),minimum=threads>4?threads:4;
+    if(n<minimum*plan->levels) return 0;
+    for(int l=0;l<plan->levels;l++) plan->start[l+1]+=plan->start[l];
+    int cursor[SIDM_DIRECT_SCHEDULE_SOURCES];
+    memcpy(cursor,plan->start,(size_t)plan->levels*sizeof(*cursor));
+    for(int b=0;b<n;b++) plan->members[cursor[level[b]]++]=b;
+    return 1;
+}
+
+static void add_stats(struct sidm_direct_stats *a,const struct sidm_direct_stats *b)
+{
+#ifdef SIDMDEBUG
+    a->pairs+=b->pairs;a->trials+=b->trials;a->events+=b->events;
+    a->subdivided_pairs+=b->subdivided_pairs;a->threaded_pairs+=b->threaded_pairs;
+    a->max_probability=fmax(a->max_probability,b->max_probability);
+    a->max_trial_probability=fmax(a->max_trial_probability,b->max_trial_probability);
+    a->sum_probability+=b->sum_probability;
+#else
+    (void)a;(void)b;
+#endif
+}
+
+static void execute_collisions(struct sidm_direct_particles p,int nlocal,
+    struct sidm_direct_source *src,const struct group *groups,
+    const unsigned char *buffer,struct reply *returned,const struct collision_plan *plan,
+    double sigma0,double w,int vd,double pmax,struct sidm_journal *j,
+    struct sidm_direct_stats *stats,int *failed,char error[256])
+{
+#ifndef SIDMDEBUG
+    (void)nlocal;
+#endif
+    const int threads=omp_get_max_threads();
+    struct sidm_direct_stats per_thread[threads];
+    int errors[threads];char messages[threads][256];
+    memset(per_thread,0,sizeof(per_thread));memset(errors,0,sizeof(errors));
+#pragma omp parallel
+    {
+        const int tid=omp_get_thread_num();
+        struct sidm_direct_stats *st=&per_thread[tid];
+        for(int l=0;l<plan->levels;l++) {
+#pragma omp for schedule(static)
+            for(int m=plan->start[l];m<plan->start[l+1];m++) {
+                const int b=plan->members[m];
+                if(groups) {
+                    const struct group *g=&groups[b];
+                    struct sidm_direct_source *s=&src[g->source];
+                    const uint64_t seed=s->seed^sidm_random_mix(particle_id(p,s->index));
+                    for(int k=0;k<g->count;k++) {
+                        const struct sidm_direct_neighbor *e=&s->neighbors[g->first+k];
+                        scatter_pair(velocity(p,s->index),velocity(p,e->index),e->id,seed,
+                            e->coefficient,sigma0,w,vd,pmax,j,p,s->index,e->index,
+                            &s->max_sigma_v,&s->max_relative_speed,st,&errors[tid],messages[tid],NULL);
+                    }
+#ifdef SIDMDEBUG
+                    st->threaded_pairs+=g->count;
+#endif
+                } else {
+                    struct packet a;size_t at=plan->offsets[b];
+                    memcpy(&a,buffer+at,sizeof(a));at+=sizeof(a);
+                    double max_sv=0,max_u=0;
+                    for(int k=0;k<a.n;k++) {
+                        struct target e;memcpy(&e,buffer+at,sizeof(e));at+=sizeof(e);
+#ifdef SIDMDEBUG
+                        if(e.index<0 || e.index>=nlocal || particle_id(p,e.index)!=e.id) {
+                            fail(&errors[tid],messages[tid],"Direct SIDM remote index/ID mismatch");continue;
+                        }
+#endif
+                        scatter_pair(a.v,velocity(p,e.index),particle_id(p,e.index),a.seed,
+                            e.coefficient,sigma0,w,vd,pmax,j,p,-1,e.index,&max_sv,&max_u,
+                            st,&errors[tid],messages[tid],NULL);
+                    }
+                    memcpy(returned[b].v,a.v,sizeof(a.v));
+                    returned[b].max_sigma_v=max_sv;returned[b].max_relative_speed=max_u;
+#ifdef SIDMDEBUG
+                    st->threaded_pairs+=a.n;
+#endif
+                }
+            }
+        }
+    }
+    for(int t=0;t<threads;t++) {
+        add_stats(stats,&per_thread[t]);
+        if(errors[t]) fail(failed,error,messages[t]);
+    }
+}
+
 static int prepare_sources(struct sidm_direct_particles p,int nlocal,
     struct sidm_direct_source *src,int ns,struct sidm_journal *j,
     int rank,int ntask,MPI_Comm comm,char error[256])
@@ -197,7 +453,7 @@ static int prepare_sources(struct sidm_direct_particles p,int nlocal,
     (void)p;(void)nlocal;(void)rank;(void)ntask;(void)comm;(void)error;
 #endif
     for(int a=0;a<ns;a++) {
-        struct sidm_direct_source *s=&src[a]; s->max_sigma_v=0;
+        struct sidm_direct_source *s=&src[a]; s->max_sigma_v=0; s->max_relative_speed=0;
 #ifdef SIDMDEBUG
         if(s->index<0 || s->index>=nlocal || s->n<0 || s->n>SIDM_DIRECT_MAX_NEIGHBORS ||
            (s->n&&!s->neighbors) || !isfinite(s->h) || s->h<=0 ||
@@ -219,7 +475,7 @@ static int prepare_sources(struct sidm_direct_particles p,int nlocal,
 #endif
     for(int a=0;a<ns;a++) {
         struct sidm_direct_source *s=&src[a];
-        qsort(s->neighbors,(size_t)s->n,sizeof(*s->neighbors),neighbor_order);
+        sort_neighbors(s->neighbors,s->n);
         for(int k=0;k<s->n;k++) {
             const struct sidm_direct_neighbor *e=&s->neighbors[k];
 #ifdef SIDMDEBUG
@@ -334,10 +590,10 @@ int sidm_direct_scatter(struct sidm_direct_particles p,int nlocal,
     int64_t ng=0;
     if(prepare_sources(p,nlocal,src,ns,j,rank,ntask,comm,error)) goto cleanup;
     PROFILE(stats->prepare_seconds=MPI_Wtime()-timer; timer=MPI_Wtime());
-    for(int a=0;a<ns;a++) for(int k=0;k<src[a].n;k++)
-        if(!k || src[a].neighbors[k].owner!=src[a].neighbors[k-1].owner) {
-            count[src[a].neighbors[k].owner]++; ng++;
-        }
+    for(int a=0;a<ns;a++) for(int k=0;k<src[a].n;) {
+        count[src[a].neighbors[k].owner]++; ng++;
+        k=owner_run_end(src[a].neighbors,src[a].n,k);
+    }
     if(ng>INT_MAX) fail(&failed,error,"Direct SIDM group count exceeds index range");
     /* Keep the population-sized groups transient; only bounded communication
      * buffers and small routing arrays persist between visits. Allocation and
@@ -354,46 +610,75 @@ int sidm_direct_scatter(struct sidm_direct_particles p,int nlocal,
 #endif
     for(int a=0;a<ns;a++) for(int k=0;k<src[a].n;) {
         const int first=k,owner=src[a].neighbors[k].owner;
-        while(k<src[a].n&&src[a].neighbors[k].owner==owner) k++;
+        k=owner_run_end(src[a].neighbors,src[a].n,k);
         groups[cursor[owner]++]=(struct group){a,first,k-first};
     }
     PROFILE(stats->route_seconds=MPI_Wtime()-timer; timer=MPI_Wtime());
     /* Local updates precede remote phases; no MPI or ghost storage needed. */
-    for(int offset=start[rank];offset<start[rank+1];offset+=SIDM_DIRECT_EVAL_SOURCES) {
-        const int batch=start[rank+1]-offset<SIDM_DIRECT_EVAL_SOURCES?start[rank+1]-offset:SIDM_DIRECT_EVAL_SOURCES;
-        const int parallel=threaded && batch>=16;
-        const unsigned epoch=parallel?cache_epoch():0;
-        if(parallel) {
+    for(int block=start[rank];block<start[rank+1];block+=SIDM_DIRECT_SCHEDULE_SOURCES) {
+        const int end=start[rank+1]-block<SIDM_DIRECT_SCHEDULE_SOURCES?start[rank+1]:block+SIDM_DIRECT_SCHEDULE_SOURCES;
+        struct collision_plan plan;
+        if(threaded && plan_collisions(src,groups+block,NULL,end-block,nlocal,&plan)) {
+            execute_collisions(p,nlocal,src,groups+block,NULL,NULL,&plan,sigma0,w,vd,pmax,j,&local,&failed,error);
+            continue;
+        }
+        for(int offset=block;offset<end;offset+=SIDM_DIRECT_EVAL_SOURCES) {
+            const int batch=end-offset<SIDM_DIRECT_EVAL_SOURCES?end-offset:SIDM_DIRECT_EVAL_SOURCES;
+            const int parallel=threaded && batch>=16;
+            const unsigned epoch=parallel?cache_epoch():0;
+            int epoch_changed=0;
+            if(parallel) {
 #ifdef SIDMDEBUG
-            const double before=MPI_Wtime();
+                const double before=MPI_Wtime();
 #endif
 #pragma omp parallel for
+                for(int b=0;b<batch;b++) {
+                    const struct group *g=&groups[offset+b];
+                    const struct sidm_direct_source *s=&src[g->source];
+                    const uint64_t seed=s->seed^sidm_random_mix(particle_id(p,s->index));
+                    struct group_evaluation *prediction=&Cache.groups[b];
+                    *prediction=(struct group_evaluation){0};
+                    for(int k=0;k<g->count;k++) {
+                        const struct sidm_direct_neighbor *e=&s->neighbors[g->first+k];
+                        struct pair_evaluation *pair=&Cache.pairs[b*SIDM_DIRECT_MAX_NEIGHBORS+k];
+                        *pair=evaluate_pair(velocity(p,s->index),velocity(p,e->index),e->id,seed,sigma0,w,vd);
+                        summarize_prediction(prediction,pair,e->coefficient,pmax);
+                    }
+                }
+                PROFILE(stats->predict_seconds+=MPI_Wtime()-before);
+            }
             for(int b=0;b<batch;b++) {
-                const struct group *g=&groups[offset+b];
-                const struct sidm_direct_source *s=&src[g->source];
+                const struct group *g=&groups[offset+b];struct sidm_direct_source *s=&src[g->source];
+                const struct group_evaluation *prediction=&Cache.groups[b];
+                if(parallel && !failed && !prediction->hit && !prediction->bad) {
+                    /* Before the first accepted collision every prediction is
+                     * fresh. Later groups scan marks only when they can skip. */
+                    int fresh=!epoch_changed;
+                    if(!fresh) {
+                        fresh=Cache.changed[s->index]!=epoch;
+                        for(int k=0;fresh && k<g->count;k++)
+                            fresh=Cache.changed[s->neighbors[g->first+k].index]!=epoch;
+                    }
+                    if(fresh) {
+                        apply_rejection(prediction,&s->max_sigma_v,&s->max_relative_speed,&local);
+                        continue;
+                    }
+                }
                 const uint64_t seed=s->seed^sidm_random_mix(particle_id(p,s->index));
                 for(int k=0;k<g->count;k++) {
                     const struct sidm_direct_neighbor *e=&s->neighbors[g->first+k];
-                    Cache.pairs[b*SIDM_DIRECT_MAX_NEIGHBORS+k]=evaluate_pair(
-                        velocity(p,s->index),velocity(p,e->index),e->id,seed,sigma0,w,vd);
-                }
-            }
-            PROFILE(stats->predict_seconds+=MPI_Wtime()-before);
-        }
-        for(int b=0;b<batch;b++) {
-            const struct group *g=&groups[offset+b];struct sidm_direct_source *s=&src[g->source];
-            const uint64_t seed=s->seed^sidm_random_mix(particle_id(p,s->index));
-            for(int k=0;k<g->count;k++) {
-                const struct sidm_direct_neighbor *e=&s->neighbors[g->first+k];
-                const struct pair_evaluation *cached=parallel && Cache.changed[s->index]!=epoch &&
-                    Cache.changed[e->index]!=epoch?&Cache.pairs[b*SIDM_DIRECT_MAX_NEIGHBORS+k]:NULL;
+                    const struct pair_evaluation *cached=parallel && Cache.changed[s->index]!=epoch &&
+                        Cache.changed[e->index]!=epoch?&Cache.pairs[b*SIDM_DIRECT_MAX_NEIGHBORS+k]:NULL;
 #ifdef SIDMDEBUG
-                local.threaded_pairs+=parallel;
-                local.recomputed_pairs+=parallel && !cached;
+                    local.threaded_pairs+=parallel;
+                    local.recomputed_pairs+=parallel && !cached;
 #endif
-                if(scatter_pair(velocity(p,s->index),velocity(p,e->index),e->id,seed,
-                    e->coefficient,sigma0,w,vd,pmax,j,p,s->index,e->index,&s->max_sigma_v,&local,&failed,error,cached) && parallel)
-                    Cache.changed[s->index]=Cache.changed[e->index]=epoch;
+                    if(scatter_pair(velocity(p,s->index),velocity(p,e->index),e->id,seed,
+                        e->coefficient,sigma0,w,vd,pmax,j,p,s->index,e->index,&s->max_sigma_v,&s->max_relative_speed,&local,&failed,error,cached) && parallel) {
+                        Cache.changed[s->index]=Cache.changed[e->index]=epoch;
+                        epoch_changed=1;
+                    }
+                }
             }
         }
     }
@@ -411,7 +696,7 @@ int sidm_direct_scatter(struct sidm_direct_particles p,int nlocal,
                 if(sending) for(int b=0;b<batch;b++) {
                     const struct group *g=&groups[start[other]+offset+b];
                     const struct sidm_direct_source *s=&src[g->source];
-                    struct packet packet={.seed=s->seed^sidm_random_mix(particle_id(p,s->index)),.n=g->count};
+                    struct packet packet={.seed=s->seed^sidm_random_mix(particle_id(p,s->index)),.n=g->count,.rates_only=s->exposure==0};
                     memcpy(packet.v,velocity(p,s->index),sizeof(packet.v));
                     memcpy(buffer+bytes,&packet,sizeof(packet)); bytes+=sizeof(packet);
                     for(int k=g->first;k<g->first+g->count;k++) {
@@ -430,60 +715,91 @@ int sidm_direct_scatter(struct sidm_direct_particles p,int nlocal,
                     sending?NULL:buffer,sending?0:WIRE_BYTES,MPI_BYTE,other,19203,comm,MPI_STATUS_IGNORE);
                 PROFILE(stats->mpi_seconds+=MPI_Wtime()-timer; timer=MPI_Wtime());
                 if(!sending) {
-                    size_t at=0;
-                    for(int first=0;first<batch;first+=SIDM_DIRECT_EVAL_SOURCES) {
-                        const int n=batch-first<SIDM_DIRECT_EVAL_SOURCES?batch-first:SIDM_DIRECT_EVAL_SOURCES;
-                        const int parallel=threaded && n>=16;
-                        const unsigned epoch=parallel?cache_epoch():0;
-                        if(parallel) {
-                            /* Prediction leaves the ordered collision cursor unchanged. */
-                            size_t offsets[SIDM_DIRECT_EVAL_SOURCES],next_packet=at;
+                    struct collision_plan plan;
+                    if(threaded && batch<=SIDM_DIRECT_SCHEDULE_SOURCES &&
+                        plan_collisions(NULL,NULL,buffer,batch,nlocal,&plan))
+                        execute_collisions(p,nlocal,NULL,NULL,buffer,returned,&plan,sigma0,w,vd,pmax,j,&local,&failed,error);
+                    else {
+                        size_t at=0;
+                        for(int first=0;first<batch;first+=SIDM_DIRECT_EVAL_SOURCES) {
+                            const int n=batch-first<SIDM_DIRECT_EVAL_SOURCES?batch-first:SIDM_DIRECT_EVAL_SOURCES;
+                            const int parallel=threaded && n>=16;
+                            const unsigned epoch=parallel?cache_epoch():0;
+                            int epoch_changed=0;
+                            if(parallel) {
+                                /* Prediction leaves the ordered collision cursor unchanged. */
+                                size_t offsets[SIDM_DIRECT_EVAL_SOURCES],next_packet=at;
 #ifdef SIDMDEBUG
-                            const double before=MPI_Wtime();
+                                const double before=MPI_Wtime();
 #endif
-                            for(int b=0;b<n;b++) {
-                                struct packet a;
-                                memcpy(&a,buffer+next_packet,sizeof(a));
-                                offsets[b]=next_packet;
-                                next_packet+=sizeof(a)+(size_t)a.n*sizeof(struct target);
-                            }
+                                for(int b=0;b<n;b++) {
+                                    struct packet a;
+                                    memcpy(&a,buffer+next_packet,sizeof(a));
+                                    offsets[b]=next_packet;
+                                    next_packet+=sizeof(a)+(size_t)a.n*sizeof(struct target);
+                                }
 #pragma omp parallel for
+                                for(int b=0;b<n;b++) {
+                                    struct packet a;size_t pos=offsets[b];
+                                    memcpy(&a,buffer+pos,sizeof(a));pos+=sizeof(a);
+                                    struct group_evaluation *prediction=&Cache.groups[b];
+                                    *prediction=(struct group_evaluation){0};
+                                    for(int k=0;k<a.n;k++) {
+                                        struct target e;memcpy(&e,buffer+pos,sizeof(e));pos+=sizeof(e);
+#ifdef SIDMDEBUG
+                                        if(e.index<0||e.index>=nlocal||particle_id(p,e.index)!=e.id) {
+                                            prediction->bad=1;continue;
+                                        }
+#endif
+                                        struct pair_evaluation *pair=&Cache.pairs[b*SIDM_DIRECT_MAX_NEIGHBORS+k];
+                                        *pair=evaluate_pair(a.v,velocity(p,e.index),particle_id(p,e.index),a.seed,sigma0,w,vd);
+                                        summarize_prediction(prediction,pair,e.coefficient,pmax);
+                                    }
+                                }
+                                PROFILE(stats->predict_seconds+=MPI_Wtime()-before);
+                            }
                             for(int b=0;b<n;b++) {
-                                struct packet a;size_t pos=offsets[b];
-                                memcpy(&a,buffer+pos,sizeof(a));pos+=sizeof(a);
+                                struct packet a; memcpy(&a,buffer+at,sizeof(a)); at+=sizeof(a);
+                                double max_sv=0,max_u=0;int source_changed=0;
+                                const struct group_evaluation *prediction=&Cache.groups[b];
+                                if(parallel && !failed && !prediction->hit && !prediction->bad) {
+                                    int fresh=!epoch_changed;
+                                    if(!fresh) {
+                                        fresh=1;
+                                        for(int k=0;fresh && k<a.n;k++) {
+                                            struct target e;memcpy(&e,buffer+at+(size_t)k*sizeof(e),sizeof(e));
+                                            fresh=Cache.changed[e.index]!=epoch;
+                                        }
+                                    }
+                                    if(fresh) {
+                                        apply_rejection(prediction,&max_sv,&max_u,&local);
+                                        memcpy(returned[first+b].v,a.v,sizeof(a.v));
+                                        returned[first+b].max_sigma_v=max_sv;returned[first+b].max_relative_speed=max_u;
+                                        at+=(size_t)a.n*sizeof(struct target);
+                                        continue;
+                                    }
+                                }
                                 for(int k=0;k<a.n;k++) {
-                                    struct target e;memcpy(&e,buffer+pos,sizeof(e));pos+=sizeof(e);
+                                    struct target e; memcpy(&e,buffer+at,sizeof(e)); at+=sizeof(e);
 #ifdef SIDMDEBUG
-                                    if(e.index<0||e.index>=nlocal||particle_id(p,e.index)!=e.id) continue;
+                                    if(e.index<0||e.index>=nlocal||particle_id(p,e.index)!=e.id) {
+                                        fail(&failed,error,"Direct SIDM remote index/ID mismatch"); continue;
+                                    }
 #endif
-                                    Cache.pairs[b*SIDM_DIRECT_MAX_NEIGHBORS+k]=evaluate_pair(
-                                        a.v,velocity(p,e.index),particle_id(p,e.index),a.seed,sigma0,w,vd);
+                                    const struct pair_evaluation *cached=parallel && !source_changed && Cache.changed[e.index]!=epoch?
+                                        &Cache.pairs[b*SIDM_DIRECT_MAX_NEIGHBORS+k]:NULL;
+#ifdef SIDMDEBUG
+                                    local.threaded_pairs+=parallel;
+                                    local.recomputed_pairs+=parallel && !cached;
+#endif
+                                    if(scatter_pair(a.v,velocity(p,e.index),particle_id(p,e.index),a.seed,e.coefficient,
+                                        sigma0,w,vd,pmax,j,p,-1,e.index,&max_sv,&max_u,&local,&failed,error,cached) && parallel) {
+                                        source_changed=1;epoch_changed=1;Cache.changed[e.index]=epoch;
+                                    }
                                 }
+                                memcpy(returned[first+b].v,a.v,sizeof(a.v)); returned[first+b].max_sigma_v=max_sv;
+                                returned[first+b].max_relative_speed=max_u;
                             }
-                            PROFILE(stats->predict_seconds+=MPI_Wtime()-before);
-                        }
-                        for(int b=0;b<n;b++) {
-                            struct packet a; memcpy(&a,buffer+at,sizeof(a)); at+=sizeof(a);
-                            double max_sv=0;int source_changed=0;
-                            for(int k=0;k<a.n;k++) {
-                                struct target e; memcpy(&e,buffer+at,sizeof(e)); at+=sizeof(e);
-#ifdef SIDMDEBUG
-                                if(e.index<0||e.index>=nlocal||particle_id(p,e.index)!=e.id) {
-                                    fail(&failed,error,"Direct SIDM remote index/ID mismatch"); continue;
-                                }
-#endif
-                                const struct pair_evaluation *cached=parallel && !source_changed && Cache.changed[e.index]!=epoch?
-                                    &Cache.pairs[b*SIDM_DIRECT_MAX_NEIGHBORS+k]:NULL;
-#ifdef SIDMDEBUG
-                                local.threaded_pairs+=parallel;
-                                local.recomputed_pairs+=parallel && !cached;
-#endif
-                                if(scatter_pair(a.v,velocity(p,e.index),particle_id(p,e.index),a.seed,e.coefficient,
-                                    sigma0,w,vd,pmax,j,p,-1,e.index,&max_sv,&local,&failed,error,cached) && parallel) {
-                                    source_changed=1;Cache.changed[e.index]=epoch;
-                                }
-                            }
-                            memcpy(returned[first+b].v,a.v,sizeof(a.v)); returned[first+b].max_sigma_v=max_sv;
                         }
                     }
                 }
@@ -506,6 +822,7 @@ int sidm_direct_scatter(struct sidm_direct_particles p,int nlocal,
                             memcpy(v,returned[b].v,sizeof(returned[b].v));
                         }
                         s->max_sigma_v=fmax(s->max_sigma_v,returned[b].max_sigma_v);
+                        s->max_relative_speed=fmax(s->max_relative_speed,returned[b].max_relative_speed);
                     }
                 }
                 PROFILE(stats->pack_seconds+=MPI_Wtime()-timer);

@@ -21,15 +21,23 @@
 #include "../treewalk.h"
 #include "../walltime.h"
 static void capture_walk(TreeWalk *,int *,size_t);
+static int source_batch_size=65536;
+#define SIDM_SOURCE_BATCH_SIZE source_batch_size
 #define treewalk_run capture_walk
 #include "../sidm-distributed.c"
 #undef treewalk_run
 #define TEST_N 512
 static struct ClockTable clocks;
 static uint64_t exported_batches;
-static int velocity_dependent;
+static int velocity_dependent,implicit_source_list;
+static int max_walk_sources,walk_calls;
 static void capture_walk(TreeWalk *tw,int *active,size_t nactive)
-{ treewalk_run(tw,active,nactive);exported_batches+=tw->Nexportfull; }
+{
+    assert_true(nactive<=(size_t)source_batch_size);
+    if((int)nactive>max_walk_sources) max_walk_sources=nactive;
+    walk_calls++;
+    treewalk_run(tw,active,nactive);exported_batches+=tw->Nexportfull;
+}
 static void fixture(struct particle_data *p, int id)
 {
     memset(p,0,sizeof(*p));
@@ -145,8 +153,10 @@ static void test_direct_hierarchy(void **state)
         if(domain.TopLeaves[leaf].Task!=rank) continue;
         p.TopLeaf=leaf;P[PartManager->NumPart++]=p;
         /* Coincident massive gas must not enter the DM neighbor/rate solve. */
-        p.Type=0;p.ID+=TEST_N;p.Mass=100;p.Vel[0]=1000;
-        P[PartManager->NumPart++]=p;
+        if(!implicit_source_list) {
+            p.Type=0;p.ID+=TEST_N;p.Mass=100;p.Vel[0]=1000;
+            P[PartManager->NumPart++]=p;
+        }
     }
     ForceTree tree={0};force_tree_rebuild_mask(&tree,&domain,DMMASK,NULL);
     DriftKickTimes times={0};times.Ti_Current=2;
@@ -155,24 +165,25 @@ static void test_direct_hierarchy(void **state)
     int indices[2*TEST_N],ns=0;
     /* More than 100 exports per thread on two ranks, even with balanced
      * chunks. Non-source ranks still exercise inactive-only receivers. */
-    for(int i=0;i<PartManager->NumPart;i++) if(P[i].Type==1&&rank==0&&((ntask>1&&!getenv("SIDM_TEST_EMPTY_OWNER"))||P[i].ID%3)) indices[ns++]=i;
-    ActiveParticles sources={.Particles=P,.ActiveParticle=indices,.NumActiveParticle=ns};
+    for(int i=0;i<PartManager->NumPart;i++) if(P[i].Type==1&&(implicit_source_list||
+        (rank==0&&((ntask>1&&!getenv("SIDM_TEST_EMPTY_OWNER"))||P[i].ID%3)))) indices[ns++]=i;
+    ActiveParticles sources={.Particles=P,.ActiveParticle=implicit_source_list?NULL:indices,.NumActiveParticle=ns};
     double reference[TEST_N][3];uint64_t large_batches=0;
     for(int tiny=0;tiny<2;tiny++) {
-        reset_state();exported_batches=0;
+        reset_state();exported_batches=0;max_walk_sources=walk_calls=0;
         for(int i=0;i<PartManager->NumPart;i++) P[i].Ti_drift=times.Ti_Current;
         /* Four ranks need room for a complete native 32-source chunk. */
         const size_t slots=ntask==4?256:100;
         treewalk_set_max_export_buffer(tiny?slots*sizeof(struct dist_query)*omp_get_max_threads():4*1024*1024);
-        double intervals[2*TEST_N]={0},limits[2*TEST_N];
+        double intervals[2*TEST_N]={0},limits[2*TEST_N],motion_limits[2*TEST_N];
         for(int i=0;i<PartManager->NumPart;i++) limits[i]=NAN;
         const size_t memory_before=mymalloc_usedbytes();
-        sidm_distributed_force_intervals(&sources,&cp,units,&times,&tree,intervals,limits,123);
+        sidm_distributed_force_intervals(&sources,&cp,units,&times,&tree,intervals,limits,motion_limits,123);
         assert_int_equal(mymalloc_usedbytes(),memory_before);
         /* Zero exposure still measures the exact initial neighbor rate; it
          * must neither collide nor reset inactive receivers' support. */
         for(int a=0;a<ns;a++) {
-            int i=indices[a],id=P[i].ID-1;double h=support(id,1,0),max_sv=0;
+            int i=indices[a],id=P[i].ID-1;double h=support(id,1,0),max_sv=0,max_speed=0;
             struct particle_data src;fixture(&src,id);
             assert_true(fabs(P[i].Hsml/h-1)<1e-13);
             for(int j=0;j<TEST_N;j++) if(j!=id&&distance(id,j,1)<=h) {
@@ -181,11 +192,39 @@ static void test_direct_hierarchy(void **state)
                 const double w=20*get_atime(times.Ti_Current);
                 const double shape=velocity_dependent?sidm_rate_viscosity_shape(u*u/(w*w)):1;
                 /* h=.5, mass unit=8, length unit=2: sigma_code=20. */
-                max_sv=fmax(max_sv,20*u*shape);
+                max_sv=fmax(max_sv,20*u*shape);max_speed=fmax(max_speed,u);
             }
             assert_true(fabs(limits[i]/(.5/(.5*sidm_rate_cubic_kernel(0,h)*max_sv))-1)<1e-12);
-            intervals[i]=.4;
+            assert_true(fabs(motion_limits[i]/(h/max_speed)-1)<1e-12);
         }
+        if(source_batch_size<65536) {
+            double initial_limits[2*TEST_N],initial_motion[2*TEST_N];
+            memcpy(initial_limits,limits,sizeof(limits));
+            memcpy(initial_motion,motion_limits,sizeof(motion_limits));
+            for(int i=0;i<PartManager->NumPart;i++) if(P[i].Type==1) {
+                P[i].Vel[0]+=3;P[i].Vel[1]-=5;P[i].Vel[2]+=7;
+            }
+            sidm_distributed_force_intervals(&sources,&cp,units,&times,&tree,intervals,limits,motion_limits,123);
+            assert_int_equal(mymalloc_usedbytes(),memory_before);
+            for(int a=0;a<ns;a++) {
+                const int i=indices[a];
+                assert_true(fabs(limits[i]/initial_limits[i]-1)<1e-12);
+                assert_true(fabs(motion_limits[i]/initial_motion[i]-1)<1e-12);
+            }
+            for(int i=0;i<PartManager->NumPart;i++) if(P[i].Type==1)
+                P[i].Vel[0]=P[i].Vel[1]=P[i].Vel[2]=4;
+            sidm_distributed_force_intervals(&sources,&cp,units,&times,&tree,intervals,limits,motion_limits,123);
+            assert_int_equal(mymalloc_usedbytes(),memory_before);
+            for(int a=0;a<ns;a++) {
+                assert_true(limits[indices[a]]==DBL_MAX);
+                assert_true(motion_limits[indices[a]]==DBL_MAX);
+            }
+            for(int i=0;i<PartManager->NumPart;i++) if(P[i].Type==1) {
+                struct particle_data initial;fixture(&initial,P[i].ID-1);
+                memcpy(P[i].Vel,initial.Vel,sizeof(P[i].Vel));
+            }
+        }
+        for(int a=0;a<ns;a++) intervals[indices[a]]=.4;
         for(int i=0;i<PartManager->NumPart;i++) {
             if(P[i].Type!=1) {
                 struct particle_data initial;fixture(&initial,P[i].ID-TEST_N-1);
@@ -197,7 +236,7 @@ static void test_direct_hierarchy(void **state)
             assert_memory_equal(P[i].Vel,initial.Vel,sizeof(P[i].Vel));
         }
         long double before[4],after[4];moments(before);
-        sidm_distributed_force_intervals(&sources,&cp,units,&times,&tree,intervals,limits,123);
+        sidm_distributed_force_intervals(&sources,&cp,units,&times,&tree,intervals,limits,motion_limits,123);
         assert_int_equal(mymalloc_usedbytes(),memory_before);
         moments(after);
         for(int d=0;d<4;d++) assert_true(fabsl(after[d]-before[d])<1e-11*(1+fabsl(before[d])));
@@ -214,18 +253,29 @@ static void test_direct_hierarchy(void **state)
             receivers+=(memcmp(P[i].Vel,initial.Vel,sizeof(P[i].Vel))!=0)&&(rank!=0||((ntask==1||getenv("SIDM_TEST_EMPTY_OWNER"))&&P[i].ID%3==0));
         }
         MPI_Allreduce(MPI_IN_PLACE,&receivers,1,MPI_INT,MPI_SUM,MPI_COMM_WORLD);
-        assert_true(receivers>0);
+        if(!implicit_source_list) assert_true(receivers>0);
+        if(ns>source_batch_size) assert_int_equal(max_walk_sources,source_batch_size);
+        int largest=ns;MPI_Allreduce(MPI_IN_PLACE,&largest,1,MPI_INT,MPI_MAX,MPI_COMM_WORLD);
+        assert_true(walk_calls>=largest/source_batch_size+(largest%source_batch_size!=0));
         uint64_t batches;MPI_Allreduce(&exported_batches,&batches,1,MPI_UINT64_T,MPI_SUM,MPI_COMM_WORLD);
         if(!tiny) { memcpy(reference,current,sizeof(reference));large_batches=batches; }
         else {
             assert_memory_equal(reference,current,sizeof(reference));
-            if(ntask>1 && !getenv("SIDM_TEST_EMPTY_OWNER")) assert_true(batches>large_batches);
+            if(ntask>1 && !getenv("SIDM_TEST_EMPTY_OWNER") && source_batch_size>=65536)
+                assert_true(batches>large_batches);
         }
     }
     treewalk_set_max_export_buffer(3584*1024*1024L);
     sidm_local_configure(0,.2,16);
     force_tree_free(&tree);myfree(domain.Tasks);myfree(domain.TopLeaves);myfree(domain.TopNodes);
     myfree(P);PartManager->Base=NULL;PartManager->NumPart=PartManager->MaxPart=0;
+}
+static void test_bounded_sources(void **state)
+{ source_batch_size=64;test_direct_hierarchy(state);source_batch_size=65536; }
+static void test_bounded_implicit_sources(void **state)
+{
+    source_batch_size=63;implicit_source_list=1;test_direct_hierarchy(state);
+    implicit_source_list=0;source_batch_size=65536;
 }
 static void test_velocity_dependent_units(void **state)
 { velocity_dependent=1;test_direct_hierarchy(state);velocity_dependent=0; }
@@ -252,7 +302,8 @@ int main(void)
     printf("SIDM distributed test threads: requested=%d observed=%d\n",requested,observed_threads);
     if(observed_threads!=requested) return EXIT_FAILURE;
     const struct CMUnitTest tests[]={cmocka_unit_test(test_direct_hierarchy),
-        cmocka_unit_test(test_velocity_dependent_units)};
+        cmocka_unit_test(test_velocity_dependent_units),cmocka_unit_test(test_bounded_sources),
+        cmocka_unit_test(test_bounded_implicit_sources)};
     return cmocka_run_group_tests_mpi(tests,setup,NULL);
 }
 #else
