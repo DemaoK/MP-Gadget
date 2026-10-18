@@ -209,6 +209,7 @@ class Ours(object):
         self.O = cat.orphans
         self.otid = self.O["TrackId"].astype(np.int64) if cat.norphans else np.zeros(0, np.int64)
         self._orows, self._rows = np.arange(self.otid.size), np.arange(self.tid.size)
+        cat.clear_cache()   # the raw particle blocks are folded into the arrays above
 
     def orow(self, trackids):
         return _lookup(self.otid, self._orows, trackids)
@@ -221,6 +222,11 @@ class Ours(object):
 
     def types(self, ids):
         return _lookup(self.id_sorted, self.id_type.astype(np.int64), ids)
+
+    def drop_particles(self):
+        """Free the particle-level arrays; row(), orow() and the tables keep working."""
+        self.id_sorted = self.id_type = self.bid_sorted = self.bid_owner = self.bid_type = None
+        self.tr_track = self.tr_id = self.tr_pos = None
 
 
 # ---------------------------------------------------------------------------------- HBT side
@@ -304,6 +310,10 @@ class HBT(object):
 
     def owner(self, ids):
         return _lookup(self.ids_sorted, self.owner_sorted, ids)
+
+    def drop_particles(self):
+        """Free the bound ID lists; row() and the Subhalos table keep working."""
+        self.ids = self.owner_of = self.pos_in_list = self.ids_sorted = self.owner_sorted = None
 
 
 # ---------------------------------------------------------------------------------- matching
@@ -1051,6 +1061,9 @@ def sequence(args, pigs, hbtpath):
         cats.append((ours, hbt))
         matches.append(M)
         maps.append(pm)
+        if len(cats) > 1:   # the previous output's particles served its tie check; only tables are needed now
+            for c in cats[-2]:
+                c.drop_particles()
     cum = {}
     tot_persist, tot_both = 0, 0
     for i in range(1, len(pigs)):

@@ -307,6 +307,10 @@ class SubhaloCatalogue(object):
                 self._cache[key] = np.zeros(0, dtype=dt)
         return self._cache[key]
 
+    def clear_cache(self):
+        """Drop the cached per-particle blocks; the tables stay (for callers keeping many catalogues)."""
+        self._cache.clear()
+
     def has_particle_tags(self, ptype):
         return all("%d/%s" % (ptype, n) in self.blocks for n, _ in PARTICLE_TAG_BLOCKS)
 
