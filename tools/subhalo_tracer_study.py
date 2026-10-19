@@ -4,7 +4,7 @@
 would decide hosts and descendants differently (CDM vs SIDM study).
 
 Usage:
-  subhalo_tracer_study.py PIG_A PIG_B [--part PART_A] [--rows OUT.npz] [options]
+  subhalo_tracer_study.py PIG_A PIG_B [--part PART_A | --density knn] [--rows OUT.npz] [options]
   subhalo_tracer_study.py --sequence OUTPUT_DIR [--first N --last M]   (one line per pair)
 
 Markers of a track resolved in A (the finder's own definitions):
@@ -37,13 +37,22 @@ Sections (each stratified by Nbound in A, [20,100) / [100,1000) / >=1000, and ce
              percentile. D = int da / (a^2 H) in comoving length per peculiar km/s (catalogue
              velocities are physical peculiar km/s, positions comoving), LCDM from the Header, no
              radiation (a 0.2 % error at a = 0.13).
-  5 SIDM     with --part (A's PART holding 1/SIDMSupport, the kernel support h): expected number of
-             scatterings per particle over the interval, N = rho sigma0/m f((v/w)^2) v dt with
-             rho = m Nngb / (4 pi h^3 / 3) (physical), v = the track's CoreSigmaV, dt proper time,
-             f(y) = 6 int_0^1 t(1-t)/(1+y t)^2 dt (f(0) = 1). Tracer retention (bound to the same
-             track) in N bins and median N of tracers / core / bound set. Skipped without --part.
+  5 SIDM     expected number of scatterings per particle over the interval, N = rho sigma0/m
+             f((v/w)^2) v dt with rho = m Nngb / (4 pi h^3 / 3) (physical), v = the track's CoreSigmaV,
+             dt proper time, f(y) = 6 int_0^1 t(1-t)/(1+y t)^2 dt (f(0) = 1). Tracer retention (bound
+             to the same track) in N bins, the same for satellites with Nbound >= 100, and median N
+             of tracers / core / bound set. The kernel support h comes from
+               --part PART_A    A's PART block 1/SIDMSupport (SIDM runs only);
+               --density knn    the distance to the Nngb-th neighbour (self = neighbour 0) among the
+                                particles stored in A's PIG (all types, periodic box), for tracers and
+                                core only (bound-set N is nan). The PIG holds only FOF group members
+                                and tagged particles outside groups, so field neighbours are missing
+                                and h is overestimated where they matter (halo outskirts); works for
+                                any run, e.g. the CDM control. knn wins if both are given.
+             Skipped with neither.
 
---rows writes the per-track table (one row per track resolved in A) to an .npz file.
+--rows writes the per-track table (one row per track resolved in A) to an .npz file; with an
+h source it adds density_source (["part"] or ["knn"]) and h_tracer (comoving, as N_tracer).
 """
 
 from __future__ import print_function
@@ -261,6 +270,26 @@ def sidm_part(A, part, args):
     return q, hq, mq
 
 
+def knn_support(A, P, box, args):
+    """(IDs, h, mass) of A's tracer and core particles, h = distance to the Nngb-th neighbour among
+    all particles of P (A's PIG; the particle itself is neighbour 0, as in SPH codes)."""
+    from scipy.spatial import cKDTree
+    q = np.unique(np.concatenate([A.tw_id[A.tw_j < args.ntracers], A.core_id]))
+    ids = P["ID"].astype(np.int64)
+    rows = np.nonzero(np.isin(ids, q))[0]
+    rows = rows[np.argsort(ids[rows], kind="stable")]
+    if not np.array_equal(ids[rows], q):
+        raise RuntimeError("knn: tracer / core IDs not found once each in PIG_A")
+    pos = np.mod(P["Position"].astype(np.float64), box)
+    pos[pos >= box] -= box   # mod can round up to box itself; cKDTree needs [0, box)
+    tree = cKDTree(pos, boxsize=box)
+    hq = np.empty(q.size)
+    step = 1 << 20
+    for s in range(0, q.size, step):  # chunked: one distance per query, but bounded scratch
+        hq[s:s + step] = tree.query(pos[rows[s:s + step]], k=[args.sidm_neighbors + 1], workers=-1)[0][:, 0]
+    return q, hq, P["Mass"][rows].astype(np.float64)
+
+
 def study(A, B, args, part=None, out=sys.stdout, quiet=False):
     n = A.tid.size
     nb, rank = A.Nbound.astype(np.int64), A.Rank
@@ -322,23 +351,34 @@ def study(A, B, args, part=None, out=sys.stdout, quiet=False):
     # 5. SIDM scattering proxy
     if part is not None:
         q, hq, mq = part
+        knn = args.density == "knn"
         hub, ul, um = (float(np.atleast_1d(A.header[k])[0]) for k in ("HubbleParam", "UnitLength_in_cm", "UnitMass_in_g"))
 
-        def rho_of(ids):   # physical g/cm^3 from the kernel support; nan where PART has no entry
+        def h_of(ids):   # (comoving h, mass) of particle IDs; nan where the source has no entry
             if q.size == 0:
-                return np.full(ids.size, np.nan)
+                return np.full(ids.size, np.nan), np.full(ids.size, np.nan)
             pos = np.minimum(np.searchsorted(q, ids), q.size - 1)
             hit = q[pos] == ids
-            hh = np.where(hit, hq[pos] * A.a * ul / hub, np.nan)
-            return np.where(hit, mq[pos], np.nan) * um / hub * args.sidm_neighbors / (4 * np.pi / 3 * hh ** 3)
+            return np.where(hit, hq[pos], np.nan), np.where(hit, mq[pos], np.nan)
+
+        def rho_of(ids):   # physical g/cm^3 from the kernel support
+            h, m = h_of(ids)
+            hh = h * A.a * ul / hub
+            return m * um / hub * args.sidm_neighbors / (4 * np.pi / 3 * hh ** 3)
         v = A.CoreSigmaV.astype(np.float64)
         perv = args.sigma0 * fshape((v / args.wturn) ** 2) * v * 1e5 * dt   # N per unit rho, per track
-        tN, cN, fbN = (rho_of(i) * perv[r] for i, r in ((tr_id, tr_row), (A.core_id, A.core_row), (A.fb_id, A.fb_row)))
+        tN, cN = (rho_of(i) * perv[r] for i, r in ((tr_id, tr_row), (A.core_id, A.core_row)))
+        # knn queries tracers and core only: the bound-set N stays undefined rather than core-biased
+        fbN = np.full(A.fb_id.size, np.nan) if knn else rho_of(A.fb_id) * perv[A.fb_row]
         R["N_tracer"] = np.full((n, args.ntracers), np.nan)
         R["N_tracer"][tr_row, tr_j] = tN
+        R["h_tracer"] = np.full((n, args.ntracers), np.nan)
+        R["h_tracer"][tr_row, tr_j] = h_of(tr_id)[0]
+        R["density_source"] = np.array([args.density])
         for lab, x, r in (("N_core_mean", cN, A.core_row), ("N_bound_mean", fbN, A.fb_row)):
             ok = np.isfinite(x)
-            R[lab] = np.bincount(r[ok], weights=x[ok], minlength=n) / np.bincount(r[ok], minlength=n)
+            cnt = np.bincount(r[ok], minlength=n)
+            R[lab] = np.bincount(r[ok], weights=x[ok], minlength=n) / np.where(cnt > 0, cnt, np.nan)
     else:
         tN = cN = fbN = None
     if args.rows:
@@ -400,18 +440,25 @@ def study(A, B, args, part=None, out=sys.stdout, quiet=False):
                 q.append("%7.3f / %7.3f" % tuple(np.percentile(R[k + c][m], [50, 90])) if m.any() else "   -")
         p("%-12s %7d | %s %s %s| %s %s %s" % (lab, m.sum(), *q))
     if tN is not None:
-        p("\n5 SIDM proxy: sigma0/m %g cm^2/g, w %g km/s, Nngb %d; tracer retention (same track) by expected scatterings N"
-          % (args.sigma0, args.wturn, args.sidm_neighbors))
+        knn = args.density == "knn"
+        p("\n5 SIDM proxy%s: sigma0/m %g cm^2/g, w %g km/s, Nngb %d; tracer retention (same track) by expected scatterings N"
+          % (" (knn density over the catalogue's group particles)" if knn else "", args.sigma0, args.wturn,
+             args.sidm_neighbors))
         edges = [0, 0.03, 0.1, 0.3, 1, np.inf]
         same = tfate == 0
-        for lo, hi in zip(edges[:-1], edges[1:]):
-            m = (tN >= lo) & (tN < hi)
-            p("  N in [%5g, %5g)  tracers %8d  retained %6.2f %%" % (lo, hi, m.sum(), pct(np.sum(same[m]), m.sum())))
-        p("  no SIDMSupport (not found / not type 1): %d tracers" % np.sum(~np.isfinite(tN)))
+        # all tracers, then the satellites with Nbound >= 100, where the N-loss correlation matters
+        sat = (rank[tr_row] != 0) & (nb[tr_row] >= 100)
+        for sel in (None, sat):
+            if sel is not None:
+                p("  satellites (Rank > 0) with Nbound >= 100:")
+            for lo, hi in zip(edges[:-1], edges[1:]):
+                m = (tN >= lo) & (tN < hi) & (True if sel is None else sel)
+                p("  N in [%5g, %5g)  tracers %8d  retained %6.2f %%" % (lo, hi, m.sum(), pct(np.sum(same[m]), m.sum())))
+        p("  no %s: %d tracers" % ("knn h" if knn else "SIDMSupport (not found / not type 1)", np.sum(~np.isfinite(tN))))
         p("  median N: %-12s %10s %10s %10s" % ("Nbound", "tracers", "core", "bound"))
         for lo, hi, lab in NBINS:
             mt, mc, mf = [(nb[r] >= lo) & (nb[r] < hi) for r in (tr_row, A.core_row, A.fb_row)]
-            p("            %-12s %10.4g %10.4g %10.4g" % (lab, *[np.nanmedian(x[mm]) if np.any(mm) else np.nan
+            p("            %-12s %10.4g %10.4g %10.4g" % (lab, *[np.nanmedian(x[mm]) if np.isfinite(x[mm]).any() else np.nan
                                                              for x, mm in ((tN, mt), (cN, mc), (fbN, mf))]))
     return S
 
@@ -435,10 +482,13 @@ def summary_numbers(R, both):
 
 def load(cat, earlier, later, args):
     """Earlier/Later views of one catalogue; its particle blocks are read once and released."""
+    knn = earlier and args.density == "knn"
     names = ["ID", "BoundTrackId", "BindRank"] + (["TrackId", "Mass"] if earlier else []) + (["GroupID"] if later else [])
-    P = read_particles(cat, names)
+    P = read_particles(cat, names + (["Position"] if knn else []))
     cat.clear_cache()
     out = (Earlier(cat, P, args) if earlier else None, Later(cat, P) if later else None)
+    if knn:   # the tree needs every stored position; built and dropped here, before P is released
+        out[0].knn = knn_support(out[0], P, float(np.atleast_1d(cat.header["BoxSize"])[0]), args)
     del P
     return out
 
@@ -475,6 +525,8 @@ def main(argv=None):
     ap.add_argument("--first", type=int, default=0)
     ap.add_argument("--last", type=int, default=-1)
     ap.add_argument("--part", help="PART snapshot of A with 1/SIDMSupport (section 5)")
+    ap.add_argument("--density", choices=("part", "knn"), default="part",
+                    help="section 5 kernel support: PART's 1/SIDMSupport, or Nngb-th neighbour distance in PIG_A")
     ap.add_argument("--sigma0", type=float, default=147.1, help="sigma0/m in cm^2/g")
     ap.add_argument("--wturn", type=float, default=120.0, help="velocity scale w in km/s")
     ap.add_argument("--sidm-neighbors", type=int, default=38)
@@ -486,12 +538,17 @@ def main(argv=None):
     args = ap.parse_args(argv)
     args.nwide = max(args.nwide, args.ntracers)  # rule a widens the finder's vote, never narrows it
     if args.sequence:
-        args.rows, args.part = None, None
+        args.rows, args.part, args.density = None, None, "part"
         return sequence(args)
     if not (args.pig_a and args.pig_b):
         ap.error("give PIG_A PIG_B or --sequence")
+    if args.density == "knn" and args.part:
+        print("note: --density knn given, --part %s ignored" % args.part, file=sys.stderr)
     A = load(SubhaloCatalogue(args.pig_a), True, False, args)[0]
-    part = sidm_part(A, args.part, args) if args.part else None
+    if args.density == "knn":
+        part, A.knn = A.knn, None
+    else:
+        part = sidm_part(A, args.part, args) if args.part else None
     B = load(SubhaloCatalogue(args.pig_b), False, True, args)[1]
     study(A, B, args, part=part)
     return 0
