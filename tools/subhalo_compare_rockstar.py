@@ -788,8 +788,10 @@ def main(argv=None):
     p.add_argument("--ntracers", type=int, default=10, help="tracers per subhalo for the ID match (default 10)")
     p.add_argument("--min-np", type=int, default=100, help="our Nbound threshold of the summary (default 100)")
     p.add_argument("--accept-frac", type=float, default=0.9, help="target matched fraction of centrals (default 0.9)")
-    p.add_argument("--median-tol", type=float, default=0.1,
-                   help="target |median ratio - 1| for Mvir and, with --field, MSO[0]; <= 0 disables (default 0.1)")
+    # decision 63: the FOF-only central source (decision 52) puts the median Mvir ratio to Rockstar at
+    # 0.90-0.97 over the 512^3 run, so the target is 20 %, not 10 %
+    p.add_argument("--median-tol", type=float, default=0.2,
+                   help="target |median ratio - 1| for Mvir and, with --field, MSO[0]; <= 0 disables (default 0.2)")
     p.add_argument("--rs-median-tol", type=float, default=0.2,
                    help="target |median Rs ratio - 1| of hosts: Rs(SO) (RsSO, decision 44), or the bound-set Rs(fit) "
                    "for a catalogue without RsSO (default 0.2; <= 0 disables)")
