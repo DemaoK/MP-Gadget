@@ -43,9 +43,6 @@ init_forcetree_params(const double treeallocfactor)
     ForceTreeParams.TreeAllocFactor = treeallocfactor;
 }
 
-static ForceTree
-force_tree_build(int mask, DomainDecomp * ddecomp, const ActiveParticles * act, const int DoMoments, const int alloc_father, const char * EmergencyOutputDir);
-
 static void
 force_treeupdate_pseudos(const int no, const int level, const ForceTree * const tree);
 
@@ -121,7 +118,7 @@ force_tree_full(ForceTree * tree, DomainDecomp * ddecomp, const int HybridNuTrac
     if(HybridNuTracer)
         mask = GASMASK + DMMASK + STARMASK + BHMASK;
 
-    /*No father array by default, only need it for hmax. We want moments.*/
+    /* Compute moments and retain parent indices for hmax propagation. */
     *tree = force_tree_build(mask, ddecomp, &act, 1, 1, EmergencyOutputDir);
     /* This is all particles (even if there are neutrinos)*/
     tree->full_particle_tree_flag = 1;
@@ -141,7 +138,7 @@ force_tree_active_moments(ForceTree * tree, DomainDecomp * ddecomp, const Active
     if(HybridNuTracer)
         mask = GASMASK + DMMASK + STARMASK + BHMASK;
 
-    /*No father array by default, only need it for hmax. We want moments.*/
+    /* Compute moments; parent indices are optional for hmax propagation. */
     *tree = force_tree_build(mask, ddecomp, act, 1, alloc_father, EmergencyOutputDir);
     /* This is all particles if active particle is null (even if there are neutrinos)*/
     if(!act->ActiveParticle)
@@ -159,7 +156,7 @@ force_tree_rebuild_mask(ForceTree * tree, DomainDecomp * ddecomp, int mask, cons
 
     /* Build for all particles*/
     ActiveParticles act = init_empty_active_particles(PartManager);
-    /* No moments, but need father for hmax. The hybridnugrav only affects moments, so isn't needed.*/
+    /* Neighbor tree: no moments; retain parent indices for hmax updates. */
     *tree = force_tree_build(mask, ddecomp, &act, 0, 1, EmergencyOutputDir);
     if(mask == ALLMASK)
         tree->full_particle_tree_flag = 1;

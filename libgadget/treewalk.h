@@ -161,6 +161,8 @@ struct TreeWalk {
     data_index ** ExportTable_thread;
     /* Flags that our export buffer is full*/
     int BufferFullFlag;
+    /* Skip collective log statistics; must agree on every rank. */
+    int NoWorkStats;
     /* Number of particles we can fit into the export buffer*/
     size_t BunchSize;
     /* List of neighbour candidates.*/

@@ -1361,7 +1361,7 @@ build_active_particles(ActiveParticles * act, const DriftKickTimes * const times
 #ifdef SIDM
             if(sidm_enabled && type == 1) {
                 sidm_bins[PartManager->Base[i].TimeBinSIDM]++;
-                nactivesidm += PartManager->Base[i].TiSIDMNext == times->Ti_Current;
+                nactivesidm += sidm_source_deadline(&PartManager->Base[i]) == times->Ti_Current;
             }
 #endif
             /* Account gas and BHs to their hydro bin and other particles to their gravity bin*/
@@ -1412,7 +1412,7 @@ build_active_particles(ActiveParticles * act, const DriftKickTimes * const times
 #ifdef SIDM
                 if(sidm_enabled && type == 1) {
                     sidm_bins[PartManager->Base[i].TimeBinSIDM]++;
-                    sidm_active = PartManager->Base[i].TiSIDMNext == times->Ti_Current;
+                    sidm_active = sidm_source_deadline(&PartManager->Base[i]) == times->Ti_Current;
                 }
 #endif
                 nactivesidm += sidm_active;

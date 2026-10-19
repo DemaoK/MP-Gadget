@@ -683,8 +683,10 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
             int64_t due = visit.sources.NumActiveParticle;
             MPI_Allreduce(MPI_IN_PLACE, &due, 1, MPI_INT64_T, MPI_SUM, MPI_COMM_WORLD);
             if(due) {
-                ForceTree sourceTree = {0};
-                force_tree_rebuild_mask(&sourceTree, ddecomp, DMMASK, All.OutputDir);
+                ActiveParticles all = init_empty_active_particles(PartManager);
+                /* Parent indices only seed uncached supports at startup. */
+                ForceTree sourceTree = force_tree_build(DMMASK, ddecomp, &all,
+                    0, NumCurrentTiStep == 0, All.OutputDir);
                 walltime_measure("/SPH/SIDM_Build");
                 sidm_distributed_force_intervals(&visit.sources, &All.CP, units, &times,
                     &sourceTree, visit.intervals, visit.limits, visit.motion_limits, All.RandomSeed);

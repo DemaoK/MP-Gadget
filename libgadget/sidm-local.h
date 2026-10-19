@@ -3,6 +3,13 @@
 
 #include "timestep.h"
 
+#ifdef SIDM
+static inline inttime_t sidm_source_deadline(const struct particle_data *p)
+{
+    return p->TiSIDMLast + dti_from_timebin(p->TimeBinSIDM);
+}
+#endif
+
 /* Separate cosmological SIDM source clocks. Only synchronized PM checkpoints
  * may be restarted: every source interval is flushed before writing them. */
 void sidm_local_configure(int enabled, double transport_fraction, double max_dloga);
@@ -16,7 +23,7 @@ void sidm_local_kick_phase(DriftKickTimes *times, int opening);
 
 struct sidm_local_visit {
     ActiveParticles sources;
-    /* Collision exposures and forward bounds are integrals dt/a^4. */
+    /* All arrays follow source-list order. Exposure and rate limits are dt/a^4. */
     double *intervals, *limits;
     /* Support / sampled maximum canonical relative speed (drift integral). */
     double *motion_limits;
@@ -25,9 +32,9 @@ struct sidm_local_visit {
 #endif
 };
 /* Allocate event scratch, released by commit; do not migrate particles or
- * retain nested allocations across commit. Only source entries of intervals
- * are initialized; the distributed solve fills limits. The native active list must
- * include SIDM-only sources; its live DM indices must be strictly increasing. */
+ * retain nested allocations across commit. The distributed solve fills limits.
+ * The native active list must include SIDM-only sources; its live DM indices
+ * must be strictly increasing. */
 struct sidm_local_visit sidm_local_begin_active(const DriftKickTimes *times, Cosmology *CP,
     int flush, const ActiveParticles *active);
 void sidm_local_commit(struct sidm_local_visit *visit, DriftKickTimes *times, Cosmology *CP);

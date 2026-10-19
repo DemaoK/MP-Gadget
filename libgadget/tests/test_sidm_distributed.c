@@ -29,7 +29,7 @@ static int source_batch_size=65536;
 #define TEST_N 512
 static struct ClockTable clocks;
 static uint64_t exported_batches;
-static int velocity_dependent,implicit_source_list;
+static int velocity_dependent,full_source_list;
 static int max_walk_sources,walk_calls;
 static void capture_walk(TreeWalk *tw,int *active,size_t nactive)
 {
@@ -153,21 +153,25 @@ static void test_direct_hierarchy(void **state)
         if(domain.TopLeaves[leaf].Task!=rank) continue;
         p.TopLeaf=leaf;P[PartManager->NumPart++]=p;
         /* Coincident massive gas must not enter the DM neighbor/rate solve. */
-        if(!implicit_source_list) {
+        if(!full_source_list) {
             p.Type=0;p.ID+=TEST_N;p.Mass=100;p.Vel[0]=1000;
             P[PartManager->NumPart++]=p;
         }
     }
-    ForceTree tree={0};force_tree_rebuild_mask(&tree,&domain,DMMASK,NULL);
+    ActiveParticles all=init_empty_active_particles(PartManager);
+    /* Startup seeding and later parent-free searches share the same oracle. */
+    ForceTree tree=force_tree_build(DMMASK,&domain,&all,0,full_source_list,NULL);
+    if(full_source_list) assert_non_null(tree.Father);
+    else assert_null(tree.Father);
     DriftKickTimes times={0};times.Ti_Current=2;
     DistParams.neighbors=38;
     DistParams.probability=.5;DistParams.velocity_dependent=velocity_dependent;DistParams.sigma0=20;DistParams.w=20;
     int indices[2*TEST_N],ns=0;
     /* More than 100 exports per thread on two ranks, even with balanced
      * chunks. Non-source ranks still exercise inactive-only receivers. */
-    for(int i=0;i<PartManager->NumPart;i++) if(P[i].Type==1&&(implicit_source_list||
+    for(int i=0;i<PartManager->NumPart;i++) if(P[i].Type==1&&(full_source_list||
         (rank==0&&((ntask>1&&!getenv("SIDM_TEST_EMPTY_OWNER"))||P[i].ID%3)))) indices[ns++]=i;
-    ActiveParticles sources={.Particles=P,.ActiveParticle=implicit_source_list?NULL:indices,.NumActiveParticle=ns};
+    ActiveParticles sources={.Particles=P,.ActiveParticle=indices,.NumActiveParticle=ns};
     double reference[TEST_N][3];uint64_t large_batches=0;
     for(int tiny=0;tiny<2;tiny++) {
         reset_state();exported_batches=0;max_walk_sources=walk_calls=0;
@@ -175,8 +179,9 @@ static void test_direct_hierarchy(void **state)
         /* Four ranks need room for a complete native 32-source chunk. */
         const size_t slots=ntask==4?256:100;
         treewalk_set_max_export_buffer(tiny?slots*sizeof(struct dist_query)*omp_get_max_threads():4*1024*1024);
-        double intervals[2*TEST_N]={0},limits[2*TEST_N],motion_limits[2*TEST_N];
-        for(int i=0;i<PartManager->NumPart;i++) limits[i]=NAN;
+        double intervals[ns+1],limits[ns+1],motion_limits[ns+1];
+        memset(intervals,0,sizeof(intervals));
+        for(int a=0;a<ns;a++) limits[a]=NAN;
         const size_t memory_before=mymalloc_usedbytes();
         sidm_distributed_force_intervals(&sources,&cp,units,&times,&tree,intervals,limits,motion_limits,123);
         assert_int_equal(mymalloc_usedbytes(),memory_before);
@@ -194,11 +199,11 @@ static void test_direct_hierarchy(void **state)
                 /* h=.5, mass unit=8, length unit=2: sigma_code=20. */
                 max_sv=fmax(max_sv,20*u*shape);max_speed=fmax(max_speed,u);
             }
-            assert_true(fabs(limits[i]/(.5/(.5*sidm_rate_cubic_kernel(0,h)*max_sv))-1)<1e-12);
-            assert_true(fabs(motion_limits[i]/(h/max_speed)-1)<1e-12);
+            assert_true(fabs(limits[a]/(.5/(.5*sidm_rate_cubic_kernel(0,h)*max_sv))-1)<1e-12);
+            assert_true(fabs(motion_limits[a]/(h/max_speed)-1)<1e-12);
         }
         if(source_batch_size<65536) {
-            double initial_limits[2*TEST_N],initial_motion[2*TEST_N];
+            double initial_limits[ns+1],initial_motion[ns+1];
             memcpy(initial_limits,limits,sizeof(limits));
             memcpy(initial_motion,motion_limits,sizeof(motion_limits));
             for(int i=0;i<PartManager->NumPart;i++) if(P[i].Type==1) {
@@ -207,24 +212,23 @@ static void test_direct_hierarchy(void **state)
             sidm_distributed_force_intervals(&sources,&cp,units,&times,&tree,intervals,limits,motion_limits,123);
             assert_int_equal(mymalloc_usedbytes(),memory_before);
             for(int a=0;a<ns;a++) {
-                const int i=indices[a];
-                assert_true(fabs(limits[i]/initial_limits[i]-1)<1e-12);
-                assert_true(fabs(motion_limits[i]/initial_motion[i]-1)<1e-12);
+                assert_true(fabs(limits[a]/initial_limits[a]-1)<1e-12);
+                assert_true(fabs(motion_limits[a]/initial_motion[a]-1)<1e-12);
             }
             for(int i=0;i<PartManager->NumPart;i++) if(P[i].Type==1)
                 P[i].Vel[0]=P[i].Vel[1]=P[i].Vel[2]=4;
             sidm_distributed_force_intervals(&sources,&cp,units,&times,&tree,intervals,limits,motion_limits,123);
             assert_int_equal(mymalloc_usedbytes(),memory_before);
             for(int a=0;a<ns;a++) {
-                assert_true(limits[indices[a]]==DBL_MAX);
-                assert_true(motion_limits[indices[a]]==DBL_MAX);
+                assert_true(limits[a]==DBL_MAX);
+                assert_true(motion_limits[a]==DBL_MAX);
             }
             for(int i=0;i<PartManager->NumPart;i++) if(P[i].Type==1) {
                 struct particle_data initial;fixture(&initial,P[i].ID-1);
                 memcpy(P[i].Vel,initial.Vel,sizeof(P[i].Vel));
             }
         }
-        for(int a=0;a<ns;a++) intervals[indices[a]]=.4;
+        for(int a=0;a<ns;a++) intervals[a]=.4;
         for(int i=0;i<PartManager->NumPart;i++) {
             if(P[i].Type!=1) {
                 struct particle_data initial;fixture(&initial,P[i].ID-TEST_N-1);
@@ -253,7 +257,7 @@ static void test_direct_hierarchy(void **state)
             receivers+=(memcmp(P[i].Vel,initial.Vel,sizeof(P[i].Vel))!=0)&&(rank!=0||((ntask==1||getenv("SIDM_TEST_EMPTY_OWNER"))&&P[i].ID%3==0));
         }
         MPI_Allreduce(MPI_IN_PLACE,&receivers,1,MPI_INT,MPI_SUM,MPI_COMM_WORLD);
-        if(!implicit_source_list) assert_true(receivers>0);
+        if(!full_source_list) assert_true(receivers>0);
         if(ns>source_batch_size) assert_int_equal(max_walk_sources,source_batch_size);
         int largest=ns;MPI_Allreduce(MPI_IN_PLACE,&largest,1,MPI_INT,MPI_MAX,MPI_COMM_WORLD);
         assert_true(walk_calls>=largest/source_batch_size+(largest%source_batch_size!=0));
@@ -272,10 +276,10 @@ static void test_direct_hierarchy(void **state)
 }
 static void test_bounded_sources(void **state)
 { source_batch_size=64;test_direct_hierarchy(state);source_batch_size=65536; }
-static void test_bounded_implicit_sources(void **state)
+static void test_bounded_full_sources(void **state)
 {
-    source_batch_size=63;implicit_source_list=1;test_direct_hierarchy(state);
-    implicit_source_list=0;source_batch_size=65536;
+    source_batch_size=63;full_source_list=1;test_direct_hierarchy(state);
+    full_source_list=0;source_batch_size=65536;
 }
 static void test_velocity_dependent_units(void **state)
 { velocity_dependent=1;test_direct_hierarchy(state);velocity_dependent=0; }
@@ -303,7 +307,7 @@ int main(void)
     if(observed_threads!=requested) return EXIT_FAILURE;
     const struct CMUnitTest tests[]={cmocka_unit_test(test_direct_hierarchy),
         cmocka_unit_test(test_velocity_dependent_units),cmocka_unit_test(test_bounded_sources),
-        cmocka_unit_test(test_bounded_implicit_sources)};
+        cmocka_unit_test(test_bounded_full_sources)};
     return cmocka_run_group_tests_mpi(tests,setup,NULL);
 }
 #else

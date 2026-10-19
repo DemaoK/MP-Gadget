@@ -100,7 +100,7 @@ void sidm_local_initialize(const DriftKickTimes *times,Cosmology *CP)
     Local.forward_epoch=-1;
     memset(Local.bins,0,sizeof(Local.bins));
     for(int i=0;i<PartManager->NumPart;i++) if(live_dm(i)) {
-        P[i].TiSIDMLast=P[i].TiSIDMNext=times->Ti_Current;
+        P[i].TiSIDMLast=times->Ti_Current;
         P[i].TimeBinSIDM=0;
         Local.bins[0]++;
     }
@@ -131,18 +131,13 @@ void sidm_local_kick_phase(DriftKickTimes *times,int opening)
         times->Ti_kick[b]=times->Ti_Current+(opening?dti_from_timebin(b)/2:0);
 }
 
-static int select_source(int i,const DriftKickTimes *times,Cosmology *CP,
-    int flush,struct sidm_local_visit *visit)
+static int select_source(int i,const DriftKickTimes *times,int flush)
 {
     if(!live_dm(i)) return 0;
-    if(P[i].TiSIDMLast>times->Ti_Current || P[i].TiSIDMNext<times->Ti_Current)
+    const inttime_t next=sidm_source_deadline(&P[i]);
+    if(P[i].TiSIDMLast>times->Ti_Current || next<times->Ti_Current)
         endrun(1,"SIDM source interval missed for ID %lu.\n",P[i].ID);
-    if(!flush && P[i].TiSIDMNext!=times->Ti_Current) return 0;
-    visit->intervals[i]=sidm_scatter_factor(CP,P[i].TiSIDMLast,times->Ti_Current);
-#ifdef SIDMDEBUG
-    visit->old_support[i]=P[i].Hsml;
-#endif
-    return 1;
+    return flush || next==times->Ti_Current;
 }
 
 struct sidm_local_visit sidm_local_begin_active(const DriftKickTimes *times,Cosmology *CP,
@@ -150,24 +145,13 @@ struct sidm_local_visit sidm_local_begin_active(const DriftKickTimes *times,Cosm
 {
     const int n=PartManager->NumPart;
     struct sidm_local_visit out={0};
-    out.sources.ActiveParticle=mymalloc("SIDM active sources",((size_t)n+1)*sizeof(int));
-    out.intervals=mymalloc("SIDM intervals",((size_t)n+1)*sizeof(double));
-    out.limits=mymalloc("SIDM limits",((size_t)n+1)*sizeof(double));
-    out.motion_limits=mymalloc("SIDM motion limits",((size_t)n+1)*sizeof(double));
-#ifdef SIDMDEBUG
-    out.old_support=mymalloc("SIDM previous support",((size_t)n+1)*sizeof(double));
-    uint64_t due=0,flushed=0;
-#endif
     out.sources.Particles=P;
     const int indexed=active && !flush;
     const int candidates=indexed?active->NumActiveParticle:n;
+    out.sources.ActiveParticle=mymalloc("SIDM active sources",((size_t)candidates+1)*sizeof(int));
     if(omp_get_max_threads()>1 && candidates>=1024*omp_get_max_threads()) {
         gadget_thread_arrays queues={.dest=out.sources.ActiveParticle,.total_size=candidates};
-#ifdef SIDMDEBUG
-#pragma omp parallel reduction(+:due,flushed)
-#else
 #pragma omp parallel
-#endif
         {
 #pragma omp master
             {
@@ -189,12 +173,8 @@ struct sidm_local_visit sidm_local_begin_active(const DriftKickTimes *times,Cosm
 #pragma omp for schedule(static,queues.schedsz)
             for(int a=0;a<candidates;a++) {
                 const int i=indexed && active->ActiveParticle?active->ActiveParticle[a]:a;
-                if(!select_source(i,times,CP,flush,&out)) continue;
+                if(!select_source(i,times,flush)) continue;
                 queues.srcs[tid][count++]=i;
-#ifdef SIDMDEBUG
-                due+=P[i].TiSIDMNext==times->Ti_Current;
-                flushed+=P[i].TiSIDMNext!=times->Ti_Current;
-#endif
             }
             queues.sizes[tid]=count;
         }
@@ -202,20 +182,38 @@ struct sidm_local_visit sidm_local_begin_active(const DriftKickTimes *times,Cosm
     } else {
         for(int a=0;a<candidates;a++) {
             const int i=indexed && active->ActiveParticle?active->ActiveParticle[a]:a;
-            if(!select_source(i,times,CP,flush,&out)) continue;
+            if(!select_source(i,times,flush)) continue;
             out.sources.ActiveParticle[out.sources.NumActiveParticle++]=i;
-#ifdef SIDMDEBUG
-            due+=P[i].TiSIDMNext==times->Ti_Current;
-            flushed+=P[i].TiSIDMNext!=times->Ti_Current;
-#endif
         }
     }
 #ifdef SIDMDEBUG
-    Local.due+=due;Local.flushed+=flushed;
     if(indexed && out.sources.NumActiveParticle!=active->NumActiveSIDM)
         endrun(1,"Local SIDM source count disagrees with native activity.\n");
 #endif
-    out.sources.NumActiveSIDM=out.sources.NumActiveParticle;
+    const int nsource=out.sources.NumActiveParticle;
+    out.sources.NumActiveSIDM=nsource;
+    out.sources.ActiveParticle=myrealloc(out.sources.ActiveParticle,((size_t)nsource+1)*sizeof(int));
+    out.intervals=mymalloc("SIDM intervals",((size_t)nsource+1)*sizeof(double));
+    out.limits=mymalloc("SIDM limits",((size_t)nsource+1)*sizeof(double));
+    out.motion_limits=mymalloc("SIDM motion limits",((size_t)nsource+1)*sizeof(double));
+#ifdef SIDMDEBUG
+    out.old_support=mymalloc("SIDM previous support",((size_t)nsource+1)*sizeof(double));
+    uint64_t due=0;
+#pragma omp parallel for if(nsource>=1024*omp_get_max_threads()) reduction(+:due)
+#else
+#pragma omp parallel for if(nsource>=1024*omp_get_max_threads())
+#endif
+    for(int a=0;a<nsource;a++) {
+        const int i=out.sources.ActiveParticle[a];
+        out.intervals[a]=sidm_scatter_factor(CP,P[i].TiSIDMLast,times->Ti_Current);
+#ifdef SIDMDEBUG
+        out.old_support[a]=P[i].Hsml;
+        due+=sidm_source_deadline(&P[i])==times->Ti_Current;
+#endif
+    }
+#ifdef SIDMDEBUG
+    Local.due+=due;Local.flushed+=nsource-due;
+#endif
     return out;
 }
 
@@ -246,16 +244,15 @@ void sidm_local_commit(struct sidm_local_visit *visit,DriftKickTimes *times,Cosm
     for(int a=0;a<nsource;a++) {
         const int i=visit->sources.ActiveParticle[a];
 #ifdef SIDMDEBUG
-        if(visit->old_support[i]>0 && visit->intervals[i]>0)
-            maxchange=fmax(maxchange,fabs(P[i].Hsml/visit->old_support[i]-1));
+        if(visit->old_support[a]>0 && visit->intervals[a]>0)
+            maxchange=fmax(maxchange,fabs(P[i].Hsml/visit->old_support[a]-1));
 #endif
         delta[P[i].TimeBinSIDM]--;
         P[i].TiSIDMLast=times->Ti_Current;
         /* Local relative motion predicts a support crossing time. It is not
          * a bound on later entrants or on velocity changes after this visit. */
         int limiter=0;
-        P[i].TimeBinSIDM=terminal?0:interval_bin(visit->limits[i],visit->motion_limits[i],&limiter);
-        P[i].TiSIDMNext=times->Ti_Current+dti_from_timebin(P[i].TimeBinSIDM);
+        P[i].TimeBinSIDM=terminal?0:interval_bin(visit->limits[a],visit->motion_limits[a],&limiter);
         delta[P[i].TimeBinSIDM]++;
 #ifdef SIDMDEBUG
         source_limits[limiter]+=!terminal;

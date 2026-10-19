@@ -136,6 +136,11 @@ void force_tree_active_moments(ForceTree * tree, DomainDecomp * ddecomp, const A
  * with all particle types, and of course the tree is smaller.*/
 void force_tree_rebuild_mask(ForceTree * tree, DomainDecomp * ddecomp, int mask, const char * EmergencyOutputDir);
 
+/* Construct a tree with optional moments and particle-parent indices.
+ * Asymmetric neighbor searches with cached radii need neither. */
+ForceTree force_tree_build(int mask, DomainDecomp * ddecomp, const ActiveParticles *act,
+    int DoMoments, int alloc_father, const char * EmergencyOutputDir);
+
 /* Just construct a toptree for domain exchange. If alloc_high is true, allocate the toptree at the upper memory range. */
 ForceTree force_tree_top_build(DomainDecomp * ddecomp, const int alloc_high);
 /* Find the topnode leaf in the tree that the current particle is attached to*/

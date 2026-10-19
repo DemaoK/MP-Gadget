@@ -33,7 +33,7 @@ struct particle_data
     /* Cacheline is here: above data is needed for the treebuild*/
     MyFloat Vel[3];   /* particle velocity at its current time */
 #ifdef SIDM
-    inttime_t TiSIDMLast, TiSIDMNext; /* Directed-source interval and deadline; migrate with owner. */
+    inttime_t TiSIDMLast; /* Last directed-source visit; migrates with owner. */
     unsigned char TimeBinSIDM; /* Aligned source interval; zero at startup/final output. */
 #endif
     MyFloat FullTreeGravAccel[3]; /* Short-range tree acceleration at the most recent timestep

@@ -59,14 +59,16 @@ struct dist_query { TreeWalkQueryBase base; double h; uint64_t id; };
 struct dist_work {
     struct support_work *support;
     struct sidm_direct_neighbor *heaps;
-    int *source_index, source_start, rank, neighbors;
+    int *source_index; /* Native particle index -> position in the source list. */
+    int source_start; /* First source-list position in the current batch. */
+    int rank, neighbors;
 };
 static int farther(struct sidm_direct_neighbor a, struct sidm_direct_neighbor b)
 { return a.r2 > b.r2 || (a.r2 == b.r2 && a.id > b.id); }
 
 static int support_slot(const struct dist_work *work, int i)
 {
-    return (work->source_index ? work->source_index[i] : i) - work->source_start;
+    return work->source_index[i] - work->source_start;
 }
 
 static struct sidm_direct_neighbor *support_heap(struct dist_work *work, int i)
@@ -146,6 +148,9 @@ static void support_ngbiter(TreeWalkQueryBase *query, TreeWalkResultBase *result
 static TreeWalk make_walk(const ForceTree *tree,struct dist_work *work)
 {
     TreeWalk tw={0};tw.tree=tree;tw.priv=work;tw.ev_label="SIDM_Support";
+#ifndef SIDMDEBUG
+    tw.NoWorkStats=1;
+#endif
     tw.visit=treewalk_visit_nolist_ngbiter;tw.NoNgblist=1;
     tw.ngbiter=support_ngbiter;tw.ngbiter_type_elsize=sizeof(TreeWalkNgbIterBase);
     tw.haswork=support_haswork;tw.fill=support_fill;tw.reduce=support_reduce;
@@ -235,14 +240,9 @@ void sidm_distributed_force_intervals(const ActiveParticles *act,Cosmology *CP,
     struct dist_work work={0};MPI_Comm_rank(MPI_COMM_WORLD,&work.rank);
     work.neighbors=DistParams.neighbors;
     work.support=mymalloc("SIDM support",((size_t)capacity+1)*sizeof(*work.support));
-    /* The callbacks receive native particle indices. Contiguous PM lists
-     * need no mapping; explicit lists map to their source-list positions. */
-    if(act->ActiveParticle)
-        work.source_index=mymalloc("SIDM source index",((size_t)npart+1)*sizeof(*work.source_index));
+    /* Tree callbacks receive native particle indices, not source positions. */
+    work.source_index=mymalloc("SIDM source index",((size_t)npart+1)*sizeof(*work.source_index));
     work.heaps=mymalloc("SIDM neighbor heaps",((size_t)capacity+1)*work.neighbors*sizeof(*work.heaps));
-    int *implicit_sources=NULL;
-    if(!act->ActiveParticle)
-        implicit_sources=mymalloc("SIDM implicit sources",((size_t)capacity+1)*sizeof(*implicit_sources));
     struct sidm_direct_source *sources=mymalloc("SIDM direct sources",((size_t)capacity+1)*sizeof(*sources));
     struct sidm_journal journal={0};
     int audit=Population.mass<=0;
@@ -252,18 +252,18 @@ void sidm_distributed_force_intervals(const ActiveParticles *act,Cosmology *CP,
     journal.entries=mymalloc("SIDM journal",((size_t)npart+1)*sizeof(*journal.entries));
     journal.marked=mymalloc("SIDM journal marks",((size_t)npart+1)*sizeof(*journal.marked));
     memset(journal.marked,0,(size_t)npart);
-    if(work.source_index) for(int i=0;i<npart;i++) work.source_index[i]=-1;
+    for(int i=0;i<npart;i++) work.source_index[i]=-1;
 #endif
     if(audit) audit_population(tree);
     journal.validated_mass=Population.mass;
     for(int a=0;a<nactive;a++) {
-        const int i=act->ActiveParticle?act->ActiveParticle[a]:a;
+        const int i=act->ActiveParticle[a];
 #ifdef SIDMDEBUG
-        if(i<0 || i>=npart || (work.source_index && work.source_index[i]>=0) ||
+        if(i<0 || i>=npart || work.source_index[i]>=0 ||
            P[i].Ti_drift!=times->Ti_Current || P[i].Type!=1 || P[i].IsGarbage || P[i].Swallowed)
             endrun(1,"Invalid SIDM source list or drift epoch.\n");
 #endif
-        if(work.source_index) work.source_index[i]=a;
+        work.source_index[i]=a;
     }
     const double mass=Population.mass;
     const double sigma0=DistParams.sigma0*CP->HubbleParam*units.UnitMass_in_g/(units.UnitLength_in_cm*units.UnitLength_in_cm);
@@ -287,11 +287,10 @@ void sidm_distributed_force_intervals(const ActiveParticles *act,Cosmology *CP,
         work.source_start=offset<nactive?offset:nactive;
         const int remaining=nactive-work.source_start;
         const int count=remaining<batch_size?remaining:batch_size;
-        int *batch_sources=act->ActiveParticle?act->ActiveParticle+work.source_start:implicit_sources;
+        int *batch_sources=act->ActiveParticle+work.source_start;
 #pragma omp parallel for
         for(int a=0;a<count;a++) {
-            const int i=act->ActiveParticle?batch_sources[a]:work.source_start+a;
-            if(implicit_sources) implicit_sources[a]=i;
+            const int i=batch_sources[a];
             memset(&work.support[a],0,sizeof(work.support[a]));
             const int cached=isfinite(P[i].Hsml) && P[i].Hsml>0;
             double h=cached?SUPPORT_REUSE_FACTOR*P[i].Hsml:guess;
@@ -348,7 +347,7 @@ void sidm_distributed_force_intervals(const ActiveParticles *act,Cosmology *CP,
             hmin=fmin(hmin,h);hmax=fmax(hmax,h);
 #endif
             sources[a]=(struct sidm_direct_source){.index=i,.n=work.neighbors,.neighbors=support_heap(&work,i),
-                .h=h,.exposure=intervals[i],.seed=event_seed};
+                .h=h,.exposure=intervals[work.source_start+a],.seed=event_seed};
         }
 #ifdef SIDMDEBUG
         support_seconds+=walltime_measure(".");
@@ -367,15 +366,15 @@ void sidm_distributed_force_intervals(const ActiveParticles *act,Cosmology *CP,
 #pragma omp parallel for
 #endif
         for(int a=0;a<count;a++) {
-            const int i=batch_sources[a];
+            const int slot=work.source_start+a;
             const double rate=.5*mass*sidm_rate_cubic_kernel(0,sources[a].h)*sources[a].max_sigma_v;
-            limits[i]=rate>0?DistParams.probability/rate:DBL_MAX;
-            motion_limits[i]=sources[a].max_relative_speed>0?sources[a].h/sources[a].max_relative_speed:DBL_MAX;
-            if(!isfinite(rate) || rate<0 || !isfinite(limits[i]) || limits[i]<=0 ||
-               !isfinite(motion_limits[i]) || motion_limits[i]<=0)
+            limits[slot]=rate>0?DistParams.probability/rate:DBL_MAX;
+            motion_limits[slot]=sources[a].max_relative_speed>0?sources[a].h/sources[a].max_relative_speed:DBL_MAX;
+            if(!isfinite(rate) || rate<0 || !isfinite(limits[slot]) || limits[slot]<=0 ||
+               !isfinite(motion_limits[slot]) || motion_limits[slot]<=0)
                 endrun(1,"Invalid SIDM measured source rate or motion interval.\n");
 #ifdef SIDMDEBUG
-            limit=fmin(limit,limits[i]);
+            limit=fmin(limit,limits[slot]);
 #endif
         }
 #ifdef SIDMDEBUG
@@ -403,9 +402,8 @@ void sidm_distributed_force_intervals(const ActiveParticles *act,Cosmology *CP,
     myfree(journal.entries);
 #endif
     myfree(sources);
-    if(implicit_sources) myfree(implicit_sources);
     myfree(work.heaps);
-    if(work.source_index) myfree(work.source_index);
+    myfree(work.source_index);
     myfree(work.support);
     walltime_measure("/SPH/SIDM_Finalize");
 }

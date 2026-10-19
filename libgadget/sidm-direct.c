@@ -583,16 +583,17 @@ int sidm_direct_scatter(struct sidm_direct_particles p,int nlocal,
     }
     j->count=0;
 #endif
-    if(reserve_routing(ntask)) fail(&failed,error,"Direct SIDM routing allocation failed");
-    if(collective_error(failed,error,comm)) goto cleanup;
-    count=Workspace.routing; start=count+ntask; cursor=start+ntask+1; incoming=cursor+ntask;
-    memset(count,0,(size_t)ntask*sizeof(*count)); start[0]=0;
-    int64_t ng=0;
     if(prepare_sources(p,nlocal,src,ns,j,rank,ntask,comm,error)) goto cleanup;
     PROFILE(stats->prepare_seconds=MPI_Wtime()-timer; timer=MPI_Wtime());
-    for(int a=0;a<ns;a++) for(int k=0;k<src[a].n;) {
-        count[src[a].neighbors[k].owner]++; ng++;
-        k=owner_run_end(src[a].neighbors,src[a].n,k);
+    int64_t ng=0;
+    if(reserve_routing(ntask)) fail(&failed,error,"Direct SIDM routing allocation failed");
+    if(!failed) {
+        count=Workspace.routing; start=count+ntask; cursor=start+ntask+1; incoming=cursor+ntask;
+        memset(count,0,(size_t)ntask*sizeof(*count)); start[0]=0;
+        for(int a=0;a<ns;a++) for(int k=0;k<src[a].n;) {
+            count[src[a].neighbors[k].owner]++; ng++;
+            k=owner_run_end(src[a].neighbors,src[a].n,k);
+        }
     }
     if(ng>INT_MAX) fail(&failed,error,"Direct SIDM group count exceeds index range");
     /* Keep the population-sized groups transient; only bounded communication

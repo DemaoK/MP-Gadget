@@ -73,10 +73,8 @@ static DriftKickTimes initialize_clocks(void)
 }
 static void unlimited(struct sidm_local_visit *visit)
 {
-    for(int a=0;a<visit->sources.NumActiveParticle;a++) {
-        const int i=visit->sources.ActiveParticle[a];
-        visit->limits[i]=visit->motion_limits[i]=DBL_MAX;
-    }
+    for(int a=0;a<visit->sources.NumActiveParticle;a++)
+        visit->limits[a]=visit->motion_limits[a]=DBL_MAX;
 }
 static void recount(void)
 {
@@ -104,10 +102,10 @@ static void clocks_for_boost(double boost,double distant_speed,inttime_t deadlin
     P[1].Hsml=relative*motion/.2;
     visit.motion_limits[1]=P[1].Hsml/relative;
     for(int a=0;a<visit.sources.NumActiveParticle;a++)
-        near(visit.intervals[visit.sources.ActiveParticle[a]],0);
+        near(visit.intervals[a],0);
     sidm_local_commit(&visit,&times,&cp);
     for(int i=0;i<3;i++) {
-        deadline[i]=P[i].TiSIDMNext;
+        deadline[i]=sidm_source_deadline(&P[i]);
         assert_true(is_timebin_active(P[i].TimeBinSIDM,0));
         assert_int_equal(deadline[i],dti_from_timebin(P[i].TimeBinSIDM));
     }
@@ -141,8 +139,8 @@ static void test_pm_due_and_checkpoint_flush(void **state)
     visit.limits[0]=1.1*sidm_scatter_factor(&cp,0,2);
     visit.motion_limits[1]=1.1*sidm_drift_factor(&cp,0,8)/.2;
     sidm_local_commit(&visit,&times,&cp);
-    assert_int_equal(P[0].TiSIDMNext,2);
-    assert_int_equal(P[1].TiSIDMNext,8);
+    assert_int_equal(sidm_source_deadline(&P[0]),2);
+    assert_int_equal(sidm_source_deadline(&P[1]),8);
     times.Ti_Current=times.PM_length=2;
     assert_true(is_PM_timestep(&times));
     /* PM's native list contains every particle; ordinary SIDM visits still
@@ -156,7 +154,7 @@ static void test_pm_due_and_checkpoint_flush(void **state)
     unlimited(&visit);
     sidm_local_commit(&visit,&times,&cp);
     assert_int_equal(P[1].TiSIDMLast,0);
-    assert_int_equal(P[1].TiSIDMNext,8);
+    assert_int_equal(sidm_source_deadline(&P[1]),8);
     /* An explicit checkpoint also consumes the undued source at this PM. */
     times.PM_start=2;times.PM_length=2;times.Ti_Current=times.PM_kick=4;
     times.Ti_kick[TIMEBINS-2]=4;
@@ -168,13 +166,13 @@ static void test_pm_due_and_checkpoint_flush(void **state)
     sidm_local_assert_flushed(&times);
     for(int i=0;i<2;i++) {
         assert_int_equal(P[i].TiSIDMLast,4);
-        assert_int_equal(P[i].TiSIDMNext,8);
+        assert_int_equal(sidm_source_deadline(&P[i]),8);
         assert_true(is_timebin_active(P[i].TimeBinSIDM,4));
     }
     times.PM_start=4;times.PM_length=TIMEBASE-4;
     assert_int_equal(sidm_local_next_event(&times,0),8);
     /* Terminal flushing has no pending source bin beyond the timeline. */
-    for(int i=0;i<2;i++) {P[i].TiSIDMNext=TIMEBASE;P[i].TimeBinSIDM=TIMEBINS;}
+    for(int i=0;i<2;i++) {P[i].TiSIDMLast=TIMEBASE/2;P[i].TimeBinSIDM=TIMEBINS-1;}
     recount();
     times.Ti_Current=times.PM_kick=TIMEBASE;
     times.Ti_kick[TIMEBINS-2]=TIMEBASE;
@@ -212,7 +210,6 @@ static void test_threaded_source_selection_and_commit(void **state)
             indices[at++]=i;
             const int due=i%17==0;
             P[i].TimeBinSIDM=TIMEBINS-(due?6:5);
-            P[i].TiSIDMNext=due?now:2*now;
             active.NumActiveSIDM+=due;
         }
         recount();
@@ -224,16 +221,17 @@ static void test_threaded_source_selection_and_commit(void **state)
             unlimited(&visit);
             int a=0;
             for(int i=0;i<n;i++) if(i%8>=2 && (flush || i%17==0)) {
-                assert_int_equal(visit.sources.ActiveParticle[a++],i);
+                assert_int_equal(visit.sources.ActiveParticle[a],i);
                 const double interval=sidm_scatter_factor(&cp,P[i].TiSIDMLast,now);
-                assert_true(visit.intervals[i]==interval);
-                if(threads==1) exposure[flush][i]=visit.intervals[i];
-                else assert_true(visit.intervals[i]==exposure[flush][i]);
+                assert_true(visit.intervals[a]==interval);
+                if(threads==1) exposure[flush][i]=visit.intervals[a];
+                else assert_true(visit.intervals[a]==exposure[flush][i]);
                 if(flush && i%3==0)
-                    visit.limits[i]=1.1*sidm_scatter_factor(&cp,now,now+now/2);
+                    visit.limits[a]=1.1*sidm_scatter_factor(&cp,now,now+now/2);
                 if(flush?i%3==1:i%2==1)
-                    visit.motion_limits[i]=1.1*sidm_drift_factor(&cp,now,
+                    visit.motion_limits[a]=1.1*sidm_drift_factor(&cp,now,
                         now+(flush?now/4:now/2))/.2;
+                a++;
             }
             sidm_local_commit(&visit,&times,&cp);
             for(int i=0;i<n;i++) if(i%8>=2) {
@@ -241,11 +239,11 @@ static void test_threaded_source_selection_and_commit(void **state)
                     const inttime_t step=flush?(i%3==0?now/2:i%3==1?now/4:now):
                         (i%2?now/2:now);
                     assert_int_equal(P[i].TiSIDMLast,now);
-                    assert_int_equal(P[i].TiSIDMNext,now+step);
+                    assert_int_equal(sidm_source_deadline(&P[i]),now+step);
                     assert_int_equal(dti_from_timebin(P[i].TimeBinSIDM),step);
                 } else {
                     assert_int_equal(P[i].TiSIDMLast,0);
-                    assert_int_equal(P[i].TiSIDMNext,2*now);
+                    assert_int_equal(sidm_source_deadline(&P[i]),2*now);
                 }
             }
             const inttime_t next=sidm_local_next_event(&times,0);
@@ -255,11 +253,11 @@ static void test_threaded_source_selection_and_commit(void **state)
         }
         for(int i=0;i<n;i++) {
             if(threads==1) {
-                serial[i].last=P[i].TiSIDMLast;serial[i].next=P[i].TiSIDMNext;
+                serial[i].last=P[i].TiSIDMLast;serial[i].next=sidm_source_deadline(&P[i]);
                 serial[i].bin=P[i].TimeBinSIDM;
             } else {
                 assert_int_equal(P[i].TiSIDMLast,serial[i].last);
-                assert_int_equal(P[i].TiSIDMNext,serial[i].next);
+                assert_int_equal(sidm_source_deadline(&P[i]),serial[i].next);
                 assert_int_equal(P[i].TimeBinSIDM,serial[i].bin);
             }
         }

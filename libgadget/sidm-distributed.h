@@ -9,8 +9,9 @@ void set_sidm_distributed_params(ParameterSet *ps);
  * Other species are ignored. Intervals and returned limits are dt/a^4
  * exposure factors; geometry uses comoving positions and support.
  * Motion limits are comoving support divided by measured relative speed,
- * in the simulation velocity convention. All arrays have NumPart entries.
- * Sources index P. Zero exposure
+ * in the simulation velocity convention. ActiveParticle must be an explicit
+ * list of indices into P, including on ranks with no sources. Arrays follow
+ * that list and have NumActiveParticle entries. Zero exposure
  * initializes rates/support without scattering. Inactive receivers retain
  * their source clocks. Ownership stays fixed until this operation returns.
  * seed is the global base seed; the adapter derives the event stream.

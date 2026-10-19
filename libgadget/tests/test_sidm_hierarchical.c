@@ -40,7 +40,10 @@ static void test_collision_activity_and_drift(void **state)
         P[i].Vel[0]=velocity[i];P[i].TimeBinGravity=i<2?fine:coarse;
     }
     sidm_local_initialize(&times,&cp);
-    for(int i=0;i<PartManager->NumPart;i++) P[i].TiSIDMNext=i?TIMEBASE:collision;
+    for(int i=0;i<PartManager->NumPart;i++) {
+        P[i].TimeBinSIDM=i?TIMEBINS:1;
+        P[i].TiSIDMLast=i?0:collision-2;
+    }
     drift_all_particles(0,collision,&cp,(double[3]){0});
     times.Ti_Current=collision;
     ActiveParticles act=init_empty_active_particles(PartManager);
@@ -83,7 +86,6 @@ static void test_source_bin_recount_and_ownership(void **state)
         P[i].TimeBinGravity=TIMEBINS;P[i].TimeBinHydro=1;
         P[i].Ti_drift=2;P[i].TiSIDMLast=0;
         P[i].TimeBinSIDM=i<2?3+i:1;
-        P[i].TiSIDMNext=dti_from_timebin(P[i].TimeBinSIDM);
     }
     P[3].IsGarbage=1;
     int64_t empty[TIMEBINS+1]={0};sidm_local_set_bin_counts(empty);
@@ -106,7 +108,6 @@ static void test_source_bin_recount_and_ownership(void **state)
     /* The next activity scan replaces stale owner-local counts. */
     for(int i=0;i<2;i++) {
         P[i].TimeBinSIDM++;
-        P[i].TiSIDMNext=dti_from_timebin(P[i].TimeBinSIDM);
     }
     act=init_empty_active_particles(PartManager);
     build_active_particles(&act,&times,3,get_atime(2),PartManager);
