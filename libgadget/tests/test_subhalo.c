@@ -5795,6 +5795,21 @@ test_subhalo_orphan_set_update(void ** state)
         subhalo_orphan_update(&t, h, 4, off0, box, vfac, 4);
         CHECK(t.Host == 4 && subhalo_isfinite(t.TracerPos[0]) && t.TracerPos[0] > 50, "underflowing weights: Host %ld TracerPos %g\n", t.Host,
               t.TracerPos[0]);
+        /* only ranks 14 and 15 found, penalties 708: exp(-708) is normal but the rank factor makes
+         * every final weight underflow; the rank weights alone, no NaN */
+        struct SubhaloIdHit hh[16];
+        for(k = 0; k < 16; k++) {
+            hh[k] = os_hit(60 + 0.1 * k, 50, 50, 5 + k / 15, 708, 2. * k);
+            hh[k].found = k >= 14;
+        }
+        t = os_orphan(16, 1.0f);
+        subhalo_orphan_update(&t, hh, 16, off0, box, vfac, 4);
+        const double w14 = 1 / (1 + sqrt(14.)), w15 = 1 / (1 + sqrt(15.));
+        const double xe = (61.4 * w14 + 61.5 * w15) / (w14 + w15);
+        CHECK(t.NOrphanFound == 2 && subhalo_isfinite(t.TracerPos[0]) && fabs(t.TracerPos[0] - xe) < 1e-9 && subhalo_isfinite(t.OrphanSigmaX)
+              && subhalo_isfinite(t.TracerVel[0]) && t.Host == 5,
+              "underflowing final weights: TracerPos %g (expected %g) OrphanSigmaX %g TracerVel %g Host %ld\n", t.TracerPos[0], xe,
+              t.OrphanSigmaX, t.TracerVel[0], t.Host);
     }
     /* "no group" is a ballot: -1 wins over a group with less weight, and loses to one with more */
     {

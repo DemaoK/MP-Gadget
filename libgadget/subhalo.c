@@ -871,8 +871,8 @@ subhalo_orphan_update(struct SubTrack * t, const struct SubhaloIdHit * hit, int 
         t->OrphanSigmaX = -1;
         return 0;
     }
-    /* positions unwrapped about the first found marker; the centre is that marker for one or two,
-     * else the component-wise lower median */
+    /* positions unwrapped about the first found marker; the centre: one or two found, the first,
+     * most-bound one (a median of two would mix particles), else the component-wise lower median */
     for(k = 0; k < nf; k++)
         for(d = 0; d < 3; d++)
             x[k][d] = hit[f[0]].Pos[d] + NEAREST(hit[f[k]].Pos[d] - hit[f[0]].Pos[d], BoxSize);
@@ -922,17 +922,22 @@ subhalo_orphan_update(struct SubTrack * t, const struct SubhaloIdHit * hit, int 
     /* weights as the host vote: exp(-penalty) / (1 + sqrt(rank in the followed set)) */
     int64_t cand[SUBHALO_MAXTRACERS];
     double w[SUBHALO_MAXTRACERS], W = 0, mx[3] = {0, 0, 0}, mv[3] = {0, 0, 0};
-    for(k = 0; k < nk; k++)
-        W += subhalo_tracer_weight(hit[f[keep[k]]].Penalty);
-    /* penalties so large that every exp underflows: the rank weights alone */
-    const int unitw = !(W > 0);
-    W = 0;
+    for(k = 0; k < nk; k++) {
+        w[k] = subhalo_tracer_weight(hit[f[keep[k]]].Penalty) / (1.0 + sqrt((double) f[keep[k]]));
+        W += w[k];
+    }
+    /* every final weight underflowed (huge penalties): the rank weights alone, whose sum is > 0 */
+    if(!(W > 0)) {
+        W = 0;
+        for(k = 0; k < nk; k++) {
+            w[k] = 1.0 / (1.0 + sqrt((double) f[keep[k]]));
+            W += w[k];
+        }
+    }
     for(k = 0; k < nk; k++) {
         const int q = keep[k];
         const struct SubhaloIdHit * h = &hit[f[q]];
-        w[k] = (unitw ? 1.0 : subhalo_tracer_weight(h->Penalty)) / (1.0 + sqrt((double) f[q]));
         cand[k] = h->GrNr + 1;   /* -1 (no group) is a legitimate ballot */
-        W += w[k];
         for(d = 0; d < 3; d++) {
             mx[d] += w[k] * x[q][d];
             mv[d] += w[k] * h->Vel[d];

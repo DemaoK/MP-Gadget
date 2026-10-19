@@ -1581,12 +1581,14 @@ def orphan_markers(O, r):
     return np.array([mb], np.uint64) if mb != NO_ID else np.zeros(0, np.uint64)
 
 
-def orphan_set_state(pos, gid, scale, box):
-    """The finder's orphan state from every marker of a set (subhalo_orphan_update), unit penalties:
-    positions unwrapped about the first, the centre the first for one or two markers else the
-    component-wise lower median, kept within 3 scale (all for scale <= 0, else the closest),
-    weights 1/(1 + sqrt(rank)). Returns (position wrapped into [0, box), kept count, host GroupID
-    by weighted plurality with -1 a ballot and ties to the smaller)."""
+def orphan_set_state(pos, gid, scale, box, pen=None):
+    """The finder's orphan state from every marker of a set (subhalo_orphan_update), penalties pen
+    (default 0): positions unwrapped about the first, then the minimum image about the centre (one
+    or two markers: the first, most-bound one, as a median of two would mix particles; else the
+    component-wise lower median); kept within 3 scale (all for scale <= 0, else the closest);
+    weights exp(-pen) / (1 + sqrt(rank)), the rank part alone if they all underflow. Returns
+    (position wrapped into [0, box), kept count, host GroupID by weighted plurality, -1 a ballot,
+    ties to the smaller)."""
     pos = np.asarray(pos, np.float64)
     x = pos[0] + _periodic(pos - pos[0], box)
     n = x.shape[0]
@@ -1596,15 +1598,16 @@ def orphan_set_state(pos, gid, scale, box):
     keep = np.nonzero((r2 <= 9.0 * float(scale) ** 2) if scale > 0 else np.ones(n, bool))[0]
     if keep.size == 0:
         keep = np.array([int(np.argmin(r2))])
-    if keep.size == 1:
-        m = pos[keep[0]]
-    else:
-        w = 1.0 / (1.0 + np.sqrt(keep.astype(np.float64)))
-        m = (w[:, None] * x[keep]).sum(axis=0) / w.sum()
+    rankw = 1.0 / (1.0 + np.sqrt(keep.astype(np.float64)))
+    pen = np.zeros(n) if pen is None else np.asarray(pen, np.float64)
+    w = np.where(pen[keep] > 0, np.exp(-np.maximum(pen[keep], 0)), 1.0) * rankw
+    if not w.sum() > 0:
+        w = rankw
+    m = pos[keep[0]] if keep.size == 1 else (w[:, None] * x[keep]).sum(axis=0) / w.sum()
     sums = {}
-    for j in keep.tolist():
+    for j, wj in zip(keep.tolist(), w.tolist()):
         g = int(gid[j])
-        sums[g] = sums.get(g, 0.0) + 1.0 / (1.0 + np.sqrt(float(j)))
+        sums[g] = sums.get(g, 0.0) + wj
     host = min(sums, key=lambda g: (-sums[g], g))
     return np.mod(m, box), int(keep.size), host
 
