@@ -63,9 +63,10 @@ ten at k + j, from the Position / Velocity of the stored ones ("found"; field ma
               in rank order) and of their velocities; distances below are minimum-image residuals
               about it
   sigma_x/v   rms 3D distance of the found markers from the centre (comoving catalogue units;
-              physical peculiar km/s: the Velocity block is divided by a when the Header's
-              UsePeculiarVelocity is 0, i.e. it holds a v_pec), *_rel = / CoreSigmaX or CoreSigmaV
-              at k-1 (physical peculiar km/s); one found -> 0, none -> NaN (no centre)
+              physical peculiar km/s: the Velocity block times UnitVelocity_in_cm_per_s / 1e5, and
+              divided by a when the Header's UsePeculiarVelocity is 0, i.e. it holds a v_pec),
+              *_rel = / CoreSigmaX or CoreSigmaV at k-1 (physical peculiar km/s); one found -> 0,
+              none -> NaN (no centre)
   n_coherent  found markers within 3 CoreSigmaX(k-1) of the centre (the remnant)
   d_clip      distance of the mean of those markers from the centre, / CoreSigmaX (NaN if none)
   d_mb        distance of the ten's first marker from the centre, / CoreSigmaX; NaN if not stored
@@ -170,6 +171,15 @@ def n_expected(E, ids, erow, a_next, args):
     return rho * args.sigma0 * fshape((v / args.wturn) ** 2) * v * 1e5 * dt
 
 
+def pecvel_flag(h):
+    """UsePeculiarVelocity of a Header: missing -> 0 (petaio's default); a string -> 1 if 'peculiar_physical'."""
+    v = h.get("UsePeculiarVelocity", 0)
+    if isinstance(v, (str, bytes)) or np.asarray(v).dtype.kind in "SUO":
+        t = "".join(x.decode() if isinstance(x, bytes) else str(x) for x in np.atleast_1d(v))
+        return int("peculiar_physical" in t)
+    return int(np.atleast_1d(v)[0])
+
+
 class LaterPV(Later):
     """Later plus Position / Velocity in its sorted-ID order and the Orphan tracer columns (death mode).
     P must already be sorted by ID, so Later's own argsort is the identity."""
@@ -178,10 +188,10 @@ class LaterPV(Later):
         Later.__init__(self, cat, P)
         self.pos, self.vel = P["Position"].astype(np.float64), P["Velocity"].astype(np.float64)
         self.box = float(np.atleast_1d(cat.header["BoxSize"])[0])
-        # Velocity block: peculiar km/s if UsePeculiarVelocity (else a * v_pec, petaio's default 0)
-        self.pecvel = int(np.atleast_1d(cat.header.get("UsePeculiarVelocity", 0))[0])
-        if not self.pecvel:
-            self.vel /= cat.scale_factor
+        # Velocity block: peculiar velocity if UsePeculiarVelocity (else a * v_pec, petaio's default 0)
+        self.pecvel = pecvel_flag(cat.header)
+        uvel = float(np.atleast_1d(cat.header.get("UnitVelocity_in_cm_per_s", 1e5))[0])
+        self.vel *= (uvel / 1e5) / (1.0 if self.pecvel else cat.scale_factor)   # -> physical peculiar km/s
         O, no = cat.orphans, cat.norphans
         self.osink = O["SinkTrackId"].astype(np.int64) if no else np.zeros(0, np.int64)
         self.olost = O["SnapTracerLost"].astype(np.int64) if no else np.zeros(0, np.int64)
