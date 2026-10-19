@@ -701,7 +701,7 @@ def compare_hlist(args):
     sacc = seq.scale_of(S["SnapAcc"][r])
     for lab, ct, ours in (("Mpeak / MboundPeak", H["Mpeak"][ok], S["MboundPeak"][r] * mconv),
                           ("Vpeak / VmaxPeak", H["Vpeak"][ok], S["VmaxPeak"][r]),
-                          ("Mvir / exported mass (Mbound here)", H["mvir"][ok], S["Mbound"][r] * mconv)):
+                          ("Mvir / Mbound (satellites' export)", H["mvir"][ok], S["Mbound"][r] * mconv)):
         rr = ct / np.where(ours > 0, ours, np.nan)
         print("  %-36s p10/p50/p90 %s, exact (1e-3) %.1f%%" % (lab, _q(rr), 100 * np.mean(np.abs(rr - 1) < 1e-3)))
     same = np.isclose(H["Acc_Scale"][ok], sacc, atol=2e-3)
