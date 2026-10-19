@@ -224,6 +224,7 @@ create_gadget_parameter_set()
     param_declare_int(ps, "SubhaloMinNumPart", OPTIONAL, 20, "Minimum number of bound particles of a resolved subhalo.");
     param_declare_int(ps, "SubhaloMinNumTracerPart", OPTIONAL, 10, "Minimum number of bound tracer particles of a resolved subhalo.");
     param_declare_int(ps, "SubhaloNumTracerHostFinding", OPTIONAL, 10, "Tracers used in the host vote and for descendants. Must not exceed SubhaloMinNumTracerPart.");
+    param_declare_int(ps, "SubhaloOrphanTracers", OPTIONAL, 10, "Particles an orphan follows: its MostBoundID and the first host-vote tracers at death; position and host from their clipped, penalty-weighted set. 1 = the MostBoundID alone (HBT). At most 16.");
     param_declare_double(ps, "SubhaloLookupBatchBytes", OPTIONAL, 64.*1024*1024, "Per-rank bound in bytes on one batch of the tracer ID lookups: the gathered IDs plus the outgoing and returning replies (at least one ID per rank and batch).");
     param_declare_double(ps, "SubhaloMajorProgenitorMassRatio", OPTIONAL, 0.8, "Central candidacy mass ratio.");
     param_declare_double(ps, "SubhaloBoundMassPrecision", OPTIONAL, 0.995, "Unbinding convergence criterion.");

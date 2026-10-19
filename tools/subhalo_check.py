@@ -20,7 +20,10 @@ input could not be read.
                               the vote; a target absent or dead before the call, or a cycle, fails;
                               a chain ending in a track that died in the call without sinking, as
                               after a failed re-unbinding, is a warning),
-                              resurrections, recomputed from the two PIGs. A group with resolved
+                              resurrections, recomputed from the two PIGs (an orphan following
+                              several particles, decision 70: its host from PIG_next's own record,
+                              which must be the group of one of its markers, or -1 with a marker
+                              outside every group). A group with resolved
                               survivors has one Rank 0 member, the most massive (CompareMass) and
                               a previous member; in an orphan-only group the orphan nearest in
                               kinetic distance (H from RSDFactor, float32 roundoff allowed) is
@@ -52,6 +55,16 @@ input could not be read.
   orphans PIGDIR [...]        Orphan/*: TracerPos inside the box, SnapTracerLost -1 or <= the
                               snapshot, Snap* ordering, SinkTrackId / DescendantTrackId /
                               NestedParentTrackId / CentralTrackId refer to existing tracks.
+                              The followed set (decision 70; legacy values for schema 1):
+                              NOrphanTracers in [1, 16], OrphanIDs[0] = MostBoundID, the others
+                              distinct, -1 exactly after NOrphanTracers; NOrphanFound in [0,
+                              NOrphanTracers], 0 exactly when SnapTracerLost >= 0, 1 at the death
+                              snapshot; OrphanSigmaX -1 or >= 0, defined exactly when NOrphanFound
+                              >= 2 and at most 6 OrphanScale; OrphanScale -1 or > 0. TracerPos
+                              against the saved markers: OrphanIDs[0]'s position at death, else
+                              the clipped weighted mean recomputed when every marker is saved
+                              (unit penalties; a warning unless --tracer-pos), with HostGroup their
+                              weighted plurality group.
   props PIGDIR [...]          Phase 3: the property columns. Bound SO (MBoundSO, RBoundSO) and field
                               SO (MSO, RSO) defined for a looser threshold whenever for a tighter one,
                               non-increasing with the threshold density (Header SOThresholds, else the
@@ -88,7 +101,8 @@ input could not be read.
                               maxima; SnapAcc, SnapFirstAcc, SnapLastIsolation, SnapLastMajorMerger
                               against the Rank history (subhalo_history_update).
   compare PIG_A PIG_B         check 5: every Subhalo/* and Orphan/* column equal after sorting by
-                              TrackId, and the per-particle tags equal when matched by ID.
+                              TrackId, and the per-particle tags equal when matched by ID
+                              (--ignore skips a column or one of the compared Header attributes).
   markincomplete PIGDIR       check 6 helper: set Header SubhaloStateComplete (default 0).
   tagcounts PIGDIR            tagged particles per type (to compare with the run log, check 4).
 
@@ -381,7 +395,7 @@ def check_consistency(pigdir, ck, phase1=True, expect_field="auto", allow_incomp
     tag = os.path.basename(pigdir.rstrip("/"))
     if not allow_incomplete:
         ck.check(cat.complete(), "%s: SubhaloStateComplete = %s" % (tag, attr(h, "SubhaloStateComplete")))
-    ck.check(int(attr(h, "SubhaloSchemaVersion", -1)) == 1, "%s: SubhaloSchemaVersion %s" % (tag, attr(h, "SubhaloSchemaVersion")))
+    ck.check(int(attr(h, "SubhaloSchemaVersion", -1)) in (1, 2), "%s: SubhaloSchemaVersion %s" % (tag, attr(h, "SubhaloSchemaVersion")))
     snap = snapnum_of(pigdir)
     if snap is not None and "SnapshotIndex" in h:
         ck.check(int(attr(h, "SnapshotIndex")) == snap, "%s: SnapshotIndex %s" % (tag, attr(h, "SnapshotIndex")))
@@ -1095,11 +1109,41 @@ def _tracking_phase2a(ck, A, B, args):
     if nwrong > 20:
         ck.fail("... %d tracks with a HostGroup other than their vote" % nwrong)
 
-    # 3. orphan hosts from their MostBoundID (step 1); resurrected orphans
+    # 3. orphan hosts from their MostBoundID (step 1); resurrected orphans. An orphan following
+    #    several particles (decision 70) takes the plurality group of its kept markers, whose
+    #    clip and penalties PIG_next does not hold: its host is read from PIG_next's own record
+    #    and must be the group of one of its markers (-1: one outside every group)
     so = np.argsort(mid)
     orph_alive = OA["SnapTracerLost"] < 0 if "SnapTracerLost" in OA else np.ones(len(OA["TrackId"]), bool)
     orph_host = lookup(mid[so], OA["MostBoundID"].astype(mid.dtype), mgid[so], default=-1)
     orph_host[~orph_alive] = -1
+    oset = OA["NOrphanTracers"] > 1 if "NOrphanTracers" in OA else np.zeros(len(OA["TrackId"]), bool)
+    saved_b = np.sort(particles(B)["ID"]) if np.any(oset & orph_alive) else np.zeros(0, np.uint64)
+    nmulti = 0
+    for ra in np.nonzero(oset & orph_alive)[0].tolist():
+        T = int(OA["TrackId"][ra])
+        rb, rs = B.orphan_row(T), B.subhalo_row(T)
+        if rb >= 0:
+            got, lost_b = int(OB["HostGroup"][rb]), int(OB["SnapTracerLost"][rb]) >= 0
+        elif rs >= 0:
+            got, lost_b = int(SB["HostGroup"][rs]), False
+        else:
+            continue
+        nmulti += 1
+        mk = orphan_markers(OA, ra)
+        g = lookup(mid[so], mk.astype(mid.dtype), mgid[so], default=-1)
+        if lost_b:
+            ck.check(got == -1 and not np.any(lookup(saved_b, mk.astype(saved_b.dtype)) >= 0),
+                     "orphan %d lost its markers at this call but has HostGroup %d or a marker saved in %s" % (T, got, args.next))
+        elif got >= 0:
+            ck.check(np.any(g == got), "orphan %d (%d markers): host %d holds none of its markers (their groups %s)"
+                     % (T, mk.size, got, g.tolist()))
+        else:
+            ck.check(np.any(g < 0), "orphan %d (%d markers): host -1 but every marker is in a group %s" % (T, mk.size, g.tolist()))
+        orph_host[ra] = got
+    if nmulti:
+        print("  %d previous orphans follow several particles: hosts from %s, checked against their markers' groups"
+              % (nmulti, args.next))
     resurrected = OA["TrackId"][lookup(tid_sb, OA["TrackId"]) >= 0]
     for T in resurrected.tolist():
         ra, rb = A.orphan_row(T), B.subhalo_row(T)
@@ -1107,8 +1151,8 @@ def _tracking_phase2a(ck, A, B, args):
                  % (T, OA["SnapTracerLost"][ra]))
         ck.check(SB["HostGroup"][rb] == orph_host[ra] and SB["Rank"][rb] == 0,
                  "resurrected orphan %d: HostGroup %d Rank %d, expected the central of group %d "
-                 "(the group holding its MostBoundID %d)" % (T, SB["HostGroup"][rb], SB["Rank"][rb],
-                                                             orph_host[ra], OA["MostBoundID"][ra]))
+                 "(the group holding its MostBoundID %d, or for a set its markers' plurality)"
+                 % (T, SB["HostGroup"][rb], SB["Rank"][rb], orph_host[ra], OA["MostBoundID"][ra]))
 
     # 4. members per group and the central decision (step 7b); hostless (pseudo-key) centrals are not checked here
     cand, ocand = {}, {}
@@ -1138,6 +1182,8 @@ def _tracking_phase2a(ck, A, B, args):
     if multi and H_b is None:
         ck.warn("%s has no Header/RSDFactor: the orphan choice in %d groups is not checked" % (args.next, len(multi)))
     mbid = dict(zip(OA["TrackId"].tolist(), OA["MostBoundID"].tolist()))
+    multi_t = set(OA["TrackId"][oset].tolist())
+    nkin_multi = 0
     ncen_bad = npromo = 0
     for g in gid_b.tolist():
         cen = rank0.get(g, [])
@@ -1175,6 +1221,9 @@ def _tracking_phase2a(ck, A, B, args):
                         "(died again?)" % (g, ids[:8]))
             elif c not in ids:
                 ck.fail("group %d: central %d is not one of its orphans %s" % (g, c, ids[:8]))
+            elif len(ids) > 1 and any(T in multi_t for T in ids):
+                # the resurrected one's set mean (its tracer) is in no table of PIG_next
+                nkin_multi += 1
             elif g not in frame:
                 if len(ids) > 1 and H_b is not None:
                     ck.fail("group %d: no section-0 particles for its orphans %s" % (g, ids[:8]))
@@ -1210,6 +1259,9 @@ def _tracking_phase2a(ck, A, B, args):
             ck.check(c >= ntr_a, "group %d has no previous member but its central %d is not newborn" % (g, c))
     if ncen_bad > 20:
         ck.fail("... %d groups whose central is not a previous member" % ncen_bad)
+    if nkin_multi:
+        ck.note("%d orphan-only groups with an orphan following several particles: the kinetic-distance choice is not "
+                "checked (the tracer of the resurrected one is not saved)" % nkin_multi)
     if npromo:
         ck.note("%d groups have a promoted central (the most massive survivor, not a DecideCentrals-eligible "
                 "candidate)" % npromo)
@@ -1516,6 +1568,47 @@ def cmd_tags(args):
 
 
 # ---------------------------------------------------------------------------------- orphans
+NO_ID = np.uint64(0xFFFFFFFFFFFFFFFF)
+
+
+def orphan_markers(O, r):
+    """The IDs orphan row r follows (decision 70): OrphanIDs[:NOrphanTracers], or its MostBoundID
+    alone for a row without a set."""
+    n = int(O["NOrphanTracers"][r]) if "NOrphanTracers" in O else 0
+    if n > 0:
+        return np.asarray(O["OrphanIDs"][r]).reshape(-1)[:n].astype(np.uint64)
+    mb = np.uint64(O["MostBoundID"][r])
+    return np.array([mb], np.uint64) if mb != NO_ID else np.zeros(0, np.uint64)
+
+
+def orphan_set_state(pos, gid, scale, box):
+    """The finder's orphan state from every marker of a set (subhalo_orphan_update), unit penalties:
+    positions unwrapped about the first, the centre the first for one or two markers else the
+    component-wise lower median, kept within 3 scale (all for scale <= 0, else the closest),
+    weights 1/(1 + sqrt(rank)). Returns (position wrapped into [0, box), kept count, host GroupID
+    by weighted plurality with -1 a ballot and ties to the smaller)."""
+    pos = np.asarray(pos, np.float64)
+    x = pos[0] + _periodic(pos - pos[0], box)
+    n = x.shape[0]
+    c = x[0] if n <= 2 else np.sort(x, axis=0)[(n - 1) // 2]
+    x = x - box * (x - c > 0.5 * box) + box * (x - c < -0.5 * box)
+    r2 = ((x - c) ** 2).sum(axis=1)
+    keep = np.nonzero((r2 <= 9.0 * float(scale) ** 2) if scale > 0 else np.ones(n, bool))[0]
+    if keep.size == 0:
+        keep = np.array([int(np.argmin(r2))])
+    if keep.size == 1:
+        m = pos[keep[0]]
+    else:
+        w = 1.0 / (1.0 + np.sqrt(keep.astype(np.float64)))
+        m = (w[:, None] * x[keep]).sum(axis=0) / w.sum()
+    sums = {}
+    for j in keep.tolist():
+        g = int(gid[j])
+        sums[g] = sums.get(g, 0.0) + 1.0 / (1.0 + np.sqrt(float(j)))
+    host = min(sums, key=lambda g: (-sums[g], g))
+    return np.mod(m, box), int(keep.size), host
+
+
 def check_orphans(pigdir, ck, tracer_pos=False):
     try:
         cat = SubhaloCatalogue(pigdir)
@@ -1561,26 +1654,92 @@ def check_orphans(pigdir, ck, tracer_pos=False):
         ck.check(not np.any(bad), "%s: %d orphans whose %s is not an existing track (e.g. %s -> %s)"
                  % (tag, np.count_nonzero(bad), col, tid[bad][:5].tolist(), v[bad][:5].tolist()))
         ck.check(np.all(v >= -1), "%s: %s values below -1" % (tag, col))
-    # TracerPos against the tracer particle when it is saved in this PIG (only after the step-1
-    # lookup of Phase 2a; Phase 1 never updates TracerPos)
+    # the followed set (decision 70; a schema-1 catalogue holds the legacy set)
+    ids = np.asarray(O["OrphanIDs"]).astype(np.uint64)
+    if ids.ndim != 2:
+        ids = ids.reshape(n, -1) if n else np.zeros((0, 16), np.uint64)
+    kmax = ids.shape[1]
+    nt = O["NOrphanTracers"].astype(np.int64)
+    nfd = O["NOrphanFound"].astype(np.int64)
+    sx = O["OrphanSigmaX"].astype(np.float64)
+    sc = O["OrphanScale"].astype(np.float64)
+    mb = O["MostBoundID"].astype(np.uint64)
+    has = nt >= 1
+    bad = ~((has & (nt <= kmax)) | ((nt == 0) & (mb == NO_ID)))
+    ck.check(not np.any(bad), "%s: %d orphans with NOrphanTracers outside [1, %d] (0 only without a MostBoundID) (e.g. %s)"
+             % (tag, np.count_nonzero(bad), kmax, tid[bad][:5].tolist()))
+    bad = has & (ids[:, 0] != mb)
+    ck.check(not np.any(bad), "%s: %d orphans whose OrphanIDs[0] is not their MostBoundID (e.g. %s)"
+             % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    inset = np.arange(kmax)[None, :] < nt[:, None]
+    bad = np.any(inset & (ids == NO_ID), axis=1) | np.any(~inset & (ids != NO_ID), axis=1)
+    ck.check(not np.any(bad), "%s: %d orphans with a -1 inside OrphanIDs[:NOrphanTracers] or an ID after it (e.g. %s)"
+             % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    srt = np.sort(np.where(inset, ids, NO_ID), axis=1)
+    bad = np.any((srt[:, 1:] == srt[:, :-1]) & (srt[:, 1:] != NO_ID), axis=1) if kmax > 1 else np.zeros(n, bool)
+    ck.check(not np.any(bad), "%s: %d orphans with a repeated ID in OrphanIDs (e.g. %s)" % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    bad = (nfd < 0) | (nfd > nt) | (has & ((nfd == 0) != (lost >= 0)))
+    ck.check(not np.any(bad), "%s: %d orphans with NOrphanFound outside [0, NOrphanTracers] or not 0 exactly when SnapTracerLost >= 0 "
+             "(e.g. %s)" % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    newdead = death == snap
+    bad = newdead & has & ((nfd != 1) | (sx != -1))
+    ck.check(not np.any(bad), "%s: %d orphans that died at this snapshot with NOrphanFound != 1 or OrphanSigmaX != -1 (e.g. %s)"
+             % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    bad = ~np.isfinite(sx) | ~((sx == -1) | (sx >= 0)) | ((sx >= 0) != (nfd >= 2))
+    ck.check(not np.any(bad), "%s: %d orphans with OrphanSigmaX neither -1 nor >= 0, or not defined exactly when NOrphanFound >= 2 "
+             "(e.g. %s)" % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    bad = ~np.isfinite(sc) | ~((sc == -1) | (sc > 0))
+    ck.check(not np.any(bad), "%s: %d orphans with OrphanScale neither -1 nor > 0 (e.g. %s)" % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+    # the kept markers lie within 3 OrphanScale of the centre, so within 6 of their mean
+    bad = (sc > 0) & (sx > 6 * sc * (1 + 1e-5))
+    ck.check(not np.any(bad), "%s: %d orphans with OrphanSigmaX above 6 OrphanScale (e.g. %s)" % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
+
+    # TracerPos against the saved markers (only after the step-1 lookup of Phase 2a; Phase 1 never
+    # updates TracerPos): at death the position of OrphanIDs[0] (the MostBoundID); later, when every
+    # marker is saved, the set's state recomputed with unit penalties, HostGroup included
     P = particles(cat, extra=("Position",))
     so = np.argsort(P["ID"])
-    r = lookup(P["ID"][so], O["MostBoundID"].astype(P["ID"].dtype)) if n else np.zeros(0, np.int64)
-    have = (r >= 0) & (lost < 0)
-    nmis = 0
-    if np.any(have) and P["Position"].ndim == 2:
-        ppos = P["Position"][so][r[have]]
-        d = ppos - pos[have]
-        d -= box * np.round(d / box)
-        far = np.sqrt((d ** 2).sum(axis=1)) > 1e-6 * box
-        nmis = int(np.count_nonzero(far))
-    msg = "%s: %d of %d orphans with a live tracer saved in this PIG have TracerPos != its Position" % (tag, nmis, np.count_nonzero(have))
+    pid = P["ID"][so]
+    nmis = nchk = nset = nhost = 0
+    ex = []
+    if P["Position"].ndim == 2 and np.isfinite(box):
+        ppos, pgid = P["Position"][so], P["GroupID"][so]
+        for r in np.nonzero(lost < 0)[0].tolist():
+            mk = orphan_markers(O, r)
+            if mk.size == 0:
+                continue
+            k = lookup(pid, mk.astype(pid.dtype))
+            if death[r] == snap or nfd[r] == 1 and mk.size == 1:
+                # at death (or with one marker) TracerPos is OrphanIDs[0]'s position
+                if k[0] < 0:
+                    continue
+                exp, host = ppos[k[0]], None
+            elif np.all(k >= 0):
+                exp, nk, host = orphan_set_state(ppos[k], pgid[k], sc[r], box)
+                nset += 1
+                if nk != nfd[r] and len(ex) < 5:
+                    ex.append("%d: NOrphanFound %d, recomputed %d" % (tid[r], nfd[r], nk))
+                nmis += nk != nfd[r]
+            else:
+                continue
+            nchk += 1
+            d = _periodic(exp - pos[r], box)
+            far = np.sqrt((d ** 2).sum()) > 1e-6 * box
+            nmis += far
+            if far and len(ex) < 5:
+                ex.append("%d: TracerPos %s, expected %s" % (tid[r], np.round(pos[r], 6).tolist(), np.round(exp, 6).tolist()))
+            if host is not None and death[r] < snap and int(O["HostGroup"][r]) != host:
+                nhost += 1
+                if len(ex) < 5:
+                    ex.append("%d: HostGroup %d, the kept markers' plurality %d" % (tid[r], O["HostGroup"][r], host))
+    msg = ("%s: %d of %d orphans checked against their saved markers (%d by the recomputed set state) differ in TracerPos, "
+           "NOrphanFound or HostGroup (%d hosts) %s" % (tag, nmis + nhost, nchk, nset, nhost, ex))
     if tracer_pos:
-        ck.check(nmis == 0, msg)
-    elif nmis:
-        ck.warn(msg + " (fails with --tracer-pos; Phase 1 never updates TracerPos)")
-    print("  %s: %d orphans (%d sunk, %d tracer lost), %d with the tracer saved in this PIG"
-          % (tag, n, np.count_nonzero(sunk), np.count_nonzero(lost >= 0), np.count_nonzero(r >= 0)))
+        ck.check(nmis + nhost == 0, msg)
+    elif nmis + nhost:
+        ck.warn(msg + " (fails with --tracer-pos; Phase 1 never updates TracerPos; penalised markers weigh less)")
+    print("  %s: %d orphans (%d sunk, %d tracer lost, %d following more than one particle), %d checked against their saved markers"
+          % (tag, n, np.count_nonzero(sunk), np.count_nonzero(lost >= 0), np.count_nonzero(nt > 1), nchk))
 
 
 def cmd_orphans(args):
@@ -2303,6 +2462,8 @@ def cmd_compare(args):
     rtol = 0.0 if args.exact else args.rtol
     ignore = set(args.ignore or [])
     for key in ("NumSubhalosTotal", "NumOrphansTotal", "NumTracksTotal", "SubhaloSchemaVersion", "SnapshotIndex"):
+        if key in ignore:
+            continue
         va, vb = attr(A.header, key), attr(B.header, key)
         ck.check(np.array_equal(np.atleast_1d(va), np.atleast_1d(vb)), "Header %s: %s vs %s" % (key, va, vb))
     _compare_tables(ck, "Subhalo", A.subhalos, B.subhalos, rtol, args.atol, ignore, not args.compare_inplace_flag)

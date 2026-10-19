@@ -2226,6 +2226,7 @@ fill_alive_record(const struct Coll * C, int64_t c, const struct CoreOut * fin, 
     /* a resurrected orphan: the orphan tracer state is not a Subhalo column */
     if(m->kind == SUBHALO_MEM_ORPHAN) {
         rec->SnapTracerLost = -1;
+        subhalo_track_clear_orphan_set(rec);
         for(d = 0; d < 3; d++) {
             rec->TracerPos[d] = -1;
             rec->TracerVel[d] = -1;

@@ -19,7 +19,9 @@
  * nest_tree, deep_chain, mixed_call, nocentral, fallback (serial/in-place transitions), itercap,
  * lookup (three modes), serial_keys (scheduler at 1-4 threads), reserve_admission,
  * local_sort (thread-count independent), header_params, sampled_default (SubhaloFinalPass = 0),
- * weighted_plurality and penalty_descendant (collision-penalty weights of the tracer votes).
+ * weighted_plurality and penalty_descendant (collision-penalty weights of the tracer votes),
+ * orphan_set_death, _update, _lookup, _sink (decision 70: orphans following several particles;
+ * life cycle also reads its PIG_003 as a version-1 state).
  *
  * SUBHALO_TEST_ONLY=<substring> runs only the matching tests. The sort-key range checks abort
  * through endrun, so they run alone: SUBHALO_TEST_SORTKEY_OVERFLOW=grnr|trackid|bindrank
@@ -102,6 +104,8 @@ default_subhalo_params(void)
     sp.SubhaloMinNumPart = 20;
     sp.SubhaloMinNumTracerPart = 10;
     sp.SubhaloNumTracerHostFinding = 10;
+    /* the fixtures follow an orphan through its MostBoundID alone (default 10; orphan_set tests K > 1) */
+    sp.SubhaloOrphanTracers = 1;
     sp.SubhaloLookupBatchBytes = 64L * 1024 * 1024;
     sp.SubhaloMajorProgenitorMassRatio = 0.8;
     sp.SubhaloBoundMassPrecision = 0.995;
@@ -558,6 +562,7 @@ test_subhalo_header_params(void ** state)
     const struct SubhaloParams saved = *subhalo_get_params();
     struct SubhaloParams p = default_subhalo_params();
     p.SubhaloNumNeighboursForReassignment = 7;
+    p.SubhaloOrphanTracers = 9;
     p.SubhaloBoundMassPrecision = 0.9950001;
     p.SubhaloMaxGatherFraction = 0.1 + 0.2;
     p.SubhaloMajorProgenitorMassRatio = 0.80000000000000004 - 1e-16;
@@ -580,7 +585,7 @@ test_subhalo_header_params(void ** state)
     struct { const char * name; int kind; int seen; void * val; } f[] = {
         I(SubhaloFinderOn), D(SubhaloMaxGatherFraction), L(SubhaloCollectiveMinPart), I(SubhaloMaxUnbindIterations),
         I(SubhaloRestartFresh), I(SubhaloTracerTypes), I(SubhaloPotentialTypes), I(SubhaloMinNumPart),
-        I(SubhaloMinNumTracerPart), I(SubhaloNumTracerHostFinding), L(SubhaloLookupBatchBytes),
+        I(SubhaloMinNumTracerPart), I(SubhaloNumTracerHostFinding), I(SubhaloOrphanTracers), L(SubhaloLookupBatchBytes),
         D(SubhaloMajorProgenitorMassRatio), D(SubhaloBoundMassPrecision), D(SubhaloSourceRelaxFactor),
         I(SubhaloPotentialSampleSize), I(SubhaloFinalPass), D(SubhaloTreeOpenAngle), I(SubhaloMergeTrapped),
         I(SubhaloSinkSymmetric), I(SubhaloCoreSize), I(SubhaloReassignGas), I(SubhaloNumNeighboursForReassignment),
@@ -2957,6 +2962,77 @@ rewrite_i8_block(const char * pigname, const char * block, const int64_t * vals,
     MPI_Barrier(MPI_COMM_WORLD);
 }
 
+/* Set Header/SubhaloSchemaVersion of a PIG on rank 0. */
+static void
+set_schema_version(const char * pigname, int32_t schema)
+{
+    if(get_thistask() == 0) {
+        BigFile bf;
+        BigBlock bh;
+        if(0 != big_file_open(&bf, pigname) || 0 != big_file_open_block(&bf, &bh, "Header"))
+            endrun(1, "test: cannot open the header of %s\n", pigname);
+        big_block_set_attr(&bh, "SubhaloSchemaVersion", &schema, "i4", 1);
+        big_block_close(&bh);
+        big_file_close(&bf);
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+}
+
+/* Decision 70: PIG_snap as a version-1 state (header 1, no followed-set columns) is read with the
+ * legacy set, the MostBoundID alone; an unknown version is skipped. */
+static void
+check_schema1_state(const char * dir, int snap, const char * what)
+{
+    char * pig = fastpm_strdup_printf("%s/PIG_%03d", dir, snap);
+    const int64_t NTotal = subhalo_get_table()->NTotal;
+    struct SubTrack * rec0 = fetch_all_tracks(NTotal);
+    set_schema_version(pig, SUBHALO_SCHEMA_VERSION + 1);
+    int m = subhalo_find_state(dir, "PIG", snap, MPI_COMM_WORLD);
+    CHECK(m == snap - 1, "%s: a schema %d state was not skipped (search returned %d)\n", what, SUBHALO_SCHEMA_VERSION + 1, m);
+    set_schema_version(pig, 1);
+    {
+        const char * cols[5] = {"OrphanIDs", "NOrphanTracers", "NOrphanFound", "OrphanSigmaX", "OrphanScale"};
+        int k;
+        for(k = 0; k < 5; k++) {
+            char * b = fastpm_strdup_printf("%s/Orphan/%s", pig, cols[k]);
+            rm_tree(b);
+            myfree(b);
+        }
+    }
+    m = subhalo_find_state(dir, "PIG", snap, MPI_COMM_WORLD);
+    CHECK(m == snap, "%s: the version-1 state was not found (search returned %d)\n", what, m);
+    struct SubTrackTable t2;
+    double st = -1;
+    subhalo_table_init(&t2, 1024 * sizeof(struct SubTrack), MPI_COMM_WORLD);
+    int rc = subhalo_read_state_checked(pig, &t2, &st, MPI_COMM_WORLD);
+    CHECK(rc == 0, "%s: the version-1 state was rejected\n", what);
+    int64_t i, norph = 0;
+    int bad = 0, k;
+    for(i = 0; i < t2.NLocal; i++) {
+        const struct SubTrack * b = &t2.Track[i], * a = &rec0[b->TrackId];
+        if(a->Nbound > 0) {
+            LOCAL_CHECK(bad, b->NOrphanTracers == 0 && b->OrphanIDs[0] == (MyIDType) -1 && b->OrphanScale == -1, "%s: resolved %ld has a set\n",
+                        what, b->TrackId);
+            continue;
+        }
+        norph++;
+        LOCAL_CHECK(bad, b->NOrphanTracers == 1 && b->OrphanIDs[0] == a->MostBoundID && b->NOrphanFound == (a->SnapTracerLost < 0)
+                    && b->OrphanSigmaX == -1 && b->OrphanScale == -1 && b->SnapTracerLost == a->SnapTracerLost && b->TracerPos[0] == a->TracerPos[0],
+                    "%s: orphan %ld read as %d ids (%lu, MostBoundID %lu) found %d scale %g\n", what, b->TrackId, b->NOrphanTracers,
+                    (unsigned long) b->OrphanIDs[0], (unsigned long) a->MostBoundID, b->NOrphanFound, b->OrphanScale);
+        for(k = 1; k < SUBHALO_MAXTRACERS; k++)
+            LOCAL_CHECK(bad, b->OrphanIDs[k] == (MyIDType) -1, "%s: orphan %ld OrphanIDs[%d] %lu\n", what, b->TrackId, k, (unsigned long) b->OrphanIDs[k]);
+    }
+    assert_all_true(bad == 0);
+    int64_t ntot = 0;
+    MPI_Allreduce(&norph, &ntot, 1, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
+    CHECK(ntot > 0, "%s: the version-1 state holds no orphan\n", what);
+    message(0, "%s: version-1 state read with %ld legacy orphans\n", what, ntot);
+    subhalo_table_free(&t2);
+    free(rec0);
+    myfree(pig);
+}
+
 /* Restart from PIG_snap of dir and compare the tags and persistent record fields with the
  * in-memory state they were written from. */
 static void
@@ -2997,10 +3073,14 @@ check_restart_roundtrip(const char * dir, int snap, const char * what)
             && a->SnapBirth == b->SnapBirth && a->SnapDeath == b->SnapDeath && a->SnapSink == b->SnapSink
             && a->SnapLastIsolation == b->SnapLastIsolation && a->MostBoundID == b->MostBoundID && b->Nbound == 0
             && a->MboundPeak == b->MboundPeak && a->SnapMboundPeak == b->SnapMboundPeak && a->MboundAcc == b->MboundAcc
-            && a->SnapAcc == b->SnapAcc && a->SnapLastMajorMerger == b->SnapLastMajorMerger && a->SnapTracerLost == b->SnapTracerLost;
+            && a->SnapAcc == b->SnapAcc && a->SnapLastMajorMerger == b->SnapLastMajorMerger && a->SnapTracerLost == b->SnapTracerLost
+            && a->NOrphanTracers == b->NOrphanTracers && a->NOrphanFound == b->NOrphanFound && a->OrphanSigmaX == b->OrphanSigmaX
+            && a->OrphanScale == b->OrphanScale;
         int d;
         for(d = 0; d < 3; d++)
             same = same && a->TracerPos[d] == b->TracerPos[d] && a->TracerVel[d] == b->TracerVel[d];
+        for(d = 0; d < SUBHALO_MAXTRACERS; d++)
+            same = same && a->OrphanIDs[d] == b->OrphanIDs[d];
         CHECK(same, "%s: orphan record %ld differs after the restart (SnapDeath %d/%d SinkTrackId %ld/%ld)\n", what, i,
               a->SnapDeath, b->SnapDeath, a->SinkTrackId, b->SinkTrackId);
     }
@@ -3123,6 +3203,7 @@ test_subhalo_lifecycle_pig(void ** state)
 
     /* the PIG of the last stage (zero groups, an empty interior rank) restores the state */
     check_restart_roundtrip(dir, 3, "life cycle PIG_003");
+    check_schema1_state(dir, 3, "life cycle PIG_003 as version 1");
 
     /* (v) corrupted states. A truncated payload under an intact block header: PIG_003 is not a
      * state any more and the search falls back to PIG_002. */
@@ -5415,6 +5496,608 @@ test_subhalo_lookup(void ** state)
     teardown_pman();
 }
 
+/* ------------------------------------------------------------------ decision 70: multi-particle orphans */
+
+/* The parameters with SubhaloOrphanTracers = K. */
+static void
+os_set_k(int K)
+{
+    struct SubhaloParams sp = *subhalo_get_params();
+    sp.SubhaloOrphanTracers = K;
+    subhalo_set_testpar(sp);
+}
+
+/* A found marker at x in group g with TracerPenalty pen and Vel (vx, 0, 0). */
+static struct SubhaloIdHit
+os_hit(double x0, double x1, double x2, int64_t g, float pen, double vx)
+{
+    struct SubhaloIdHit h;
+    memset(&h, 0, sizeof(h));
+    h.Pos[0] = x0;
+    h.Pos[1] = x1;
+    h.Pos[2] = x2;
+    h.Vel[0] = vx;
+    h.GrNr = g;
+    h.BoundTrackId = -1;
+    h.found = 1;
+    h.Penalty = pen;
+    return h;
+}
+
+/* An orphan following markers 1000 .. 1000 + n - 1 with clip scale S, last at (7, 7, 7). */
+static struct SubTrack
+os_orphan(int n, float S)
+{
+    struct SubTrack t;
+    subhalo_track_clear(&t, 3);
+    t.SnapBirth = t.SnapDeath = 0;
+    t.MostBoundID = 1000;
+    int k;
+    for(k = 0; k < n; k++)
+        t.OrphanIDs[k] = 1000 + k;
+    t.NOrphanTracers = n;
+    t.NOrphanFound = 1;
+    t.OrphanScale = S;
+    for(k = 0; k < 3; k++) {
+        t.TracerPos[k] = 7;
+        t.TracerVel[k] = 7;
+    }
+    return t;
+}
+
+/* Reference mean of the kept markers keep[] (their ranks in h), weights exp(-pen) / (1 + sqrt(j)),
+ * unwrapped about h[keep[0]]; and their rms spread about it. */
+static void
+os_reference(const struct SubhaloIdHit * h, const int * keep, int nk, double box, double pos[3], double * vx, double * sigma)
+{
+    double W = 0, m[3] = {0, 0, 0}, mv = 0, s2 = 0;
+    int k, d;
+    for(k = 0; k < nk; k++) {
+        const double w = exp(-(double) h[keep[k]].Penalty) / (1 + sqrt((double) keep[k]));
+        W += w;
+        for(d = 0; d < 3; d++)
+            m[d] += w * (h[keep[0]].Pos[d] + NEAREST(h[keep[k]].Pos[d] - h[keep[0]].Pos[d], box));
+        mv += w * h[keep[k]].Vel[0];
+    }
+    for(d = 0; d < 3; d++)
+        m[d] /= W;
+    for(k = 0; k < nk; k++)
+        for(d = 0; d < 3; d++) {
+            const double x = h[keep[0]].Pos[d] + NEAREST(h[keep[k]].Pos[d] - h[keep[0]].Pos[d], box) - m[d];
+            s2 += x * x;
+        }
+    for(d = 0; d < 3; d++)
+        pos[d] = p2_wrap(m[d]);
+    *vx = mv / W;
+    *sigma = sqrt(s2 / nk);
+}
+
+static double
+os_pdist(const double a[3], const double b[3])
+{
+    double s = 0;
+    int d;
+    for(d = 0; d < 3; d++) {
+        const double x = NEAREST(a[d] - b[d], BOXSIZE);
+        s += x * x;
+    }
+    return sqrt(s);
+}
+
+/* The followed set at death: MostBoundID, then the first distinct step-0 tracers, at most K; the
+ * clip scale CoreSigmaX, else Rhalf, else -1. */
+static void
+test_subhalo_orphan_set_death(void ** state)
+{
+    const struct SubhaloParams saved = *subhalo_get_params();
+    subhalo_set_testpar(default_subhalo_params());
+    struct SubTrack base;
+    subhalo_track_clear(&base, 4);
+    base.Nbound = base.NboundTracer = 50;
+    base.Mbound = 1;
+    base.SnapBirth = 0;
+    base.MostBoundID = 500;
+    base.CoreSigmaX = 0.25f;
+    base.Rhalf = 0.8f;
+    int j, d;
+    for(d = 0; d < 3; d++) {
+        base.MostBoundPos[d] = 1 + d;
+        base.MostBoundVel[d] = 4 + d;
+    }
+    base.NTracers = 12;
+    for(j = 0; j < base.NTracers; j++)
+        base.TracerIDs[j] = 500 + j;
+    const int Ks[4] = {1, 3, 10, 16};
+    int ik;
+    for(ik = 0; ik < 4; ik++) {
+        const int K = Ks[ik];
+        os_set_k(K);
+        struct SubTrack t = base;
+        subhalo_track_make_orphan(&t, SUBHALO_NOTRACK, 2);
+        const int nexp = K < 12 ? K : 12;
+        int bad = 0;
+        LOCAL_CHECK(bad, t.NOrphanTracers == nexp && t.NOrphanFound == 1 && t.OrphanSigmaX == -1 && t.OrphanScale == 0.25f,
+                    "death K %d: NOrphanTracers %d NOrphanFound %d OrphanSigmaX %g OrphanScale %g\n", K, t.NOrphanTracers,
+                    t.NOrphanFound, t.OrphanSigmaX, t.OrphanScale);
+        for(j = 0; j < SUBHALO_MAXTRACERS; j++)
+            LOCAL_CHECK(bad, t.OrphanIDs[j] == (j < nexp ? (MyIDType) (500 + j) : (MyIDType) -1), "death K %d: OrphanIDs[%d] = %lu\n", K, j,
+                        (unsigned long) t.OrphanIDs[j]);
+        for(d = 0; d < 3; d++)
+            LOCAL_CHECK(bad, t.TracerPos[d] == t.MostBoundPos[d] && t.TracerVel[d] == t.MostBoundVel[d], "death K %d: TracerPos[%d] %g\n", K, d,
+                        t.TracerPos[d]);
+        LOCAL_CHECK(bad, t.Nbound == 0 && t.SnapDeath == 2 && t.SnapTracerLost == -1, "death K %d: Nbound %d SnapDeath %d\n", K, t.Nbound,
+                    t.SnapDeath);
+        assert_all_true(bad == 0);
+    }
+    /* a sink: the most-bound particle of this call leads, then the step-0 tracers */
+    os_set_k(3);
+    struct SubTrack t = base;
+    t.MostBoundID = 777;
+    subhalo_track_make_orphan(&t, 9, 2);
+    CHECK(t.NOrphanTracers == 3 && t.OrphanIDs[0] == 777 && t.OrphanIDs[1] == 500 && t.OrphanIDs[2] == 501 && t.OrphanIDs[3] == (MyIDType) -1
+          && t.SinkTrackId == 9 && t.SnapSink == 2,
+          "sink K 3: %d ids %lu %lu %lu, SinkTrackId %ld\n", t.NOrphanTracers, (unsigned long) t.OrphanIDs[0], (unsigned long) t.OrphanIDs[1],
+          (unsigned long) t.OrphanIDs[2], t.SinkTrackId);
+    /* duplicates and the MostBoundID among the tracers are skipped */
+    os_set_k(10);
+    t = base;
+    t.NTracers = 5;
+    t.TracerIDs[0] = 501; t.TracerIDs[1] = 500; t.TracerIDs[2] = 501; t.TracerIDs[3] = 502; t.TracerIDs[4] = 500;
+    subhalo_track_make_orphan(&t, SUBHALO_NOTRACK, 2);
+    CHECK(t.NOrphanTracers == 3 && t.OrphanIDs[0] == 500 && t.OrphanIDs[1] == 501 && t.OrphanIDs[2] == 502 && t.OrphanIDs[3] == (MyIDType) -1,
+          "duplicates: %d ids %lu %lu %lu\n", t.NOrphanTracers, (unsigned long) t.OrphanIDs[0], (unsigned long) t.OrphanIDs[1],
+          (unsigned long) t.OrphanIDs[2]);
+    /* no step-0 tracers: the MostBoundID alone; the scale falls back to Rhalf, then to -1 */
+    t = base;
+    t.NTracers = 0;
+    t.CoreSigmaX = -1;
+    subhalo_track_make_orphan(&t, SUBHALO_NOTRACK, 2);
+    CHECK(t.NOrphanTracers == 1 && t.OrphanIDs[0] == 500 && t.OrphanIDs[1] == (MyIDType) -1 && t.OrphanScale == 0.8f,
+          "no tracers: %d ids, OrphanScale %g\n", t.NOrphanTracers, t.OrphanScale);
+    t = base;
+    t.CoreSigmaX = 0;
+    t.Rhalf = -1;
+    subhalo_track_make_orphan(&t, SUBHALO_NOTRACK, 2);
+    CHECK(t.OrphanScale == -1 && t.NOrphanTracers == 10, "no scale: OrphanScale %g\n", t.OrphanScale);
+    /* no MostBoundID: nothing to follow */
+    t = base;
+    t.MostBoundID = (MyIDType) -1;
+    subhalo_track_make_orphan(&t, SUBHALO_NOTRACK, 2);
+    CHECK(t.NOrphanTracers == 0 && t.NOrphanFound == 0 && t.OrphanIDs[0] == (MyIDType) -1, "no MostBoundID: %d ids\n", t.NOrphanTracers);
+    /* a cleared record holds no set */
+    subhalo_track_clear(&t, 5);
+    CHECK(t.NOrphanTracers == 0 && t.NOrphanFound == 0 && t.OrphanSigmaX == -1 && t.OrphanScale == -1 && t.OrphanIDs[15] == (MyIDType) -1,
+          "cleared record: %d %d %g %g\n", t.NOrphanTracers, t.NOrphanFound, t.OrphanSigmaX, t.OrphanScale);
+    subhalo_set_testpar(saved);
+}
+
+/* One orphan's state from its markers' hits (subhalo_orphan_update), particle-free. */
+static void
+test_subhalo_orphan_set_update(void ** state)
+{
+    const double box = BOXSIZE, vfac = 2.0, off0[3] = {0, 0, 0};
+    struct SubhaloIdHit h[SUBHALO_MAXTRACERS];
+    double ref[3], rv, rs;
+    int d, k;
+
+    /* one marker: its own values bit for bit (K = 1), in the physical frame */
+    {
+        const double off[3] = {0.1, -0.3, 999.95};
+        struct SubTrack t = os_orphan(1, 0.5f);
+        h[0] = os_hit(123.456789012345, 0.1, 0.01, 6, 0, 3.3);
+        CHECK(subhalo_orphan_update(&t, h, 1, off, box, vfac, 4) == 1, "one marker: not found\n");
+        int same = t.Host == 6 && t.NOrphanFound == 1 && t.OrphanSigmaX == -1 && t.SnapTracerLost == -1;
+        for(d = 0; d < 3; d++)
+            same = same && t.TracerPos[d] == subhalo_wrap_box(h[0].Pos[d] - off[d], box) && t.TracerVel[d] == (float) (h[0].Vel[d] * vfac);
+        CHECK(same, "one marker: TracerPos %.17g %.17g %.17g Host %ld\n", t.TracerPos[0], t.TracerPos[1], t.TracerPos[2], t.Host);
+    }
+    /* all lost: SnapTracerLost, no host, the last position kept */
+    {
+        struct SubTrack t = os_orphan(3, 0.5f);
+        for(k = 0; k < 3; k++) {
+            h[k] = os_hit(50, 50, 50, 2, 0, 0);
+            h[k].found = 0;
+        }
+        CHECK(subhalo_orphan_update(&t, h, 3, off0, box, vfac, 4) == 0, "all lost: reported found\n");
+        CHECK(t.SnapTracerLost == 4 && t.Host == -1 && t.NOrphanFound == 0 && t.OrphanSigmaX == -1 && t.TracerPos[0] == 7 && t.TracerVel[1] == 7,
+              "all lost: SnapTracerLost %d Host %ld NOrphanFound %d TracerPos %g\n", t.SnapTracerLost, t.Host, t.NOrphanFound, t.TracerPos[0]);
+    }
+    /* all found, then some lost: the weights keep each marker's rank in the set */
+    {
+        struct SubTrack t = os_orphan(8, 1.0f);
+        for(k = 0; k < 8; k++)
+            h[k] = os_hit(200 + 0.11 * k, 300 - 0.07 * k * k / 8., 400 + 0.05 * (k % 3), 3, 0, 10. * k);
+        int keep[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+        subhalo_orphan_update(&t, h, 8, off0, box, vfac, 4);
+        os_reference(h, keep, 8, box, ref, &rv, &rs);
+        CHECK(os_pdist(ref, t.TracerPos) < 1e-10 && fabs(t.TracerVel[0] - rv * vfac) < 1e-5 * fabs(rv * vfac) && t.NOrphanFound == 8
+              && fabs(t.OrphanSigmaX - rs) < 1e-6 * rs && t.Host == 3,
+              "all found: TracerPos %.12g (expected %.12g) TracerVel %g (%g) NOrphanFound %d sigma %g (%g)\n", t.TracerPos[0], ref[0],
+              t.TracerVel[0], rv * vfac, t.NOrphanFound, t.OrphanSigmaX, rs);
+        h[0].found = h[3].found = h[6].found = 0;
+        const int keep2[5] = {1, 2, 4, 5, 7};
+        t = os_orphan(8, 1.0f);
+        subhalo_orphan_update(&t, h, 8, off0, box, vfac, 4);
+        os_reference(h, keep2, 5, box, ref, &rv, &rs);
+        CHECK(os_pdist(ref, t.TracerPos) < 1e-10 && t.NOrphanFound == 5 && t.SnapTracerLost == -1 && fabs(t.OrphanSigmaX - rs) < 1e-6 * rs,
+              "some lost: TracerPos %.12g (expected %.12g) NOrphanFound %d\n", t.TracerPos[0], ref[0], t.NOrphanFound);
+    }
+    /* clipping: a marker displaced by 10 OrphanScale is dropped, the mean is that of the others */
+    {
+        struct SubTrack t = os_orphan(6, 1.0f);
+        for(k = 0; k < 6; k++)
+            h[k] = os_hit(50 + 0.04 * k, 50 + 0.03 * (k % 2), 50 - 0.02 * k, 1, 0, 1);
+        h[2].Pos[0] += 10;
+        const int keep[5] = {0, 1, 3, 4, 5};
+        subhalo_orphan_update(&t, h, 6, off0, box, vfac, 4);
+        os_reference(h, keep, 5, box, ref, &rv, &rs);
+        CHECK(os_pdist(ref, t.TracerPos) < 1e-10 && t.NOrphanFound == 5 && t.OrphanSigmaX < 0.2,
+              "clip: TracerPos %.12g (expected %.12g) NOrphanFound %d OrphanSigmaX %g\n", t.TracerPos[0], ref[0], t.NOrphanFound, t.OrphanSigmaX);
+        /* without a scale nothing is clipped */
+        t = os_orphan(6, -1);
+        const int all[6] = {0, 1, 2, 3, 4, 5};
+        subhalo_orphan_update(&t, h, 6, off0, box, vfac, 4);
+        os_reference(h, all, 6, box, ref, &rv, &rs);
+        CHECK(os_pdist(ref, t.TracerPos) < 1e-10 && t.NOrphanFound == 6, "no clip: NOrphanFound %d\n", t.NOrphanFound);
+    }
+    /* two markers: the centre is the first; the second is kept only within 3 OrphanScale of it */
+    {
+        struct SubTrack t = os_orphan(2, 1.0f);
+        h[0] = os_hit(50, 50, 50, 1, 0, 1);
+        h[1] = os_hit(55, 50, 50, 1, 0, 1);
+        subhalo_orphan_update(&t, h, 2, off0, box, vfac, 4);
+        CHECK(t.TracerPos[0] == 50 && t.NOrphanFound == 1 && t.OrphanSigmaX == -1, "two markers, far: TracerPos %g NOrphanFound %d\n",
+              t.TracerPos[0], t.NOrphanFound);
+        t = os_orphan(2, 2.0f);
+        subhalo_orphan_update(&t, h, 2, off0, box, vfac, 4);
+        const double xm = (50 + 55 / (1 + 1.)) / (1 + 1 / (1 + 1.));
+        CHECK(fabs(t.TracerPos[0] - xm) < 1e-10 && t.NOrphanFound == 2 && fabs(t.OrphanSigmaX - sqrt(125. / 18.)) < 1e-6,
+              "two markers, near: TracerPos %.12g (expected %.12g) OrphanSigmaX %g\n", t.TracerPos[0], xm, t.OrphanSigmaX);
+    }
+    /* nothing within the clip of the component-wise median: the marker closest to it */
+    {
+        struct SubTrack t = os_orphan(3, 0.01f);
+        h[0] = os_hit(60, 50, 50, 1, 0, 1);
+        h[1] = os_hit(50, 59, 50, 2, 0, 1);
+        h[2] = os_hit(50, 50, 51, 3, 0, 1);
+        subhalo_orphan_update(&t, h, 3, off0, box, vfac, 4);
+        CHECK(t.TracerPos[0] == 50 && t.TracerPos[2] == 51 && t.Host == 3 && t.NOrphanFound == 1, "empty clip: TracerPos %g %g %g Host %ld\n",
+              t.TracerPos[0], t.TracerPos[1], t.TracerPos[2], t.Host);
+    }
+    /* penalties: a heavily penalised marker barely moves the centre, and flip the host */
+    {
+        struct SubTrack t = os_orphan(4, 1.0f);
+        for(k = 0; k < 4; k++)
+            h[k] = os_hit(50, 50, 50, 4, 0, 0);
+        h[3].Pos[0] = 50.6;
+        h[3].Penalty = 30;
+        subhalo_orphan_update(&t, h, 4, off0, box, vfac, 4);
+        CHECK(fabs(t.TracerPos[0] - 50) < 1e-9 && t.NOrphanFound == 4, "penalised marker: TracerPos %.15g\n", t.TracerPos[0]);
+        h[3].Penalty = 0;
+        t = os_orphan(4, 1.0f);
+        subhalo_orphan_update(&t, h, 4, off0, box, vfac, 4);
+        CHECK(t.TracerPos[0] - 50 > 0.05, "unpenalised marker: TracerPos %.15g\n", t.TracerPos[0]);
+        /* ranks 0, 1 in group 4 with penalty 5, ranks 2, 3 in group 8: group 8 wins, 4 without the penalties */
+        h[0].GrNr = h[1].GrNr = 4;
+        h[2].GrNr = h[3].GrNr = 8;
+        h[0].Penalty = h[1].Penalty = 5;
+        t = os_orphan(4, 1.0f);
+        subhalo_orphan_update(&t, h, 4, off0, box, vfac, 4);
+        CHECK(t.Host == 8, "penalised host vote: Host %ld, expected 8\n", t.Host);
+        h[0].Penalty = h[1].Penalty = 0;
+        t = os_orphan(4, 1.0f);
+        subhalo_orphan_update(&t, h, 4, off0, box, vfac, 4);
+        CHECK(t.Host == 4, "host vote: Host %ld, expected 4\n", t.Host);
+        /* penalties that underflow every weight: the rank weights alone */
+        for(k = 0; k < 4; k++)
+            h[k].Penalty = 1e30f;
+        t = os_orphan(4, 1.0f);
+        subhalo_orphan_update(&t, h, 4, off0, box, vfac, 4);
+        CHECK(t.Host == 4 && subhalo_isfinite(t.TracerPos[0]) && t.TracerPos[0] > 50, "underflowing weights: Host %ld TracerPos %g\n", t.Host,
+              t.TracerPos[0]);
+    }
+    /* "no group" is a ballot: -1 wins over a group with less weight, and loses to one with more */
+    {
+        const int64_t g1[5] = {-1, 7, -1, -1, 7}, g2[5] = {7, -1, 7, -1, -1};
+        struct SubTrack t = os_orphan(5, 1.0f);
+        for(k = 0; k < 5; k++)
+            h[k] = os_hit(50 + 0.01 * k, 50, 50, g1[k], 0, 0);
+        subhalo_orphan_update(&t, h, 5, off0, box, vfac, 4);
+        CHECK(t.Host == -1 && t.NOrphanFound == 5, "field ballots: Host %ld, expected -1\n", t.Host);
+        for(k = 0; k < 5; k++)
+            h[k].GrNr = g2[k];
+        t = os_orphan(5, 1.0f);
+        subhalo_orphan_update(&t, h, 5, off0, box, vfac, 4);
+        CHECK(t.Host == 7, "group ballots: Host %ld, expected 7\n", t.Host);
+    }
+    /* a set wider than half the box: the minimum image about the median, not about the first */
+    {
+        struct SubTrack t = os_orphan(5, -1);
+        const double xs[5] = {500, 950, 900, 940, 50}, xi[5] = {500, 950, 900, 940, 1050};
+        double W = 0, m = 0;
+        for(k = 0; k < 5; k++) {
+            h[k] = os_hit(xs[k], 500, 500, 2, 0, 0);
+            W += 1 / (1 + sqrt((double) k));
+            m += xi[k] / (1 + sqrt((double) k));
+        }
+        subhalo_orphan_update(&t, h, 5, off0, box, vfac, 4);
+        const double e[3] = {p2_wrap(m / W), 500, 500};
+        CHECK(os_pdist(e, t.TracerPos) < 1e-9 && t.NOrphanFound == 5, "wide set: TracerPos %.12g, expected %.12g\n", t.TracerPos[0], e[0]);
+    }
+    /* a set straddling the box edge: unwrapped about the first marker, the mean wrapped back */
+    {
+        struct SubTrack t = os_orphan(4, 1.0f);
+        const double xs[4] = {999.9, 0.05, 999.95, 0.1};
+        for(k = 0; k < 4; k++)
+            h[k] = os_hit(xs[k], 500, 0.02 * k, 2, 0, 0);
+        const int keep[4] = {0, 1, 2, 3};
+        const double off[3] = {0.5, 0, 0};
+        subhalo_orphan_update(&t, h, 4, off, box, vfac, 4);
+        os_reference(h, keep, 4, box, ref, &rv, &rs);
+        ref[0] = p2_wrap(ref[0] - off[0]);
+        int inbox = 1;
+        for(d = 0; d < 3; d++)
+            inbox = inbox && t.TracerPos[d] >= 0 && t.TracerPos[d] < box;
+        CHECK(inbox && os_pdist(ref, t.TracerPos) < 1e-10 && t.NOrphanFound == 4 && t.OrphanSigmaX < 0.2,
+              "box edge: TracerPos %.12g %.12g %.12g (expected %.12g) sigma %g\n", t.TracerPos[0], t.TracerPos[1], t.TracerPos[2], ref[0],
+              t.OrphanSigmaX);
+    }
+}
+
+/* The step-1 lookup over the ranks: all markers found, some or all lost, no set (MostBoundID
+ * alone), lost earlier, resolved, across the box edge, clipped to one; with a particle offset. */
+#define OS_N 64
+static void
+os_particle(MyIDType id, double pos[3], double * vx, int64_t * g)
+{
+    pos[0] = 100 + 0.1 * (double) (id % 8) + 0.01 * (double) id;
+    pos[1] = 200 - 0.05 * (double) (id % 5);
+    pos[2] = 300 + 0.02 * (double) (id % 3);
+    if(id >= 30 && id < 34)
+        pos[0] = (id % 2) ? 0.05 * (double) (id - 29) : BOXSIZE - 0.05 * (double) (id - 29);
+    *vx = 0.01 * (double) id;
+    *g = (id == 1 || id == 12) ? -1 : 2 + (int64_t) (id / 10);
+}
+
+static void
+test_subhalo_orphan_set_lookup(void ** state)
+{
+    Cosmology CP;
+    struct SubhaloParams sp = default_subhalo_params();
+    sp.SubhaloOrphanTracers = 5;
+    syn_setup(&CP, OS_N, sp);
+    const double off[3] = {3, -2, 0.5};
+    int64_t i;
+    int d, k;
+    for(d = 0; d < 3; d++)
+        PartManager->CurrentParticleOffset[d] = off[d];
+    for(i = 0; i < PartManager->NumPart; i++) {
+        double pos[3], vx;
+        int64_t g;
+        os_particle(P[i].ID, pos, &vx, &g);
+        for(d = 0; d < 3; d++) {
+            P[i].Pos[d] = pos[d];
+            P[i].Vel[d] = d == 0 ? vx : 0;
+        }
+        P[i].GrNr = g;
+    }
+    const MyIDType sets[8][5] = {{0, 1, 2, 3, 4}, {10, 11, 9999, 12, 9998}, {9990, 9991, 9992}, {20}, {40, 41}, {50}, {30, 31, 32, 33}, {60, 61, 62}};
+    const int nset[8] = {5, 5, 3, 0, 2, 0, 4, 3};
+    struct SubTrack recs[8];
+    for(k = 0; k < 8; k++) {
+        recs[k] = os_orphan(nset[k], 10.0f);
+        recs[k].TrackId = k;
+        recs[k].MostBoundID = sets[k][0];
+        for(d = 0; d < nset[k]; d++)
+            recs[k].OrphanIDs[d] = sets[k][d];
+    }
+    recs[3].MostBoundID = 20;           /* a record without a set: its MostBoundID alone */
+    recs[4].SnapTracerLost = 1;         /* lost earlier: frozen */
+    recs[5] = syn_rec(5, 40, 1.0, -1, 5, 0, 0);
+    recs[5].NboundPrev = 40;            /* resolved: not an orphan */
+    recs[7].OrphanScale = 1e-4f;        /* 60, 61, 62 are 0.01 apart: only the median one is kept */
+    syn_records(recs, 8);
+    int64_t nlook = 0, nfound = 0;
+    const double atime = 0.5, vfac = subhalo_vel_to_kms(atime);
+    subhalo_orphan_lookup(subhalo_get_table(), 4, atime, &nlook, &nfound, MPI_COMM_WORLD);
+    CHECK(nlook == 5 + 5 + 3 + 1 + 4 + 3 && nfound == 5 + 3 + 0 + 1 + 4 + 3, "lookup: %ld looked up, %ld found\n", nlook, nfound);
+    struct SubTrack * rec = fetch_all_tracks(8);
+    /* the expected states from the particle function */
+    const int expn[8] = {5, 3, 0, 1, -1, -1, 4, 1};
+    for(k = 0; k < 8; k++) {
+        if(k == 4 || k == 5)
+            continue;
+        struct SubhaloIdHit h[5];
+        int keep[5], nk = 0, j;
+        for(j = 0; j < (k == 3 ? 1 : nset[k]); j++) {
+            const MyIDType id = k == 3 ? 20 : sets[k][j];
+            double vx;
+            int64_t g;
+            os_particle(id, h[j].Pos, &vx, &g);
+            h[j] = os_hit(h[j].Pos[0], h[j].Pos[1], h[j].Pos[2], g, 0, vx);
+            if(id < OS_N && !(k == 7 && j != 1))
+                keep[nk++] = j;
+        }
+        CHECK(rec[k].NOrphanFound == expn[k], "lookup orphan %d: NOrphanFound %d, expected %d\n", k, rec[k].NOrphanFound, expn[k]);
+        if(nk == 0) {
+            CHECK(rec[k].SnapTracerLost == 4 && rec[k].Host == -1 && rec[k].TracerPos[0] == 7 && rec[k].OrphanSigmaX == -1,
+                  "lookup orphan %d: all lost, SnapTracerLost %d Host %ld\n", k, rec[k].SnapTracerLost, rec[k].Host);
+            continue;
+        }
+        double ref[3], rv, rs;
+        os_reference(h, keep, nk, BOXSIZE, ref, &rv, &rs);
+        for(d = 0; d < 3; d++)
+            ref[d] = p2_wrap(ref[d] - off[d]);
+        int64_t cand[5];
+        double w[5];
+        for(j = 0; j < nk; j++) {
+            cand[j] = h[keep[j]].GrNr + 1;
+            w[j] = 1 / (1 + sqrt((double) keep[j]));
+        }
+        const int64_t host = subhalo_weighted_plurality(cand, w, nk, NULL, NULL) - 1;
+        CHECK(rec[k].SnapTracerLost == -1 && os_pdist(ref, rec[k].TracerPos) < 1e-10 && fabs(rec[k].TracerVel[0] - rv * vfac) < 1e-5 * (1 + fabs(rv * vfac))
+              && rec[k].Host == host && (nk < 2 ? rec[k].OrphanSigmaX == -1 : fabs(rec[k].OrphanSigmaX - rs) < 1e-6 * rs),
+              "lookup orphan %d: TracerPos %.12g %.12g %.12g (expected %.12g %.12g %.12g) TracerVel %g (%g) Host %ld (%ld) sigma %g (%g)\n", k,
+              rec[k].TracerPos[0], rec[k].TracerPos[1], rec[k].TracerPos[2], ref[0], ref[1], ref[2], rec[k].TracerVel[0], rv * vfac,
+              rec[k].Host, host, rec[k].OrphanSigmaX, rs);
+        if(nk == 1)
+            /* one marker is copied exactly */
+            CHECK(rec[k].TracerPos[1] == subhalo_wrap_box(h[keep[0]].Pos[1] - off[1], BOXSIZE), "lookup orphan %d: one marker not exact\n", k);
+    }
+    CHECK(rec[3].NOrphanTracers == 0 && rec[4].SnapTracerLost == 1 && rec[4].NOrphanFound == 1 && rec[4].TracerPos[0] == 7
+          && rec[5].Nbound == 40 && rec[5].SnapTracerLost == -1 && rec[5].TracerPos[0] == -1,
+          "lookup: the record without a set has %d, the frozen orphan SnapTracerLost %d, the resolved track TracerPos %g\n",
+          rec[3].NOrphanTracers, rec[4].SnapTracerLost, rec[5].TracerPos[0]);
+    free(rec);
+    syn_teardown();
+}
+
+/* End to end with SubhaloOrphanTracers = 5 on sink_orphan's fixture: the set at the sink, its
+ * clipped mean one call later, and the set cleared when its markers resurrect the orphan. */
+static void
+test_subhalo_orphan_set_sink(void ** state)
+{
+    Cosmology CP;
+    p2_setup(&CP);
+    os_set_k(5);
+    double cen[2][3] = {{P2_cA[0], P2_cA[1], P2_cA[2]}, {P2_cB[0], P2_cB[1], P2_cB[2]}};
+    double bulk[2][3] = {{0, 0, 0}, {0, 0, 0}};
+    p2_place(0.5, CP.GravInternal, cen, bulk);
+    int64_t ng, n, i;
+    int d, j;
+    int ret = run_finder_call(0, &CP, &ng);
+    CHECK(ret == 1 && ng == 2, "orphan set: first call\n");
+    struct SubTrack * rec = fetch_all_tracks(2);
+    const float sigB = rec[1].CoreSigmaX;
+    free(rec);
+    /* B's step-0 tracers of call 1: its own-bound type-1 particles in (BindRank, ID) order */
+    struct tagrec * r = gather_tags(&n);
+    MyIDType step0[10];
+    int n0 = 0;
+    {
+        int32_t lastrank = -1;
+        while(n0 < 10) {
+            int64_t best = -1;
+            for(i = 0; i < n; i++)
+                if(r[i].TrackId == 1 && r[i].BoundTrackId == 1 && r[i].Type == 1 && r[i].BindRank > lastrank
+                   && (best < 0 || r[i].BindRank < r[best].BindRank))
+                    best = i;
+            if(best < 0)
+                break;
+            step0[n0++] = r[best].ID;
+            lastrank = r[best].BindRank;
+        }
+    }
+    free(r);
+    /* call 1: B on A's centre at rest sinks */
+    cen[1][0] = P2_cA[0]; cen[1][1] = P2_cA[1]; cen[1][2] = P2_cA[2];
+    p2_place(0.55, CP.GravInternal, cen, bulk);
+    ret = run_finder_call(1, &CP, &ng);
+    CHECK(ret == 1 && ng == 1, "orphan set: one group expected (%ld)\n", ng);
+    rec = fetch_all_tracks(2);
+    CHECK(rec[1].Nbound == 0 && rec[1].SinkTrackId == 0 && rec[1].NOrphanTracers == 5 && rec[1].OrphanIDs[0] == rec[1].MostBoundID
+          && rec[1].NOrphanFound == 1 && rec[1].OrphanSigmaX == -1 && rec[1].OrphanScale == sigB && sigB > 0 && rec[1].OrphanIDs[5] == (MyIDType) -1,
+          "orphan set: track 1 Nbound %d SinkTrackId %ld NOrphanTracers %d OrphanIDs[0] %lu MostBoundID %lu OrphanScale %g (CoreSigmaX %g)\n",
+          rec[1].Nbound, rec[1].SinkTrackId, rec[1].NOrphanTracers, (unsigned long) rec[1].OrphanIDs[0], (unsigned long) rec[1].MostBoundID,
+          rec[1].OrphanScale, sigB);
+    /* the other four: the first step-0 tracers other than the MostBoundID */
+    {
+        int m = 1, bad = 0;
+        for(j = 0; j < n0 && m < 5; j++)
+            if(step0[j] != rec[1].MostBoundID) {
+                LOCAL_CHECK(bad, rec[1].OrphanIDs[m] == step0[j], "orphan set: OrphanIDs[%d] %lu, expected step-0 tracer %lu\n", m,
+                            (unsigned long) rec[1].OrphanIDs[m], (unsigned long) step0[j]);
+                m++;
+            }
+        CHECK(bad == 0 && m == 5, "orphan set: %d step-0 tracers matched\n", m);
+    }
+    MyIDType oids[5];
+    for(j = 0; j < 5; j++)
+        oids[j] = rec[1].OrphanIDs[j];
+    const float scale = rec[1].OrphanScale;
+    free(rec);
+
+    /* call 2: everything shifted by 5 kpc/h; the set is followed */
+    for(i = 0; i < PartManager->NumPart; i++)
+        P[i].Pos[0] = p2_wrap(P[i].Pos[0] + 5.);
+    ret = run_finder_call(2, &CP, &ng);
+    CHECK(ret == 1 && ng == 1, "orphan set: call 2\n");
+    r = gather_tags(&n);
+    rec = fetch_all_tracks(2);
+    int64_t lenA;
+    const int64_t g = p2_group_of(r, n, 0, &lenA);
+    {
+        /* the reference: lower median, clip at 3 OrphanScale, rank-weighted mean */
+        struct SubhaloIdHit h[5];
+        double c[3], v[5];
+        int keep[5], nk = 0;
+        for(j = 0; j < 5; j++) {
+            const int64_t ti = tagrec_index(r, n, oids[j]);
+            CHECK(ti >= 0 && r[ti].GrNr == g, "orphan set: marker %lu missing or outside A's group\n", (unsigned long) oids[j]);
+            h[j] = os_hit(r[ti].Pos[0], r[ti].Pos[1], r[ti].Pos[2], g, 0, 0);
+        }
+        for(d = 0; d < 3; d++) {
+            for(j = 0; j < 5; j++)
+                v[j] = h[0].Pos[d] + NEAREST(h[j].Pos[d] - h[0].Pos[d], BOXSIZE);
+            qsort(v, 5, sizeof(double), cmp_double);
+            c[d] = v[2];
+        }
+        for(j = 0; j < 5; j++) {
+            double r2 = 0;
+            for(d = 0; d < 3; d++) {
+                const double x = h[0].Pos[d] + NEAREST(h[j].Pos[d] - h[0].Pos[d], BOXSIZE) - c[d];
+                r2 += x * x;
+            }
+            if(r2 <= 9. * scale * scale)
+                keep[nk++] = j;
+        }
+        CHECK(nk >= 1, "orphan set: the reference keeps no marker\n");
+        double ref[3], rv, rs;
+        os_reference(h, keep, nk, BOXSIZE, ref, &rv, &rs);
+        for(d = 0; d < 3; d++)
+            ref[d] = p2_wrap(ref[d] - PartManager->CurrentParticleOffset[d]);
+        CHECK(rec[1].Nbound == 0 && rec[1].SnapTracerLost == -1 && rec[1].HostGroup == g && rec[1].NOrphanFound == nk
+              && os_pdist(ref, rec[1].TracerPos) < 1e-9,
+              "orphan set call 2: HostGroup %ld (group %ld) NOrphanFound %d (expected %d) TracerPos %.12g %.12g %.12g (expected %.12g %.12g %.12g)\n",
+              rec[1].HostGroup, g, rec[1].NOrphanFound, nk, rec[1].TracerPos[0], rec[1].TracerPos[1], rec[1].TracerPos[2], ref[0], ref[1], ref[2]);
+        message(0, "Orphan set: %d of 5 markers kept at call 2 (OrphanScale %g, OrphanSigmaX %g)\n", nk, scale, rec[1].OrphanSigmaX);
+    }
+    free(rec);
+    free(r);
+
+    /* call 3: the five markers and 30 field particles in a cold ball far away: resurrected. The
+     * markers sit in A's core and lead A's host vote: untagged, so that A stays in its group. */
+    const double ball[3] = {500., 100., 900.};
+    for(i = 0; i < PartManager->NumPart; i++) {
+        const int64_t k = (int64_t) P[i].ID - P2_NA - P2_NB;
+        int ism = 0;
+        for(j = 0; j < 5; j++)
+            ism |= P[i].ID == oids[j];
+        if(!ism && !(p2_clump(P[i].ID) < 0 && k < 30))
+            continue;
+        double x[3];
+        const double c0[3] = {0, 0, 0};
+        rand_in_ball(P[i].ID, 31, 1.0, c0, x);
+        for(d = 0; d < 3; d++) {
+            P[i].Pos[d] = ball[d] + x[d];
+            P[i].Vel[d] = 0;
+        }
+        P[i].Mass = 0.05;
+        if(ism)
+            P[i].TrackId = P[i].BoundTrackId = P[i].BindRank = -1;
+    }
+    ret = run_finder_call(3, &CP, &ng);
+    CHECK(ret == 1 && ng == 2, "orphan set: call 3, %ld groups\n", ng);
+    rec = fetch_all_tracks(2);
+    CHECK(subhalo_get_table()->NTotal == 2 && rec[1].Nbound >= 20 && rec[1].SnapDeath == -1 && rec[1].Rank == 0 && rec[1].NOrphanTracers == 0
+          && rec[1].NOrphanFound == 0 && rec[1].OrphanIDs[0] == (MyIDType) -1 && rec[1].OrphanScale == -1 && rec[1].OrphanSigmaX == -1,
+          "orphan set resurrection: NTotal %ld Nbound %d SnapDeath %d NOrphanTracers %d OrphanIDs[0] %lu OrphanScale %g\n",
+          subhalo_get_table()->NTotal, rec[1].Nbound, rec[1].SnapDeath, rec[1].NOrphanTracers, (unsigned long) rec[1].OrphanIDs[0],
+          rec[1].OrphanScale);
+    free(rec);
+    p2_teardown();
+}
+
 int main(void) {
     if(getenv("SUBHALO_TEST_SORTKEY_OVERFLOW")) {
         const struct CMUnitTest overflow[] = {
@@ -5451,6 +6134,10 @@ int main(void) {
         cmocka_unit_test(test_subhalo_sampled_default),
         cmocka_unit_test(test_subhalo_weighted_plurality),
         cmocka_unit_test(test_subhalo_penalty_descendant),
+        cmocka_unit_test(test_subhalo_orphan_set_death),
+        cmocka_unit_test(test_subhalo_orphan_set_update),
+        cmocka_unit_test(test_subhalo_orphan_set_lookup),
+        cmocka_unit_test(test_subhalo_orphan_set_sink),
     };
     /* SUBHALO_TEST_ONLY=<substring> runs only the tests whose name contains it */
     const char * only = getenv("SUBHALO_TEST_ONLY");

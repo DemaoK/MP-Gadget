@@ -103,6 +103,8 @@ default_subhalo_params(void)
     sp.SubhaloMinNumPart = 20;
     sp.SubhaloMinNumTracerPart = 10;
     sp.SubhaloNumTracerHostFinding = 10;
+    /* the fixtures follow an orphan through its MostBoundID alone (default 10; orphan_set tests K > 1) */
+    sp.SubhaloOrphanTracers = 1;
     sp.SubhaloLookupBatchBytes = 64L * 1024 * 1024;
     sp.SubhaloMajorProgenitorMassRatio = 0.8;
     sp.SubhaloBoundMassPrecision = 0.995;

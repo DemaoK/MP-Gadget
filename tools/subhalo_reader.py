@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """Reader for the runtime subhalo finder's catalogues in MP-Gadget PIG_xxx directories.
 
-Schema: halofinder_design.md section 9 and Appendix B (SubhaloSchemaVersion 1).
+Schema: halofinder_design.md section 9 and Appendix B (SubhaloSchemaVersion 2; version 1 lacks the
+Orphan followed-set columns, which are then filled with the legacy values, see ORPHAN_SET_COLUMNS).
 
 Layout of a PIG written with SubhaloFinderOn = 1:
 
@@ -108,9 +109,21 @@ ORPHAN_COLUMNS = [
     ("SnapLastIsolation", "i4", 1), ("SnapTracerLost", "i4", 1),
 ] + _GROUP_E
 
+# Schema 2 (decision 70): the particles an orphan follows. OrphanIDs (MostBoundID first, then the
+# first step-0 tracers, UINT64_MAX padded), their count, the markers kept at the last lookup, the
+# rms spread of the kept set about TracerPos and the clip scale fixed at death (-1: none).
+MAXTRACERS = 16
+ORPHAN_SET_COLUMNS = [
+    ("OrphanIDs", "u8", MAXTRACERS), ("NOrphanTracers", "i4", 1), ("NOrphanFound", "i4", 1),
+    ("OrphanSigmaX", "f4", 1), ("OrphanScale", "f4", 1),
+]
+ORPHAN_COLUMNS = ORPHAN_COLUMNS + ORPHAN_SET_COLUMNS
+NO_ID = np.uint64(0xFFFFFFFFFFFFFFFF)
+
 # Appendix B marks these optional; the decision-44 SO profile columns are absent from catalogues
 # written before them (read leniently: the props rules then skip them).
-OPTIONAL_COLUMNS = ("GeomParentTrackId", "GeomUpParentTrackId", "RsSO", "RsKlypinSO", "VmaxSO", "RmaxSO")
+OPTIONAL_COLUMNS = ("GeomParentTrackId", "GeomUpParentTrackId", "RsSO", "RsKlypinSO", "VmaxSO", "RmaxSO") \
+    + tuple(c[0] for c in ORPHAN_SET_COLUMNS)
 
 PARTICLE_TAG_BLOCKS = [("TrackId", "i8"), ("BindRank", "i4"), ("BoundTrackId", "i8")]
 
@@ -179,6 +192,7 @@ class SubhaloCatalogue(object):
         self.missing_columns = []
         self.subhalos = self._read_table("Subhalo", SUBHALO_COLUMNS, strict)
         self.orphans = self._read_table("Orphan", ORPHAN_COLUMNS, strict)
+        self._fill_legacy_orphan_set()
         self._read_groups()
         self._cache = {}
         self._sub_index = None
@@ -215,6 +229,28 @@ class SubhaloCatalogue(object):
             if block.startswith(prefix + "/") and block.split("/", 1)[1] not in known:
                 out[block.split("/", 1)[1]] = self.file[block][:]
         return out
+
+    def _fill_legacy_orphan_set(self):
+        """A catalogue without the followed-set columns (schema 1): every orphan follows its
+        MostBoundID alone, unclipped, as the finder's restart reads such a state (subhalo_io.c)."""
+        O = self.orphans
+        if "MostBoundID" not in O:
+            return
+        mb = O["MostBoundID"].astype(np.uint64)
+        n = mb.shape[0]
+        has = mb != NO_ID
+        if "OrphanIDs" not in O:
+            ids = np.full((n, MAXTRACERS), NO_ID, dtype=np.uint64)
+            ids[:, 0] = mb
+            O["OrphanIDs"] = ids
+        if "NOrphanTracers" not in O:
+            O["NOrphanTracers"] = has.astype(np.int32)
+        if "NOrphanFound" not in O:
+            lost = O["SnapTracerLost"] >= 0 if "SnapTracerLost" in O else np.zeros(n, bool)
+            O["NOrphanFound"] = (has & ~lost).astype(np.int32)
+        for c in ("OrphanSigmaX", "OrphanScale"):
+            if c not in O:
+                O[c] = np.full(n, -1, dtype=np.float32)
 
     def _read_groups(self):
         if "FOFGroups/LengthByType" in self.blocks:

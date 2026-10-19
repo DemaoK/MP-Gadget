@@ -148,8 +148,11 @@ void subhalo_history_update(struct SubTrack * rec, int SnapNum, double MaxMerger
  * and the transient NboundPrev, Host and Key of old (NULL: a newborn, SnapBirth = SnapNum). */
 void subhalo_track_carry(struct SubTrack * rec, const struct SubTrack * old, int64_t TrackId, int SnapNum);
 
-/* Set the orphan state of a record that sank into winner (SinkTrackId) or died (winner = -1). */
+/* Set the orphan state of a record that sank into winner (SinkTrackId) or died (winner = -1),
+ * with its followed set: MostBoundID, then up to SubhaloOrphanTracers - 1 distinct TracerIDs. */
 void subhalo_track_make_orphan(struct SubTrack * t, int64_t winner, int SnapNum);
+/* The followed-set columns of a record reset to "absent" (resolved: no set, -1 scales). */
+void subhalo_track_clear_orphan_set(struct SubTrack * t);
 
 /* The tracks no key processed this call, on their home ranks: one without live particles dies (not
  * sunk); one with own-tag field particles gets the hostless rule (all bound, SUBHALO_FLAG_INPLACE,
@@ -628,10 +631,13 @@ void subhalo_lookup_set_max_batch(int64_t maxbatch);
  * live particles, else the sorted index), 1 always the index, 2 always the scan. */
 void subhalo_lookup_set_mode(int mode);
 /* Step 1: every orphan record homed here (Nbound == 0, SnapTracerLost < 0) looks up its
- * MostBoundID: a hit sets Host to the particle's GrNr (-1 outside groups) and TracerPos
- * (physical frame) / TracerVel (km/s), a miss sets SnapTracerLost = SnapNum. Returns the
- * global (looked up, found) counts. Collective. */
+ * followed set (OrphanIDs; MostBoundID alone for a record without one) and updates its state
+ * with subhalo_orphan_update. Returns the global (IDs looked up, found) counts. Collective. */
 void subhalo_orphan_lookup(struct SubTrackTable * tab, int SnapNum, double atime, int64_t * nlook, int64_t * nfound, MPI_Comm Comm);
+/* One orphan's state from its n markers' hits (OrphanIDs order): none found marks it lost; else the
+ * markers within 3 OrphanScale of their median give TracerPos/Vel (weighted mean) and Host (weighted
+ * plurality), one kept marker copied exactly. Returns 1 if a marker was found. */
+int subhalo_orphan_update(struct SubTrack * t, const struct SubhaloIdHit * hit, int n, const double Offset[3], double BoxSize, double vfac, int SnapNum);
 
 /* ------------------------------------------------------------------ per-key processing (subhalo_track.c) */
 

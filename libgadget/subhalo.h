@@ -34,6 +34,7 @@ struct SubhaloParams {
     int    SubhaloMinNumPart;            /* 20 */
     int    SubhaloMinNumTracerPart;      /* 10 */
     int    SubhaloNumTracerHostFinding;  /* 10 */
+    int    SubhaloOrphanTracers;         /* 10: particles an orphan follows (1 = its MostBoundID alone, as HBT) */
     int64_t SubhaloLookupBatchBytes;     /* 64 MB */
     double SubhaloMajorProgenitorMassRatio; /* 0.8 */
     double SubhaloBoundMassPrecision;    /* 0.995 */
@@ -72,10 +73,11 @@ const struct SubhaloParams * subhalo_get_params(void);
 
 /* ------------------------------------------------------------------ constants */
 
-#define SUBHALO_SCHEMA_VERSION 1
+/* 2: the Orphan table's followed set (OrphanIDs ... OrphanScale); a version-1 state is still read. */
+#define SUBHALO_SCHEMA_VERSION 2
 #define SUBHALO_NSO 5                 /* vir, 200b, 200c, 500c, 2500c */
 #define SUBHALO_NOTRACK (-1L)
-/* Upper bound on SubhaloNumTracerHostFinding: the tracer IDs of step 0 live in the record. */
+/* Upper bound on SubhaloNumTracerHostFinding and SubhaloOrphanTracers: the IDs live in the record. */
 #define SUBHALO_MAXTRACERS 16
 /* Provisional TrackId of a newborn candidate with FOF ordinal g >= 1 (design 7.2 step 3): <= -3,
  * since -1 is "no track" and -2 is SUBHALO_DESC_PENDING. */
@@ -105,7 +107,7 @@ struct SubTrack {
     /* group A: identity and links */
     int64_t TrackId;
     int64_t HostGroup;               /* FOF GroupID at this call, -1 field/hostless; for an orphan its
-                                      * tracer's group (-1 in the field or lost) */
+                                      * kept markers' plurality group (-1 in the field or lost) */
     int64_t NestedParentTrackId;     /* pid, -1 for a central */
     int64_t CentralTrackId;          /* upid; a central's own TrackId; for an orphan the central of its
                                       * current host group, -1 if none (its other links stay as at death) */
@@ -150,11 +152,16 @@ struct SubTrack {
     int32_t SnapMboundPeak, SnapVmaxPeak, SnapAcc, SnapFirstAcc, SnapLastMajorMerger;
     int64_t GeomParentTrackId, GeomUpParentTrackId;
     /* group F: orphan tracer state */
-    double  TracerPos[3];
+    double  TracerPos[3];            /* weighted mean of the kept markers, physical frame */
     float   TracerVel[3];
     int32_t SnapTracerLost;
+    MyIDType OrphanIDs[SUBHALO_MAXTRACERS]; /* the followed set fixed at death, MostBoundID first, -1 padded */
+    int32_t NOrphanTracers;          /* its size, 0 while resolved */
+    int32_t NOrphanFound;            /* markers found and kept at this call, 0 when lost or resolved */
+    float   OrphanSigmaX;            /* rms distance of the kept markers from TracerPos, -1 below 2 */
+    float   OrphanScale;             /* clip scale: CoreSigmaX at death (Rhalf fallback), -1 = no clip */
     /* ---- transient, never written: valid only inside one subhalo_find call ---- */
-    int64_t Host;                    /* host vote result this call (GrNr or -1); an orphan's tracer GrNr */
+    int64_t Host;                    /* host vote result this call (GrNr or -1); an orphan's markers' vote */
     int32_t NboundPrev;              /* Nbound at the previous call, frozen for the central choice */
     int32_t Alive;                   /* 1 if this track won a key or is hostless-resolved this call */
     /* previous-bound frame from the BoundTrackId sums, in the kernel's frame (translated comoving,

@@ -224,6 +224,36 @@ SUBTRACK_PROPERTY(GeomUpParentTrackId, GeomUpParentTrackId, int64_t, 1)
 SUBTRACK_PROPERTY(TracerPos, TracerPos[0], double, 3)
 SUBTRACK_PROPERTY(TracerVel, TracerVel[0], float, 3)
 SUBTRACK_PROPERTY(SnapTracerLost, SnapTracerLost, int32_t, 1)
+SUBTRACK_PROPERTY(OrphanIDs, OrphanIDs[0], uint64_t, SUBHALO_MAXTRACERS)
+SUBTRACK_PROPERTY(NOrphanTracers, NOrphanTracers, int32_t, 1)
+SUBTRACK_PROPERTY(NOrphanFound, NOrphanFound, int32_t, 1)
+SUBTRACK_PROPERTY(OrphanSigmaX, OrphanSigmaX, float, 1)
+SUBTRACK_PROPERTY(OrphanScale, OrphanScale, float, 1)
+
+/* The schema version that introduced a column: the followed set of the orphans is version 2. */
+static int
+subhalo_column_schema(const IOTableEntry * ent)
+{
+    static const char * v2[] = {"OrphanIDs", "NOrphanTracers", "NOrphanFound", "OrphanSigmaX", "OrphanScale"};
+    size_t k;
+    if(ent->ptype == PTYPE_ORPHAN)
+        for(k = 0; k < sizeof(v2) / sizeof(v2[0]); k++)
+            if(0 == strcmp(ent->name, v2[k]))
+                return 2;
+    return 1;
+}
+
+/* The followed set of an orphan read from a version-1 state: its MostBoundID alone, unclipped. */
+static void
+subhalo_orphan_legacy_set(struct SubTrack * t)
+{
+    subhalo_track_clear_orphan_set(t);
+    if(t->MostBoundID == (MyIDType) -1)
+        return;
+    t->OrphanIDs[0] = t->MostBoundID;
+    t->NOrphanTracers = 1;
+    t->NOrphanFound = t->SnapTracerLost < 0;
+}
 
 /* Columns common to both tables: group A links and snapshots, and group E. */
 static void
@@ -345,6 +375,11 @@ subhalo_register_table_blocks(struct IOTable * T)
     SUBREG(TracerPos, "f8", 3, o, T);
     SUBREG(TracerVel, "f4", 3, o, T);
     SUBREG(SnapTracerLost, "i4", 1, o, T);
+    SUBREG(OrphanIDs, "u8", SUBHALO_MAXTRACERS, o, T);
+    SUBREG(NOrphanTracers, "i4", 1, o, T);
+    SUBREG(NOrphanFound, "i4", 1, o, T);
+    SUBREG(OrphanSigmaX, "f4", 1, o, T);
+    SUBREG(OrphanScale, "f4", 1, o, T);
 }
 
 static const char *
@@ -642,6 +677,7 @@ subhalo_format_params(char * buf, size_t size)
         "SubhaloMinNumPart = %d\n"
         "SubhaloMinNumTracerPart = %d\n"
         "SubhaloNumTracerHostFinding = %d\n"
+        "SubhaloOrphanTracers = %d\n"
         "SubhaloLookupBatchBytes = %ld\n"
         "SubhaloMajorProgenitorMassRatio = %.17g\n"
         "SubhaloBoundMassPrecision = %.17g\n"
@@ -666,7 +702,7 @@ subhalo_format_params(char * buf, size_t size)
         sp->SubhaloFinderOn, sp->SubhaloMaxGatherFraction, sp->SubhaloCollectiveMinPart,
         sp->SubhaloMaxUnbindIterations, sp->SubhaloRestartFresh, sp->SubhaloTracerTypes,
         sp->SubhaloPotentialTypes, sp->SubhaloMinNumPart, sp->SubhaloMinNumTracerPart,
-        sp->SubhaloNumTracerHostFinding, sp->SubhaloLookupBatchBytes,
+        sp->SubhaloNumTracerHostFinding, sp->SubhaloOrphanTracers, sp->SubhaloLookupBatchBytes,
         sp->SubhaloMajorProgenitorMassRatio, sp->SubhaloBoundMassPrecision,
         sp->SubhaloSourceRelaxFactor, sp->SubhaloPotentialSampleSize, sp->SubhaloFinalPass, sp->SubhaloTreeOpenAngle,
         sp->SubhaloMergeTrapped, sp->SubhaloSinkSymmetric, sp->SubhaloCoreSize,
@@ -828,7 +864,7 @@ subhalo_probe_block(BigFile * bf, const char * blockname, int64_t size, int nmem
     return bad;
 }
 
-/* Rank 0 only: is PIG_m a complete state of schema SUBHALO_SCHEMA_VERSION? */
+/* Rank 0 only: is PIG_m a complete state of schema SUBHALO_SCHEMA_VERSION (or version 1)? */
 static int
 subhalo_state_valid(const char * fname, int m)
 {
@@ -866,8 +902,8 @@ subhalo_state_valid(const char * fname, int m)
         message(0, "PIG %s: subhalo header attributes missing, skipping.\n", fname);
         goto header_done;
     }
-    if(schema != SUBHALO_SCHEMA_VERSION) {
-        message(0, "PIG %s: subhalo schema version %d, this build reads %d, skipping.\n", fname, schema, SUBHALO_SCHEMA_VERSION);
+    if(schema != SUBHALO_SCHEMA_VERSION && schema != 1) {
+        message(0, "PIG %s: subhalo schema version %d, this build reads %d and 1, skipping.\n", fname, schema, SUBHALO_SCHEMA_VERSION);
         goto header_done;
     }
     /* finite-value checks first: under -ffast-math a NaN comparison proves nothing */
@@ -892,11 +928,13 @@ header_done:
         return 0;
     }
 
-    /* Every column of the schema with the right row count. */
+    /* Every column of the state's schema with the right row count. */
     struct IOTable T = {0};
     subhalo_register_table_blocks(&T);
     int e, bad = 0;
     for(e = 0; e < T.used; e++) {
+        if(subhalo_column_schema(&T.ent[e]) > schema)
+            continue;
         char blockname[128];
         snprintf(blockname, sizeof(blockname), "%s/%s", subhalo_table_dir(T.ent[e].ptype), T.ent[e].name);
         bad += subhalo_probe_block(&bf, blockname, (T.ent[e].ptype == PTYPE_SUBHALO) ? nsub : norph, T.ent[e].items, T.ent[e].dtype);
@@ -1036,8 +1074,8 @@ subhalo_read_state_checked(const char * pigname, struct SubTrackTable * tab, dou
     }
     if(0 != big_block_mpi_close(&bh, Comm))
         SUBHALO_STATE_FATAL(pigname, "Failed to close the header of %s\n", pigname);
-    if(schema != SUBHALO_SCHEMA_VERSION)
-        SUBHALO_STATE_FATAL(pigname, "Subhalo schema %d in %s, this build reads %d\n", schema, pigname, SUBHALO_SCHEMA_VERSION);
+    if(schema != SUBHALO_SCHEMA_VERSION && schema != 1)
+        SUBHALO_STATE_FATAL(pigname, "Subhalo schema %d in %s, this build reads %d and 1\n", schema, pigname, SUBHALO_SCHEMA_VERSION);
     if(!subhalo_count_ok(NumSubhalosTotal) || !subhalo_count_ok(NumOrphansTotal) || !subhalo_count_ok(NumTracksTotal)
             || NumSubhalosTotal + NumOrphansTotal != NumTracksTotal || !subhalo_isfinite(StateTime))
         SUBHALO_STATE_FATAL(pigname, "Subhalo state %s: inconsistent header (%ld subhalos + %ld orphans, %ld tracks, a = %g)\n",
@@ -1058,6 +1096,8 @@ subhalo_read_state_checked(const char * pigname, struct SubTrackTable * tab, dou
     int e;
     for(e = 0; e < T.used; e++) {
         IOTableEntry * ent = &T.ent[e];
+        if(subhalo_column_schema(ent) > schema)
+            continue;
         const int issub = (ent->ptype == PTYPE_SUBHALO);
         const int64_t n = issub ? nsub : norph;
         struct SubTrack * base = issub ? recs : recs + nsub;
@@ -1079,9 +1119,14 @@ subhalo_read_state_checked(const char * pigname, struct SubTrackTable * tab, dou
     if(0 != big_file_mpi_close(&bf, Comm))
         SUBHALO_STATE_FATAL(pigname, "Failed to close %s\n", pigname);
 
-    /* Orphan rows carry no counts: an orphan has no bound particles. */
+    /* Orphan rows carry no counts: an orphan has no bound particles. A version-1 orphan follows
+     * its MostBoundID alone. */
+    if(schema == 1)
+        message(0, "Subhalo state %s has schema version 1: its orphans follow their MostBoundID alone, unclipped.\n", pigname);
     for(i = nsub; i < nsub + norph; i++) {
         int k;
+        if(schema == 1)
+            subhalo_orphan_legacy_set(&recs[i]);
         recs[i].Nbound = recs[i].NboundExclusive = recs[i].NboundTracer = 0;
         recs[i].Mbound = 0;
         for(k = 0; k < 6; k++) {

@@ -412,6 +412,7 @@ subhalo_track_carry(struct SubTrack * rec, const struct SubTrack * old, int64_t 
         rec->TracerVel[d] = old->TracerVel[d];
     }
     rec->SnapTracerLost = old->SnapTracerLost;
+    /* the followed set stays cleared: a carried record is resolved */
     rec->NboundPrev = old->NboundPrev;
     rec->Host = old->Host;
     rec->Key = old->Key;
@@ -1013,6 +1014,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
             if(x_is_resurrected(&nd[v])) {
                 /* the orphan tracer state is not a Subhalo column: cleared, as a restart reads it */
                 rec->SnapTracerLost = -1;
+                subhalo_track_clear_orphan_set(rec);
                 for(d = 0; d < 3; d++) {
                     rec->TracerPos[d] = -1;
                     rec->TracerVel[d] = -1;
