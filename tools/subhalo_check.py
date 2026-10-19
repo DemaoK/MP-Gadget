@@ -1586,7 +1586,7 @@ def orphan_set_state(pos, gid, scale, box, pen=None):
     (default 0): positions unwrapped about the first, then the minimum image about the centre (one
     or two markers: the first, most-bound one, as a median of two would mix particles; else the
     component-wise lower median); kept within 3 scale (all for scale <= 0, else the closest);
-    weights exp(-pen) / (1 + sqrt(rank)), the rank part alone if they all underflow. Returns
+    weights exp(-pen) / (1 + sqrt(rank)) (subnormals as 0), the rank part alone if all are 0. Returns
     (position wrapped into [0, box), kept count, host GroupID by weighted plurality, -1 a ballot,
     ties to the smaller)."""
     pos = np.asarray(pos, np.float64)
@@ -1601,6 +1601,8 @@ def orphan_set_state(pos, gid, scale, box, pen=None):
     rankw = 1.0 / (1.0 + np.sqrt(keep.astype(np.float64)))
     pen = np.zeros(n) if pen is None else np.asarray(pen, np.float64)
     w = np.where(pen[keep] > 0, np.exp(-np.maximum(pen[keep], 0)), 1.0) * rankw
+    # the C build flushes subnormals to zero (-ffast-math)
+    w[w < np.finfo(np.float64).tiny] = 0.0
     if not w.sum() > 0:
         w = rankw
     m = pos[keep[0]] if keep.size == 1 else (w[:, None] * x[keep]).sum(axis=0) / w.sum()

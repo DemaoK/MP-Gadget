@@ -5810,6 +5810,14 @@ test_subhalo_orphan_set_update(void ** state)
               && subhalo_isfinite(t.TracerVel[0]) && t.Host == 5,
               "underflowing final weights: TracerPos %g (expected %g) OrphanSigmaX %g TracerVel %g Host %ld\n", t.TracerPos[0], xe,
               t.OrphanSigmaX, t.TracerVel[0], t.Host);
+        /* penalties 710 and 709: both weights subnormal, flushed to zero; the rank weights decide
+         * (tools/subhalo_check.py orphan_set_state mirrors this) */
+        h[0] = os_hit(60, 50, 50, 5, 710, 0);
+        h[1] = os_hit(61, 50, 50, 6, 709, 0);
+        t = os_orphan(2, 1.0f);
+        subhalo_orphan_update(&t, h, 2, off0, box, vfac, 4);
+        CHECK(fabs(t.TracerPos[0] - (60 + 61 * 0.5) / 1.5) < 1e-9 && t.Host == 5, "subnormal weights: TracerPos %.12g Host %ld\n",
+              t.TracerPos[0], t.Host);
     }
     /* "no group" is a ballot: -1 wins over a group with less weight, and loses to one with more */
     {
