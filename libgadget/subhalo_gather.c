@@ -68,7 +68,7 @@ struct TracerTuple {
     int64_t GrNr;
     MyIDType ID;
     int32_t BindRank;
-    int32_t pad;
+    float Penalty;           /* its TracerPenalty */
 };
 
 static int
@@ -119,7 +119,7 @@ subhalo_host_vote(struct SubTrackTable * tab, MPI_Comm Comm)
             v[m].GrNr = p->GrNr >= 0 ? p->GrNr : -1;
             v[m].ID = p->ID;
             v[m].BindRank = p->BindRank;
-            v[m].pad = 0;
+            v[m].Penalty = p->TracerPenalty;
         });
 #undef VOTE_PRED
     ta_free(off);
@@ -136,9 +136,10 @@ subhalo_host_vote(struct SubTrackTable * tab, MPI_Comm Comm)
     qsort_openmp(in, nin, sizeof(struct TracerTuple), cmp_tracertuple);
     nin = keep_first_tracers(in, nin, K);
 
-    /* HBT's DecideLocalHostId: weight 1 / (1 + sqrt(i)) for the i-th tracer; the GrNr (-1: none)
-     * with the largest sum wins, ties to the smaller. A track without tuples keeps Host = -1. */
-    int64_t a = 0, nhosted = 0, nfield = 0;
+    /* HBT's DecideLocalHostId: weight exp(-Penalty) / (1 + sqrt(i)) for the i-th tracer; the GrNr
+     * (-1: none) with the largest sum wins, ties to the smaller. A track without tuples keeps Host = -1. */
+    int64_t a = 0, nhosted = 0, nfield = 0, npen = 0;
+    double wsum = 0;
     int missing = 0;
     while(a < nin) {
         int64_t b = a;
@@ -146,29 +147,24 @@ subhalo_host_vote(struct SubTrackTable * tab, MPI_Comm Comm)
             b++;
         int64_t cand[SUBHALO_MAXTRACERS];
         double w[SUBHALO_MAXTRACERS];
-        int nc = 0, j, c;
+        int j;
         struct SubTrack * rec = subhalo_table_get(tab, in[a].TrackId);
         for(j = 0; j < b - a; j++) {
-            const int64_t g = in[a + j].GrNr;
-            for(c = 0; c < nc && cand[c] != g; c++) {}
-            if(c == nc) {
-                cand[nc] = g;
-                w[nc] = 0;
-                nc++;
-            }
-            w[c] += 1.0 / (1.0 + sqrt((double) j));
+            /* "no group" (-1) is a legitimate ballot: shift by one so that the helper counts it */
+            cand[j] = in[a + j].GrNr + 1;
+            const double tw = subhalo_tracer_weight(in[a + j].Penalty);
+            w[j] = tw / (1.0 + sqrt((double) j));
+            npen += in[a + j].Penalty > 0;
+            wsum += tw;
             if(rec)
                 rec->TracerIDs[j] = in[a + j].ID;
         }
-        int best = 0;
-        for(c = 1; c < nc; c++)
-            if(w[c] > w[best] || (w[c] == w[best] && cand[c] < cand[best]))
-                best = c;
+        const int64_t host = subhalo_weighted_plurality(cand, w, (int) (b - a), NULL, NULL) - 1;
         if(!rec)
             missing = 1;
         else {
             rec->NTracers = (int32_t) (b - a);
-            rec->Host = cand[best];
+            rec->Host = host;
             if(rec->Host >= 0) nhosted++; else nfield++;
         }
         a = b;
@@ -179,9 +175,13 @@ subhalo_host_vote(struct SubTrackTable * tab, MPI_Comm Comm)
     ta_free(sendcounts);
     myfree(v);
 
-    int64_t loc[2] = {nhosted, nfield}, tot[2];
-    MPI_Allreduce(loc, tot, 2, MPI_INT64, MPI_SUM, Comm);
-    message(0, "Subhalo host vote: %ld tracks hosted by a FOF group, %ld with no host group (tracer vote).\n", tot[0], tot[1]);
+    int64_t loc[4] = {nhosted, nfield, npen, nin}, tot[4];
+    MPI_Allreduce(loc, tot, 4, MPI_INT64, MPI_SUM, Comm);
+    double wtot = 0;
+    MPI_Allreduce(&wsum, &wtot, 1, MPI_DOUBLE, MPI_SUM, Comm);
+    message(0, "Subhalo host vote: %ld tracks hosted by a FOF group, %ld with no host group (tracer vote); "
+               "%ld of %ld tracers with a collision penalty, mean weight %.3f.\n",
+            tot[0], tot[1], tot[2], tot[3], tot[3] > 0 ? wtot / tot[3] : 1.0);
 }
 
 /* ------------------------------------------------------------------ step 3: previous-bound frames */

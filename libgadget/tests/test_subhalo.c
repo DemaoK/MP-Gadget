@@ -18,7 +18,8 @@
  * kept; sinking, orphan tracer, resurrection; all but central_source log a tag/record checksum),
  * nest_tree, deep_chain, mixed_call, nocentral, fallback (serial/in-place transitions), itercap,
  * lookup (three modes), serial_keys (scheduler at 1-4 threads), reserve_admission,
- * local_sort (thread-count independent), header_params, sampled_default (SubhaloFinalPass = 0).
+ * local_sort (thread-count independent), header_params, sampled_default (SubhaloFinalPass = 0),
+ * weighted_plurality and penalty_descendant (collision-penalty weights of the tracer votes).
  *
  * SUBHALO_TEST_ONLY=<substring> runs only the matching tests. The sort-key range checks abort
  * through endrun, so they run alone: SUBHALO_TEST_SORTKEY_OVERFLOW=grnr|trackid|bindrank
@@ -902,6 +903,7 @@ test_subhalo_sort_key_overflow(void ** state)
 static int64_t tagT(MyIDType id) { return (int64_t) id * 1000003LL + (1LL << 35); }
 static int32_t tagB(MyIDType id) { return (int32_t)(((uint32_t) id * 7919u) ^ 0x5A5A5A5Au) & 0x7fffffff; }
 static int64_t tagBT(MyIDType id) { return -(int64_t) id - 2; }
+static float tagP(MyIDType id) { return 0.125f * (float) (id % 11); }
 
 static int
 scatter_layout(int i, const void * userdata)
@@ -929,9 +931,11 @@ check_exchanged_tags(int (*layout)(int, const void *), int NTask, int64_t TotNum
         nongarbage++;
         LOCAL_CHECK(bad, layout(i, &NTask) == ThisTask, "particle ID %lu on rank %d, layout says %d\n",
                 (unsigned long) P[i].ID, ThisTask, layout(i, &NTask));
-        LOCAL_CHECK(bad, P[i].TrackId == tagT(P[i].ID) && P[i].BindRank == tagB(P[i].ID) && P[i].BoundTrackId == tagBT(P[i].ID),
-                "particle ID %lu: tags (%ld %d %ld) expected (%ld %d %ld)\n", (unsigned long) P[i].ID,
-                P[i].TrackId, P[i].BindRank, P[i].BoundTrackId, tagT(P[i].ID), tagB(P[i].ID), tagBT(P[i].ID));
+        LOCAL_CHECK(bad, P[i].TrackId == tagT(P[i].ID) && P[i].BindRank == tagB(P[i].ID) && P[i].BoundTrackId == tagBT(P[i].ID)
+                && P[i].TracerPenalty == tagP(P[i].ID),
+                "particle ID %lu: tags (%ld %d %ld %g) expected (%ld %d %ld %g)\n", (unsigned long) P[i].ID,
+                P[i].TrackId, P[i].BindRank, P[i].BoundTrackId, P[i].TracerPenalty, tagT(P[i].ID), tagB(P[i].ID), tagBT(P[i].ID),
+                tagP(P[i].ID));
     }
     assert_all_true((bad == 0));
     int64_t tot = 0;
@@ -947,6 +951,10 @@ test_subhalo_exchange_tags(void ** state)
     int ThisTask = get_thistask();
     const int npertype = 8;
     int64_t NType[6] = {npertype, npertype, npertype, npertype, npertype, npertype};
+    /* TracerPenalty fills the padding after BindRank: the particle size is unchanged */
+    assert_int_equal(offsetof(struct particle_data, TracerPenalty), offsetof(struct particle_data, BindRank) + 4);
+    assert_int_equal(offsetof(struct particle_data, BoundTrackId), offsetof(struct particle_data, BindRank) + 8);
+    assert_int_equal(sizeof(struct SubhaloIdHit), 72);
 
     particle_alloc_memory(PartManager, 1000., 1024);
     PartManager->NumPart = 6 * npertype;
@@ -965,6 +973,7 @@ test_subhalo_exchange_tags(void ** state)
         P[i].TrackId = tagT(P[i].ID);
         P[i].BindRank = tagB(P[i].ID);
         P[i].BoundTrackId = tagBT(P[i].ID);
+        P[i].TracerPenalty = tagP(P[i].ID);
     }
     slots_setup_id(PartManager, SlotsManager);
     int64_t TotNumPart = 0;
@@ -1840,7 +1849,16 @@ test_subhalo_forced_failure(void ** state)
     struct SubTrack * rec0 = fetch_all_tracks(T6_NCLUMP);
     CHECK(subhalo_last_call_snapshot() == 0, "failure test: last call snapshot %d\n", subhalo_last_call_snapshot());
 
+    int64_t i;
+    int bad = 0;
+    for(i = 0; i < PartManager->NumPart; i++)
+        LOCAL_CHECK(bad, P[i].TracerPenalty == 0, "complete call: particle %lu keeps TracerPenalty %g\n",
+                    (unsigned long) P[i].ID, P[i].TracerPenalty);
+    assert_all_true((bad == 0));
     if(NTask > 1) {
+        /* small unanimous penalties: a skipped call keeps them, the next complete call zeroes them */
+        for(i = 0; i < PartManager->NumPart; i++)
+            P[i].TracerPenalty = 1e-3f * (float) (1 + P[i].ID % 4);
         sp.SubhaloDebugForceExchangeFailure = 1;
         subhalo_set_testpar(sp);
         ret = run_finder_call(1, &CP, &ngroups);
@@ -1850,8 +1868,9 @@ test_subhalo_forced_failure(void ** state)
         CHECK(tab->NTotal == T6_NCLUMP, "forced failure: NTotal changed to %ld\n", tab->NTotal);
         struct tagrec * r1 = gather_tags(&n1);
         CHECK(n1 == ntot, "forced failure: %ld particles after the restore, expected %ld\n", n1, ntot);
-        int64_t i;
-        int bad = 0;
+        for(i = 0; i < PartManager->NumPart; i++)
+            LOCAL_CHECK(bad, P[i].TracerPenalty == 1e-3f * (float) (1 + P[i].ID % 4),
+                        "forced failure: particle %lu TracerPenalty %g changed\n", (unsigned long) P[i].ID, P[i].TracerPenalty);
         for(i = 0; i < n1 && i < n0; i++)
             LOCAL_CHECK(bad, r1[i].ID == r0[i].ID && r1[i].TrackId == r0[i].TrackId && r1[i].BindRank == r0[i].BindRank
                     && r1[i].BoundTrackId == r0[i].BoundTrackId,
@@ -1886,6 +1905,10 @@ test_subhalo_forced_failure(void ** state)
             LOCAL_CHECK(bad, r2[i].TrackId == r0[i].TrackId && r2[i].BoundTrackId == r0[i].BoundTrackId,
                     "after the failure: particle %lu TrackId %ld, first call %ld\n", (unsigned long) r2[i].ID, r2[i].TrackId, r0[i].TrackId);
         CHECK(bad == 0, "the call after a failure did not continue the tracks\n");
+        for(i = 0; i < PartManager->NumPart; i++)
+            LOCAL_CHECK(bad, P[i].TracerPenalty == 0, "after the failure: particle %lu keeps TracerPenalty %g\n",
+                        (unsigned long) P[i].ID, P[i].TracerPenalty);
+        assert_all_true((bad == 0));
         CHECK(check_group_invariants(r2, n2) == 0, "after the failure: group invariants violated\n");
         free(r2);
     }
@@ -2718,8 +2741,71 @@ test_subhalo_unhosted_direct(void ** state)
     MPI_Allreduce(ntag, ntagtot, 6, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
     CHECK(ntagtot[1] == 2 && ntagtot[5] == 0, "tagged count: type 1 %ld type 5 %ld, expected 2 and 0\n", ntagtot[1], ntagtot[5]);
 
+    /* Collision penalties (SIDM): track 2's tracers of rank 0-4 are in group 7, 5-9 in group 8.
+     * Unpenalised, 7 wins (2.61 to 1.38); a penalty 0.1 on the first five keeps 7 (2.36), a
+     * penalty 5 (weight 0.0067) hands the vote to 8. */
+    const float pen[3] = {0, 0.1f, 5};
+    const int64_t expect[3] = {7, 7, 8};
+    int c;
+    for(c = 0; c < 3; c++) {
+        PartManager->NumPart = 0;
+        reset_direct_records(tab);
+        for(p = 0; p < 10; p++) {
+            if((p * 3 + 1) % NTask != ThisTask)
+                continue;
+            place_direct(60 + p, 1, 200 + p, 100, 100, 1, 2, 0, p < 5 ? 7 : 8);
+            P[PartManager->NumPart - 1].BindRank = p;
+            P[PartManager->NumPart - 1].TracerPenalty = p < 5 ? pen[c] : 0;
+        }
+        subhalo_host_vote(tab, MPI_COMM_WORLD);
+        rec = fetch_all_tracks(4);
+        CHECK(rec[2].Host == expect[c] && rec[2].NTracers == 10 && rec[2].TracerIDs[0] == 60 && rec[2].TracerIDs[9] == 69,
+              "penalised host vote %d: Host %ld (expected %ld), %d tracers, first %lu last %lu\n", c, rec[2].Host, expect[c],
+              rec[2].NTracers, (unsigned long) rec[2].TracerIDs[0], (unsigned long) rec[2].TracerIDs[9]);
+        free(rec);
+    }
+
     subhalo_set_units(3.085678e21, 1.989e43, 1e5);
     teardown_pman();
+}
+
+/* The shared weighted plurality of the host and descendant votes. */
+static void
+test_subhalo_weighted_plurality(void ** state)
+{
+    double top, second;
+    const int64_t none[1] = {0};
+    const double w1[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+    /* no ballot, and only negative candidates */
+    CHECK(subhalo_weighted_plurality(none, w1, 0, &top, &second) == SUBHALO_NOTRACK && top == 0 && second == 0,
+          "plurality of nothing: top %g second %g\n", top, second);
+    const int64_t neg[3] = {-1, -2, -1};
+    CHECK(subhalo_weighted_plurality(neg, w1, 3, &top, &second) == SUBHALO_NOTRACK && top == 0 && second == 0,
+          "plurality of negatives: top %g second %g\n", top, second);
+    CHECK(subhalo_weighted_plurality(neg, w1, 3, NULL, NULL) == SUBHALO_NOTRACK, "plurality without the sums\n");
+    /* equal sums go to the smaller candidate, whatever the ballot order */
+    const int64_t tie[4] = {7, 3, 7, 3}, tie2[4] = {3, 7, 3, 7};
+    CHECK(subhalo_weighted_plurality(tie, w1, 4, &top, &second) == 3 && top == 2 && second == 2, "tie: top %g second %g\n", top, second);
+    CHECK(subhalo_weighted_plurality(tie2, w1, 4, NULL, NULL) == 3, "tie in the other order\n");
+    /* unit weights reproduce the counts exactly (negative ballots skipped) */
+    const int64_t cnt[8] = {5, 2, 5, 9, 2, 5, -1, 9};
+    CHECK(subhalo_weighted_plurality(cnt, w1, 8, &top, &second) == 5 && top == 3 && second == 2,
+          "counts: top %g second %g\n", top, second);
+    const int64_t cnt2[6] = {9, 2, -1, 9, 2, -1};
+    CHECK(subhalo_weighted_plurality(cnt2, w1, 6, &top, &second) == 2 && top == 2 && second == 2, "count tie: top %g\n", top);
+    /* exp weights: two unpenalised ballots beat three with penalty 5 */
+    const int64_t mix[5] = {4, 4, 4, 8, 8};
+    const double e5 = subhalo_tracer_weight(5);
+    const double wm[5] = {e5, e5, e5, 1, 1};
+    CHECK(subhalo_weighted_plurality(mix, wm, 5, &top, &second) == 8 && top == 2 && fabs(second - 3 * exp(-5.)) < 1e-12,
+          "exp weights: top %g second %g\n", top, second);
+    /* a heavy negative ballot does not count */
+    const int64_t nb[2] = {-1, 6};
+    const double wn[2] = {10, 0.5};
+    CHECK(subhalo_weighted_plurality(nb, wn, 2, &top, &second) == 6 && top == 0.5 && second == 0, "negative ballot: top %g\n", top);
+    /* the weight of a zero or negative penalty is exactly 1 */
+    CHECK(subhalo_tracer_weight(0) == 1.0 && subhalo_tracer_weight(-1) == 1.0 && fabs(subhalo_tracer_weight(1) - exp(-1.0)) < 1e-15,
+          "tracer weights %g %g %g\n", subhalo_tracer_weight(0), subhalo_tracer_weight(-1), subhalo_tracer_weight(1));
 }
 
 /* ------------------------------------------------------------------ test 9: life cycle with the PIG */
@@ -4840,6 +4926,59 @@ test_subhalo_mixed_call(void ** state)
     syn_teardown();
 }
 
+/* ---- collision penalties in the descendant vote: call 1 of mixed_call, where the dying D has
+ *      six tracers bound to S in its key and one bound to U, found remotely ----
+ * Unpenalised S wins 6 to 1; with penalty 2 on the six (6 e^-2 = 0.81) the unpenalised remote
+ * tracer wins; with penalty 1 on that one too (e^-1 = 0.37) S wins again. D's host stays S's group
+ * (tracers 8 and 9 there are unpenalised). Every penalty is zero after the call. */
+static void
+test_subhalo_penalty_descendant(void ** state)
+{
+    const float pS[3] = {0, 2, 2}, pU[3] = {0, 0, 1};
+    const int64_t expect[3] = {0, 2, 0};
+    int c;
+    for(c = 0; c < 3; c++) {
+        Cosmology CP;
+        struct SubhaloParams sp = default_subhalo_params();
+        sp.SubhaloCollectiveMinPart = 500;
+        sp.SubhaloFieldSO = 0;
+        syn_setup(&CP, MX_END + SYN_NFIELD, sp);
+        struct SubTrack recs[4];
+        recs[0] = syn_rec(0, 300, 0.03, -1, 0, 0, 0);
+        recs[1] = syn_rec(1, 40, 0.004, 0, 0, 1, 1);
+        recs[2] = syn_rec(2, 150, 0.015, -1, 2, 0, 0);
+        recs[3] = syn_rec(3, 700, 0.07, -1, 3, 0, 0);
+        syn_records(recs, 4);
+        struct MixUd ud = {1};
+        const double atime = 0.55;
+        syn_place(mix_particle, &ud, atime, 1);
+        int64_t i, ng, nempty;
+        for(i = 0; i < PartManager->NumPart; i++) {
+            if(P[i].ID >= MX_D0 && P[i].ID < MX_D0 + 6)
+                P[i].TracerPenalty = pS[c];
+            else if(P[i].ID == MX_D0 + 6)
+                P[i].TracerPenalty = pU[c];
+        }
+        int ret = lifecycle_call(1, atime, &CP, 0, NULL, &ng, &nempty);
+        CHECK(ret == 1 && ng == 4, "penalty case %d: ret %d, %ld groups\n", c, ret, ng);
+        int64_t n;
+        struct tagrec * r = gather_tags(&n);
+        struct SubTrack * rec = fetch_all_tracks(4);
+        const int64_t gS = r[tagrec_index(r, n, MX_S0 + 1)].GrNr;
+        CHECK(rec[1].Nbound == 0 && rec[1].SnapDeath == 1 && rec[1].HostGroup == gS && rec[1].DescendantTrackId == expect[c],
+              "penalty case %d: D Nbound %d SnapDeath %d HostGroup %ld (S's %ld) Desc %ld, expected %ld\n", c, rec[1].Nbound,
+              rec[1].SnapDeath, rec[1].HostGroup, gS, rec[1].DescendantTrackId, expect[c]);
+        int bad = 0;
+        for(i = 0; i < PartManager->NumPart; i++)
+            LOCAL_CHECK(bad, P[i].TracerPenalty == 0, "penalty case %d: particle %lu keeps TracerPenalty %g\n", c,
+                        (unsigned long) P[i].ID, P[i].TracerPenalty);
+        assert_all_true((bad == 0));
+        free(rec);
+        free(r);
+        syn_teardown();
+    }
+}
+
 /* ---- Phase 3 audit P2: the current central of a group in which nothing survives ----
  * K (0) held its own group at the previous call; its 100 particles are now hot (3000 km/s) and
  * K dies in its serial key with no survivor; the orphan O (1, stale host 99 and central 0)
@@ -5310,6 +5449,8 @@ int main(void) {
         cmocka_unit_test(test_subhalo_local_sort),
         cmocka_unit_test(test_subhalo_header_params),
         cmocka_unit_test(test_subhalo_sampled_default),
+        cmocka_unit_test(test_subhalo_weighted_plurality),
+        cmocka_unit_test(test_subhalo_penalty_descendant),
     };
     /* SUBHALO_TEST_ONLY=<substring> runs only the tests whose name contains it */
     const char * only = getenv("SUBHALO_TEST_ONLY");

@@ -67,6 +67,10 @@ struct particle_data
      * the particle at the last finder call, or -1. */
     int64_t TrackId;
     int32_t BindRank;
+    /* (Expected) scatterings since the last complete finder call, summed by a scattering module, 0
+     * without one: the finder weights this tracer's votes by exp(-TracerPenalty) and every complete
+     * call zeroes it. Travels with the particle; never written (a restart starts at 0). */
+    float TracerPenalty;
     int64_t BoundTrackId;
     MyFloat Potential;		/* Gravitational potential. This is the total potential only on a PM timestep,
                              * after gravtree+gravpm is called. We do not save the potential on short timesteps

@@ -1231,8 +1231,11 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
                     if(ids[mid].ID < key.ID) lo = mid + 1;
                     else hi = mid;
                 }
-                if(lo < n && ids[lo].ID == key.ID)
-                    rs->DescOwner[t] = part_live(&P[ids[lo].i]) ? P[ids[lo].i].BoundTrackId : -1;
+                if(lo < n && ids[lo].ID == key.ID) {
+                    const struct particle_data * tp = &P[ids[lo].i];
+                    rs->DescOwner[t] = part_live(tp) ? tp->BoundTrackId : -1;
+                    rs->DescWeight[t] = part_live(tp) ? subhalo_tracer_weight(tp->TracerPenalty) : 1;
+                }
                 else
                     rs->DescOwner[t] = SUBHALO_DESC_PENDING;
             }

@@ -427,8 +427,20 @@ struct SubhaloKeySeg {
  * the (BindRank, ID, GrNr) of the SubhaloNumTracerHostFinding lowest-BindRank live tracer-type
  * particles it holds with TrackId == BoundTrackId == T to T's home rank, which keeps the first
  * SubhaloNumTracerHostFinding by (BindRank, ID) as TracerIDs and sets Host to the GrNr (-1: no
- * group) with the largest weight sum 1 / (1 + sqrt(i)), ties to the smaller GrNr. Collective. */
+ * group) with the largest weight sum exp(-TracerPenalty) / (1 + sqrt(i)), ties to the smaller
+ * GrNr. Collective. */
 void subhalo_host_vote(struct SubTrackTable * tab, MPI_Comm Comm);
+/* A tracer's vote weight exp(-TracerPenalty); exactly 1 for a zero (or negative) penalty, so
+ * runs without a scattering module vote bit for bit as before. */
+static inline double
+subhalo_tracer_weight(float penalty)
+{
+    return penalty > 0 ? exp(-(double) penalty) : 1.0;
+}
+/* Weighted plurality of n ballots: the candidate >= 0 with the largest summed weight (sums in
+ * ballot order), ties to the smaller; SUBHALO_NOTRACK if there is none. top and second (NULL
+ * allowed) get the winning and the runner-up sums (0 if absent). n <= SUBHALO_MAXTRACERS. */
+int64_t subhalo_weighted_plurality(const int64_t * cand, const double * w, int n, double * top, double * second);
 /* Step 3, previous-bound frames: sums over the live particles with BoundTrackId == T, as
  * nearest-image displacements from one common reference per track (the lowest (own tag, BindRank,
  * ID)), reduced on the home rank in rank order into RefPos, RefVel, NPrev, MPrev. Collective. */
@@ -595,7 +607,7 @@ struct SubhaloIdHit {
     double Pos[3];           /* translated comoving frame */
     double Vel[3];           /* internal Vel */
     int found;
-    int pad;
+    float Penalty;           /* its TracerPenalty */
 };
 /* For ids[0..n) (any rank, duplicates allowed) find the live particle with that exact ID on any
  * rank: a per-rank sorted (ID, index) index, the ids gathered in batches bounded by
@@ -633,6 +645,7 @@ struct SubhaloResult {
     int history;             /* 1: resolved this call, apply subhalo_history_update */
     int ndesc;               /* descendant votes (a track resolved at the previous call that died or sank) */
     int64_t DescOwner[SUBHALO_MAXTRACERS];  /* per tracer: its BoundTrackId, -1 if unbound or lost, SUBHALO_DESC_PENDING still to be looked up (step 11) */
+    float DescWeight[SUBHALO_MAXTRACERS];   /* and its vote weight exp(-TracerPenalty), set with a resolved DescOwner */
     int64_t ipk;             /* the central of an oversized key (in place or a sub-tree survivor promoted to
                               * Rank 0): index of its key in plan->Inplace, else -1 */
     /* the node's state for the rounds (serial sub-tree keys) */

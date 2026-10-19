@@ -8,6 +8,7 @@
 #include <string.h>
 #include <math.h>
 #include <limits.h>
+#include <stddef.h>
 #include <omp.h>
 
 #include "utils/endrun.h"
@@ -24,6 +25,11 @@
 #include "subhalo_collective.h"
 #include "subhalo_unbind.h"
 #include "subhalo_so.h"
+
+/* TracerPenalty sits in the padding after BindRank, so struct particle_data keeps its size. */
+_Static_assert(offsetof(struct particle_data, TracerPenalty) == offsetof(struct particle_data, BindRank) + sizeof(int32_t)
+               && offsetof(struct particle_data, BoundTrackId) == offsetof(struct particle_data, TracerPenalty) + sizeof(float),
+               "TracerPenalty must fill the padding between BindRank and BoundTrackId");
 
 /* ------------------------------------------------------------------ parameters */
 
@@ -749,6 +755,7 @@ subhalo_lookup_ids(const MyIDType * ids, int64_t n, struct SubhaloIdHit * out, M
                 e->q = i - displs[r];
                 e->h.GrNr = p->GrNr >= 0 ? p->GrNr : -1;
                 e->h.BoundTrackId = p->BoundTrackId;
+                e->h.Penalty = p->TracerPenalty;
                 int d;
                 for(d = 0; d < 3; d++) {
                     e->h.Pos[d] = p->Pos[d];
@@ -1307,6 +1314,7 @@ subhalo_init(int RestartSnapNum, int MaxStateSnapNum, const char * OutputDir, MP
         P[i].TrackId = -1;
         P[i].BindRank = -1;
         P[i].BoundTrackId = -1;
+        P[i].TracerPenalty = 0;
     }
     SubStatus.LastCallComplete = 0;
     SubStatus.LastCallSnapshot = -1;
@@ -1917,8 +1925,42 @@ subhalo_update_unhosted(struct SubTrackTable * tab, int SnapNum, double atime, i
 
 /* ------------------------------------------------------------------ step 11: remote descendants */
 
+int64_t
+subhalo_weighted_plurality(const int64_t * cand, const double * w, int n, double * top, double * second)
+{
+    int64_t uc[SUBHALO_MAXTRACERS];
+    double us[SUBHALO_MAXTRACERS];
+    int k, c, nu = 0, best = -1;
+    if(n > SUBHALO_MAXTRACERS)
+        endrun(5, "Weighted plurality of %d ballots, at most %d supported.\n", n, SUBHALO_MAXTRACERS);
+    /* per-candidate sums in ballot order (an indexed update, so never reassociated) */
+    for(k = 0; k < n; k++) {
+        if(cand[k] < 0)
+            continue;
+        for(c = 0; c < nu && uc[c] != cand[k]; c++) {}
+        if(c == nu) {
+            uc[nu] = cand[k];
+            us[nu++] = 0;
+        }
+        us[c] += w[k];
+    }
+    for(c = 0; c < nu; c++)
+        if(best < 0 || us[c] > us[best] || (us[c] == us[best] && uc[c] < uc[best]))
+            best = c;
+    double run = 0;
+    for(c = 0; c < nu; c++)
+        if(c != best && us[c] > run)
+            run = us[c];
+    if(top)
+        *top = best >= 0 ? us[best] : 0;
+    if(second)
+        *second = run;
+    return best >= 0 ? uc[best] : SUBHALO_NOTRACK;
+}
+
 /* Dead or sunk tracks: tracers outside their key looked up on the restored layout, then the
- * majority BoundTrackId (ties to the smaller TrackId, -1 if none), as HBT's merger_tree.cpp. Collective. */
+ * BoundTrackId with the largest summed tracer weight exp(-TracerPenalty) (the majority as HBT's
+ * merger_tree.cpp without penalties; ties to the smaller TrackId, -1 if none). Collective. */
 static void
 subhalo_finish_descendants(struct SubhaloResult * res, int64_t nres, MPI_Comm Comm)
 {
@@ -1946,26 +1988,15 @@ subhalo_finish_descendants(struct SubhaloResult * res, int64_t nres, MPI_Comm Co
         for(j = 0; j < res[i].ndesc; j++)
             if(res[i].DescOwner[j] == SUBHALO_DESC_PENDING) {
                 res[i].DescOwner[j] = hit[n].found ? hit[n].BoundTrackId : -1;
+                res[i].DescWeight[j] = hit[n].found ? subhalo_tracer_weight(hit[n].Penalty) : 1;
                 nremote++;
                 nfound += hit[n].found;
                 n++;
             }
-        int64_t best = -1, bestc = 0;
-        int a, b;
-        for(a = 0; a < res[i].ndesc; a++) {
-            const int64_t o = res[i].DescOwner[a];
-            if(o < 0)
-                continue;
-            int64_t c = 0;
-            for(b = 0; b < res[i].ndesc; b++)
-                if(res[i].DescOwner[b] == o)
-                    c++;
-            if(c > bestc || (c == bestc && o < best)) {
-                bestc = c;
-                best = o;
-            }
-        }
-        res[i].rec.DescendantTrackId = best;
+        double w[SUBHALO_MAXTRACERS];
+        for(j = 0; j < res[i].ndesc; j++)
+            w[j] = res[i].DescWeight[j];
+        res[i].rec.DescendantTrackId = subhalo_weighted_plurality(res[i].DescOwner, w, res[i].ndesc, NULL, NULL);
         ndecided++;
     }
     myfree(hit);
@@ -2592,6 +2623,10 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
             SubLastStats.NFinalPositive, SubLastStats.NFinalBound, SubLastStats.NTailRejected,
             SubLastStats.NFallbackField, SubLastStats.NFallbackReleased, norphsync_tot, SubLastStats.ArenaPeakFrac);
     log_tagged("after the call", Comm);
+    /* the votes consumed the scattering penalties; a skipped call returned above and keeps them */
+    #pragma omp parallel for
+    for(i = 0; i < PartManager->NumPart; i++)
+        P[i].TracerPenalty = 0;
 
     if(SubStatus.StateSnapshot >= 0 && SubStatus.StateTime > 0)
         SubStatus.TimeSincePrevious = atime - SubStatus.StateTime;
