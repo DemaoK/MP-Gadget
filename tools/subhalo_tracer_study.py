@@ -280,13 +280,15 @@ def knn_support(A, P, box, args):
     rows = rows[np.argsort(ids[rows], kind="stable")]
     if not np.array_equal(ids[rows], q):
         raise RuntimeError("knn: tracer / core IDs not found once each in PIG_A")
-    pos = np.mod(P["Position"].astype(np.float64), box)
+    pos = P["Position"].astype(np.float64)
+    np.mod(pos, box, out=pos)   # in place: one float64 copy of the positions, not two
     pos[pos >= box] -= box   # mod can round up to box itself; cKDTree needs [0, box)
     tree = cKDTree(pos, boxsize=box)
     hq = np.empty(q.size)
     step = 1 << 20
     for s in range(0, q.size, step):  # chunked: one distance per query, but bounded scratch
         hq[s:s + step] = tree.query(pos[rows[s:s + step]], k=[args.sidm_neighbors + 1], workers=-1)[0][:, 0]
+    hq[~np.isfinite(hq)] = np.nan   # fewer than Nngb particles in the catalogue: no support, not zero scattering
     return q, hq, P["Mass"][rows].astype(np.float64)
 
 
