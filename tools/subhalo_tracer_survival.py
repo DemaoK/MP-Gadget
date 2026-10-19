@@ -60,10 +60,12 @@ the *_tag scalars are k-1's, snap_tag / a_tag are k's. j = 0 is k itself, follow
 "host" = the DescendantTrackId at k when >= 0, else the SinkTrackId at k. Spatial coherence of the
 ten at k + j, from the Position / Velocity of the stored ones ("found"; field markers are absent):
   centre      component-wise median of the found positions (unwrapped about the first found marker,
-              in rank order) and of their velocities
-  sigma_x/v   rms 3D distance of the found markers from the centre (comoving catalogue units,
-              catalogue velocities), *_rel = / CoreSigmaX or CoreSigmaV at k-1; one found -> 0,
-              none -> NaN (no centre)
+              in rank order) and of their velocities; distances below are minimum-image residuals
+              about it
+  sigma_x/v   rms 3D distance of the found markers from the centre (comoving catalogue units;
+              physical peculiar km/s: the Velocity block is divided by a when the Header's
+              UsePeculiarVelocity is 0, i.e. it holds a v_pec), *_rel = / CoreSigmaX or CoreSigmaV
+              at k-1 (physical peculiar km/s); one found -> 0, none -> NaN (no centre)
   n_coherent  found markers within 3 CoreSigmaX(k-1) of the centre (the remnant)
   d_clip      distance of the mean of those markers from the centre, / CoreSigmaX (NaN if none)
   d_mb        distance of the ten's first marker from the centre, / CoreSigmaX; NaN if not stored
@@ -176,6 +178,10 @@ class LaterPV(Later):
         Later.__init__(self, cat, P)
         self.pos, self.vel = P["Position"].astype(np.float64), P["Velocity"].astype(np.float64)
         self.box = float(np.atleast_1d(cat.header["BoxSize"])[0])
+        # Velocity block: peculiar km/s if UsePeculiarVelocity (else a * v_pec, petaio's default 0)
+        self.pecvel = int(np.atleast_1d(cat.header.get("UsePeculiarVelocity", 0))[0])
+        if not self.pecvel:
+            self.vel /= cat.scale_factor
         O, no = cat.orphans, cat.norphans
         self.osink = O["SinkTrackId"].astype(np.int64) if no else np.zeros(0, np.int64)
         self.olost = O["SnapTracerLost"].astype(np.int64) if no else np.zeros(0, np.int64)
@@ -387,7 +393,8 @@ class Cohorts(object):
         med = np.stack([group_median(lf, D[:, c], nr) for c in range(3)], 1)
         vmed = np.stack([group_median(lf, V[:, c], nr) for c in range(3)], 1)
         cen = ref + med
-        r = np.linalg.norm(D - med[lf], axis=1)
+        res = periodic(D - med[lf], L.box)   # minimum image about the median, not about the first marker
+        r = np.linalg.norm(res, axis=1)
         rv = np.linalg.norm(V - vmed[lf], axis=1)
         nfd = np.where(has, nf, np.nan)
         sx = np.sqrt(np.bincount(lf, weights=r ** 2, minlength=nr) / nfd)
@@ -399,10 +406,11 @@ class Cohorts(object):
         ins = r <= 3 * csx[lf]
         ncoh = np.bincount(lf[ins], minlength=nr)
         # clipped centre: mean offset of the markers inside 3 CoreSigmaX, relative to the median
-        cm = np.stack([np.bincount(lf[ins], weights=D[ins, c], minlength=nr) for c in range(3)], 1)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            cm /= ncoh[:, None]
-        dclip = np.where(ncoh > 0, np.linalg.norm(cm - med, axis=1) / csx, np.nan)
+        cm = np.zeros((nr, 3))   # float even when no marker passes (bincount of nothing is integer)
+        for c in range(3):
+            cm[:, c] = np.bincount(lf[ins], weights=res[ins, c], minlength=nr)
+        cm /= np.where(ncoh > 0, ncoh, np.nan)[:, None]
+        dclip = np.linalg.norm(cm, axis=1) / csx
         mb = rk == 0
         dmb, mbf = np.full(nr, np.nan), np.zeros(nr, np.int8)
         dmb[lf[mb]] = np.linalg.norm(periodic(X[mb] - cen[lf[mb]], L.box), axis=1) / csx[lf[mb]]
@@ -417,7 +425,9 @@ class Cohorts(object):
                    n_coherent=ncoh, mb_found=mbf, plurality=np.where(win == NOBALLOT, -1, win))
         for k, v in out.items():
             R[k][rows, j] = v
-        R["centre_x"][rows, j], R["centre_v"][rows, j] = np.mod(cen, L.box), vmed
+        cw = np.mod(cen, L.box)
+        cw[cw >= L.box] = 0.0   # mod of a tiny negative coordinate can round to the box size
+        R["centre_x"][rows, j], R["centre_v"][rows, j] = cw, vmed
 
     def prune(self, p):
         """Close the entries whose next j would exceed --maxj and drop their markers."""
@@ -609,7 +619,7 @@ def report_death(p, args, R, strata):
                 q(R["n_found"][:, j].astype(float), d, 50), q(R["n_coherent"][:, j].astype(float), d, 50),
                 q(dmb, d, 50), q(R["d_clip"][:, j], d, 50), pct(np.sum(d & ~hasmb), d.sum()),
                 pct(np.sum(dmb[hasmb] > 3), hasmb.sum()),
-                pct(np.sum(2 * R["n_coherent"][d, j] >= R["n_ten"][d]), d.sum()),
+                pct(np.sum(2 * R["n_coherent"][d, j].astype(np.int64) >= R["n_ten"][d]), d.sum()),
                 pct(np.sum(R["plurality"][hasd, j] == R["desc_death"][hasd]), hasd.sum())))
     # d_orphan == d_mb only where the orphan follows ten[0] (sunk tracks may follow another particle)
     both = defined & np.isfinite(R["d_mb"]) & np.isfinite(R["d_orphan"])
