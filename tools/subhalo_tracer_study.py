@@ -14,7 +14,7 @@ Markers of a track resolved in A (the finder's own definitions):
   bound    the full bound set: every row with BoundTrackId == the track (own tag first, then the
            overlap rows of nested children), mass-weighted; "rank" is the position in that order.
 
-Sections (each stratified by Nbound in A, 20-100 / 100-1000 / >1000, and central / satellite):
+Sections (each stratified by Nbound in A, [20,100) / [100,1000) / >=1000, and central / satellite):
   1 fate     per marker set, % of the markers (bound: of the mass) that at B are bound to the
              same track / bound to another track / saved but unbound / absent (in no group and
              untagged, so not stored). For tracks with tracers bound elsewhere, how often the
@@ -59,7 +59,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from subhalo_reader import SubhaloCatalogue, SubhaloSequence, NO_GROUP_U4  # noqa: E402
 
 CM_PER_MPC = 3.085678e24
-NBINS = [(20, 100, "20-100"), (100, 1000, "100-1e3"), (1000, np.inf, ">1e3")]
+NBINS = [(20, 100, "20-100"), (100, 1000, "100-1e3"), (1000, np.inf, ">=1e3")]
 NOBALLOT = -2
 FATES = ("same", "other", "unbnd", "absent")
 
@@ -190,8 +190,10 @@ class Later(object):
 
     def look(self, q):
         """(present, BoundTrackId, BindRank, GroupID) of particle IDs q; -1 / huge / -1 if absent."""
-        pos = np.minimum(np.searchsorted(self.ids, q), max(self.ids.size - 1, 0))
-        pres = self.ids[pos] == q if self.ids.size else np.zeros(q.size, bool)
+        if self.ids.size == 0:
+            return np.zeros(q.size, bool), np.full(q.size, -1), np.full(q.size, np.iinfo(np.int64).max), np.full(q.size, -1)
+        pos = np.minimum(np.searchsorted(self.ids, q), self.ids.size - 1)
+        pres = self.ids[pos] == q
         bt = np.where(pres, self.bt[pos], -1)
         br = np.where(pres, self.br[pos], np.iinfo(np.int64).max)
         gid = np.where(pres, self.gid[pos], -1)
@@ -199,8 +201,19 @@ class Later(object):
 
     def row(self, tid, which="sub"):
         keys = self.tid if which == "sub" else self.otid
-        pos = np.minimum(np.searchsorted(keys, tid), max(keys.size - 1, 0))
-        return np.where((keys.size > 0) & (keys[pos] == tid), pos, -1)
+        if keys.size == 0:
+            return np.full(np.shape(tid), -1)
+        pos = np.minimum(np.searchsorted(keys, tid), keys.size - 1)
+        return np.where(keys[pos] == tid, pos, -1)
+
+
+def take(arr, rows, default):
+    """arr[rows] with `default` where rows < 0; safe for an empty table (no orphans in B)."""
+    out = np.full(rows.shape + arr.shape[1:], default, dtype=arr.dtype if arr.size else type(default))
+    ok = rows >= 0
+    if arr.size and ok.any():
+        out[ok] = arr[rows[ok]]
+    return out
 
 
 def fate(trackid, pres, bt):
@@ -235,6 +248,8 @@ def sidm_part(A, part, args):
     q, first = np.unique(A.fb_id[m1], return_index=True)
     mq, hq = A.fb_mass[m1][first], np.full(q.size, np.nan)
     bid, bh = f["1/ID"], f["1/SIDMSupport"]
+    if q.size == 0:
+        return q, hq, mq
     step = 1 << 24
     for s in range(0, bid.size, step):  # chunked: PART is the whole box
         ids = bid[s:s + step].astype(np.int64)
@@ -267,12 +282,12 @@ def study(A, B, args, part=None, out=sys.stdout, quiet=False):
     R["other_holder"] = vote(tr_row[oth], tbt[oth], np.ones(oth.sum()), n)[0]
     brow_any = B.row(A.tid)
     orow_any = B.row(A.tid, "orphan")
-    R["desc_B"] = np.where(brow_any >= 0, B.desc[np.maximum(brow_any, 0)], -1)
+    R["desc_B"] = take(B.desc, brow_any, -1)
     if B.otid.size:
-        R["desc_B"] = np.where(orow_any >= 0, B.odesc[np.maximum(orow_any, 0)], R["desc_B"])
+        R["desc_B"] = np.where(orow_any >= 0, take(B.odesc, orow_any, -1), R["desc_B"])
     # 2. host votes over B GroupID; the mass-plurality group of the A bound set
     w = 1.0 / (1.0 + np.sqrt(A.tw_j))
-    R["host_B"] = np.where(brow_any >= 0, B.host[np.maximum(brow_any, 0)], NOBALLOT)
+    R["host_B"] = take(B.host, brow_any, NOBALLOT)
     R["vote10"] = vote(tr_row, tgid, w[ten], n)[0]
     wgid = B.look(A.tw_id)[3]
     R["vote_a"] = vote(A.tw_row, wgid, w, n)[0]
@@ -287,7 +302,7 @@ def study(A, B, args, part=None, out=sys.stdout, quiet=False):
     # 3. death descendants
     R["dies"] = (brow_any < 0) & (orow_any >= 0)
     if B.otid.size:
-        R["dies"] &= B.odeath[np.maximum(orow_any, 0)] == B.snap
+        R["dies"] &= take(B.odeath, orow_any, -1) == B.snap
     R["desc_a"], top, sec = vote(tr_row, tbt, np.ones(tr_row.size), n, skip_negative=True)
     R["margin"] = (top - sec) / float(args.ntracers)
     R["desc_b"] = vote(A.fb_row, fbt, 1.0 / (1.0 + np.sqrt(A.fb_rank)), n, skip_negative=True)[0]
@@ -298,10 +313,9 @@ def study(A, B, args, part=None, out=sys.stdout, quiet=False):
     drift, dt = cosmo_integrals(A.header, A.a, B.a)
     box = float(np.atleast_1d(A.header.get("BoxSize", np.inf))[0])
     both = brow_any >= 0
-    br_ = np.maximum(brow_any, 0)
     sig = np.where(A.CoreSigmaX > 0, A.CoreSigmaX, np.nan)
     for k in ("MostBoundPos", "CorePos", "CoMPos"):
-        d = periodic(B.S[k][br_] - getattr(A, k), box)
+        d = periodic(take(B.S[k], brow_any, np.nan) - getattr(A, k), box)
         R["raw_" + k] = np.where(both, np.linalg.norm(d, axis=1) / sig, np.nan)
         dp = periodic(d - A.CoMVel.astype(np.float64) * drift, box)
         R["res_" + k] = np.where(both, np.linalg.norm(dp, axis=1) / sig, np.nan)
@@ -465,11 +479,12 @@ def main(argv=None):
     ap.add_argument("--wturn", type=float, default=120.0, help="velocity scale w in km/s")
     ap.add_argument("--sidm-neighbors", type=int, default=38)
     ap.add_argument("--ntracers", type=int, default=10)
-    ap.add_argument("--nwide", type=int, default=50, help="tracers of host rule a")
+    ap.add_argument("--nwide", type=int, default=50, help="tracers of host rule a (at least --ntracers)")
     ap.add_argument("--ncore", type=int, default=20)
     ap.add_argument("--kick-rank", type=int, default=100, help="host rule b: B BindRank above this is kicked")
     ap.add_argument("--rows", help="write the per-track table to this .npz")
     args = ap.parse_args(argv)
+    args.nwide = max(args.nwide, args.ntracers)  # rule a widens the finder's vote, never narrows it
     if args.sequence:
         args.rows, args.part = None, None
         return sequence(args)
