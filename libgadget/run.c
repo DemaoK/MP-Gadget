@@ -829,10 +829,9 @@ runfof(const int RestartSnapNum, const inttime_t Ti_Current, const struct header
      * snapshot, and the finder recomputes the catalogue of snapshot RestartSnapNum. */
     subhalo_init(RestartSnapNum, RestartSnapNum - 1, All.OutputDir, MPI_COMM_WORLD);
 
-    PetaPM pm = {0};
-    gravpm_init_periodic(&pm, PartManager->BoxSize, All.Asmth, All.Nmesh, All.CP.GravInternal);
+    /* No PetaPM here: nothing on the FOF or finder path uses it, and planning the FFT would hold
+     * three mesh-sized arrays beside the particles (5.4 GB per rank at 512^3 on 16 ranks). */
     DomainDecomp ddecomp[1] = {0};
-    /* ... read in initial model */
 
     domain_decompose_full(ddecomp, MPI_COMM_WORLD);	/* do initial domain decomposition (gives equal numbers of particles) */
 
