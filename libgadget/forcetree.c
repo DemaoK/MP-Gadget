@@ -43,6 +43,12 @@ init_forcetree_params(const double treeallocfactor)
     ForceTreeParams.TreeAllocFactor = treeallocfactor;
 }
 
+double
+force_tree_get_alloc_factor(void)
+{
+    return ForceTreeParams.TreeAllocFactor;
+}
+
 static void
 force_treeupdate_pseudos(const int no, const int level, const ForceTree * const tree);
 

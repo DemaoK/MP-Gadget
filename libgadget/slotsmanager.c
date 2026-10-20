@@ -452,28 +452,18 @@ slots_gc_sorted(struct part_manager_type * pman, struct slots_manager_type * sma
     }
     /* Sort the keys*/
     qsort_openmp(peanokeys, pman->NumPart, sizeof(struct PeanoOrder), order_by_type_and_key);
-    /* Now sort the base with a cycle leader permutation algorithm, like qsort.*/
-    for(i = 0; i < pman->NumPart; i++) {
-        int k = peanokeys[i].Pindex;
-        /* This element already in the right place*/
-        if(k == i)
-            continue;
-        /* Copy the wrongly placed element to a tmp*/
-        struct particle_data tmp_p = pman->Base[i];
-        int j = i;
-        do {
-            /* Update index so that we know this element is permuted.*/
-            peanokeys[j].Pindex = j;
-            /* Copy the right element in.*/
-            pman->Base[j] = pman->Base[k];
-            /* k is the new j*/
-            j = k;
-            k = peanokeys[j].Pindex;
-        } while(i != k);
-
-        /* We finished when we found the right spot for the first object, the one we copied into tmp*/
-        peanokeys[j].Pindex = j;
-        pman->Base[j] = tmp_p;
+    /* Now permute the base: element i of the result is element Pindex of the input. The cycle
+     * list is built serially, the record moves are threaded (permute_openmp); the result is the
+     * same as the serial cycle-leader permutation's. */
+    {
+        int * src = (int *) mymalloc("PermSrc", pman->NumPart * sizeof(int) + 1);
+        int * order = (int *) mymalloc("PermOrder", pman->NumPart * sizeof(int) + 1);
+        #pragma omp parallel for
+        for(i = 0; i < pman->NumPart; i++)
+            src[i] = peanokeys[i].Pindex;
+        permute_openmp(pman->Base, pman->NumPart, sizeof(struct particle_data), src, order);
+        myfree(order);
+        myfree(src);
     }
     // message(1, "garbage %ld\n", garbage);
     /*Remove garbage particles*/

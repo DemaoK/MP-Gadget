@@ -44,6 +44,31 @@ struct GravShortPriv {
 
 #define GRAV_GET_PRIV(tw) ((struct GravShortPriv *) ((tw)->priv))
 
+/* Dimensionless potential polynomial wp(u), 0 <= u = r / h < 1, of the Gadget-2 spline kernel
+ * with h = FORCE_SOFTENING(): inside h the potential of a mass m is G m wp(u) / h (wp(0) = -2.8,
+ * wp(1) = -1). Shared by apply_accn_to_output (gravshort-tree.c), which must stay bit-identical,
+ * and the subhalo unbinding kernel (subhalo_unbind.c). */
+static inline double
+grav_spline_wp(const double u)
+{
+    if(u < 0.5)
+        return -2.8 + u * u * (5.333333333333 + u * u * (6.4 * u - 9.6));
+    else
+        return -3.2 + 0.066666666667 / u + u * u * (10.666666666667 +
+                u * (-16.0 + u * (9.6 - 2.133333333333 * u)));
+}
+
+/* W(r, h) >= 0 such that the (Newtonian, no long-range window) potential of a point mass m at
+ * comoving distance r is -G m W(r, h) / a in physical units: W = 1 / r for r >= h and
+ * -wp(r / h) / h inside the softening (W(0, h) = 2.8 / h). */
+static inline double
+grav_spline_potential(const double r, const double h)
+{
+    if(r >= h)
+        return 1.0 / r;
+    return -grav_spline_wp(r / h) / h;
+}
+
 static void
 grav_short_postprocess(int i, TreeWalk * tw)
 {

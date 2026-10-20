@@ -11,6 +11,10 @@ static struct ClockTable * CT = NULL;
 
 static double WallTimeClock;
 static double LastReportTime;
+/* walltime_redirect_begin/end: while set, every measure and add books its time to this clock
+ * (full name) instead of the one it names; Redirected counts the nested begins. */
+static char Redirect[128];
+static int Redirected = 0;
 
 static void walltime_clock_insert(const char * name);
 static void walltime_summary_clocks(struct Clock * C, int N, int root, MPI_Comm comm);
@@ -178,6 +182,8 @@ void walltime_reset() {
 }
 
 double walltime_add_internal(const char * name, const double dt) {
+    if(Redirected)
+        name = Redirect;
     int id = walltime_clock(name);
     CT->C[id].time += dt;
     return dt;
@@ -186,6 +192,8 @@ double walltime_measure_internal(const char * name) {
     double t = seconds();
     double dt = t - WallTimeClock;
     WallTimeClock = seconds();
+    if(Redirected && name[0] != '.')
+        name = Redirect;
     if(name[0] != '.') {
         int id = walltime_clock(name);
         CT->C[id].time += dt;
@@ -208,6 +216,29 @@ double walltime_add_full(const char * name, const double dt, const char * file, 
     snprintf(fullname, 128, "%s@%s:%04d", name, basename, line);
     return walltime_add_internal(fullname, dt);
 
+}
+
+/* Attributes a callee's time to the caller's clock: from walltime_redirect_begin to
+ * walltime_redirect_end every walltime_measure and walltime_add books its time to the clock name
+ * (with the caller's "@file:line") instead of the clock it names, and the end measures the last
+ * interval to that clock. The caller measures before the begin, so that the redirected clock gets
+ * exactly the callee's time; nothing is counted twice and the total of the clocks is unchanged.
+ * A measure that ignores its interval (WALLTIME_IGNORE) still ignores it, since its callers book
+ * the interval in parts with walltime_add. Nested begins keep the outermost clock. */
+void walltime_redirect_begin_full(const char * name, const char * file, const int line) {
+    if(Redirected++ > 0)
+        return;
+    const char * basename = file + strlen(file);
+    while(basename >= file && *basename != '/') basename --;
+    basename ++;
+    snprintf(Redirect, sizeof(Redirect), "%s@%s:%04d", name, basename, line);
+}
+void walltime_redirect_end(void) {
+    if(Redirected <= 0)
+        return;
+    /* the last interval of the callee goes to the redirected clock as well */
+    walltime_measure_internal(Redirect);
+    Redirected--;
 }
 
 /* returns the number of cpu-ticks in seconds that

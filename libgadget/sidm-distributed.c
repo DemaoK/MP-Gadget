@@ -2,6 +2,7 @@
 #include "sidm-direct.h"
 #include "sidm-rate.h"
 #include "sidm-random.h"
+#include "subhalo.h"
 #include "treewalk.h"
 #include "utils/endrun.h"
 #include "utils/mymalloc.h"
@@ -275,7 +276,8 @@ void sidm_distributed_force_intervals(const ActiveParticles *act,Cosmology *CP,
     const double maxradius=nextafter(.5*PartManager->BoxSize,0);
     const double guess=PartManager->BoxSize*cbrt((double)work.neighbors/Population.count);
     const uint64_t event_seed=sidm_event_seed(seed,(uint64_t)times->Ti_Current);
-    const struct sidm_direct_particles native={P,sizeof(*P),offsetof(struct particle_data,ID),offsetof(struct particle_data,Vel)};
+    const struct sidm_direct_particles native={P,sizeof(*P),offsetof(struct particle_data,ID),offsetof(struct particle_data,Vel),
+        subhalo_finder_on()?offsetof(struct particle_data,TracerPenalty):SIZE_MAX};
 #ifdef SIDMDEBUG
     double walk_seconds[6]={0},support_seconds=0,scatter_seconds=0;
     double hmin=DBL_MAX,hmax=0,limit=DBL_MAX;

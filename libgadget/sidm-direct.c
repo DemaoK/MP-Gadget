@@ -19,7 +19,7 @@ struct target {
     uint64_t id; /* Owner index is sufficient outside development audits. */
 #endif
 };
-struct reply { double v[3], max_sigma_v, max_relative_speed; };
+struct reply { double v[3], max_sigma_v, max_relative_speed; int events; };
 #ifdef SIDMDEBUG
 #define PROFILE(code) do { code; } while(0)
 #else
@@ -147,6 +147,11 @@ static uint64_t particle_id(struct sidm_direct_particles p,int i)
 { return *(const uint64_t *)((char *)p.base+(size_t)i*p.stride+p.id_offset); }
 static double *velocity(struct sidm_direct_particles p,int i)
 { return (double *)((char *)p.base+(size_t)i*p.stride+p.velocity_offset); }
+static void add_penalty(struct sidm_direct_particles p,int i,int events)
+{
+    if(p.penalty_offset!=SIZE_MAX)
+        *(float *)((char *)p.base+(size_t)i*p.stride+p.penalty_offset)+=events;
+}
 #ifdef SIDMDEBUG
 static void touch(struct sidm_journal *j,struct sidm_direct_particles p,int i,
     int *failed,char error[256])
@@ -242,11 +247,11 @@ static int scatter_pair(double a[3],double b[3],uint64_t bid,uint64_t seed,
 #endif
     if(cached && n==1 && cached->draw>=probability) return 0;
     seed=sidm_random_mix(seed^sidm_random_mix(bid+UINT64_C(0xd1b54a32d192ed03)));
-    int changed=0;
+    int events=0;
 #ifdef SIDMDEBUG
     int touched=0;
 #else
-    (void)j;(void)p;(void)ai;(void)bi;
+    (void)j;
 #endif
     for(uint64_t k=0;k<n;k++) {
         if(uniform(&seed)>=probability) continue;
@@ -258,7 +263,7 @@ static int scatter_pair(double a[3],double b[3],uint64_t bid,uint64_t seed,
             touched=1;
         }
 #endif
-        changed=1;
+        events++;
         const double z=2*uniform(&seed)-1,phi=2*acos(-1.0)*uniform(&seed);
         const double r=sqrt(fmax(0,1-z*z)),dir[3]={r*cos(phi),r*sin(phi),z};
         for(int d=0;d<3;d++) {
@@ -270,7 +275,11 @@ static int scatter_pair(double a[3],double b[3],uint64_t bid,uint64_t seed,
         s->events++;
 #endif
     }
-    return changed;
+    if(events) {
+        if(ai>=0) add_penalty(p,ai,events);
+        add_penalty(p,bi,events);
+    }
+    return events;
 }
 
 /* Keep the original order of every pair of source groups sharing an endpoint.
@@ -417,6 +426,7 @@ static void execute_collisions(struct sidm_direct_particles p,int nlocal,
                     struct packet a;size_t at=plan->offsets[b];
                     memcpy(&a,buffer+at,sizeof(a));at+=sizeof(a);
                     double max_sv=0,max_u=0;
+                    int events=0;
                     for(int k=0;k<a.n;k++) {
                         struct target e;memcpy(&e,buffer+at,sizeof(e));at+=sizeof(e);
 #ifdef SIDMDEBUG
@@ -424,12 +434,13 @@ static void execute_collisions(struct sidm_direct_particles p,int nlocal,
                             fail(&errors[tid],messages[tid],"Direct SIDM remote index/ID mismatch");continue;
                         }
 #endif
-                        scatter_pair(a.v,velocity(p,e.index),particle_id(p,e.index),a.seed,
+                        events+=scatter_pair(a.v,velocity(p,e.index),particle_id(p,e.index),a.seed,
                             e.coefficient,sigma0,w,vd,pmax,j,p,-1,e.index,&max_sv,&max_u,
                             st,&errors[tid],messages[tid],NULL);
                     }
                     memcpy(returned[b].v,a.v,sizeof(a.v));
                     returned[b].max_sigma_v=max_sv;returned[b].max_relative_speed=max_u;
+                    returned[b].events=events;
 #ifdef SIDMDEBUG
                     st->threaded_pairs+=a.n;
 #endif
@@ -570,6 +581,7 @@ int sidm_direct_scatter(struct sidm_direct_particles p,int nlocal,
     if(p.stride<sizeof(uint64_t) || p.stride<3*sizeof(double) ||
        p.id_offset>p.stride-sizeof(uint64_t) || p.velocity_offset>p.stride-3*sizeof(double) ||
        p.stride%sizeof(double) || p.id_offset%sizeof(uint64_t) || p.velocity_offset%sizeof(double) ||
+       (p.penalty_offset!=SIZE_MAX && (p.penalty_offset>p.stride-sizeof(float) || p.penalty_offset%sizeof(float))) ||
        (uintptr_t)p.base%sizeof(double))
         fail(&failed,error,"Invalid direct SIDM particle view");
     if(collective_error(failed,error,comm)) goto cleanup;
@@ -762,6 +774,7 @@ int sidm_direct_scatter(struct sidm_direct_particles p,int nlocal,
                             for(int b=0;b<n;b++) {
                                 struct packet a; memcpy(&a,buffer+at,sizeof(a)); at+=sizeof(a);
                                 double max_sv=0,max_u=0;int source_changed=0;
+                                int events=0;
                                 const struct group_evaluation *prediction=&Cache.groups[b];
                                 if(parallel && !failed && !prediction->hit && !prediction->bad) {
                                     int fresh=!epoch_changed;
@@ -776,6 +789,7 @@ int sidm_direct_scatter(struct sidm_direct_particles p,int nlocal,
                                         apply_rejection(prediction,&max_sv,&max_u,&local);
                                         memcpy(returned[first+b].v,a.v,sizeof(a.v));
                                         returned[first+b].max_sigma_v=max_sv;returned[first+b].max_relative_speed=max_u;
+                                        returned[first+b].events=0;
                                         at+=(size_t)a.n*sizeof(struct target);
                                         continue;
                                     }
@@ -793,13 +807,16 @@ int sidm_direct_scatter(struct sidm_direct_particles p,int nlocal,
                                     local.threaded_pairs+=parallel;
                                     local.recomputed_pairs+=parallel && !cached;
 #endif
-                                    if(scatter_pair(a.v,velocity(p,e.index),particle_id(p,e.index),a.seed,e.coefficient,
-                                        sigma0,w,vd,pmax,j,p,-1,e.index,&max_sv,&max_u,&local,&failed,error,cached) && parallel) {
+                                    const int accepted=scatter_pair(a.v,velocity(p,e.index),particle_id(p,e.index),a.seed,e.coefficient,
+                                        sigma0,w,vd,pmax,j,p,-1,e.index,&max_sv,&max_u,&local,&failed,error,cached);
+                                    events+=accepted;
+                                    if(accepted && parallel) {
                                         source_changed=1;epoch_changed=1;Cache.changed[e.index]=epoch;
                                     }
                                 }
                                 memcpy(returned[first+b].v,a.v,sizeof(a.v)); returned[first+b].max_sigma_v=max_sv;
                                 returned[first+b].max_relative_speed=max_u;
+                                returned[first+b].events=events;
                             }
                         }
                     }
@@ -815,6 +832,7 @@ int sidm_direct_scatter(struct sidm_direct_particles p,int nlocal,
 #endif
                     for(int b=0;b<batch;b++) {
                         struct sidm_direct_source *s=&src[groups[start[other]+offset+b].source];
+                        if(returned[b].events) add_penalty(p,s->index,returned[b].events);
                         double *v=velocity(p,s->index);
                         if(memcmp(v,returned[b].v,sizeof(returned[b].v))) {
 #ifdef SIDMDEBUG

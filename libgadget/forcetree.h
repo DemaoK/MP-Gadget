@@ -113,6 +113,8 @@ typedef struct ForceTree {
 
 /*Initialize the internal parameters of the forcetree module*/
 void init_forcetree_params(const double treeallocfactor);
+/* The current TreeAllocFactor (force_tree_build raises it when a build runs out of nodes). */
+double force_tree_get_alloc_factor(void);
 
 int force_tree_allocated(const ForceTree * tt);
 

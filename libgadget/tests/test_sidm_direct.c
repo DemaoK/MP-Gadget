@@ -18,6 +18,7 @@
 #define K 7
 static int rank,tasks,owners;
 static double exposure_scale=1;
+static int record_penalties=1;
 static int owner(int id) { return id%owners; }
 static int index_of(int id) { return id/owners; }
 static int source(int id) { return id%5!=0; }
@@ -43,7 +44,7 @@ static void initial(int id,double v[3],int boost)
     const double shift[]={1024,-512,256};
     for(int d=0;d<3;d++) v[d]=.125*((id*(d+3)+d*7)%31-15)+(boost?shift[d]:0);
 }
-static void oracle_group(int sender,int receiver,double v[N][3],double rate[N],
+static void oracle_group(int sender,int receiver,double v[N][3],double rate[N],uint64_t hits[N],
     double pmax,int vd,int zero,struct sidm_direct_stats *st)
 {
     for(int i=0;i<N;i++) if(source(i)&&owner(i)==sender)
@@ -66,12 +67,13 @@ static void oracle_group(int sender,int receiver,double v[N][3],double rate[N],
                     v[i][d]=c+.5*u*unit[d]; v[j][d]=c-.5*u*unit[d];
                 }
                 st->events++;
+                hits[i]++;hits[j]++;
             }
         }
 }
-static void oracle(double v[N][3],double rate[N],double pmax,int vd,int zero,struct sidm_direct_stats *st)
+static void oracle(double v[N][3],double rate[N],uint64_t hits[N],double pmax,int vd,int zero,struct sidm_direct_stats *st)
 {
-    for(int r=0;r<tasks;r++) oracle_group(r,r,v,rate,pmax,vd,zero,st);
+    for(int r=0;r<tasks;r++) oracle_group(r,r,v,rate,hits,pmax,vd,zero,st);
     /* Circle tournament expressed as a rotating rank array, independent of
      * the production phase_partner expression. Local rank groups commute. */
     const int nt=tasks+(tasks%2);
@@ -81,8 +83,8 @@ static void oracle(double v[N][3],double rate[N],double pmax,int vd,int zero,str
             int a=ring[r],b=ring[nt-1-r];
             if(a>=tasks||b>=tasks) continue;
             if(a>b) { int t=a;a=b;b=t; }
-            oracle_group(a,b,v,rate,pmax,vd,zero,st);
-            oracle_group(b,a,v,rate,pmax,vd,zero,st);
+            oracle_group(a,b,v,rate,hits,pmax,vd,zero,st);
+            oracle_group(b,a,v,rate,hits,pmax,vd,zero,st);
         }
         const int first=ring[0];
         for(int r=0;r<nt-2;r++) ring[r]=ring[r+1];
@@ -100,7 +102,7 @@ static void check(double pmax,int vd,int boost,int zero,int negative)
 {
     /* Nontrivial native stride and gaps around the fields. All cases use the
      * same view interface as production and preserve unrelated fields. */
-    struct native { double unused[7],v[3]; uint64_t guard,id; } p[N];
+    struct native { double unused[7],v[3]; uint64_t guard,id; float penalty; } p[N];
     struct sidm_direct_source s[N];
     struct sidm_direct_neighbor ngb[N][K];
     struct sidm_journal_entry entries[N]; unsigned char marked[N]={0};
@@ -109,6 +111,7 @@ static void check(double pmax,int vd,int boost,int zero,int negative)
     for(int id=0;id<N;id++) if(owner(id)==rank) {
         memset(&p[n],0x5a,sizeof(p[n]));
         p[n].id=id+1;
+        p[n].penalty=.25f*(id%7);
         initial(id,p[n].v,boost);
         assert(index_of(id)==n);
         if(source(id)) {
@@ -128,13 +131,22 @@ static void check(double pmax,int vd,int boost,int zero,int negative)
     if(negative==4&&rank==0&&ns) s[0].exposure=DBL_MAX;
     struct sidm_direct_stats actual,expected={0}; char error[256];
     const struct sidm_direct_particles view={p,sizeof(*p),
-        offsetof(struct native,id),offsetof(struct native,v)};
+        offsetof(struct native,id),offsetof(struct native,v),record_penalties?offsetof(struct native,penalty):SIZE_MAX};
     int code=sidm_direct_scatter(view,n,s,ns,.3,2,vd,pmax,MPI_COMM_WORLD,&journal,&actual,error);
     for(int i=0;i<n;i++) assert(p[i].guard==UINT64_C(0x5a5a5a5a5a5a5a5a));
     if(negative) { assert(code!=0);if(!rank)printf("PASS direct negative %d: %s\n",negative,error);return; }
     if(code) { fprintf(stderr,"%s\n",error);MPI_Abort(MPI_COMM_WORLD,1); }
     double ref[N][3],rate[N]={0}; for(int i=0;i<N;i++) initial(i,ref[i],boost);
-    oracle(ref,rate,pmax,vd,zero,&expected);
+    uint64_t hits[N]={0};
+    oracle(ref,rate,hits,pmax,vd,zero,&expected);
+    uint64_t count=0;
+    for(int i=0;i<n;i++) {
+        const int id=p[i].id-1;
+        assert(p[i].penalty==.25f*(id%7)+(record_penalties?hits[id]:0));
+        count+=p[i].penalty-.25f*(id%7);
+    }
+    MPI_Allreduce(MPI_IN_PLACE,&count,1,MPI_UINT64_T,MPI_SUM,MPI_COMM_WORLD);
+    assert(count==(record_penalties?2*expected.events:0));
     for(int i=0;i<n;i++) for(int d=0;d<3;d++) close_number(p[i].v[d],ref[p[i].id-1][d]);
     for(int a=0;a<ns;a++) close_number(s[a].max_sigma_v,rate[p[s[a].index].id-1]);
 #ifdef SIDMDEBUG
@@ -167,10 +179,12 @@ static void check(double pmax,int vd,int boost,int zero,int negative)
      * same trajectory up to velocity arithmetic roundoff. */
     if(boost) {
         struct sidm_direct_stats unboosted={0};double v[N][3],r[N]={0};
+        uint64_t unboosted_hits[N]={0};
         for(int i=0;i<N;i++) initial(i,v[i],0);
-        oracle(v,r,pmax,vd,zero,&unboosted);
+        oracle(v,r,unboosted_hits,pmax,vd,zero,&unboosted);
         const double shift[]={1024,-512,256};
         assert(unboosted.events==expected.events);
+        assert(!memcmp(hits,unboosted_hits,sizeof(hits)));
         for(int i=0;i<N;i++) for(int d=0;d<3;d++) close_number(ref[i][d]-shift[d],v[i][d]);
     }
     /* Exact output fingerprints compare builds/thread counts without relaxing
@@ -192,6 +206,10 @@ static void check(double pmax,int vd,int boost,int zero,int negative)
     /* No sources on ANY rank, reusing a populated journal. */
     assert(!sidm_direct_scatter(view,n,NULL,0,.3,2,vd,pmax,MPI_COMM_WORLD,&journal,&actual,error));
     assert(actual.pairs==0&&actual.events==0&&journal.count==0);
+    for(int i=0;i<n;i++) {
+        const int id=p[i].id-1;
+        assert(p[i].penalty==.25f*(id%7)+(record_penalties?hits[id]:0));
+    }
     if(!rank)printf("PASS direct ranks=%d owners=%d p=%g vd=%d boost=%d zero=%d events=%llu subdivisions=%llu\n",
         tasks,owners,pmax,vd,boost,zero,(unsigned long long)expected.events,(unsigned long long)expected.subdivided_pairs);
 }
@@ -201,12 +219,13 @@ static void check(double pmax,int vd,int boost,int zero,int negative)
 static void check_waves(void)
 {
     enum { GROUPS=128, WIDTH=4, LOCAL=GROUPS*(WIDTH+1) };
-    struct particle { uint64_t id; double v[3]; } p[LOCAL];
+    struct particle { uint64_t id; double v[3]; float penalty; } p[LOCAL];
     struct sidm_direct_source s[GROUPS];
     struct sidm_direct_neighbor neighbors[GROUPS][WIDTH];
     struct sidm_journal_entry entries[LOCAL];unsigned char marked[LOCAL]={0};
     struct sidm_journal journal={.entries=entries,.marked=marked,.capacity=LOCAL,.validated_mass=1};
     double reference[LOCAL][3],reference_sv[GROUPS],reference_u[GROUPS];
+    float reference_penalty[LOCAL];
     const int threads=omp_get_max_threads();
     uint64_t fingerprint=0;
     for(int run=0;run<4;run++) {
@@ -214,6 +233,7 @@ static void check_waves(void)
         omp_set_num_threads(threaded?(threads>1?threads:4):1);
         for(int i=0;i<LOCAL;i++) {
             p[i].id=(uint64_t)rank*LOCAL+i+1;
+            p[i].penalty=0;
             initial(i,p[i].v,0);
         }
         for(int b=0;b<GROUPS;b++) {
@@ -227,11 +247,14 @@ static void check_waves(void)
             }
         }
         struct sidm_direct_stats stats;char error[256];
-        const struct sidm_direct_particles view={p,sizeof(*p),offsetof(struct particle,id),offsetof(struct particle,v)};
+        const struct sidm_direct_particles view={p,sizeof(*p),offsetof(struct particle,id),offsetof(struct particle,v),offsetof(struct particle,penalty)};
         assert(!sidm_direct_scatter(view,LOCAL,s,GROUPS,.3,2,0,.1,MPI_COMM_WORLD,&journal,&stats,error));
         for(int i=0;i<LOCAL;i++) {
             if(!threaded) memcpy(reference[i],p[i].v,sizeof(reference[i]));
             else assert(!memcmp(reference[i],p[i].v,sizeof(reference[i])));
+            if(!threaded) reference_penalty[i]=p[i].penalty;
+            else assert(reference_penalty[i]==p[i].penalty);
+            if(zero) assert(p[i].penalty==0);
         }
         for(int b=0;b<GROUPS;b++) {
             assert(s[b].max_relative_speed>0);
@@ -239,6 +262,10 @@ static void check_waves(void)
             else {assert(s[b].max_sigma_v==reference_sv[b]);assert(s[b].max_relative_speed==reference_u[b]);}
         }
 #ifdef SIDMDEBUG
+        uint64_t count=0;
+        for(int i=0;i<LOCAL;i++) count+=p[i].penalty;
+        MPI_Allreduce(MPI_IN_PLACE,&count,1,MPI_UINT64_T,MPI_SUM,MPI_COMM_WORLD);
+        assert(count==2*stats.events);
         if(!zero) assert(stats.events>0 && stats.subdivided_pairs>0);
         else assert(stats.events==0 && journal.count==0);
         if(threaded) assert(stats.threaded_pairs==stats.pairs);
@@ -289,6 +316,8 @@ int main(int argc,char **argv)
         check(.5,0,0,0,4);
     }
     check_waves();
+    record_penalties=0;
+    check(.5,0,0,0,0);
     if(!rank) puts("PASS direct SIDM");
     MPI_Finalize();return 0;
 }

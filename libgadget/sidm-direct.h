@@ -34,6 +34,7 @@ struct sidm_direct_neighbor {
 struct sidm_direct_particles {
     void *base;
     size_t stride, id_offset, velocity_offset;
+    size_t penalty_offset; /* float accepted-scatter count; SIZE_MAX disables recording. */
 };
 struct sidm_direct_source {
     int index, n;

@@ -14,6 +14,11 @@ double walltime_measure_internal(const char * name);
 double walltime_add_internal(const char * name, const double dt);
 double walltime_measure_full(const char * name, const char * file, const int line);
 double walltime_add_full(const char * name, const double dt, const char * file, const int line);
+/* Books every measure and add between the begin and the end to the clock name (a callee's own
+ * clocks are not charged); see walltime.c. */
+#define walltime_redirect_begin(name) walltime_redirect_begin_full(name, __FILE__, __LINE__)
+void walltime_redirect_begin_full(const char * name, const char * file, const int line);
+void walltime_redirect_end(void);
 
 enum clocktype {
     CLOCK_STEP_MEAN ,

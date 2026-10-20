@@ -87,6 +87,8 @@ def run(base, args):
     values = dict(InitCondFile='../IC/IC', OutputDir='output', SIDMOn=int(args.mode != 'cdm'),
                   vdSIDMOn=1, sigma0=147.1, wTurn=120, SIDMNeighbors=38,
                   SIDMDirectedProbability=.5, SIDMTransportFraction=args.transport_fraction)
+    if args.halo_finder:
+        values.update(SubhaloFinderOn=1, FOFSaveParticles=1)
     if args.without_sidm:
         values = {k: v for k, v in values.items()
                   if not k.startswith("SIDM") and k not in ("vdSIDMOn", "sigma0", "wTurn")}
@@ -121,7 +123,7 @@ def run(base, args):
         (output / 'Snapshots.txt').write_text(f'{restart:03d} {atime:.17g}\n')
         power = snapshot.parent / f'powerspectrum-{atime:.4f}.txt'
         if power.exists():
-            (output / power.name).symlink_to(power)
+            shutil.copy2(power, output / power.name)
     report = dict(mode=args.mode, binary=str(binary), sha256=digest(binary),
                   parameter_overrides=values, compiled_sidm=not args.without_sidm,
                   restart_from=str(args.restart_from) if args.restart_from else None)
@@ -298,6 +300,8 @@ def main():
     parser.add_argument('--cpu-limit', type=int)
     parser.add_argument('--memory', type=int)
     parser.add_argument('--transport-fraction', type=float, default=.2)
+    parser.add_argument('--halo-finder', action='store_true',
+                        help='Enable runtime subhalo finding and write its restart state')
     parser.add_argument('--without-sidm', action='store_true',
                         help='CDM control binary compiled without SIDM; omit SIDM parameter keys')
     args = parser.parse_args()

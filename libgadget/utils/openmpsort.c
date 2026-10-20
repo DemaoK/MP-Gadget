@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <stdint.h>
+#include <limits.h>
 #include "mymalloc.h"
 /* Below is a merge-sort routine copied directly from glibc version 2.26
  * (although the code is the same since Dec. 2010, glibc 2.13).
@@ -171,16 +172,17 @@ msort_with_tmp (const struct msort_param *p, void *b, size_t n)
 /*End code copied from glibc*/
 /*=====================================================*/
 
-static void merge(void * base1, size_t nmemb1, void * base2, size_t nmemb2, void * output, size_t size,
+/* Stable merge of x[0..nx) and y[0..ny) (ties to x) into output. */
+static void merge(const void * base1, size_t nmemb1, const void * base2, size_t nmemb2, void * output, size_t size,
          int(*compar)(const void *, const void *), int indirect) {
-    char * p1 = (char *) base1;
-    char * p2 = (char *) base2;
+    const char * p1 = (const char *) base1;
+    const char * p2 = (const char *) base2;
     char * po = (char *) output;
-    char * s1 = p1 + nmemb1 * size, *s2 = p2 + nmemb2 * size;
+    const char * s1 = p1 + nmemb1 * size, *s2 = p2 + nmemb2 * size;
     while(p1 < s1 && p2 < s2) {
         int cmp;
         if(indirect) {
-            cmp = compar(*(void **)p1, *(void **)p2);
+            cmp = compar(*(void * const *)p1, *(void * const *)p2);
         }
         else {
             cmp = compar(p1, p2);
@@ -202,180 +204,271 @@ static void merge(void * base1, size_t nmemb1, void * base2, size_t nmemb2, void
     }
 }
 
-void qsort_openmp(void *base, size_t nmemb, size_t size,
-                         int(*compar)(const void *, const void *)) {
-    int Nt = omp_get_max_threads();
-    ptrdiff_t * Anmemb = ta_malloc("Anmemb", ptrdiff_t, Nt);
-    ptrdiff_t * Anmemb_old = ta_malloc("Anmemb_old", ptrdiff_t, Nt);
+/* Merge path: the number of elements of x among the first d outputs of the stable merge of x
+ * and y (ties to x), by bisection on the cross diagonal d. */
+static size_t
+merge_split(const char * x, size_t nx, const char * y, size_t ny, size_t d, size_t size,
+            int(*compar)(const void *, const void *), int indirect)
+{
+    size_t lo = d > ny ? d - ny : 0, hi = d < nx ? d : nx;
+    while(lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        const char * a = x + mid * size;
+        const char * b = y + (d - 1 - mid) * size;
+        const int c = indirect ? compar(*(void * const *) a, *(void * const *) b) : compar(a, b);
+        if(c <= 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
 
-    void ** Abase_store = ta_malloc("Abase", void *, Nt);
-    void ** Atmp_store = ta_malloc("Atmp", void *, Nt);
-    void ** Abase = Abase_store;
-    void ** Atmp = Atmp_store;
+/* Bit helpers of permute_openmp. */
+static inline int
+bit_get(const unsigned char * v, size_t i)
+{
+    return (v[i >> 3] >> (i & 7)) & 1;
+}
+static inline void
+bit_set(unsigned char * v, size_t i)
+{
+    v[i >> 3] |= (unsigned char) (1u << (i & 7));
+}
 
-    /*Should I use indirect sorting?*/
-    int indirect = 0;
-    if(size > 32)
-        indirect = 1;
-    void * tmp;
-    /*NOTE: if this allocation becomes a problem,
-     * switch to glibc's quicksort (serial!) */
-    if(indirect)
-        tmp = mymalloc("qsort",2*nmemb*sizeof(void *) + size);
-    else
-        tmp = mymalloc("qsort", size * nmemb);
-
-#pragma omp parallel
+/* Applies a permutation in place: element j of the result is element src[j] of the input. The
+ * cycles are listed serially (order[], int-only work), cut into units of consecutive cycle
+ * positions, and the record moves of the units run in parallel; the element that a unit's last
+ * move reads from the next unit, and the start of a cycle that began in an earlier unit, are
+ * copied before any move. The result does not depend on the number of threads. order must hold
+ * nmemb ints; src is not modified. */
+void
+permute_openmp(void * base, size_t nmemb, size_t size, const int * src, int * order)
+{
+    char * b0 = (char *) base;
+    if(nmemb <= 1)
+        return;
+    const size_t nbytes = nmemb / 8 + 1;
+    unsigned char * vis = (unsigned char *) mymalloc("PermVis", nbytes);
+    unsigned char * cs = (unsigned char *) mymalloc("PermCs", nbytes);
+    memset(vis, 0, nbytes);
+    memset(cs, 0, nbytes);
+    const int Nt = omp_get_max_threads();
+    size_t S = nmemb / (16 * (size_t) Nt) + 1;
+    if(S < 1024)
+        S = 1024;
+    const size_t umax = nmemb / S + 2;
+    size_t * ucs = (size_t *) mymalloc("PermUcs", sizeof(size_t) * umax);
+    size_t no = 0, cstart = 0, i;
+    for(i = 0; i < nmemb; i++) {
+        if((size_t) src[i] == i || bit_get(vis, i))
+            continue;
+        size_t j = i;
+        cstart = no;
+        bit_set(cs, no);
+        do {
+            bit_set(vis, j);
+            if(no % S == 0)
+                ucs[no / S] = cstart;
+            order[no++] = (int) j;
+            j = (size_t) src[j];
+        } while(j != i);
+    }
+    const size_t nunits = (no + S - 1) / S;
+    char * saveB = (char *) mymalloc("PermSaveB", size * (nunits + 1));
+    char * saveS = (char *) mymalloc("PermSaveS", size * (nunits + 1));
+    char * tmps = (char *) mymalloc("PermTmp", size * Nt);
+    int64_t u;
+    /* the values a unit reads before they are overwritten by another unit */
+    #pragma omp parallel for
+    for(u = 0; u < (int64_t) nunits; u++) {
+        const size_t a = u * S, b = a + S < no ? a + S : no;
+        if(b < no && !bit_get(cs, b))
+            memcpy(saveB + u * size, b0 + (size_t) order[b] * size, size);
+        if(ucs[u] < a)
+            memcpy(saveS + u * size, b0 + (size_t) order[ucs[u]] * size, size);
+    }
+    #pragma omp parallel
     {
-        int tid = omp_get_thread_num();
-        /* actual number of threads*/
-        int Nt = omp_get_num_threads();
-
-        /* domain decomposition */
-        ptrdiff_t start = tid * nmemb / Nt;
-        ptrdiff_t end = (tid + 1) * nmemb / Nt;
-        /* save decoposition to global array for merging */
-        Anmemb[tid] = end - start;
-        Anmemb_old[tid] = end - start;
-        Abase[tid] = ((char*) base) + start * size;
-        Atmp[tid] = ((char*) tmp) + start * size;
-
-        struct msort_param p;
-        p.t = ((char **) Atmp)[tid];
-        p.s = size;
-        p.var = 4;
-        p.cmp = compar;
-        /*For large arrays we use an indirect sort following glibc*/
-        if(indirect)
-        {
-            /* Indirect sorting: copy everything in this thread to the new pointer space,
-             * which is after the tmp space. */
-            char *ip = (char *) Abase[tid];
-            void **tp = (void **) ((char *)tmp + (nmemb + start)* sizeof (void *));
-            void **t = tp;
-            void *end = (void *) (tp + Anmemb[tid]);
-
-            while ((void *) t < end)
-            {
-              *t++ = ip;
-              ip += size;
-            }
-            p.s = sizeof (void *);
-            p.var = 3;
-            Abase[tid] = tp;
-            Atmp[tid] = ((char*) tmp) + start * p.s;
-            p.t = ((char **)Atmp)[tid];
-        }
-        else {
-            /*Copied from glibc*/
-            if ((size & (sizeof (uint32_t) - 1)) == 0
-                && ((char *) base - (char *) 0) % __alignof__ (uint32_t) == 0)
-              {
-                if (size == sizeof (uint32_t))
-                  p.var = 0;
-                else if (size == sizeof (uint64_t)
-                         && ((char *) base - (char *) 0) % __alignof__ (uint64_t) == 0)
-                  p.var = 1;
-                else if ((size & (sizeof (unsigned long) - 1)) == 0
-                         && ((char *) base - (char *) 0)
-                            % __alignof__ (unsigned long) == 0)
-                  p.var = 2;
-              }
-            /*End copied from glibc*/
-        }
-        msort_with_tmp (&p, Abase[tid], Anmemb[tid]);
-        /* now each sub array is sorted, kick start the merging */
-        int sep;
-        for (sep = 1; sep < Nt; sep *=2 ) {
-            int color = tid / sep;
-            int key = tid % sep;
-#if 0
-            if(tid == 0) {
-                printf("sep = %d Abase[0] %p base %p, Atmp[0] %p tmp %p\n",
-                        sep, Abase[0], base, Atmp[0], tmp);
-                printf("base 73134 = %d 73135 = %d\n", ((int*) base)[73134], ((int*) base)[73135]);
-                printf("tmp  73134 = %d 73135 = %d\n", ((int*) tmp )[73134], ((int*) tmp )[73135]);
-            }
-#endif
-#pragma omp barrier
-            /* only group leaders work */
-            if(key == 0 && color % 2 == 0) {
-                int nextT = tid + sep;
-                /*merge with next guy */
-#pragma omp critical
-		    {
-                /* only even leaders arrives to this point*/
-                if(nextT >= Nt) {
-                    /* no next guy, copy directly.*/
-                    merge(Abase[tid], Anmemb[tid], NULL, 0, Atmp[tid], p.s, compar, indirect);
-                }  else {
-#if 0
-                    printf("%d + %d merging with %td/%td:%td %td/%td:%td\n", tid, nextT,
-                            ((char*)Abase[tid] - (char*) base) / size,
-                            ((char*)Abase[tid] - (char*) tmp) / size,
-                            Anmemb[tid],
-                            ((char*)Abase[nextT] - (char*) base) / size,
-                            ((char*)Abase[nextT] - (char*) tmp) / size,
-                            Anmemb[nextT]);
-#endif
-                    merge(Abase[tid], Anmemb[tid], Abase[nextT], Anmemb[nextT], Atmp[tid], p.s, compar, indirect);
-                    /* merge two lists */
-                    Anmemb[tid] += Anmemb[nextT];
-                    Anmemb[nextT] = 0;
-		    }
+        char * tmp = tmps + size * omp_get_thread_num();
+        #pragma omp for schedule(dynamic, 1)
+        for(u = 0; u < (int64_t) nunits; u++) {
+            const size_t a = u * S, b = a + S < no ? a + S : no;
+            int started_here = 0;
+            size_t k;
+            for(k = a; k < b; k++) {
+                char * dk = b0 + (size_t) order[k] * size;
+                if(bit_get(cs, k)) {
+                    memcpy(tmp, dk, size);
+                    started_here = 1;
                 }
+                const char * sp;
+                if(k + 1 < no && !bit_get(cs, k + 1))
+                    sp = (k + 1 < b) ? b0 + (size_t) order[k + 1] * size : saveB + u * size;
+                else
+                    sp = started_here ? tmp : saveS + u * size;
+                memcpy(dk, sp, size);
             }
-
-            /* now swap Abase and Atmp for next merge */
-#pragma omp barrier
-#pragma omp master
-	    {
-                void ** a = Abase;
-                Abase = Atmp;
-                Atmp = a;
-	    }
-#pragma omp barrier
-            /* at this point Abase contains the sorted array */
-        }
-        /* output was written to the tmp rather than desired location, copy it */
-        if((!indirect && Abase[0] != base)
-                || (indirect && Abase[0] != (char *) tmp + nmemb * sizeof(void *))) {
-            memmove(Atmp[tid], Abase[tid], Anmemb_old[tid] * p.s);
         }
     }
+    myfree(tmps);
+    myfree(saveS);
+    myfree(saveB);
+    myfree(ucs);
+    myfree(cs);
+    myfree(vis);
+}
 
-    ta_free(Atmp_store);
-    ta_free(Abase_store);
-    ta_free(Anmemb_old);
-    ta_free(Anmemb);
+/* A parallel stable merge sort (the result equals that of any stable sort, independent of the
+ * number of threads): every thread sorts a contiguous chunk with glibc's msort, then the runs
+ * are merged pairwise, log2(threads) levels, every thread producing an equal share of each
+ * level's output through merge-path splits. Records larger than 32 bytes are sorted through
+ * pointers and moved once at the end (permute_openmp). */
+void qsort_openmp(void *base, size_t nmemb, size_t size,
+                         int(*compar)(const void *, const void *)) {
+    if(nmemb <= 1)
+        return;
+    /*Should I use indirect sorting?*/
+    const int indirect = size > 32;
+    const size_t es = indirect ? sizeof(void *) : size;
+    /*NOTE: if this allocation becomes a problem,
+     * switch to glibc's quicksort (serial!) */
+    char * tmp;
+    if(indirect)
+        tmp = (char *) mymalloc("qsort",2*nmemb*sizeof(void *) + size);
+    else
+        tmp = (char *) mymalloc("qsort", size * nmemb);
+    char * A = indirect ? tmp + nmemb * sizeof(void *) : (char *) base;
+    char * B = tmp;
 
-    /*Copied from glibc */
-    /* tp[0] .. tp[n - 1] is now sorted, copy around entries of
-       the original array (done serially).  Knuth vol. 3 (2nd ed.) exercise 5.2-10.  */
-    if(indirect) {
-        char *kp, *ip;
-        size_t i;
-        void **tp = (void **) ((char *) tmp + nmemb * sizeof (void *));
-        void *tmp_storage = (void *) (tp + nmemb);
-        for (i = 0, ip = (char *) base; i < nmemb; i++, ip += size)
-          if ((kp = ((char **)tp)[i]) != ip)
-            {
-              size_t j = i;
-              char *jp = ip;
-              memcpy (tmp_storage, ip, size);
+    int var = 4;
+    if(indirect)
+        var = 3;
+    else {
+        /*Copied from glibc*/
+        if ((size & (sizeof (uint32_t) - 1)) == 0
+            && ((char *) base - (char *) 0) % __alignof__ (uint32_t) == 0)
+          {
+            if (size == sizeof (uint32_t))
+              var = 0;
+            else if (size == sizeof (uint64_t)
+                     && ((char *) base - (char *) 0) % __alignof__ (uint64_t) == 0)
+              var = 1;
+            else if ((size & (sizeof (unsigned long) - 1)) == 0
+                     && ((char *) base - (char *) 0)
+                        % __alignof__ (unsigned long) == 0)
+              var = 2;
+          }
+        /*End copied from glibc*/
+    }
 
-              do {
-                size_t k = (kp - (char *) base) / size;
-                tp[j] = jp;
-                memcpy (jp, kp, size);
-                j = k;
-                jp = kp;
-                kp = ((char **)tp)[k];
-              } while (kp != ip);
+    /* at least 1024 elements per thread */
+    int Nt = omp_get_max_threads();
+    if((size_t) Nt > nmemb / 1024)
+        Nt = (int) (nmemb / 1024);
+    if(Nt < 1)
+        Nt = 1;
+    size_t * bnd = ta_malloc("qsortbnd", size_t, Nt + 1);
+    char * res = A;
 
-              tp[j] = jp;
-              memcpy (jp, tmp_storage, size);
+#pragma omp parallel num_threads(Nt)
+    {
+        const int nt = omp_get_num_threads();
+        const int tid = omp_get_thread_num();
+#pragma omp single
+        {
+            int r;
+            for(r = 0; r <= nt; r++)
+                bnd[r] = (size_t) r * nmemb / nt;
+        }
+        const size_t start = bnd[tid], end = bnd[tid + 1];
+        if(indirect) {
+            void ** tp = (void **) A;
+            size_t i;
+            for(i = start; i < end; i++)
+                tp[i] = (char *) base + i * size;
+        }
+        struct msort_param p;
+        p.s = es;
+        p.var = var;
+        p.cmp = compar;
+        p.arg = NULL;
+        p.t = B + start * es;
+        msort_with_tmp (&p, A + start * es, end - start);
+#pragma omp barrier
+        char * src = A, * dst = B;
+        int w;
+        const size_t o0 = start, o1 = end;
+        for(w = 1; w < nt; w *= 2) {
+            int q;
+            for(q = 0; 2 * q * w < nt; q++) {
+                const int c0 = 2 * q * w;
+                const int c1 = c0 + w < nt ? c0 + w : nt;
+                const int c2 = c0 + 2 * w < nt ? c0 + 2 * w : nt;
+                const size_t s0 = bnd[c0], s1 = bnd[c1], s2 = bnd[c2];
+                const size_t lo = o0 > s0 ? o0 : s0, hi = o1 < s2 ? o1 : s2;
+                if(lo >= hi)
+                    continue;
+                const char * x = src + s0 * es, * y = src + s1 * es;
+                const size_t nx = s1 - s0, ny = s2 - s1;
+                const size_t i0 = merge_split(x, nx, y, ny, lo - s0, es, compar, indirect);
+                const size_t i1 = merge_split(x, nx, y, ny, hi - s0, es, compar, indirect);
+                const size_t j0 = lo - s0 - i0, j1 = hi - s0 - i1;
+                merge(x + i0 * es, i1 - i0, y + j0 * es, j1 - j0, dst + lo * es, es, compar, indirect);
             }
+            char * t = src;
+            src = dst;
+            dst = t;
+#pragma omp barrier
+        }
+        /* src holds the sorted elements; a direct sort copies them back */
+        if(!indirect && src != (char *) base)
+            memcpy((char *) base + o0 * es, src + o0 * es, (o1 - o0) * es);
+#pragma omp single
+        res = src;
+    }
+    ta_free(bnd);
+
+    if(indirect) {
+        void ** tp = (void **) res;
+        char * other = (res == A) ? B : A;
+        if(nmemb <= (size_t) INT_MAX) {
+            /* the source index of every result slot and the cycle list in the other half */
+            int * srcidx = (int *) other;
+            int * order = srcidx + nmemb;
+            size_t i;
+            #pragma omp parallel for
+            for(i = 0; i < nmemb; i++)
+                srcidx[i] = (int) (((char *) tp[i] - (char *) base) / size);
+            permute_openmp(base, nmemb, size, srcidx, order);
+        }
+        else {
+            /*Copied from glibc */
+            /* tp[0] .. tp[n - 1] is now sorted, copy around entries of
+               the original array (done serially).  Knuth vol. 3 (2nd ed.) exercise 5.2-10.  */
+            char *kp, *ip;
+            size_t i;
+            void *tmp_storage = (void *) (tmp + 2 * nmemb * sizeof(void *));
+            for (i = 0, ip = (char *) base; i < nmemb; i++, ip += size)
+              if ((kp = ((char **)tp)[i]) != ip)
+                {
+                  size_t j = i;
+                  char *jp = ip;
+                  memcpy (tmp_storage, ip, size);
+
+                  do {
+                    size_t k = (kp - (char *) base) / size;
+                    tp[j] = jp;
+                    memcpy (jp, kp, size);
+                    j = k;
+                    jp = kp;
+                    kp = ((char **)tp)[k];
+                  } while (kp != ip);
+
+                  tp[j] = jp;
+                  memcpy (jp, tmp_storage, size);
+                }
+        }
     }
     myfree(tmp);
 }

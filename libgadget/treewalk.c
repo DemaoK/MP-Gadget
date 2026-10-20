@@ -118,6 +118,9 @@ ev_begin(TreeWalk * tw, int * active_set, const size_t size)
     bytesperbuffer += ceil(ImportBufferBoost * (tw->query_type_elsize + tw->result_type_elsize));
     /*Use all free bytes for the tree buffer, as in exchange. Leave some free memory for array overhead.*/
     size_t freebytes = (size_t) mymalloc_freebytes();
+    if(freebytes < 4096 * 10 * bytesperbuffer)
+        endrun(1231244, "Not enough free memory in %s for the treewalk reserve: need %zu bytes (40960 buffers of %zu) have %zu.\n",
+               tw->ev_label, 4096 * 10 * bytesperbuffer, bytesperbuffer, freebytes);
     freebytes -= 4096 * 10 * bytesperbuffer;
 
     tw->BunchSize = (size_t) floor(((double)freebytes)/ bytesperbuffer);

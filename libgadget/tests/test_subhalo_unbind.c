@@ -1,0 +1,2440 @@
+/* Serial tests of the unbinding kernel (subhalo_unbind.c; design 7.4) and the k-nearest tracer
+ * search: Hernquist haloes, unbound shells, subsampling, satellites, scale factor, thermal energy,
+ * periodic gravity, ties, tree order, core fill, sinking, death; bitwise results at 1 to 8
+ * threads and inside a worker region (decisions 37, 42.5); the sampled final pass (42.4).
+ * test_timing takes sizes, thresholds, threads and the final-pass mode from SUBHALO_UNBIND_TIMING*.
+ * Haloes sample the exact Hernquist distribution function (truncated at 100 scale radii) across a
+ * periodic boundary; a = 1, H = 0, units kpc/h, 1e10 Msun/h, km/s. Run as: mpirun -np 1. */
+
+#define _GNU_SOURCE      /* sched_getaffinity (the timing table's binding warning) */
+#include <sched.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <stddef.h>
+#include <setjmp.h>
+#include <cmocka.h>
+#include <math.h>
+#include <mpi.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include <gsl/gsl_rng.h>
+#include <gsl/gsl_randist.h>
+#include <omp.h>
+
+#include <libgadget/partmanager.h>
+#include <libgadget/slotsmanager.h>
+#include <libgadget/physconst.h>
+#include <libgadget/subhalo_unbind.h>
+#include <libgadget/utils/mymalloc.h>
+/* grav_spline_potential for the brute-force oracles; the header's treewalk callbacks are unused */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#include <libgadget/gravshort.h>
+#pragma GCC diagnostic pop
+#include "stub.h"
+
+/* GRAVITY / UnitLength^3 * UnitMass * UnitTime^2 for kpc/h, 1e10 Msun/h, km/s (cosmology.c:19) */
+#define TEST_G (6.672e-8 / pow(3.085678e21, 3) * 1.989e43 * pow(3.085678e21 / 1e5, 2))
+#define BOXSIZE 20000.
+#define NHALO 20000
+#define HQ_M 100.        /* 1e12 Msun/h */
+#define HQ_A 20.         /* kpc/h */
+#define HQ_RMAX (100. * HQ_A)
+#define EPS 0.5          /* Plummer-equivalent softening; h = 2.8 EPS */
+
+static const double Centre[3] = {3.0, BOXSIZE - 5.0, 0.5 * BOXSIZE};
+static const double Bulk[3] = {100., -50., 30.};
+
+static struct SubhaloUnbindParams
+default_params(void)
+{
+    struct SubhaloUnbindParams up;
+    memset(&up, 0, sizeof(up));
+    up.atime = 1;
+    up.Hubble = 0;
+    up.G = TEST_G;
+    up.h = 2.8 * EPS;
+    up.BoxSize = BOXSIZE;
+    up.PotentialTypes = 1 + 2 + 16 + 32;
+    up.TracerTypes = 2 + 16;
+    up.MinNumPart = 20;
+    up.MinNumTracerPart = 10;
+    up.SampleSize = 0;      /* exact: the tree on every particle */
+    up.MaxIter = 50;
+    up.OpenAngle = 0.45;
+    up.BoundMassPrecision = 0.995;
+    up.WithThermal = 0;
+    return up;
+}
+
+/* ------------------------------------------------------------------ Hernquist sampling */
+
+/* Hernquist DF in units G = M = a = 1 up to a constant, q2 = -E in (0, 1). */
+static double
+hq_df(double q2)
+{
+    if(q2 <= 0)
+        return 0;
+    if(q2 >= 1)
+        q2 = 1 - 1e-15;
+    const double q = sqrt(q2), omq = 1 - q2;
+    const double br = 3 * asin(q) + q * sqrt(omq) * (1 - 2 * q2) * (8 * q2 * q2 - 8 * q2 - 3);
+    return br > 0 ? pow(omq, -2.5) * br : 0;
+}
+
+/* Speed at radius r (units a) from p(v) dv ~ v^2 f(psi - v^2 / 2) dv on [0, v_esc], by
+ * rejection against 1.5 times the maximum of v^2 f, located on a geometric grid in v^2 (near
+ * the centre the peak sits at v^2 ~ r). */
+static double
+hq_speed(double r, gsl_rng * rng)
+{
+    const double psi = 1. / (1. + r);
+    const double vesc = sqrt(2 * psi);
+    double gmax = 0;
+    int k;
+    for(k = 0; k <= 600; k++) {
+        const double v2 = vesc * vesc * pow(10., -12. + 12. * k / 600.);
+        const double g = v2 * hq_df(psi - 0.5 * v2);
+        if(g > gmax) gmax = g;
+    }
+    gmax *= 1.5;
+    for(;;) {
+        const double v = vesc * gsl_rng_uniform(rng);
+        if(gsl_rng_uniform(rng) * gmax < v * v * hq_df(psi - 0.5 * v * v))
+            return v;
+    }
+}
+
+static void
+random_direction(gsl_rng * rng, double u[3])
+{
+    const double ct = 2 * gsl_rng_uniform(rng) - 1, st = sqrt(1 - ct * ct);
+    const double ph = 2 * M_PI * gsl_rng_uniform(rng);
+    u[0] = st * cos(ph);
+    u[1] = st * sin(ph);
+    u[2] = ct;
+}
+
+static double
+wrapb(double x)
+{
+    while(x >= BOXSIZE) x -= BOXSIZE;
+    while(x < 0) x += BOXSIZE;
+    return x;
+}
+
+/* Sample n particles of a Hernquist sphere (mass M, scale a, truncated at rmax) into
+ * P[first, first + n), centred on cen with bulk velocity vel. Returns the particle mass. */
+static double
+make_hernquist(int64_t first, int64_t n, double M, double a, double rmax, const double cen[3], const double vel[3],
+               unsigned long seed, int64_t id0)
+{
+    gsl_rng * rng = gsl_rng_alloc(gsl_rng_mt19937);
+    gsl_rng_set(rng, seed);
+    const double Xmax = pow(rmax / (rmax + a), 2);
+    const double m = M * Xmax / n;
+    const double vg = sqrt(TEST_G * M / a);
+    int64_t i;
+    int d;
+    for(i = first; i < first + n; i++) {
+        const double s = sqrt(Xmax * gsl_rng_uniform_pos(rng));
+        const double r = s / (1 - s);
+        const double v = hq_speed(r, rng);
+        double ux[3], uv[3];
+        random_direction(rng, ux);
+        random_direction(rng, uv);
+        memset(&P[i], 0, sizeof(P[i]));
+        P[i].Type = 1;
+        P[i].Mass = m;
+        P[i].ID = id0 + (i - first);
+        for(d = 0; d < 3; d++) {
+            P[i].Pos[d] = wrapb(cen[d] + a * r * ux[d]);
+            P[i].Vel[d] = vel[d] + vg * v * uv[d];   /* a = 1: Vel = v_pec */
+        }
+    }
+    gsl_rng_free(rng);
+    return m;
+}
+
+/* ------------------------------------------------------------------ harness */
+
+struct TestCand {
+    struct SubCandidate c;
+    int64_t * Index;
+    double * Energy;
+};
+
+static void
+cand_init(struct TestCand * t, int64_t first, int64_t n, const double ref[3], const double refvel[3], uint64_t seed)
+{
+    int64_t i;
+    int d;
+    memset(&t->c, 0, sizeof(t->c));
+    t->Index = (int64_t *) mymalloc("TestIndex", sizeof(int64_t) * (n + 1));
+    t->Energy = (double *) mymalloc("TestEnergy", sizeof(double) * (n + 1));
+    for(i = 0; i < n; i++)
+        t->Index[i] = first + i;
+    t->c.Index = t->Index;
+    t->c.Energy = t->Energy;
+    t->c.N = n;
+    t->c.TrackId = 0;
+    t->c.Seed = seed;
+    for(d = 0; d < 3; d++) {
+        t->c.RefPos[d] = ref[d];
+        t->c.RefVel[d] = refvel[d];
+    }
+}
+
+static void
+cand_free(struct TestCand * t)
+{
+    myfree(t->Energy);
+    myfree(t->Index);
+}
+
+/* An arena with exactly the kernel's per-particle scratch budget: the test checks that the
+ * kernel lives within SUBHALO_UNBIND_SCRATCH_BYTES_PER_PART (Index and Energy are the test's). */
+static struct SubhaloArena
+arena_alloc(int64_t n)
+{
+    struct SubhaloArena a;
+    a.size = SUBHALO_UNBIND_SCRATCH_BYTES_PER_PART * n + 64;
+    a.used = 0;
+    a.base = (char *) mymalloc("TestArena", a.size);
+    return a;
+}
+
+static void
+setup_pman(int64_t MaxPart)
+{
+    particle_alloc_memory(PartManager, BOXSIZE, MaxPart);
+    PartManager->NumPart = MaxPart;
+}
+
+static void
+teardown_pman(void)
+{
+    myfree(PartManager->Base);
+    PartManager->Base = NULL;
+    PartManager->NumPart = 0;
+}
+
+/* Index[0, n) is a permutation of [first, first + n). */
+static int
+is_permutation(const int64_t * Index, int64_t n, int64_t first)
+{
+    char * seen = (char *) mymalloc("TestSeen", n + 1);
+    memset(seen, 0, n + 1);
+    int64_t i;
+    int ok = 1;
+    for(i = 0; i < n; i++) {
+        const int64_t k = Index[i] - first;
+        if(k < 0 || k >= n || seen[k]) {
+            ok = 0;
+            break;
+        }
+        seen[k] = 1;
+    }
+    myfree(seen);
+    return ok;
+}
+
+/* (E, ID, P index) order, the kernel's (design 7.10) */
+static int
+is_sorted(const double * E, const int64_t * I, int64_t n)
+{
+    int64_t i;
+    for(i = 1; i < n; i++) {
+        if(E[i] < E[i - 1])
+            return 0;
+        if(E[i] == E[i - 1] && (P[I[i]].ID < P[I[i - 1]].ID || (P[I[i]].ID == P[I[i - 1]].ID && I[i] < I[i - 1])))
+            return 0;
+    }
+    return 1;
+}
+
+static double
+dist_periodic(const double x[3], const double y[3])
+{
+    double r2 = 0;
+    int d;
+    for(d = 0; d < 3; d++) {
+        const double dx = NEAREST(x[d] - y[d], BOXSIZE);
+        r2 += dx * dx;
+    }
+    return sqrt(r2);
+}
+
+/* FNV-1a 64 over a byte range, for the run-to-run checksums below. */
+static uint64_t
+fnv1a(uint64_t h, const void * data, size_t len)
+{
+    const unsigned char * b = (const unsigned char *) data;
+    size_t i;
+    for(i = 0; i < len; i++) {
+        h ^= b[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+/* A checksum of everything the kernel returns for a candidate (Index and Energy over [0, N),
+ * the frame, the counts), printed so that the output of the suite can be diffed between
+ * OMP_NUM_THREADS=1 and 8 (the results must not depend on the thread count). */
+static uint64_t
+cand_checksum(const char * tag, const struct SubCandidate * c)
+{
+    uint64_t h = 0xcbf29ce484222325ULL;
+    h = fnv1a(h, c->Index, sizeof(int64_t) * c->N);
+    h = fnv1a(h, c->Energy, sizeof(double) * c->N);
+    h = fnv1a(h, c->RefPos, sizeof(c->RefPos));
+    h = fnv1a(h, c->RefVel, sizeof(c->RefVel));
+    h = fnv1a(h, &c->Mbound, sizeof(c->Mbound));
+    h = fnv1a(h, &c->Nbound, sizeof(c->Nbound));
+    h = fnv1a(h, &c->NboundTracer, sizeof(c->NboundTracer));
+    h = fnv1a(h, &c->Iterations, sizeof(c->Iterations));
+    message(0, "Checksum %s: N %ld Nbound %ld Iterations %d: %016lx\n", tag, (long) c->N, (long) c->Nbound, c->Iterations,
+            (unsigned long) h);
+    return h;
+}
+
+static int run_candidate_count = 0;
+
+/* Unbind + final pass of a fresh candidate over P[first, first + n). */
+static int
+run_candidate(struct TestCand * t, int64_t first, int64_t n, const double ref[3], const double vel[3], uint64_t seed,
+              const struct SubhaloUnbindParams * up, struct SubhaloArena * arena, int64_t * npos)
+{
+    cand_init(t, first, n, ref, vel, seed);
+    const int alive = subhalo_unbind(&t->c, up, arena);
+    assert_int_equal(arena->used, 0);
+    *npos = 0;
+    if(alive) {
+        /* the bound prefix is in energy order unless the subsampled loop's centre refinement
+         * reordered its head (subhalo_unbind.h) */
+        if(!(up->SampleSize > 0 && t->c.Nbound > up->SampleSize))
+            assert_true(is_sorted(t->c.Energy, t->c.Index, t->c.Nbound));
+        assert_true(is_sorted(t->c.Energy + t->c.Nbound, t->c.Index + t->c.Nbound, t->c.N - t->c.Nbound));
+        int64_t i;
+        for(i = 0; i < t->c.Nbound; i++)
+            assert_true(t->c.Energy[i] < 0);
+        for(i = t->c.Nbound; i < t->c.N; i++)
+            assert_true(t->c.Energy[i] >= 0);
+        const int64_t nb = t->c.Nbound;
+        *npos = subhalo_final_pass(&t->c, up, arena);
+        assert_int_equal(arena->used, 0);
+        assert_int_equal(t->c.Nbound, nb);
+        assert_true(is_sorted(t->c.Energy, t->c.Index, t->c.Nbound));
+    }
+    assert_true(is_permutation(t->c.Index, n, first));
+    char tag[32];
+    snprintf(tag, sizeof(tag), "run_candidate %d", run_candidate_count++);
+    cand_checksum(tag, &t->c);
+    return alive;
+}
+
+/* ------------------------------------------------------------------ test 1 */
+
+static void
+test_hernquist(void ** state)
+{
+    setup_pman(NHALO);
+    make_hernquist(0, NHALO, HQ_M, HQ_A, HQ_RMAX, Centre, Bulk, 4242, 0);
+    struct SubhaloUnbindParams up = default_params();
+    struct SubhaloArena arena = arena_alloc(NHALO);
+    struct TestCand t;
+    int64_t npos;
+    const double t0 = MPI_Wtime();
+    const int alive = run_candidate(&t, 0, NHALO, Centre, Bulk, 7, &up, &arena, &npos);
+    message(0, "Unbind + final pass of %d particles (tree): %.3f s with %d OpenMP threads\n", NHALO, MPI_Wtime() - t0, omp_get_max_threads());
+    assert_true(alive);
+    const double fb = (double) t.c.Nbound / NHALO;
+    message(0, "Hernquist: Nbound %ld / %d = %.4f after %d iterations; final pass E >= 0: %ld; NboundTracer %ld\n",
+            (long) t.c.Nbound, NHALO, fb, t.c.Iterations, (long) npos, (long) t.c.NboundTracer);
+    assert_true(fb >= 0.9);
+    assert_true(npos < 0.01 * t.c.Nbound);
+    assert_int_equal(t.c.NboundTracer, t.c.Nbound);
+    assert_false(t.c.Flags & SUBHALO_FLAG_ITERCAP);
+
+    /* tree against direct summation on the bound set (SampleSize >= N forces the direct sum) */
+    {
+        double * Ed = (double *) mymalloc("TestEd", sizeof(double) * t.c.Nbound);
+        struct SubhaloUnbindParams ud = up;
+        ud.SampleSize = 1 << 30;
+        subhalo_energies(t.c.Index, t.c.Nbound, Ed, t.c.Index, t.c.Nbound, t.c.RefPos, t.c.RefVel, &ud, &arena);
+        double maxrel = 0, sum2 = 0;
+        int64_t i;
+        for(i = 0; i < t.c.Nbound; i++) {
+            /* compare potentials: E - K is common to both */
+            double K = 0;
+            int d;
+            for(d = 0; d < 3; d++) {
+                const double dv = P[t.c.Index[i]].Vel[d] - t.c.RefVel[d];
+                K += 0.5 * dv * dv;
+            }
+            const double rel = fabs((t.c.Energy[i] - K) - (Ed[i] - K)) / fabs(Ed[i] - K);
+            sum2 += rel * rel;
+            if(rel > maxrel) maxrel = rel;
+        }
+        message(0, "Tree (theta 0.45) vs direct potential: rms rel err %.3g, max %.3g\n", sqrt(sum2 / t.c.Nbound), maxrel);
+        assert_true(sqrt(sum2 / t.c.Nbound) < 5e-3);
+        myfree(Ed);
+    }
+
+    /* core and properties */
+    double cp[3], cv[3], sx, sv;
+    subhalo_core(&t.c, &up, 20, cp, cv, &sx, &sv);
+    const double off = dist_periodic(cp, Centre);
+    double voff = 0;
+    int d;
+    for(d = 0; d < 3; d++)
+        voff += (cv[d] - Bulk[d]) * (cv[d] - Bulk[d]);
+    message(0, "Core: offset %.3f kpc/h from the true centre, SigmaX %.3f, |dv| %.2f km/s, SigmaV %.2f\n", off, sx, sqrt(voff), sv);
+    assert_true(off < sx);
+
+    struct SubTrack rec;
+    memset(&rec, 0, sizeof(rec));
+    const double Offset[3] = {0, 0, 0};
+    subhalo_props_hbt(&rec, &t.c, &up, 20, Offset, &arena);
+    assert_int_equal(arena.used, 0);
+    const double vmax_true = sqrt(TEST_G * HQ_M / (4 * HQ_A));
+    message(0, "Props: Vmax %.2f (analytic %.2f, err %.2f%%), Rmax %.2f (analytic %.1f), Ekin %.4g Epot %.4g T/|U| %.3f, Mbound %.3f\n",
+            rec.Vmax, vmax_true, 100 * (rec.Vmax / vmax_true - 1), rec.Rmax, HQ_A, rec.Ekin, rec.Epot, rec.KinToPot, rec.Mbound);
+    assert_true(fabs(rec.Vmax / vmax_true - 1) < 0.05);
+    assert_int_equal(rec.Nbound, t.c.Nbound);
+    assert_true(rec.MostBoundID == P[t.c.Index[0]].ID);
+    for(d = 0; d < 3; d++) {
+        assert_true(rec.CorePos[d] >= 0 && rec.CorePos[d] < BOXSIZE);
+        assert_true(fabs(rec.CoMVel[d] - Bulk[d]) < 10);
+    }
+    /* virial ratio of an equilibrium sphere (2T ~ |W|, i.e. T/|U| ~ 0.5) */
+    assert_true(rec.KinToPot > 0.4 && rec.KinToPot < 0.6);
+
+    /* brute-force Vmax against the sorted-profile maximum */
+    {
+        double best = 0;
+        int64_t i, j;
+        const int64_t nb = t.c.Nbound;
+        double * r = (double *) mymalloc("TestR", sizeof(double) * nb);
+        for(i = 0; i < nb; i++) {
+            r[i] = dist_periodic(P[t.c.Index[i]].Pos, cp);
+            if(r[i] < EPS) r[i] = EPS;
+        }
+        /* O(N^2) on a strided subset of evaluation radii plus the reported Rmax */
+        for(i = 0; i < nb; i += 7) {
+            double M = 0;
+            for(j = 0; j < nb; j++)
+                if(r[j] <= r[i]) M += P[t.c.Index[j]].Mass;
+            if(M / r[i] > best) best = M / r[i];
+        }
+        const double vb = sqrt(TEST_G * best);
+        message(0, "Vmax brute force (subset of radii) %.4f <= sorted profile %.4f\n", vb, rec.Vmax);
+        assert_true(vb <= rec.Vmax * (1 + 1e-6));
+        assert_true(vb >= rec.Vmax * (1 - 2e-3));
+        myfree(r);
+    }
+    /* an offset initial frame (2 kpc/h and 40 km/s off) is recovered by the loop; HBT's loop
+     * never re-admits a particle it removed, so a grossly wrong frame loses particles for good
+     * (0.5 a and 150 km/s off keeps about 82 %): the caller's frame matters */
+    {
+        struct TestCand w;
+        double badpos[3], badvel[3];
+        for(d = 0; d < 3; d++) {
+            badpos[d] = wrapb(Centre[d] + (d == 0 ? 2. : 0));
+            badvel[d] = Bulk[d] + (d == 2 ? 40. : 0);
+        }
+        assert_true(run_candidate(&w, 0, NHALO, badpos, badvel, 7, &up, &arena, &npos));
+        double vo = 0;
+        for(d = 0; d < 3; d++)
+            vo += (w.c.RefVel[d] - t.c.RefVel[d]) * (w.c.RefVel[d] - t.c.RefVel[d]);
+        message(0, "Bad initial frame: Nbound %ld after %d iterations, final CoM %.3g kpc/h and %.3g km/s from the good run's\n",
+                (long) w.c.Nbound, w.c.Iterations, dist_periodic(w.c.RefPos, t.c.RefPos), sqrt(vo));
+        assert_true(labs((long) (w.c.Nbound - t.c.Nbound)) <= 0.01 * t.c.Nbound);
+        assert_true(dist_periodic(w.c.RefPos, t.c.RefPos) < 0.05 * HQ_A);
+        cand_free(&w);
+    }
+    cand_free(&t);
+    myfree(arena.base);
+    teardown_pman();
+}
+
+/* ------------------------------------------------------------------ test 2 */
+
+#define NSHELL 2000
+
+static void
+test_unbound_shell(void ** state)
+{
+    setup_pman(NHALO + NSHELL);
+    const double m = make_hernquist(0, NHALO, HQ_M, HQ_A, HQ_RMAX, Centre, Bulk, 4242, 0);
+    struct SubhaloUnbindParams up = default_params();
+    struct SubhaloArena arena = arena_alloc(NHALO + NSHELL);
+
+    /* reference: the halo alone */
+    struct TestCand t1;
+    int64_t npos;
+    assert_true(run_candidate(&t1, 0, NHALO, Centre, Bulk, 7, &up, &arena, &npos));
+    const int64_t nb1 = t1.c.Nbound;
+    char * bound1 = (char *) mymalloc("TestBound1", NHALO);
+    memset(bound1, 0, NHALO);
+    int64_t i;
+    for(i = 0; i < nb1; i++)
+        bound1[t1.c.Index[i]] = 1;
+
+    /* shell at 3 a, twice the escape speed of halo + shell there, isotropic directions */
+    gsl_rng * rng = gsl_rng_alloc(gsl_rng_mt19937);
+    gsl_rng_set(rng, 99);
+    const double rs = 3 * HQ_A;
+    const double vesc = sqrt(2 * (TEST_G * HQ_M / (rs + HQ_A) + TEST_G * NSHELL * m / rs));
+    int d;
+    for(i = NHALO; i < NHALO + NSHELL; i++) {
+        double ux[3], uv[3];
+        random_direction(rng, ux);
+        random_direction(rng, uv);
+        memset(&P[i], 0, sizeof(P[i]));
+        P[i].Type = 1;
+        P[i].Mass = m;
+        P[i].ID = i;
+        for(d = 0; d < 3; d++) {
+            P[i].Pos[d] = wrapb(Centre[d] + rs * ux[d]);
+            P[i].Vel[d] = Bulk[d] + 2 * vesc * uv[d];
+        }
+    }
+    gsl_rng_free(rng);
+
+    struct TestCand t2;
+    assert_true(run_candidate(&t2, 0, NHALO + NSHELL, Centre, Bulk, 7, &up, &arena, &npos));
+    int64_t shell_bound = 0, only1 = 0, only2 = 0;
+    char * bound2 = (char *) mymalloc("TestBound2", NHALO + NSHELL);
+    memset(bound2, 0, NHALO + NSHELL);
+    for(i = 0; i < t2.c.Nbound; i++) {
+        bound2[t2.c.Index[i]] = 1;
+        if(t2.c.Index[i] >= NHALO)
+            shell_bound++;
+    }
+    for(i = 0; i < NHALO; i++) {
+        if(bound1[i] && !bound2[i]) only1++;
+        if(!bound1[i] && bound2[i]) only2++;
+    }
+    message(0, "Shell: Nbound %ld (halo alone %ld), shell particles bound %ld, halo particles bound only alone %ld, only with shell %ld, final pass E >= 0: %ld\n",
+            (long) t2.c.Nbound, (long) nb1, (long) shell_bound, (long) only1, (long) only2, (long) npos);
+    assert_int_equal(shell_bound, 0);
+    assert_true(labs((long) (t2.c.Nbound - nb1)) <= 0.01 * nb1);
+    assert_true(only1 + only2 <= 0.01 * nb1);
+    assert_true(t2.c.Iterations > 1);
+    assert_true(t2.c.ConvergenceRatio >= up.BoundMassPrecision && t2.c.ConvergenceRatio <= 1);
+    assert_int_equal(t2.c.NboundPositive, npos);
+
+    /* the same with the potential subsampled (test 3's setting) */
+    {
+        struct TestCand t3;
+        struct SubhaloUnbindParams us = up;
+        us.SampleSize = 1000;
+        assert_true(run_candidate(&t3, 0, NHALO + NSHELL, Centre, Bulk, 31, &us, &arena, &npos));
+        int64_t sb = 0;
+        for(i = 0; i < t3.c.Nbound; i++)
+            if(t3.c.Index[i] >= NHALO)
+                sb++;
+        message(0, "Shell, subsampled 1000: Nbound %ld, shell particles bound %ld, iterations %d, final pass E >= 0: %ld\n",
+                (long) t3.c.Nbound, (long) sb, t3.c.Iterations, (long) npos);
+        assert_int_equal(sb, 0);
+        assert_true(labs((long) (t3.c.Nbound - nb1)) <= 0.02 * nb1);
+        cand_free(&t3);
+    }
+    /* iteration cap: one iteration, flagged, accepted as is */
+    {
+        struct TestCand t4;
+        struct SubhaloUnbindParams uc = up;
+        uc.MaxIter = 1;
+        cand_init(&t4, 0, NHALO + NSHELL, Centre, Bulk, 7);
+        assert_true(subhalo_unbind(&t4.c, &uc, &arena));
+        message(0, "Iteration cap 1: Nbound %ld, Flags %d\n", (long) t4.c.Nbound, t4.c.Flags);
+        assert_int_equal(t4.c.Iterations, 1);
+        assert_true(t4.c.Flags & SUBHALO_FLAG_ITERCAP);
+        /* the cap diagnostic: Nbound / Nlast of the capped iteration, below the precision */
+        message(0, "Iteration cap 1: ConvergenceRatio %.4f, NboundPositive %ld before the final pass\n",
+                t4.c.ConvergenceRatio, (long) t4.c.NboundPositive);
+        assert_true(t4.c.ConvergenceRatio == (double) t4.c.Nbound / (double) (NHALO + NSHELL));
+        assert_true(t4.c.ConvergenceRatio < uc.BoundMassPrecision);
+        assert_int_equal(t4.c.NboundPositive, -1);
+        const int64_t np4 = subhalo_final_pass(&t4.c, &uc, &arena);
+        assert_int_equal(t4.c.NboundPositive, np4);
+        assert_true(is_sorted(t4.c.Energy, t4.c.Index, t4.c.Nbound));
+        cand_checksum("iteration cap 1", &t4.c);
+        cand_free(&t4);
+    }
+    myfree(bound2);
+    cand_free(&t2);
+    myfree(bound1);
+    cand_free(&t1);
+    myfree(arena.base);
+    teardown_pman();
+}
+
+/* ------------------------------------------------------------------ test 3 */
+
+static void
+test_subsampling(void ** state)
+{
+    setup_pman(NHALO);
+    make_hernquist(0, NHALO, HQ_M, HQ_A, HQ_RMAX, Centre, Bulk, 4242, 0);
+    struct SubhaloUnbindParams up = default_params();
+    struct SubhaloArena arena = arena_alloc(NHALO);
+    struct TestCand t0;
+    int64_t npos;
+    assert_true(run_candidate(&t0, 0, NHALO, Centre, Bulk, 7, &up, &arena, &npos));
+    const int64_t nb0 = t0.c.Nbound;
+
+    struct SubhaloUnbindParams us = up;
+    us.SampleSize = 1000;
+    struct TestCand a, b, c;
+    cand_init(&a, 0, NHALO, Centre, Bulk, 12345);
+    cand_init(&b, 0, NHALO, Centre, Bulk, 12345);
+    cand_init(&c, 0, NHALO, Centre, Bulk, 54321);
+    assert_true(subhalo_unbind(&a.c, &us, &arena));
+    assert_true(subhalo_unbind(&b.c, &us, &arena));
+    assert_true(subhalo_unbind(&c.c, &us, &arena));
+    assert_int_equal(arena.used, 0);
+    cand_checksum("subsampled seed 12345", &a.c);
+    cand_checksum("subsampled seed 54321", &c.c);
+    assert_int_equal(a.c.Nbound, b.c.Nbound);
+    assert_memory_equal(a.Index, b.Index, sizeof(int64_t) * NHALO);
+    assert_memory_equal(a.Energy, b.Energy, sizeof(double) * NHALO);
+    assert_memory_equal(a.c.RefPos, b.c.RefPos, sizeof(double) * 3);
+    const int differs = memcmp(a.Index, c.Index, sizeof(int64_t) * NHALO) != 0;
+    assert_true(differs);
+    assert_true(is_permutation(a.Index, NHALO, 0));
+    message(0, "Subsampled (1000): Nbound %ld (seed 12345, twice identical) and %ld (seed 54321), exact %ld; iterations %d\n",
+            (long) a.c.Nbound, (long) c.c.Nbound, (long) nb0, a.c.Iterations);
+    assert_true(labs((long) (a.c.Nbound - nb0)) <= 0.02 * nb0);
+    assert_true(labs((long) (c.c.Nbound - nb0)) <= 0.02 * nb0);
+    /* refinement: the most bound particle agrees with the exact run's */
+    const int64_t np = subhalo_final_pass(&a.c, &us, &arena);
+    cand_checksum("subsampled final pass", &a.c);
+    message(0, "Subsampled final pass: E >= 0 for %ld; most bound %ld (exact run %ld)\n", (long) np, (long) a.Index[0], (long) t0.Index[0]);
+    assert_true(np < 0.01 * a.c.Nbound);
+    cand_free(&c);
+    cand_free(&b);
+    cand_free(&a);
+    cand_free(&t0);
+    myfree(arena.base);
+    teardown_pman();
+}
+
+/* ------------------------------------------------------------------ test 4 */
+
+#define NSAT 2000
+
+static void
+test_satellite(void ** state)
+{
+    setup_pman(NHALO + NSAT);
+    make_hernquist(0, NHALO, HQ_M, HQ_A, HQ_RMAX, Centre, Bulk, 4242, 0);
+    const double Ms = HQ_M / 10, as = HQ_A / 4;
+    double scen[3], svel[3];
+    int d;
+    const double vc = sqrt(TEST_G * HQ_M * 4. / 9. / (2 * HQ_A));   /* circular speed at 2 a */
+    for(d = 0; d < 3; d++) {
+        scen[d] = wrapb(Centre[d] + (d == 0 ? 2 * HQ_A : 0));
+        svel[d] = Bulk[d] + (d == 1 ? vc : 0);
+    }
+    make_hernquist(NHALO, NSAT, Ms, as, 30 * as, scen, svel, 777, NHALO);
+    struct SubhaloUnbindParams up = default_params();
+    struct SubhaloArena arena = arena_alloc(NHALO + NSAT);
+    int64_t npos, i;
+
+    /* host alone, for reference */
+    struct TestCand h0;
+    assert_true(run_candidate(&h0, 0, NHALO, Centre, Bulk, 7, &up, &arena, &npos));
+
+    /* the satellite: its own particles plus the host particles within 15 kpc/h of its centre
+     * (inside its Jacobi radius, about 17 kpc/h), in its own frame */
+    struct TestCand s;
+    int64_t nin = 0;
+    for(i = 0; i < NHALO; i++)
+        if(dist_periodic(P[i].Pos, scen) < 15.)
+            nin++;
+    cand_init(&s, NHALO, NSAT + nin, scen, svel, 8);
+    nin = 0;
+    for(i = 0; i < NHALO; i++)
+        if(dist_periodic(P[i].Pos, scen) < 15.)
+            s.Index[NSAT + nin++] = i;
+    assert_true(subhalo_unbind(&s.c, &up, &arena));
+    npos = subhalo_final_pass(&s.c, &up, &arena);
+    cand_checksum("satellite", &s.c);
+    int64_t sat_own = 0;
+    for(i = 0; i < s.c.Nbound; i++)
+        if(s.c.Index[i] >= NHALO)
+            sat_own++;
+    const int64_t captured = s.c.Nbound - sat_own;
+    const int64_t nrem = s.c.N - s.c.Nbound;
+    message(0, "Satellite (+%ld host particles in its source): Nbound %ld, own %ld / %d, captured host particles %ld, remainder %ld, final pass E >= 0: %ld\n",
+            (long) nin, (long) s.c.Nbound, (long) sat_own, NSAT, (long) captured, (long) nrem, (long) npos);
+    assert_true(sat_own > 0.8 * NSAT);
+    assert_true(nrem > 0.5 * nin);
+
+    /* the host: its particles not in the satellite's source, plus the satellite's whole
+     * unbound remainder appended (post-order unbinding) */
+    char * insat = (char *) mymalloc("TestInSat", NHALO + NSAT);
+    memset(insat, 0, NHALO + NSAT);
+    for(i = 0; i < s.c.N; i++)
+        insat[s.c.Index[i]] = 1;
+    struct TestCand h;
+    cand_init(&h, 0, NHALO - nin + nrem, Centre, Bulk, 9);
+    int64_t k = 0;
+    for(i = 0; i < NHALO; i++)
+        if(!insat[i])
+            h.Index[k++] = i;
+    for(i = 0; i < nrem; i++)
+        h.Index[k++] = s.c.Index[s.c.Nbound + i];
+    assert_int_equal(k, h.c.N);
+    assert_true(subhalo_unbind(&h.c, &up, &arena));
+    npos = subhalo_final_pass(&h.c, &up, &arena);
+    cand_checksum("host + remainder", &h.c);
+    int64_t host_bound = 0, sat_in_host = 0;
+    for(i = 0; i < h.c.Nbound; i++) {
+        if(h.c.Index[i] < NHALO)
+            host_bound++;
+        else
+            sat_in_host++;
+    }
+    message(0, "Host + remainder: Nbound %ld (host particles %ld + captured %ld = %ld; host alone %ld; satellite particles %ld), final pass E >= 0: %ld\n",
+            (long) h.c.Nbound, (long) host_bound, (long) captured, (long) (host_bound + captured), (long) h0.c.Nbound,
+            (long) sat_in_host, (long) npos);
+    assert_true(labs((long) (host_bound + captured - h0.c.Nbound)) <= 0.01 * h0.c.Nbound);
+
+    /* sinking: satellite core far from the host core in phase space */
+    double sp[3], sv[3], ssx, ssv, hp[3], hv[3], hsx, hsv;
+    subhalo_core(&s.c, &up, 20, sp, sv, &ssx, &ssv);
+    subhalo_core(&h.c, &up, 20, hp, hv, &hsx, &hsv);
+    message(0, "Cores: satellite at %.2f kpc/h from the host core, host SigmaX %.3f SigmaV %.2f, satellite SigmaX %.3f SigmaV %.2f\n",
+            dist_periodic(sp, hp), hsx, hsv, ssx, ssv);
+    assert_int_equal(subhalo_sink_test(sp, sv, hp, hv, hsx, hsv, ssx, ssv, 0, BOXSIZE), 0);
+    assert_int_equal(subhalo_sink_test(sp, sv, hp, hv, hsx, hsv, ssx, ssv, 1, BOXSIZE), 0);
+
+    /* move the satellite rigidly onto the host core with the host core velocity */
+    for(i = NHALO; i < NHALO + NSAT; i++)
+        for(d = 0; d < 3; d++) {
+            P[i].Pos[d] = wrapb(P[i].Pos[d] + NEAREST(hp[d] - sp[d], BOXSIZE));
+            P[i].Vel[d] += hv[d] - sv[d];
+        }
+    subhalo_core(&s.c, &up, 20, sp, sv, &ssx, &ssv);
+    message(0, "Moved satellite: core offset %.3g, |dv| %.3g\n", dist_periodic(sp, hp),
+            sqrt((sv[0] - hv[0]) * (sv[0] - hv[0]) + (sv[1] - hv[1]) * (sv[1] - hv[1]) + (sv[2] - hv[2]) * (sv[2] - hv[2])));
+    assert_int_equal(subhalo_sink_test(sp, sv, hp, hv, hsx, hsv, ssx, ssv, 0, BOXSIZE), 1);
+    assert_int_equal(subhalo_sink_test(sp, sv, hp, hv, hsx, hsv, ssx, ssv, 1, BOXSIZE), 1);
+
+    cand_free(&h);
+    myfree(insat);
+    cand_free(&s);
+    cand_free(&h0);
+    myfree(arena.base);
+    teardown_pman();
+}
+
+/* ------------------------------------------------------------------ extra checks */
+
+/* The same physical system at a = 0.5 with H = 0.2 (comoving positions x / a, softening h / a,
+ * Vel = a (v - H a dx)) has the same energies: checks the G / a, Vel / a and H a dx terms. */
+static void
+test_scale_factor(void ** state)
+{
+    const int64_t n = 3000;
+    setup_pman(n);
+    make_hernquist(0, n, 10., 5., 100., Centre, Bulk, 21, 0);
+    struct SubhaloUnbindParams up = default_params();
+    struct SubhaloArena arena = arena_alloc(n);
+    struct TestCand t;
+    cand_init(&t, 0, n, Centre, Bulk, 1);
+    double * E1 = (double *) mymalloc("TestE1", sizeof(double) * n);
+    subhalo_energies(t.Index, n, E1, t.Index, n, Centre, Bulk, &up, &arena);
+
+    const double a = 0.5, H = 0.2;
+    struct SubhaloUnbindParams ua = up;
+    ua.atime = a;
+    ua.Hubble = H;
+    ua.h = up.h / a;
+    int64_t i;
+    int d;
+    double refvel[3];
+    for(d = 0; d < 3; d++)
+        refvel[d] = a * Bulk[d];
+    for(i = 0; i < n; i++)
+        for(d = 0; d < 3; d++) {
+            const double dx = NEAREST(P[i].Pos[d] - Centre[d], BOXSIZE) / a;   /* comoving */
+            P[i].Pos[d] = wrapb(Centre[d] + dx);
+            P[i].Vel[d] = a * (P[i].Vel[d] - H * a * dx);
+        }
+    double * E2 = (double *) mymalloc("TestE2", sizeof(double) * n);
+    subhalo_energies(t.Index, n, E2, t.Index, n, Centre, refvel, &ua, &arena);
+    double maxrel = 0;
+    for(i = 0; i < n; i++) {
+        const double rel = fabs(E2[i] - E1[i]) / fabs(E1[i]);
+        if(rel > maxrel) maxrel = rel;
+    }
+    message(0, "a = 0.5, H = 0.2 against a = 1, H = 0: max relative energy difference %.3g\n", maxrel);
+    assert_true(maxrel < 1e-9);
+    myfree(E2);
+    myfree(E1);
+    cand_free(&t);
+    myfree(arena.base);
+    teardown_pman();
+}
+
+
+/* Thermal energy (WithThermal): gas energies gain exactly u = Entropy / (gamma - 1) (rho / a^3)^(gamma - 1)
+ * (petaio.c GTInternalEnergy), and hot gas is unbound while cold gas and dark matter stay. */
+static void
+test_thermal(void ** state)
+{
+    const int64_t n = 4000;
+    particle_alloc_memory(PartManager, BOXSIZE, n);
+    PartManager->NumPart = n;
+    slots_init(0.01 * PartManager->MaxPart, SlotsManager);
+    slots_set_enabled(0, sizeof(struct sph_particle_data), SlotsManager);
+    int64_t ngas = 0, i;
+    for(i = 0; i < n; i++)
+        if(i % 4 == 0)
+            ngas++;
+    int64_t atleast[6] = {ngas, 0, 0, 0, 0, 0};
+    slots_reserve(1, atleast, SlotsManager);
+    SlotsManager->info[0].size = ngas;
+    make_hernquist(0, n, 10., 5., 100., Centre, Bulk, 33, 0);
+    int64_t g = 0;
+    for(i = 0; i < n; i++) {
+        if(i % 4)
+            continue;
+        P[i].Type = 0;
+        P[i].PI = g;
+        const double u = (g % 2) ? 1e6 : 1.;   /* hot: sqrt(2 u) = 1414 km/s, far above escape */
+        SphP[g].Density = 2.0;
+        SphP[g].Entropy = u * GAMMA_MINUS1 / pow(2.0, GAMMA_MINUS1);
+        g++;
+    }
+    struct SubhaloUnbindParams up = default_params();
+    struct SubhaloArena arena = arena_alloc(n);
+    struct TestCand t;
+    cand_init(&t, 0, n, Centre, Bulk, 1);
+    double * E0 = (double *) mymalloc("TestE0", sizeof(double) * n);
+    double * E1 = (double *) mymalloc("TestE1", sizeof(double) * n);
+    subhalo_energies(t.Index, n, E0, t.Index, n, Centre, Bulk, &up, &arena);
+    struct SubhaloUnbindParams ut = up;
+    ut.WithThermal = 1;
+    subhalo_energies(t.Index, n, E1, t.Index, n, Centre, Bulk, &ut, &arena);
+    double maxerr = 0;
+    for(i = 0; i < n; i++) {
+        const double u = P[i].Type == 0 ? ((P[i].PI % 2) ? 1e6 : 1.) : 0;
+        const double err = fabs(E1[i] - E0[i] - u) / (u > 0 ? u : 1);
+        if(err > maxerr) maxerr = err;
+    }
+    message(0, "Thermal: max relative error of E(thermal) - E = u: %.3g\n", maxerr);
+    assert_true(maxerr < 1e-9);
+    assert_true(subhalo_unbind(&t.c, &ut, &arena));
+    subhalo_final_pass(&t.c, &ut, &arena);
+    int64_t hot = 0, cold = 0, dm = 0;
+    for(i = 0; i < t.c.Nbound; i++) {
+        const int64_t p = t.c.Index[i];
+        if(P[p].Type != 0) dm++;
+        else if(P[p].PI % 2) hot++;
+        else cold++;
+    }
+    message(0, "Thermal unbinding: bound DM %ld / %ld, cold gas %ld / %ld, hot gas %ld / %ld\n",
+            (long) dm, (long) (n - ngas), (long) cold, (long) ((ngas + 1) / 2), (long) hot, (long) (ngas / 2));
+    assert_int_equal(hot, 0);
+    assert_true(cold > 0.95 * ((ngas + 1) / 2));
+    assert_true(dm > 0.95 * (n - ngas));
+    myfree(E1);
+    myfree(E0);
+    cand_free(&t);
+    myfree(arena.base);
+    slots_free(SlotsManager);
+    myfree(PartManager->Base);
+    PartManager->Base = NULL;
+    PartManager->NumPart = 0;
+}
+
+/* ------------------------------------------------------------------ adversarial oracles (audit J5, J6, J10, item 6) */
+
+static void
+set_particle(int64_t i, int type, double mass, MyIDType id, double x, double y, double z)
+{
+    memset(&P[i], 0, sizeof(P[i]));
+    P[i].Type = type;
+    P[i].Mass = mass;
+    P[i].ID = id;
+    P[i].Pos[0] = x;
+    P[i].Pos[1] = y;
+    P[i].Pos[2] = z;
+}
+
+static struct SubhaloArena
+arena_bytes(size_t bytes)
+{
+    struct SubhaloArena a;
+    a.size = bytes;
+    a.used = 0;
+    a.base = (char *) mymalloc("TestArena", a.size);
+    return a;
+}
+
+static double
+wrapl(double x, double L)
+{
+    while(x >= L) x -= L;
+    while(x < 0) x += L;
+    return x;
+}
+
+/* The squared periodic separation, in the kernel's operand order. */
+static double
+pr2(const double x[3], const double y[3], double L)
+{
+    const double ex = NEAREST(x[0] - y[0], L);
+    const double ey = NEAREST(x[1] - y[1], L);
+    const double ez = NEAREST(x[2] - y[2], L);
+    return ex * ex + ey * ey + ez * ez;
+}
+
+/* (d2, ID, P index) order */
+static int
+nb_better(double d2, int64_t p, double d2w, int64_t pw)
+{
+    return d2 < d2w || (d2 == d2w && (P[p].ID < P[pw].ID || (P[p].ID == P[pw].ID && p < pw)));
+}
+
+/* The k nearest of tr[0, nt) to P[q] by brute force, ordered by (d2, ID, P index). */
+static void
+knn_brute(int64_t q, const int64_t * tr, int64_t nt, int k, double L, int64_t * res)
+{
+    double bd[SUBHALO_KNN_MAXK];
+    int64_t bi[SUBHALO_KNN_MAXK];
+    int nb = 0, a;
+    int64_t j;
+    for(j = 0; j < nt; j++) {
+        const int64_t p = tr[j];
+        const double r2 = pr2(P[p].Pos, P[q].Pos, L);
+        if(nb == k && !nb_better(r2, p, bd[k - 1], bi[k - 1]))
+            continue;
+        a = nb < k ? nb++ : k - 1;
+        while(a > 0 && nb_better(r2, p, bd[a - 1], bi[a - 1])) {
+            bd[a] = bd[a - 1];
+            bi[a] = bi[a - 1];
+            a--;
+        }
+        bd[a] = r2;
+        bi[a] = p;
+    }
+    for(a = 0; a < k; a++)
+        res[a] = a < nb ? bi[a] : -1;
+}
+
+/* Periodic gravity (J5). The audit's minimal case: box 10, frame origin 0, particles at 4.9 and
+ * 5.1 (separation 0.2, 9.8 if unwrapped about the origin), by direct sum and by the tree, with
+ * velocities that bind the pair only at the periodic separation. Then a tree-sized clump
+ * straddling the unwrap cut of the frame in every axis plus a uniform background over the
+ * whole box, mixed masses, against a periodic brute force. */
+static void
+test_periodic_gravity(void ** state)
+{
+    const int64_t nc = 4000, nbg = 1000, n = nc + nbg;
+    setup_pman(n);
+    const double zero[3] = {0, 0, 0};
+    struct SubhaloArena arena = arena_alloc(n);
+    int path;
+    {
+        struct SubhaloUnbindParams up = default_params();
+        up.BoxSize = 10;
+        up.h = 0.01;
+        up.MinNumPart = 2;
+        up.MinNumTracerPart = 2;
+        const double w = sqrt(2 * TEST_G);   /* 0.5 w^2 = G m / 1: bound at r = 0.2, not at 9.8 */
+        set_particle(0, 1, 1., 7, 4.9, 0, 0);
+        set_particle(1, 1, 1., 3, 5.1, 0, 0);
+        P[0].Vel[1] = w;
+        P[1].Vel[1] = -w;
+        int64_t idx[2] = {0, 1};
+        double E[2];
+        for(path = 0; path < 2; path++) {
+            struct SubhaloUnbindParams u = up;
+            u.SampleSize = path ? 0 : 1 << 30;   /* direct sum, then the tree */
+            subhalo_energies(idx, 2, E, idx, 2, zero, zero, &u, &arena);
+            const double expect = 0.5 * w * w - TEST_G / 0.2;
+            message(0, "Periodic pair (%s): E %.6g %.6g, expected %.6g (unwrapped about the origin: %.6g)\n",
+                    path ? "tree" : "direct", E[0], E[1], expect, 0.5 * w * w - TEST_G / 9.8);
+            assert_true(fabs(E[0] / expect - 1) < 1e-9);
+            assert_true(fabs(E[1] / expect - 1) < 1e-9);
+            struct TestCand t;
+            cand_init(&t, 0, 2, zero, zero, 1);
+            assert_true(subhalo_unbind(&t.c, &u, &arena));
+            assert_int_equal(t.c.Nbound, 2);
+            assert_int_equal(subhalo_final_pass(&t.c, &u, &arena), 0);
+            assert_true(fabs(NEAREST(t.c.RefPos[0] - 5.0, 10.)) < 1e-12);
+            assert_int_equal(arena.used, 0);
+            cand_free(&t);
+        }
+    }
+    {
+        const double L = 100, h = 0.1;
+        struct SubhaloUnbindParams up = default_params();
+        up.BoxSize = L;
+        up.h = h;
+        gsl_rng * rng = gsl_rng_alloc(gsl_rng_mt19937);
+        gsl_rng_set(rng, 17);
+        int64_t i, j;
+        int d;
+        for(i = 0; i < n; i++) {
+            double x[3];
+            for(d = 0; d < 3; d++)
+                x[d] = i < nc ? wrapl(L / 2 + 4 * gsl_ran_gaussian(rng, 1.0), L) : L * gsl_rng_uniform(rng);
+            set_particle(i, 1, 0.5 + 1.5 * gsl_rng_uniform(rng), 1 + i, x[0], x[1], x[2]);
+        }
+        gsl_rng_free(rng);
+        double * phi = (double *) mymalloc("TestPhi", sizeof(double) * n);
+        double * E = (double *) mymalloc("TestE", sizeof(double) * n);
+        int64_t * idx = (int64_t *) mymalloc("TestIdx", sizeof(int64_t) * n);
+        for(i = 0; i < n; i++)
+            idx[i] = i;
+        #pragma omp parallel for private(j)
+        for(i = 0; i < n; i++) {
+            double sum = 0;
+            for(j = 0; j < n; j++)
+                if(j != i)
+                    sum += P[j].Mass * grav_spline_potential(sqrt(pr2(P[j].Pos, P[i].Pos, L)), h);
+            phi[i] = -TEST_G * sum;
+        }
+        for(path = 0; path < 2; path++) {
+            struct SubhaloUnbindParams u = up;
+            u.SampleSize = path ? 0 : 1 << 30;
+            subhalo_energies(idx, n, E, idx, n, zero, zero, &u, &arena);
+            assert_int_equal(arena.used, 0);
+            double maxrel = 0, sum2 = 0, sumc = 0;
+            for(i = 0; i < n; i++) {
+                const double rel = fabs(E[i] / phi[i] - 1);
+                if(rel > maxrel) maxrel = rel;
+                sum2 += rel * rel;
+                if(i < nc) sumc += rel * rel;
+            }
+            message(0, "Periodic clump across the frame's cut + background (%s): rms rel err %.3g (clump %.3g), max %.3g\n",
+                    path ? "tree" : "direct", sqrt(sum2 / n), sqrt(sumc / nc), maxrel);
+            if(path == 0)
+                assert_true(maxrel < 1e-10);
+            else {
+                assert_true(sqrt(sum2 / n) < 5e-3);
+                assert_true(maxrel < 5e-2);
+            }
+        }
+        myfree(idx);
+        myfree(E);
+        myfree(phi);
+    }
+    myfree(arena.base);
+    teardown_pman();
+}
+
+/* k nearest tracers (J5, J10): the audit's minimal cut, an exact tie with the larger ID first
+ * in P, and a tree-sized set (origin tracer at 0, half the tracers and queries in a cube around
+ * the antipode, half uniform, integer coordinates for exact ties, scrambled IDs) against the
+ * periodic brute force with (d2, ID, index) order; a tree built once and queried in batches
+ * gives the same rows with one build. */
+static void
+test_knn(void ** state)
+{
+    const int64_t nt = 4000, nq = 1000, n = nt + nq;
+    const int k = 10;
+    setup_pman(n);
+    struct SubhaloArena arena = arena_bytes(128 * nt + 4096);
+    int64_t tr2[2] = {0, 1}, q1 = 2, out2[2];
+
+    /* minimal cut: box 10, tracers at 0 and 4.9, query at 5.1 */
+    set_particle(0, 1, 1, 1, 0, 0, 0);
+    set_particle(1, 1, 1, 2, 4.9, 0, 0);
+    set_particle(2, 0, 1, 3, 5.1, 0, 0);
+    subhalo_knn_tracers(&q1, 1, tr2, 2, 1, out2, 10., &arena);
+    assert_int_equal(out2[0], 1);
+    subhalo_knn_tracers(&q1, 1, tr2, 2, 2, out2, 10., &arena);
+    assert_int_equal(out2[0], 1);
+    assert_int_equal(out2[1], 0);
+    /* exact tie: IDs 900 (first in P) and 100 at distance 1 */
+    set_particle(0, 1, 1, 900, 4, 5, 5);
+    set_particle(1, 1, 1, 100, 6, 5, 5);
+    set_particle(2, 0, 1, 5, 5, 5, 5);
+    subhalo_knn_tracers(&q1, 1, tr2, 2, 1, out2, 10., &arena);
+    assert_int_equal(out2[0], 1);
+    subhalo_knn_tracers(&q1, 1, tr2, 2, 2, out2, 10., &arena);
+    assert_int_equal(out2[0], 1);
+    assert_int_equal(out2[1], 0);
+    /* no tracers: padded */
+    {
+        const struct SubhaloKnnTree * kt = subhalo_knn_build(tr2, 0, 10., &arena);
+        out2[0] = out2[1] = 7;
+        subhalo_knn_query(kt, &q1, 1, 2, out2);
+        assert_int_equal(out2[0], -1);
+        assert_int_equal(out2[1], -1);
+        arena.used = 0;
+    }
+    assert_int_equal(arena.used, 0);
+
+    /* tree-sized */
+    const double L = 1000;
+    gsl_rng * rng = gsl_rng_alloc(gsl_rng_mt19937);
+    gsl_rng_set(rng, 5);
+    int64_t i, a;
+    int d;
+    for(i = 0; i < n; i++) {
+        const int64_t j = i < nt ? i : i - nt;
+        const int64_t half = i < nt ? nt / 2 : nq / 2;
+        double x[3];
+        for(d = 0; d < 3; d++)
+            x[d] = i == 0 ? 0 : (j < half ? 450 + floor(100 * gsl_rng_uniform(rng)) : floor(L * gsl_rng_uniform(rng)));
+        set_particle(i, i < nt ? 1 : 0, 1, 1 + (i * 7919) % n, x[0], x[1], x[2]);
+    }
+    gsl_rng_free(rng);
+    int64_t * tr = (int64_t *) mymalloc("TestTr", sizeof(int64_t) * nt);
+    int64_t * q = (int64_t *) mymalloc("TestQ", sizeof(int64_t) * nq);
+    int64_t * out = (int64_t *) mymalloc("TestOut", sizeof(int64_t) * nq * k);
+    int64_t * out_b = (int64_t *) mymalloc("TestOutB", sizeof(int64_t) * nq * k);
+    for(i = 0; i < nt; i++)
+        tr[i] = i;
+    for(i = 0; i < nq; i++)
+        q[i] = nt + i;
+    subhalo_knn_tracers(q, nq, tr, nt, k, out, L, &arena);
+    assert_int_equal(arena.used, 0);
+    int64_t bad = 0, ties = 0, idties = 0;
+    for(i = 0; i < nq; i++) {
+        int64_t bi[SUBHALO_KNN_MAXK];
+        knn_brute(q[i], tr, nt, k, L, bi);
+        for(a = 0; a < k; a++) {
+            if(out[i * k + a] != bi[a])
+                bad++;
+            if(a > 0 && pr2(P[bi[a]].Pos, P[q[i]].Pos, L) == pr2(P[bi[a - 1]].Pos, P[q[i]].Pos, L)) {
+                ties++;
+                if(bi[a] < bi[a - 1])
+                    idties++;   /* the ID order disagrees with the P order */
+            }
+        }
+    }
+    message(0, "kNN across the cut: %ld mismatches against the periodic brute force over %ld queries x %d (%ld exact ties, %ld against P order)\n",
+            (long) bad, (long) nq, k, (long) ties, (long) idties);
+    assert_int_equal(bad, 0);
+    assert_true(idties > 0);
+
+    /* one build, batched queries */
+    const int64_t nb0 = subhalo_knn_build_count();
+    const struct SubhaloKnnTree * kt = subhalo_knn_build(tr, nt, L, &arena);
+    for(i = 0; i < nq; i += 37)
+        subhalo_knn_query(kt, q + i, nq - i < 37 ? nq - i : 37, k, out_b + i * k);
+    arena.used = 0;
+    assert_int_equal(subhalo_knn_build_count(), nb0 + 1);
+    assert_memory_equal(out, out_b, sizeof(int64_t) * nq * k);
+
+    myfree(out_b);
+    myfree(out);
+    myfree(q);
+    myfree(tr);
+    myfree(arena.base);
+    teardown_pman();
+}
+
+/* Reassignment scaling (J6, audit item 7): one tree per key queried in 256-query batches, as the
+ * driver does, against the former rebuild per batch; the build counter and the times. */
+static void
+test_knn_scaling(void ** state)
+{
+    const int64_t sizes[2] = {10000, 40000};
+    const int k = 8, B = 256;
+    int s;
+    for(s = 0; s < 2; s++) {
+        const int64_t nt = sizes[s], nq = sizes[s], n = nt + nq;
+        setup_pman(n);
+        gsl_rng * rng = gsl_rng_alloc(gsl_rng_mt19937);
+        gsl_rng_set(rng, 77 + s);
+        int64_t i;
+        for(i = 0; i < n; i++) {
+            double x[3];
+            int d;
+            for(d = 0; d < 3; d++)
+                x[d] = wrapb(Centre[d] + 300 * (gsl_rng_uniform(rng) - 0.5));
+            set_particle(i, i < nt ? 1 : 0, 1, 1 + i, x[0], x[1], x[2]);
+        }
+        gsl_rng_free(rng);
+        int64_t * tr = (int64_t *) mymalloc("TestTr", sizeof(int64_t) * nt);
+        int64_t * q = (int64_t *) mymalloc("TestQ", sizeof(int64_t) * nq);
+        int64_t * out = (int64_t *) mymalloc("TestOut", sizeof(int64_t) * nq * k);
+        for(i = 0; i < nt; i++)
+            tr[i] = i;
+        for(i = 0; i < nq; i++)
+            q[i] = nt + i;
+        struct SubhaloArena arena = arena_bytes(128 * nt + 4096);
+        const int64_t c0 = subhalo_knn_build_count();
+        double t0 = MPI_Wtime();
+        const struct SubhaloKnnTree * kt = subhalo_knn_build(tr, nt, BOXSIZE, &arena);
+        const double tb = MPI_Wtime() - t0;
+        for(i = 0; i < nq; i += B)
+            subhalo_knn_query(kt, q + i, nq - i < B ? nq - i : B, k, out + i * k);
+        const double t1 = MPI_Wtime() - t0;
+        /* all queries in one call: split over OpenMP threads (nq > 4096), same rows */
+        {
+            int64_t * outp = (int64_t *) mymalloc("TestOutP", sizeof(int64_t) * nq * k);
+            subhalo_knn_query(kt, q, nq, k, outp);
+            assert_memory_equal(out, outp, sizeof(int64_t) * nq * k);
+            myfree(outp);
+        }
+        arena.used = 0;
+        assert_int_equal(subhalo_knn_build_count(), c0 + 1);
+        /* the former pattern: a full rebuild for every batch */
+        int64_t * out2 = (int64_t *) mymalloc("TestOut2", sizeof(int64_t) * nq * k);
+        t0 = MPI_Wtime();
+        for(i = 0; i < nq; i += B)
+            subhalo_knn_tracers(q + i, nq - i < B ? nq - i : B, tr, nt, k, out2 + i * k, BOXSIZE, &arena);
+        const double t2 = MPI_Wtime() - t0;
+        const int64_t nbatch = (nq + B - 1) / B;
+        assert_int_equal(subhalo_knn_build_count(), c0 + 1 + nbatch);
+        assert_memory_equal(out, out2, sizeof(int64_t) * nq * k);
+        message(0, "Checksum kNN %ld: %016lx\n", (long) nt, (unsigned long) fnv1a(0xcbf29ce484222325ULL, out, sizeof(int64_t) * nq * k));
+        message(0, "kNN scaling: %ld tracers, %ld queries in %ld batches: one build %.4f s + queries = %.4f s (1 build); rebuild per batch %.4f s (%ld builds)\n",
+                (long) nt, (long) nq, (long) nbatch, tb, t1, t2, (long) nbatch);
+        myfree(out2);
+        myfree(arena.base);
+        myfree(out);
+        myfree(q);
+        myfree(tr);
+        teardown_pman();
+    }
+}
+
+/* Exact energy ties (J10): NTIE particles at one point (every potential is the same sum of
+ * identical terms, direct or tree) with velocities +-(k + 1) s along axis k % 3 for pair k, so
+ * each pair ties exactly; IDs scrambled against P order. The bound and unbound parts must be in
+ * (E, ID) order and the result, IDs and energies, identical bit for bit for a second copy laid
+ * out in another P order. Then the subsampled loop's most-bound refinement, whose exact-mass
+ * energies of the head are again pair ties, must order the head by (E, ID). */
+#define NTIE 400
+static void
+fill_tie_cloud(int64_t first, int64_t stride, double s)
+{
+    int64_t j;
+    for(j = 0; j < NTIE; j++) {
+        const int64_t k = j / 2, i = first + (j * stride) % NTIE;
+        set_particle(i, 1, 1., 1 + (j * 7919) % NTIE, 1000.5, 2000.25, 3000.125);
+        P[i].Vel[k % 3] = (j % 2 ? -1 : 1) * (k + 1) * s;
+    }
+}
+
+static int64_t
+check_eid_order(const struct SubCandidate * c, int64_t lo, int64_t hi, int64_t * against_p)
+{
+    int64_t i, ties = 0;
+    for(i = lo + 1; i < hi; i++) {
+        const int64_t p = c->Index[i], pp = c->Index[i - 1];
+        assert_true(c->Energy[i - 1] <= c->Energy[i]);
+        if(c->Energy[i - 1] == c->Energy[i]) {
+            assert_true(P[pp].ID < P[p].ID);
+            ties++;
+            if(p < pp)
+                (*against_p)++;
+        }
+    }
+    return ties;
+}
+
+static void
+test_ties(void ** state)
+{
+    setup_pman(2 * NTIE);
+    fill_tie_cloud(0, 1, 45.);
+    fill_tie_cloud(NTIE, 37, 45.);
+    const double zero[3] = {0, 0, 0};
+    struct SubhaloArena arena = arena_alloc(NTIE);
+    int path;
+    for(path = 0; path < 2; path++) {
+        struct SubhaloUnbindParams up = default_params();
+        up.SampleSize = path ? 0 : 1 << 30;   /* SampleSize 0: always the tree */
+        struct TestCand A, B;
+        int64_t np, i, against = 0;
+        assert_true(run_candidate(&A, 0, NTIE, P[0].Pos, zero, 3, &up, &arena, &np));
+        assert_true(run_candidate(&B, NTIE, NTIE, P[NTIE].Pos, zero, 3, &up, &arena, &np));
+        assert_int_equal(A.c.Nbound, B.c.Nbound);
+        assert_true(A.c.Nbound < NTIE);
+        for(i = 0; i < NTIE; i++) {
+            assert_true(P[A.Index[i]].ID == P[B.Index[i]].ID);
+            assert_memory_equal(&A.Energy[i], &B.Energy[i], sizeof(double));
+        }
+        const int64_t tb = check_eid_order(&A.c, 0, A.c.Nbound, &against);
+        const int64_t tu = check_eid_order(&A.c, A.c.Nbound, NTIE, &against);
+        message(0, "Energy ties (%s): Nbound %ld of %d after %d iterations, %ld bound and %ld unbound tied pairs in ID order (%ld against P order); identical for two P orders\n",
+                path ? "tree" : "direct", (long) A.c.Nbound, NTIE, A.c.Iterations, (long) tb, (long) tu, (long) against);
+        assert_true(tb > 0 && tu > 0 && against > 0);
+        cand_free(&B);
+        cand_free(&A);
+    }
+    /* the refinement after a subsampled loop: all bound (s = 20), the head reordered by the
+     * exact self-energy of the head, ties by ID */
+    {
+        fill_tie_cloud(0, 1, 20.);
+        struct SubhaloUnbindParams us = default_params();
+        us.SampleSize = 100;
+        struct TestCand t;
+        cand_init(&t, 0, NTIE, P[0].Pos, zero, 99);
+        assert_true(subhalo_unbind(&t.c, &us, &arena));
+        assert_int_equal(t.c.Nbound, NTIE);
+        const int64_t nref = 100;
+        int64_t i, ties = 0, against = 0;
+        double K[NTIE];
+        for(i = 0; i < nref; i++) {
+            const struct particle_data * pp = &P[t.Index[i]];
+            K[i] = pp->Vel[0] * pp->Vel[0] + pp->Vel[1] * pp->Vel[1] + pp->Vel[2] * pp->Vel[2];
+            if(i == 0)
+                continue;
+            assert_true(K[i - 1] <= K[i]);
+            if(K[i - 1] == K[i]) {
+                assert_true(P[t.Index[i - 1]].ID < pp->ID);
+                ties++;
+                if(t.Index[i] < t.Index[i - 1])
+                    against++;
+            }
+        }
+        message(0, "Refined head of a subsampled loop: %ld exact ties in ID order (%ld against P order)\n", (long) ties, (long) against);
+        assert_true(ties > 0);
+        cand_free(&t);
+    }
+    myfree(arena.base);
+    teardown_pman();
+}
+
+/* Tree energies do not depend on the order of P (J10, equal Morton keys ordered by ID): a
+ * Hernquist cloud with every fifth particle on top of the previous one and mixed masses, laid
+ * out twice in different P orders with scrambled IDs, gives bitwise identical energies. */
+static void
+test_tree_order(void ** state)
+{
+    const int64_t n = 3000;
+    setup_pman(2 * n);
+    make_hernquist(0, n, 10., 5., 100., Centre, Bulk, 21, 0);
+    int64_t i;
+    int d;
+    for(i = 0; i < n; i++) {
+        P[i].ID = 1 + (i * 7919) % n;
+        if(i % 3 == 0)
+            P[i].Mass *= 1.37;
+        if(i % 5 == 1)
+            for(d = 0; d < 3; d++)
+                P[i].Pos[d] = P[i - 1].Pos[d];
+    }
+    for(i = 0; i < n; i++)
+        P[n + (i * 37) % n] = P[i];
+    struct SubhaloUnbindParams up = default_params();   /* SampleSize 0: the tree */
+    struct SubhaloArena arena = arena_alloc(n);
+    int64_t * ia = (int64_t *) mymalloc("TestIa", sizeof(int64_t) * n);
+    int64_t * ib = (int64_t *) mymalloc("TestIb", sizeof(int64_t) * n);
+    double * Ea = (double *) mymalloc("TestEa", sizeof(double) * n);
+    double * Eb = (double *) mymalloc("TestEb", sizeof(double) * n);
+    for(i = 0; i < n; i++) {
+        ia[i] = i;
+        ib[i] = n + i;
+    }
+    subhalo_energies(ia, n, Ea, ia, n, Centre, Bulk, &up, &arena);
+    subhalo_energies(ib, n, Eb, ib, n, Centre, Bulk, &up, &arena);
+    int64_t diff = 0;
+    for(i = 0; i < n; i++)
+        if(memcmp(&Ea[i], &Eb[(i * 37) % n], sizeof(double)))
+            diff++;
+    message(0, "Tree energies over two P orders (coincident particles of different masses): %ld of %ld differ\n", (long) diff, (long) n);
+    assert_int_equal(diff, 0);
+    myfree(Eb);
+    myfree(Ea);
+    myfree(ib);
+    myfree(ia);
+    myfree(arena.base);
+    teardown_pman();
+}
+
+/* A core needing non-tracer fill (subhalo_merge.cpp:122-158): 3 tracers among 50 particles of
+ * mixed masses, CoreSize 20, across the periodic boundary; the core is the 3 tracers and the
+ * first 17 non-tracers in Index order, against a direct computation in unwrapped coordinates.
+ * The most-bound ID of the properties is the first tracer, not Index[0]. */
+static void
+test_core_fill(void ** state)
+{
+    const int64_t n = 50;
+    setup_pman(n);
+    double u[50][3], w[50][3];
+    int64_t i;
+    int d;
+    for(i = 0; i < n; i++) {
+        const int tracer = i == 5 || i == 20 || i == 40;
+        for(d = 0; d < 3; d++) {
+            u[i][d] = Centre[d] + 6 * sin(1.3 * i + 2.1 * d);   /* crosses 0 in x and BOXSIZE in y */
+            w[i][d] = Bulk[d] + 50 * cos(0.7 * i + d);
+        }
+        set_particle(i, tracer ? (i == 20 ? 4 : 1) : 0, 1 + 0.5 * (i % 4), 100 + i, wrapb(u[i][0]), wrapb(u[i][1]), wrapb(u[i][2]));
+        for(d = 0; d < 3; d++)
+            P[i].Vel[d] = w[i][d];
+    }
+    /* the oracle */
+    double M = 0, mx[3] = {0}, mx2[3] = {0}, mv[3] = {0}, mv2[3] = {0};
+    int64_t num = 0, nnon = 0;
+    for(i = 0; i < n; i++) {
+        const int tracer = i == 5 || i == 20 || i == 40;
+        if(!tracer) {
+            if(nnon >= 17)
+                continue;
+            nnon++;
+        }
+        num++;
+        const double m = P[i].Mass;
+        M += m;
+        for(d = 0; d < 3; d++) {
+            mx[d] += m * u[i][d];
+            mx2[d] += m * u[i][d] * u[i][d];
+            mv[d] += m * w[i][d];
+            mv2[d] += m * w[i][d] * w[i][d];
+        }
+    }
+    assert_int_equal(num, 20);
+    double cpe[3], cve[3], sx2 = 0, sv2 = 0;
+    for(d = 0; d < 3; d++) {
+        cpe[d] = mx[d] / M;
+        cve[d] = mv[d] / M;
+        sx2 += mx2[d] / M - cpe[d] * cpe[d];
+        sv2 += mv2[d] / M - cve[d] * cve[d];
+    }
+    struct TestCand t;
+    const double zero[3] = {0, 0, 0};
+    cand_init(&t, 0, n, zero, zero, 1);
+    t.c.Nbound = n;
+    for(i = 0; i < n; i++)
+        t.Energy[i] = -1;
+    struct SubhaloUnbindParams up = default_params();
+    double cp[3], cv[3], sx, sv;
+    subhalo_core(&t.c, &up, 20, cp, cv, &sx, &sv);
+    double dp = 0, dv = 0;
+    for(d = 0; d < 3; d++) {
+        dp += pow(NEAREST(cp[d] - cpe[d], BOXSIZE), 2);
+        dv += pow(cv[d] - cve[d], 2);
+    }
+    message(0, "Core with non-tracer fill: |dCorePos| %.3g, |dCoreVel| %.3g, SigmaX %.6f (%.6f), SigmaV %.6f (%.6f)\n",
+            sqrt(dp), sqrt(dv), sx, sqrt(sx2), sv, sqrt(sv2));
+    assert_true(sqrt(dp) < 1e-9 && sqrt(dv) < 1e-9);
+    assert_true(fabs(sx / sqrt(sx2) - 1) < 1e-9 && fabs(sv / sqrt(sv2) - 1) < 1e-9);
+    for(d = 0; d < 3; d++)
+        assert_true(cp[d] >= 0 && cp[d] < BOXSIZE);
+    struct SubTrack rec;
+    memset(&rec, 0, sizeof(rec));
+    struct SubhaloArena arena = arena_bytes(SUBHALO_PROPS_BYTES_PER_PART * n + 16);
+    subhalo_props_hbt(&rec, &t.c, &up, 20, zero, &arena);
+    assert_int_equal(arena.used, 0);
+    assert_true(rec.MostBoundID == P[5].ID);
+    assert_int_equal(rec.NboundTracer, 3);
+    for(d = 0; d < 3; d++)
+        assert_true(fabs(NEAREST(rec.CorePos[d] - cpe[d], BOXSIZE)) < 1e-9);
+    myfree(arena.base);
+    cand_free(&t);
+    teardown_pman();
+}
+
+/* The two sinking forms (subhalo_merge.cpp:13-25 and the symmetric option), across the periodic
+ * boundary, and the zero-dispersion limits. */
+static void
+test_sink_forms(void ** state)
+{
+    const double aPos[3] = {BOXSIZE - 1, 10, 10}, sPos[3] = {2, 10, 10};   /* |dx| = 3 periodic */
+    const double aVel[3] = {0, 0, 0}, sVel[3] = {5, 0, 0};                  /* |dv| = 5 */
+    /* compact ancestor core, diffuse satellite core: 3/1 + 5/10 = 3.5 asymmetric, 0.3 + 0.05 symmetric */
+    assert_int_equal(subhalo_sink_test(sPos, sVel, aPos, aVel, 1, 10, 10, 100, 0, BOXSIZE), 0);
+    assert_int_equal(subhalo_sink_test(sPos, sVel, aPos, aVel, 1, 10, 10, 100, 1, BOXSIZE), 1);
+    /* diffuse ancestor: both forms sink (0.3 + 0.05), and only through the periodic offset */
+    assert_int_equal(subhalo_sink_test(sPos, sVel, aPos, aVel, 10, 100, 1, 10, 0, BOXSIZE), 1);
+    assert_int_equal(subhalo_sink_test(sPos, sVel, aPos, aVel, 10, 100, 1, 10, 1, BOXSIZE), 1);
+    /* the boundary: 1.5 + 0.5 = 2 does not sink, just below does */
+    assert_int_equal(subhalo_sink_test(sPos, sVel, aPos, aVel, 2, 10, 1e-3, 1e-3, 0, BOXSIZE), 0);
+    assert_int_equal(subhalo_sink_test(sPos, sVel, aPos, aVel, 2.0001, 10, 1e-3, 1e-3, 0, BOXSIZE), 1);
+    /* zero dispersions: any offset is infinite, a coincident core is zero */
+    assert_int_equal(subhalo_sink_test(sPos, sVel, aPos, aVel, 0, 0, 0, 0, 1, BOXSIZE), 0);
+    assert_int_equal(subhalo_sink_test(aPos, aVel, aPos, aVel, 0, 0, 0, 0, 0, BOXSIZE), 1);
+}
+
+/* Subsampled potential with a subsampleable type absent from the sample and the never
+ * subsampled black hole (subhalo_unbind.cpp:345-390, DoNotSubsampleParticleTypes): 1000 DM of
+ * mass 1, one star of mass 7 and one BH of mass 50 at one point, sample 20. Every potential is
+ * -G W(0) times the scaled source mass it sees: the DM scaled by 1000 / 20 and then by 1007 /
+ * 1000 so the absent star's mass is conserved, the BH at its true mass. */
+static void
+test_sample_types(void ** state)
+{
+    const int64_t ndm = 1000, n = ndm + 2;
+    setup_pman(n);
+    int64_t i;
+    for(i = 0; i < ndm; i++)
+        set_particle(i, 1, 1., 1 + i, 1000.5, 2000.25, 3000.125);
+    set_particle(ndm, 4, 7., 1 + ndm, 1000.5, 2000.25, 3000.125);
+    set_particle(ndm + 1, 5, 50., 2 + ndm, 1000.5, 2000.25, 3000.125);
+    struct SubhaloUnbindParams us = default_params();
+    us.SampleSize = 20;
+    const double zero[3] = {0, 0, 0};
+    struct SubhaloArena arena = arena_alloc(n);
+    struct TestCand t;
+    cand_init(&t, 0, n, P[0].Pos, zero, 2024);
+    assert_true(subhalo_unbind(&t.c, &us, &arena));
+    assert_int_equal(t.c.Nbound, n);
+    const double GW = TEST_G * grav_spline_potential(0, us.h);
+    const double fdm = 1000. / 20 * 1007. / 1000;
+    const double e_out = -GW * (1007 + 50), e_in = -GW * (1007 - fdm + 50), e_bh = -GW * 1007;
+    int64_t nout = 0, nin = 0, other = 0;
+    double estar = 0, ebh = 0;
+    for(i = 0; i < n; i++) {
+        const int64_t p = t.Index[i];
+        const double e = t.Energy[i];
+        if(p == ndm) estar = e;
+        else if(p == ndm + 1) ebh = e;
+        else if(fabs(e / e_out - 1) < 1e-12) nout++;
+        else if(fabs(e / e_in - 1) < 1e-12) nin++;
+        else other++;
+    }
+    message(0, "Subsample with the star absent: DM outside the sample %ld at E/e_out = 1, inside %ld at E/e_in = 1, other %ld; star E/e_out - 1 = %.3g, BH E/e_bh - 1 = %.3g\n",
+            (long) nout, (long) nin, (long) other, estar / e_out - 1, ebh / e_bh - 1);
+    assert_true(fabs(estar / e_out - 1) < 1e-12);   /* also: the star is not in this seed's sample */
+    assert_true(fabs(ebh / e_bh - 1) < 1e-12);
+    assert_int_equal(nin, 20);
+    assert_int_equal(nout, ndm - 20);
+    assert_int_equal(other, 0);
+    cand_free(&t);
+    myfree(arena.base);
+    teardown_pman();
+}
+
+/* Death: a hot cloud with no bound core, and a source below MinNumPart. */
+static void
+test_death(void ** state)
+{
+    const int64_t n = 500;
+    setup_pman(n);
+    make_hernquist(0, n, 0.01, HQ_A, HQ_RMAX, Centre, Bulk, 11, 0);
+    int64_t i;
+    int d;
+    for(i = 0; i < n; i++)
+        for(d = 0; d < 3; d++)
+            P[i].Vel[d] = Bulk[d] + 1000. * (d == i % 3 ? 1 : 0) * (i % 2 ? 1 : -1);
+    struct SubhaloUnbindParams up = default_params();
+    struct SubhaloArena arena = arena_alloc(n);
+    struct TestCand t;
+    cand_init(&t, 0, n, Centre, Bulk, 1);
+    assert_int_equal(subhalo_unbind(&t.c, &up, &arena), 0);
+    assert_int_equal(t.c.Nbound, 0);
+    assert_true(is_permutation(t.Index, n, 0));
+    cand_checksum("death", &t.c);
+    cand_free(&t);
+    cand_init(&t, 0, 15, Centre, Bulk, 1);
+    assert_int_equal(subhalo_unbind(&t.c, &up, &arena), 0);
+    assert_int_equal(arena.used, 0);
+    cand_free(&t);
+    myfree(arena.base);
+    teardown_pman();
+}
+
+/* ------------------------------------------------------------------ Phase 5b: intra-key threading */
+
+/* A host Hernquist sphere of nhost particles (IDs 0..) at Centre and a satellite of nsat (a
+ * tenth of the mass, a quarter of the scale radius; IDs from nhost) at 2 a on a circular orbit,
+ * every particle of the candidate in the host frame (test_satellite's system, scaled up). */
+static void
+make_host_satellite(int64_t nhost, int64_t nsat)
+{
+    make_hernquist(0, nhost, HQ_M, HQ_A, HQ_RMAX, Centre, Bulk, 4242, 0);
+    const double vc = sqrt(TEST_G * HQ_M * 4. / 9. / (2 * HQ_A));
+    double scen[3], svel[3];
+    int d;
+    for(d = 0; d < 3; d++) {
+        scen[d] = wrapb(Centre[d] + (d == 0 ? 2 * HQ_A : 0));
+        svel[d] = Bulk[d] + (d == 1 ? vc : 0);
+    }
+    make_hernquist(nhost, nsat, HQ_M / 10, HQ_A / 4, 30 * HQ_A / 4, scen, svel, 777, nhost);
+}
+
+/* What the kernel returns for one candidate, kept for a bitwise comparison. */
+struct CandResult {
+    int alive;
+    int64_t N, Nbound, NboundTracer, NboundPositive;
+    int Iterations, Flags;
+    double RefPos[3], RefVel[3], Mbound, ConvergenceRatio;
+    int64_t * Index;
+    double * Energy;
+};
+
+/* subhalo_unbind (+ subhalo_final_pass when it survives) of P[0, n) with nth OpenMP threads. */
+/* When set, run_threads copies the loop order (Index after subhalo_unbind, before the final pass,
+ * all n entries) here (test_final_pass_sampled, audit 5e R6). */
+static int64_t * FpLoopCapture;
+
+static void
+run_threads(struct CandResult * r, int nth, int64_t n, const double ref[3], const double vel[3], uint64_t seed,
+            const struct SubhaloUnbindParams * up, struct SubhaloArena * arena, double * tun, double * tfp)
+{
+    struct TestCand t;
+    omp_set_num_threads(nth);
+    cand_init(&t, 0, n, ref, vel, seed);
+    double t0 = MPI_Wtime();
+    r->alive = subhalo_unbind(&t.c, up, arena);
+    const double t1 = MPI_Wtime();
+    if(FpLoopCapture)
+        memcpy(FpLoopCapture, t.c.Index, sizeof(int64_t) * n);
+    r->NboundPositive = -1;
+    if(r->alive)
+        r->NboundPositive = subhalo_final_pass(&t.c, up, arena);
+    const double t2 = MPI_Wtime();
+    if(tun) *tun = t1 - t0;
+    if(tfp) *tfp = t2 - t1;
+    assert_int_equal(arena->used, 0);
+    assert_true(is_permutation(t.c.Index, n, 0));
+    /* the sampled final pass keeps the loop's order and does not sort its energies */
+    if(r->alive && !(up->SampledFinalPass && up->SampleSize > 0 && t.c.Nbound > up->SampleSize))
+        assert_true(is_sorted(t.c.Energy, t.c.Index, t.c.Nbound));
+    r->N = t.c.N;
+    r->Nbound = t.c.Nbound;
+    r->NboundTracer = t.c.NboundTracer;
+    r->Iterations = t.c.Iterations;
+    r->Flags = t.c.Flags;
+    r->Mbound = t.c.Mbound;
+    r->ConvergenceRatio = t.c.ConvergenceRatio;
+    memcpy(r->RefPos, t.c.RefPos, sizeof(r->RefPos));
+    memcpy(r->RefVel, t.c.RefVel, sizeof(r->RefVel));
+    r->Index = (int64_t *) malloc(sizeof(int64_t) * n);
+    r->Energy = (double *) malloc(sizeof(double) * n);
+    memcpy(r->Index, t.c.Index, sizeof(int64_t) * n);
+    memcpy(r->Energy, t.c.Energy, sizeof(double) * n);
+    char tag[64];
+    snprintf(tag, sizeof(tag), "%d thread(s)", nth);
+    cand_checksum(tag, &t.c);
+    cand_free(&t);
+}
+
+static void
+cand_result_free(struct CandResult * r)
+{
+    free(r->Energy);
+    free(r->Index);
+}
+
+/* Bitwise: Index order and Energy over the whole list (bound prefix, and the unbound part, or
+ * the whole order of a dead candidate), the frame, the counts. */
+static void
+assert_same_result(const struct CandResult * a, const struct CandResult * b)
+{
+    assert_int_equal(a->alive, b->alive);
+    assert_int_equal(a->N, b->N);
+    assert_int_equal(a->Nbound, b->Nbound);
+    assert_int_equal(a->NboundTracer, b->NboundTracer);
+    assert_int_equal(a->NboundPositive, b->NboundPositive);
+    assert_int_equal(a->Iterations, b->Iterations);
+    assert_int_equal(a->Flags, b->Flags);
+    assert_memory_equal(a->RefPos, b->RefPos, sizeof(a->RefPos));
+    assert_memory_equal(a->RefVel, b->RefVel, sizeof(a->RefVel));
+    assert_memory_equal(&a->Mbound, &b->Mbound, sizeof(double));
+    assert_memory_equal(&a->ConvergenceRatio, &b->ConvergenceRatio, sizeof(double));
+    assert_memory_equal(a->Index, b->Index, sizeof(int64_t) * a->N);
+    assert_memory_equal(a->Energy, b->Energy, sizeof(double) * a->N);
+}
+
+#define NBIG_HOST 200000
+#define NBIG_SAT 20000
+
+/* The parallel mode (subhalo_unbind.h, Phase 5b) gives bit-identical results at 1, 3 and 8
+ * threads on a 2.2e5-particle host + satellite candidate: the subsampled loop (SampleSize 1000:
+ * subsample, gather, partition, frame, refinement on 2e4) and the exact final pass (tree over
+ * 2e5), a candidate that dies after a parallel iteration (the stable partition's whole order),
+ * and the neighbour search over 2e5 tracers, with and without arena room for the sort's merge
+ * buffer. */
+static void
+test_threads_bitwise(void ** state)
+{
+    const int nmax0 = omp_get_max_threads();
+    const int64_t n = NBIG_HOST + NBIG_SAT;
+    const int nths[3] = {1, 3, 8};
+    int k;
+    setup_pman(n);
+    make_host_satellite(NBIG_HOST, NBIG_SAT);
+    struct SubhaloUnbindParams up = default_params();
+    up.SampleSize = 1000;
+    struct SubhaloArena arena = arena_alloc(n);
+    struct CandResult r[3];
+
+    /* survivor */
+    for(k = 0; k < 3; k++) {
+        double tun, tfp;
+        run_threads(&r[k], nths[k], n, Centre, Bulk, 99, &up, &arena, &tun, &tfp);
+        message(0, "Bitwise fixture, %d thread(s): Nbound %ld / %ld after %d iterations, NboundPositive %ld; unbind %.3f s, final pass %.3f s\n",
+                nths[k], (long) r[k].Nbound, (long) n, r[k].Iterations, (long) r[k].NboundPositive, tun, tfp);
+    }
+    assert_true(r[0].alive);
+    /* every step in parallel mode, the refinement of 0.1 Nbound included */
+    assert_true(SUBHALO_REFINE_FRACTION * r[0].Nbound > SUBHALO_UNBIND_CHUNK_MIN);
+    assert_true(SUBHALO_REFINE_FRACTION * r[0].Nbound > subhalo_unbind_get_par_min());
+    for(k = 1; k < 3; k++)
+        assert_same_result(&r[0], &r[k]);
+    for(k = 0; k < 3; k++)
+        cand_result_free(&r[k]);
+
+    /* a candidate that dies after its first iteration: a frame 300 km/s off and MinNumPart 0.9 N */
+    {
+        struct SubhaloUnbindParams ud = up;
+        ud.MinNumPart = (int) (0.9 * n);
+        double badvel[3] = {Bulk[0] + 300., Bulk[1], Bulk[2]};
+        for(k = 0; k < 3; k++)
+            run_threads(&r[k], nths[k], n, Centre, badvel, 5, &ud, &arena, NULL, NULL);
+        message(0, "Bitwise fixture, dead candidate: alive %d after %d iteration(s), ConvergenceRatio %.4f\n",
+                r[0].alive, r[0].Iterations, r[0].ConvergenceRatio);
+        assert_false(r[0].alive);
+        assert_true(r[0].ConvergenceRatio < 0.9);
+        for(k = 1; k < 3; k++)
+            assert_same_result(&r[0], &r[k]);
+        for(k = 0; k < 3; k++)
+            cand_result_free(&r[k]);
+    }
+
+    /* neighbours: the host's 2e5 particles as tracers, the satellite's as queries (k = 8); an
+     * arena with room for the merge buffer and one without (serial sort), each the same at
+     * every thread count (the arena size sets the leaf widening, not the thread count) */
+    {
+        const int kk = 8;
+        int64_t * tr = (int64_t *) malloc(sizeof(int64_t) * NBIG_HOST);
+        int64_t * q = (int64_t *) malloc(sizeof(int64_t) * NBIG_SAT);
+        int64_t * out[3];
+        int64_t i;
+        int a;
+        for(i = 0; i < NBIG_HOST; i++)
+            tr[i] = i;
+        for(i = 0; i < NBIG_SAT; i++)
+            q[i] = NBIG_HOST + i;
+        const size_t sizes[2] = {128 * (size_t) NBIG_HOST + 4096, 80 * (size_t) NBIG_HOST + 4096};
+        for(a = 0; a < 2; a++) {
+            struct SubhaloArena ka = arena_bytes(sizes[a]);
+            for(k = 0; k < 3; k++) {
+                omp_set_num_threads(nths[k]);
+                out[k] = (int64_t *) malloc(sizeof(int64_t) * NBIG_SAT * kk);
+                subhalo_knn_tracers(q, NBIG_SAT, tr, NBIG_HOST, kk, out[k], BOXSIZE, &ka);
+                assert_int_equal(ka.used, 0);
+            }
+            message(0, "Checksum kNN %ld tracers, arena %lu bytes: %016lx\n", (long) NBIG_HOST, (unsigned long) sizes[a],
+                    (unsigned long) fnv1a(0xcbf29ce484222325ULL, out[0], sizeof(int64_t) * NBIG_SAT * kk));
+            for(k = 1; k < 3; k++)
+                assert_memory_equal(out[0], out[k], sizeof(int64_t) * NBIG_SAT * kk);
+            if(a == 1) {
+                /* the widened leaves of the tight arena find the same neighbours */
+                int64_t * ref = (int64_t *) malloc(sizeof(int64_t) * NBIG_SAT * kk);
+                struct SubhaloArena kb = arena_bytes(sizes[0]);
+                subhalo_knn_tracers(q, NBIG_SAT, tr, NBIG_HOST, kk, ref, BOXSIZE, &kb);
+                assert_memory_equal(out[0], ref, sizeof(int64_t) * NBIG_SAT * kk);
+                myfree(kb.base);
+                free(ref);
+            }
+            for(k = 0; k < 3; k++)
+                free(out[k]);
+            myfree(ka.base);
+        }
+        free(q);
+        free(tr);
+    }
+    omp_set_num_threads(nmax0);
+    myfree(arena.base);
+    teardown_pman();
+}
+
+/* Phase 5 audit R7: the kernel inside the scheduler's worker region. A key that is not run alone
+ * is processed by one worker of subhalo_run_serial_keys' parallel region, where the kernel must
+ * stay serial (omp_in_parallel) and give the same result as alone. The host + satellite candidate
+ * of test_threads_bitwise (the satellite a tenth, unbound in the host frame: several iterations,
+ * a non-trivial partition) with 16383, 16384, 16385 and 16500 particles (around
+ * SUBHALO_UNBIND_CHUNK_MIN: the chunked sums and the stable partition start above it), with and
+ * without subsampling, from a start frame 150 km/s off (several iterations): unbind + final pass at 1 thread,
+ * alone at 4 threads (dynamic adjustment off, the team size checked), and inside an active
+ * 4-thread region where two workers run two copies of the candidate concurrently, each compared
+ * bitwise with the 1-thread result (Index and Energy over the whole list, frame, counts). */
+static void
+cand_result_take(struct CandResult * r, const struct TestCand * t, int alive, int64_t npos)
+{
+    const int64_t n = t->c.N;
+    r->alive = alive;
+    r->NboundPositive = npos;
+    r->N = n;
+    r->Nbound = t->c.Nbound;
+    r->NboundTracer = t->c.NboundTracer;
+    r->Iterations = t->c.Iterations;
+    r->Flags = t->c.Flags;
+    r->Mbound = t->c.Mbound;
+    r->ConvergenceRatio = t->c.ConvergenceRatio;
+    memcpy(r->RefPos, t->c.RefPos, sizeof(r->RefPos));
+    memcpy(r->RefVel, t->c.RefVel, sizeof(r->RefVel));
+    r->Index = (int64_t *) malloc(sizeof(int64_t) * n);
+    r->Energy = (double *) malloc(sizeof(double) * n);
+    memcpy(r->Index, t->c.Index, sizeof(int64_t) * n);
+    memcpy(r->Energy, t->c.Energy, sizeof(double) * n);
+}
+
+/* unbind + final pass of an initialised candidate, no allocation outside the arena (safe in a
+ * worker); returns alive, *npos the final pass's count */
+static int
+cand_unbind_final(struct TestCand * t, const struct SubhaloUnbindParams * up, struct SubhaloArena * arena, int64_t * npos)
+{
+    const int alive = subhalo_unbind(&t->c, up, arena);
+    *npos = alive ? subhalo_final_pass(&t->c, up, arena) : -1;
+    return alive;
+}
+
+static void
+test_threads_worker_region(void ** state)
+{
+    const int nmax0 = omp_get_max_threads();
+    const int dyn0 = omp_get_dynamic();
+    const int T = 4;
+    const int64_t sizes[4] = {SUBHALO_UNBIND_CHUNK_MIN - 1, SUBHALO_UNBIND_CHUNK_MIN, SUBHALO_UNBIND_CHUNK_MIN + 1, 16500};
+    const int samples[2] = {1000, 0};
+    /* a start frame 150 km/s off: several iterations, particles unbound on the way */
+    const double vel0[3] = {Bulk[0] + 150., Bulk[1], Bulk[2]};
+    int is, ip;
+    omp_set_dynamic(0);
+    for(is = 0; is < 4; is++)
+        for(ip = 0; ip < 2; ip++) {
+            const int64_t n = sizes[is];
+            setup_pman(n);
+            make_host_satellite(n - n / 11, n / 11);
+            struct SubhaloUnbindParams up = default_params();
+            up.SampleSize = samples[ip];
+            struct CandResult ref, alone, wk[2];
+            int64_t npos;
+            int alive;
+            /* the reference: 1 thread */
+            {
+                omp_set_num_threads(1);
+                struct TestCand t;
+                cand_init(&t, 0, n, Centre, vel0, 11);
+                struct SubhaloArena a = arena_alloc(n);
+                alive = cand_unbind_final(&t, &up, &a, &npos);
+                assert_int_equal(a.used, 0);
+                cand_result_take(&ref, &t, alive, npos);
+                myfree(a.base);
+                cand_free(&t);
+            }
+            /* alone with T threads: the runtime gives T (dynamic adjustment off) */
+            {
+                omp_set_num_threads(T);
+                int got = 0;
+                #pragma omp parallel
+                {
+                    #pragma omp master
+                    got = omp_get_num_threads();
+                }
+                assert_int_equal(got, T);
+                assert_false(omp_in_parallel());
+                struct TestCand t;
+                cand_init(&t, 0, n, Centre, vel0, 11);
+                struct SubhaloArena a = arena_alloc(n);
+                alive = cand_unbind_final(&t, &up, &a, &npos);
+                assert_int_equal(a.used, 0);
+                cand_result_take(&alone, &t, alive, npos);
+                myfree(a.base);
+                cand_free(&t);
+            }
+            /* inside an active T-thread region: workers 1 and 2 each run a copy concurrently */
+            {
+                omp_set_num_threads(T);
+                struct TestCand t[2];
+                struct SubhaloArena a[2];
+                int k, team = 0, inpar[2] = {0, 0}, wal[2] = {0, 0};
+                int64_t wpos[2] = {0, 0};
+                for(k = 0; k < 2; k++) {
+                    cand_init(&t[k], 0, n, Centre, vel0, 11);
+                    a[k] = arena_alloc(n);
+                }
+                #pragma omp parallel num_threads(T)
+                {
+                    const int tid = omp_get_thread_num();
+                    if(tid == 0)
+                        team = omp_get_num_threads();
+                    if(tid == 1 || tid == 2) {
+                        inpar[tid - 1] = omp_in_parallel();
+                        wal[tid - 1] = cand_unbind_final(&t[tid - 1], &up, &a[tid - 1], &wpos[tid - 1]);
+                    }
+                }
+                assert_int_equal(team, T);
+                for(k = 0; k < 2; k++) {
+                    assert_true(inpar[k]);
+                    assert_int_equal(a[k].used, 0);
+                    cand_result_take(&wk[k], &t[k], wal[k], wpos[k]);
+                }
+                for(k = 1; k >= 0; k--) {
+                    myfree(a[k].base);
+                    cand_free(&t[k]);
+                }
+            }
+            message(0, "Worker region, N %ld, SampleSize %d: Nbound %ld after %d iterations; alone at %d threads and in two workers of a "
+                       "%d-thread region: %s\n", (long) n, samples[ip], (long) ref.Nbound, ref.Iterations, T, T,
+                    "compared bitwise");
+            assert_true(ref.alive && ref.Nbound > 0.5 * n && ref.Iterations > 1);
+            assert_same_result(&ref, &alone);
+            assert_same_result(&ref, &wk[0]);
+            assert_same_result(&ref, &wk[1]);
+            cand_result_free(&wk[1]);
+            cand_result_free(&wk[0]);
+            cand_result_free(&alone);
+            cand_result_free(&ref);
+            teardown_pman();
+        }
+    omp_set_dynamic(dyn0);
+    omp_set_num_threads(nmax0);
+}
+
+/* The sampled final pass (SubhaloFinalPass = 0, decision 42.4; subhalo_final_pass in
+ * subhalo_unbind.h).
+ *  1. Below the sample size it is the exact pass: a 900-particle Hernquist sphere alone
+ *     (N <= SampleSize, no subsampling at all) and with 400 fast particles added (N = 1300 >
+ *     SampleSize: a subsampled first iteration, Nbound <= SampleSize), each unbound + final pass
+ *     under both options and compared bitwise (Index and Energy over the whole list, frame,
+ *     counts).
+ *  2. Above it: a 5e4-particle Hernquist sphere (rho ~ 1/r inside the scale radius: a smooth
+ *     NFW-like cusp) with SampleSize 1000, every whole-list step in parallel mode. The sampled
+ *     option is bitwise thread-count independent (1, 2 and 8 threads); against the exact pass it
+ *     has the same membership, frame, Mbound and unbound tail, its prefix is a permutation of the
+ *     exact prefix. Audit 5e R6: the loop order is captured immediately before each final pass
+ *     (and equals the exact run's); the head length K is derived from it (fp_head_length: the
+ *     shortest prefix with 5 x 20 tracers, or all bound tracers plus the non-tracer fill, and at
+ *     least 5 x 20 particles); at every thread count the K head particles are exactly the loop's
+ *     first K sorted by their exact-pass ranks, the bound suffix is the loop's order and the
+ *     unbound tail the loop's (fp_check_head); the first 20 tracers are the exact pass's 20
+ *     most-bound tracers in order, so the most bound particle is the exact pass's. Four
+ *     fixtures: DM only (K = 100); every other particle a non-tracer (type 0: a longer head);
+ *     scarce tracers (60 inner tracers, all others type 0: the head holds all 60 and the
+ *     non-tracer fill); a cold 1001-particle sphere with Nbound = SampleSize + 1 (the smallest
+ *     candidate on the sampled branch). */
+static int
+type_in_test(int mask, int type)
+{
+    return (mask >> type) & 1;
+}
+
+static void
+fp_result_sameset(const struct CandResult * a, const struct CandResult * b)
+{
+    assert_int_equal(a->alive, b->alive);
+    assert_int_equal(a->Nbound, b->Nbound);
+    assert_int_equal(a->NboundTracer, b->NboundTracer);
+    assert_memory_equal(a->RefPos, b->RefPos, sizeof(a->RefPos));
+    assert_memory_equal(a->RefVel, b->RefVel, sizeof(a->RefVel));
+    assert_memory_equal(&a->Mbound, &b->Mbound, sizeof(double));
+    /* the unbound tail: untouched by either pass */
+    assert_memory_equal(a->Index + a->Nbound, b->Index + b->Nbound, sizeof(int64_t) * (a->N - a->Nbound));
+    assert_memory_equal(a->Energy + a->Nbound, b->Energy + b->Nbound, sizeof(double) * (a->N - a->Nbound));
+    /* the bound prefix: the same set */
+    char * seen = (char *) calloc(a->N + 1, 1);
+    int64_t i, miss = 0;
+    for(i = 0; i < a->Nbound; i++)
+        seen[a->Index[i]] = 1;
+    for(i = 0; i < b->Nbound; i++)
+        miss += !seen[b->Index[i]];
+    free(seen);
+    assert_int_equal(miss, 0);
+}
+
+/* Audit 5e R6: the head length of subhalo_final_pass from the loop order L[0, n) (n = Nbound) as
+ * subhalo_unbind.h states it: the shortest prefix holding the first T = MARGIN x max(MIN,
+ * FinalRefineTracers) tracers (T clamped to n) and, when fewer than T tracers are bound, the
+ * first non-tracers that make up T, at least T particles. */
+static int64_t
+fp_head_length(const int64_t * L, int64_t n, const struct SubhaloUnbindParams * up, int64_t * ntr)
+{
+    const int64_t Kt = up->FinalRefineTracers > SUBHALO_FINAL_REFINE_MIN ? up->FinalRefineTracers : SUBHALO_FINAL_REFINE_MIN;
+    int64_t T = SUBHALO_FINAL_REFINE_MARGIN * Kt, i, NT = 0, nt = 0, nn = 0;
+    if(T > n)
+        T = n;
+    for(i = 0; i < n; i++)
+        NT += type_in_test(up->TracerTypes, P[L[i]].Type);
+    const int64_t need_tr = NT < T ? NT : T;
+    for(i = 0; i < n && (i < T || nt < need_tr || nn < T - need_tr); i++) {
+        if(type_in_test(up->TracerTypes, P[L[i]].Type))
+            nt++;
+        else
+            nn++;
+    }
+    *ntr = nt;
+    return i;
+}
+
+static const int64_t * FpRank;
+
+static int
+fp_rank_cmp(const void * a, const void * b)
+{
+    const int64_t ra = FpRank[*(const int64_t *) a], rb = FpRank[*(const int64_t *) b];
+    return (ra > rb) - (ra < rb);
+}
+
+/* Audit 5e R6: the sampled final pass's output r against the loop order L captured immediately
+ * before it (the whole list, N entries) and the exact pass's ranks: the head Index[0, K), K from
+ * L, is exactly L[0, K) sorted by exact-pass rank (every one of the K particles at its exact
+ * relative position); the bound suffix Index[K, Nbound) is L's (HBT's order); the unbound tail is
+ * untouched. Returns K (and the head's tracers in *ntr). */
+static int64_t
+fp_check_head(const struct CandResult * r, const int64_t * L, const int64_t * rank, const struct SubhaloUnbindParams * up,
+              int64_t * ntr)
+{
+    const int64_t nb = r->Nbound;
+    const int64_t K = fp_head_length(L, nb, up, ntr);
+    assert_true(K >= 1 && K <= nb);
+    int64_t * h = (int64_t *) malloc(sizeof(int64_t) * K);
+    memcpy(h, L, sizeof(int64_t) * K);
+    FpRank = rank;
+    qsort(h, K, sizeof(int64_t), fp_rank_cmp);
+    assert_memory_equal(r->Index, h, sizeof(int64_t) * K);
+    free(h);
+    if(nb > K)
+        assert_memory_equal(r->Index + K, L + K, sizeof(int64_t) * (nb - K));
+    if(r->N > nb)
+        assert_memory_equal(r->Index + nb, L + nb, sizeof(int64_t) * (r->N - nb));
+    return K;
+}
+
+static void
+test_final_pass_sampled(void ** state)
+{
+    const int nmax0 = omp_get_max_threads();
+    int k;
+    /* 1. below the sample size */
+    {
+        const int64_t nh = 900, nf = 400;
+        setup_pman(nh + nf);
+        make_hernquist(0, nh, HQ_M, HQ_A, HQ_RMAX, Centre, Bulk, 31, 0);
+        /* fast particles inside the sphere: unbound at the first iteration */
+        {
+            gsl_rng * rng = gsl_rng_alloc(gsl_rng_mt19937);
+            gsl_rng_set(rng, 32);
+            int64_t i;
+            int d;
+            for(i = nh; i < nh + nf; i++) {
+                double u[3];
+                memset(&P[i], 0, sizeof(P[i]));
+                P[i].Type = 1;
+                P[i].Mass = P[0].Mass;
+                P[i].ID = i;
+                random_direction(rng, u);
+                const double r = HQ_A * gsl_rng_uniform_pos(rng);
+                for(d = 0; d < 3; d++)
+                    P[i].Pos[d] = wrapb(Centre[d] + r * u[d]);
+                random_direction(rng, u);
+                for(d = 0; d < 3; d++)
+                    P[i].Vel[d] = Bulk[d] + 3000. * u[d];
+            }
+            gsl_rng_free(rng);
+        }
+        struct SubhaloUnbindParams ue = default_params();
+        ue.SampleSize = 1000;
+        struct SubhaloUnbindParams us = ue;
+        us.SampledFinalPass = 1;
+        const int64_t ns[2] = {nh, nh + nf};
+        int c;
+        for(c = 0; c < 2; c++) {
+            struct SubhaloArena arena = arena_alloc(ns[c]);
+            struct CandResult re, rs;
+            run_threads(&re, 1, ns[c], Centre, Bulk, 17, &ue, &arena, NULL, NULL);
+            run_threads(&rs, 1, ns[c], Centre, Bulk, 17, &us, &arena, NULL, NULL);
+            message(0, "Sampled final pass below the sample size: N %ld, Nbound %ld after %d iterations: identical to the exact pass\n",
+                    (long) ns[c], (long) re.Nbound, re.Iterations);
+            assert_true(re.alive);
+            assert_true(re.Nbound <= ue.SampleSize);
+            if(c == 1)
+                assert_true(re.Nbound < ns[c] - nf / 2);
+            assert_same_result(&re, &rs);
+            cand_result_free(&rs);
+            cand_result_free(&re);
+            myfree(arena.base);
+        }
+        teardown_pman();
+    }
+    /* 2. above the sample size: DM only, every other particle a non-tracer (type 0), scarce
+     *    tracers (60 bound, the non-tracer fill) and Nbound = SampleSize + 1 */
+    int mode;
+    for(mode = 0; mode < 4; mode++) {
+        const char * label[4] = {"DM only", "half non-tracers", "60 tracers", "Nbound = SampleSize + 1"};
+        const int64_t n = mode == 3 ? 1001 : 50000;
+        const int nths[3] = {1, 2, 8};
+        int64_t i;
+        setup_pman(n);
+        make_hernquist(0, n, HQ_M, HQ_A, HQ_RMAX, Centre, Bulk, 4243, 0);
+        if(mode == 1)
+            for(i = 1; i < n; i += 2)
+                P[i].Type = 0;
+        if(mode == 2) {
+            /* 60 tracers among the particles inside 0.1 a (about 400 of them), the others type 0 */
+            int64_t ntr = 0;
+            for(i = 0; i < n; i++) {
+                const int inner = ntr < 60 && dist_periodic(P[i].Pos, Centre) < 0.1 * HQ_A;
+                P[i].Type = inner ? 1 : 0;
+                ntr += inner;
+            }
+            assert_int_equal(ntr, 60);
+        }
+        if(mode == 3) {
+            /* a cold sphere (a tenth of the dispersion): every particle stays bound */
+            int d;
+            for(i = 0; i < n; i++)
+                for(d = 0; d < 3; d++)
+                    P[i].Vel[d] = Bulk[d] + 0.1 * (P[i].Vel[d] - Bulk[d]);
+        }
+        struct SubhaloUnbindParams ue = default_params();
+        ue.SampleSize = 1000;
+        struct SubhaloUnbindParams us = ue;
+        us.SampledFinalPass = 1;
+        struct SubhaloArena arena = arena_alloc(n);
+        struct CandResult re, rs[3];
+        double tun, tfp;
+        /* the loop order handed to each final pass (audit 5e R6) */
+        int64_t * le = (int64_t *) malloc(sizeof(int64_t) * n);
+        int64_t * ls = (int64_t *) malloc(sizeof(int64_t) * n);
+        /* a start frame 100 km/s off: several iterations, the outskirts unbound on the way (the
+         * cold sphere starts in its own frame) */
+        const double vel0[3] = {Bulk[0] + (mode == 3 ? 0 : 100.), Bulk[1], Bulk[2]};
+        FpLoopCapture = le;
+        run_threads(&re, 1, n, Centre, vel0, 23, &ue, &arena, &tun, &tfp);
+        message(0, "Sampled final pass fixture (%s), exact pass: Nbound %ld / %ld after %d iterations, NboundPositive %ld; unbind %.3f s, final pass %.3f s\n",
+                label[mode], (long) re.Nbound, (long) n, re.Iterations, (long) re.NboundPositive, tun, tfp);
+        assert_true(re.alive);
+        if(mode == 3)
+            assert_true(re.Nbound == ue.SampleSize + 1);
+        else
+            assert_true(re.Nbound > SUBHALO_UNBIND_PAR_MIN && re.Nbound > 0.9 * n && re.Iterations > 1);
+        int64_t * rank = (int64_t *) malloc(sizeof(int64_t) * n);
+        for(i = 0; i < re.Nbound; i++)
+            rank[re.Index[i]] = i;
+        int64_t K = 0, ntr = 0;
+        for(k = 0; k < 3; k++) {
+            FpLoopCapture = ls;
+            run_threads(&rs[k], nths[k], n, Centre, vel0, 23, &us, &arena, &tun, &tfp);
+            FpLoopCapture = NULL;
+            message(0, "Sampled final pass fixture, %d thread(s): NboundPositive %ld; unbind %.3f s, final pass %.3f s\n",
+                    nths[k], (long) rs[k].NboundPositive, tun, tfp);
+            /* the loop is the exact run's (it does not depend on the option or the threads) */
+            assert_memory_equal(ls, le, sizeof(int64_t) * n);
+            K = fp_check_head(&rs[k], ls, rank, &us, &ntr);
+        }
+        for(k = 1; k < 3; k++)
+            assert_same_result(&rs[0], &rs[k]);
+        fp_result_sameset(&re, &rs[0]);
+        {
+            int64_t core = 0, same = 0;
+            const int64_t T = SUBHALO_FINAL_REFINE_MARGIN * SUBHALO_FINAL_REFINE_MIN;
+            /* the first 20 tracers (or all, if fewer are bound) are the exact pass's most-bound
+             * tracers in the same order (the most-bound tracer, the core, the reserved tracers) */
+            int64_t trs[SUBHALO_FINAL_REFINE_MIN], tre[SUBHALO_FINAL_REFINE_MIN], ns = 0, ne = 0;
+            for(i = 0; i < K; i++)
+                same += rs[0].Index[i] == re.Index[i];
+            for(i = 0; i < rs[0].Nbound && ns < SUBHALO_FINAL_REFINE_MIN; i++)
+                if(type_in_test(ue.TracerTypes, P[rs[0].Index[i]].Type))
+                    trs[ns++] = rs[0].Index[i];
+            for(i = 0; i < re.Nbound && ne < SUBHALO_FINAL_REFINE_MIN; i++)
+                if(type_in_test(ue.TracerTypes, P[re.Index[i]].Type))
+                    tre[ne++] = re.Index[i];
+            assert_int_equal(ns, SUBHALO_FINAL_REFINE_MIN);
+            assert_int_equal(ne, SUBHALO_FINAL_REFINE_MIN);
+            assert_memory_equal(trs, tre, sizeof(trs));
+            for(i = 0; i < 20; i++)
+                core += rank[rs[0].Index[i]] < 20;
+            message(0, "Sampled vs exact (%s): head K = %ld (%ld tracers) from the loop order, all K in the exact pass's relative order, "
+                       "%ld / %ld at the exact pass's position, the bound suffix the loop's; most bound %ld (exact %ld); "
+                       "exact ranks of the sampled 5 most bound %ld %ld %ld %ld %ld; first-20 overlap %ld / 20; NboundPositive sampled %ld exact %ld\n",
+                    label[mode], (long) K, (long) ntr, (long) same, (long) K, (long) rs[0].Index[0], (long) re.Index[0],
+                    (long) rank[rs[0].Index[0]], (long) rank[rs[0].Index[1]], (long) rank[rs[0].Index[2]], (long) rank[rs[0].Index[3]],
+                    (long) rank[rs[0].Index[4]], (long) core, (long) rs[0].NboundPositive, (long) re.NboundPositive);
+            /* DM only: the head is exactly T; with non-tracers it is longer; with 60 tracers it
+             * holds all 60 and 40 non-tracers */
+            if(mode == 0 || mode == 3)
+                assert_true(K == T);
+            else
+                assert_true(K > T);
+            if(mode == 2)
+                assert_true(ntr == 60 && rs[0].NboundTracer == 60);
+        }
+        free(rank);
+        free(ls);
+        free(le);
+        assert_int_equal(rs[0].Index[0], re.Index[0]);
+        assert_true(rs[0].NboundPositive < 0.01 * rs[0].Nbound);
+        for(k = 0; k < 3; k++)
+            cand_result_free(&rs[k]);
+        cand_result_free(&re);
+        myfree(arena.base);
+        teardown_pman();
+    }
+    omp_set_num_threads(nmax0);
+}
+
+/* Decision 42.5 (second round): the threading threshold PAR_MIN only shares work out. Keys below
+ * SUBHALO_UNBIND_CHUNK_MIN (1500, 3000 and 10000 particles, the host + satellite candidate of
+ * test_threads_worker_region from a frame 150 km/s off, with and without subsampling, plus a
+ * candidate that dies after its first iteration and the neighbour search over 3000 tracers) give
+ * bit-identical results with PAR_MIN at 16384 (the Phase 5b value), its default and 1 (every
+ * step of more than one element in parallel mode; at 1 also with the fixed 256 loop chunks of
+ * subhalo_unbind_set_loop_chunk(0)), at 1, 2 and 8 threads, all compared with the 1-thread run
+ * at the default (the serial path). */
+static void
+par_min_case(struct CandResult * r, int nth, int64_t pm, int64_t n, const double vel[3],
+             const struct SubhaloUnbindParams * up)
+{
+    struct TestCand t;
+    int64_t npos;
+    omp_set_num_threads(nth);
+    subhalo_unbind_set_par_min(pm);
+    assert_int_equal(subhalo_unbind_get_par_min(), pm);
+    cand_init(&t, 0, n, Centre, vel, 11);
+    struct SubhaloArena a = arena_alloc(n);
+    const int alive = cand_unbind_final(&t, up, &a, &npos);
+    assert_int_equal(a.used, 0);
+    cand_result_take(r, &t, alive, npos);
+    myfree(a.base);
+    cand_free(&t);
+    subhalo_unbind_set_par_min(0);
+    assert_int_equal(subhalo_unbind_get_par_min(), SUBHALO_UNBIND_PAR_MIN);
+}
+
+static void
+test_threads_par_min(void ** state)
+{
+    const int nmax0 = omp_get_max_threads();
+    const int dyn0 = omp_get_dynamic();
+    const int64_t sizes[3] = {1500, 3000, 10000};
+    const int samples[2] = {1000, 0};
+    const int64_t pms[3] = {16384, SUBHALO_UNBIND_PAR_MIN, 1};
+    const int nths[3] = {1, 2, 8};
+    const double vel0[3] = {Bulk[0] + 150., Bulk[1], Bulk[2]};
+    const double badvel[3] = {Bulk[0] + 300., Bulk[1], Bulk[2]};
+    int is, ip, ipm, it, dead;
+    omp_set_dynamic(0);
+    for(is = 0; is < 3; is++) {
+        const int64_t n = sizes[is];
+        assert_true(n <= SUBHALO_UNBIND_CHUNK_MIN);
+        setup_pman(n);
+        make_host_satellite(n - n / 11, n / 11);
+        for(ip = 0; ip < 2; ip++)
+            for(dead = 0; dead < 2; dead++) {
+                struct SubhaloUnbindParams up = default_params();
+                up.SampleSize = samples[ip];
+                if(dead)
+                    up.MinNumPart = (int) (0.9 * n);
+                struct CandResult ref, r;
+                par_min_case(&ref, 1, SUBHALO_UNBIND_PAR_MIN, n, dead ? badvel : vel0, &up);
+                if(dead)
+                    assert_false(ref.alive);
+                else
+                    assert_true(ref.alive && ref.Nbound > 0.5 * n && ref.Iterations > 1);
+                /* ipm 3: PAR_MIN 1 with the fixed 256 loop chunks */
+                for(ipm = 0; ipm < 4; ipm++)
+                    for(it = 0; it < 3; it++) {
+                        subhalo_unbind_set_loop_chunk(ipm != 3);
+                        par_min_case(&r, nths[it], pms[ipm < 3 ? ipm : 2], n, dead ? badvel : vel0, &up);
+                        subhalo_unbind_set_loop_chunk(1);
+                        assert_same_result(&ref, &r);
+                        cand_result_free(&r);
+                    }
+                uint64_t h = 0xcbf29ce484222325ULL;
+                h = fnv1a(h, ref.Index, sizeof(int64_t) * n);
+                h = fnv1a(h, ref.Energy, sizeof(double) * n);
+                message(0, "Par-min fixture N %ld, SampleSize %d, %s: Nbound %ld after %d iterations; PAR_MIN 16384, %d, 1 at 1, 2, 8 threads "
+                           "(and 1 with the fixed 256 loop chunks) bitwise equal (checksum %016lx)\n", (long) n, samples[ip], dead ? "dead" : "survivor", (long) ref.Nbound,
+                        ref.Iterations, SUBHALO_UNBIND_PAR_MIN, (unsigned long) h);
+                cand_result_free(&ref);
+            }
+        teardown_pman();
+    }
+    /* neighbours: 3000 host tracers, 300 satellite queries, k = 8 */
+    {
+        const int64_t nh = 3000, nsat = 300;
+        const int kk = 8;
+        setup_pman(nh + nsat);
+        make_host_satellite(nh, nsat);
+        int64_t * tr = (int64_t *) malloc(sizeof(int64_t) * nh);
+        int64_t * q = (int64_t *) malloc(sizeof(int64_t) * nsat);
+        int64_t * ref = (int64_t *) malloc(sizeof(int64_t) * nsat * kk);
+        int64_t * out = (int64_t *) malloc(sizeof(int64_t) * nsat * kk);
+        int64_t i;
+        for(i = 0; i < nh; i++)
+            tr[i] = i;
+        for(i = 0; i < nsat; i++)
+            q[i] = nh + i;
+        struct SubhaloArena ka = arena_bytes(128 * (size_t) nh + 4096);
+        omp_set_num_threads(1);
+        subhalo_knn_tracers(q, nsat, tr, nh, kk, ref, BOXSIZE, &ka);
+        assert_int_equal(ka.used, 0);
+        for(ipm = 0; ipm < 4; ipm++)
+            for(it = 0; it < 3; it++) {
+                omp_set_num_threads(nths[it]);
+                subhalo_unbind_set_par_min(pms[ipm < 3 ? ipm : 2]);
+                subhalo_unbind_set_loop_chunk(ipm != 3);
+                subhalo_knn_tracers(q, nsat, tr, nh, kk, out, BOXSIZE, &ka);
+                subhalo_unbind_set_loop_chunk(1);
+                subhalo_unbind_set_par_min(0);
+                assert_int_equal(ka.used, 0);
+                assert_memory_equal(ref, out, sizeof(int64_t) * nsat * kk);
+            }
+        message(0, "Par-min kNN, %ld tracers: bitwise equal at every PAR_MIN and thread count\n", (long) nh);
+        myfree(ka.base);
+        free(out);
+        free(ref);
+        free(q);
+        free(tr);
+        teardown_pman();
+    }
+    omp_set_dynamic(dyn0);
+    omp_set_num_threads(nmax0);
+}
+
+/* Comma-separated integers from the environment variable name into v[0, nmax); returns the
+ * count, or 0 when unset or empty. */
+static int
+env_int_list(const char * name, int64_t * v, int nmax)
+{
+    const char * e = getenv(name);
+    int n = 0;
+    while(e && *e && n < nmax) {
+        char * end;
+        const long long x = strtoll(e, &end, 10);
+        if(end == e)
+            break;
+        v[n++] = x;
+        e = *end == ',' ? end + 1 : end;
+    }
+    return n;
+}
+
+/* Timing table of the parallel mode (Phase 5 plan section 4 item 6), run only when
+ * SUBHALO_UNBIND_TIMING is set to a repeat count (it takes minutes): unbind + final pass of a
+ * Hernquist sphere of 2e4, 2e5 and 1e6 particles with the production SampleSize 1000, at 1, 2,
+ * 4 and 8 threads, the minimum time over the repeats, each result checked bitwise against the
+ * 1-thread one. Run with `mpirun --bind-to none`: by default
+ * Open MPI binds a single rank to one core, and every thread then shares it.
+ * Decision 42.5 (second round) knobs: SUBHALO_UNBIND_TIMING_SIZES (e.g. 2000,4000,8000),
+ * SUBHALO_UNBIND_TIMING_THREADS (e.g. 1,2,4,8) and SUBHALO_UNBIND_TIMING_PARMIN (thresholds set
+ * with subhalo_unbind_set_par_min, e.g. 16384,8192,4096), SUBHALO_UNBIND_TIMING_LOOPCHUNK=0
+ * (subhalo_unbind_set_loop_chunk(0): the fixed 256 energy-loop chunks of Phase 5b; default
+ * adaptive); SUBHALO_UNBIND_TIMING_FIXTURE=sat
+ * times the host + satellite candidate of test_threads_worker_region (start frame 150 km/s off,
+ * several iterations) instead of the sphere. The repeats of one size and thread count
+ * interleave the thresholds (drift on a shared node hits them alike); the thread count changes
+ * only between blocks of repeats, because libgomp's team resizing made a run right after a
+ * change of team size up to 100 ms slower on r30 (an artifact; production keeps one team). The
+ * 1-thread run does not depend on the threshold and is taken once. SUBHALO_UNBIND_TIMING_SAMPLED=1
+ * times the sampled final pass instead of the exact one (TIMING SAMPLED rows, decision 42.4). */
+static void
+test_timing(void ** state)
+{
+    const char * env = getenv("SUBHALO_UNBIND_TIMING");
+    if(!env || !*env) {
+        message(0, "Timing table skipped (set SUBHALO_UNBIND_TIMING=1 to run it)\n");
+        return;
+    }
+    cpu_set_t cs;
+    int ncpu = -1;
+    if(sched_getaffinity(0, sizeof(cs), &cs) == 0)
+        ncpu = CPU_COUNT(&cs);
+    const int nmax0 = omp_get_max_threads();
+    int rep, nrep = atoi(env);
+    if(nrep < 1)
+        nrep = 1;
+    message(0, "Timing: this process may run on %d logical CPU(s), OMP max threads %d%s\n", ncpu, nmax0,
+            ncpu >= 0 && ncpu < 8 ? ": WARNING, fewer CPUs than the largest thread count; the timings are not meaningful (mpirun --bind-to none)" : "");
+    int64_t sizes[16] = {20000, 200000, 1000000}, nthl[8] = {1, 2, 4, 8}, pms[8] = {SUBHALO_UNBIND_PAR_MIN};
+    int nsize = env_int_list("SUBHALO_UNBIND_TIMING_SIZES", sizes, 16);
+    int nth = env_int_list("SUBHALO_UNBIND_TIMING_THREADS", nthl, 8);
+    int npm = env_int_list("SUBHALO_UNBIND_TIMING_PARMIN", pms, 8);
+    if(nsize == 0) nsize = 3;
+    if(nth == 0) nth = 4;
+    if(npm == 0) npm = 1;
+    const char * lc = getenv("SUBHALO_UNBIND_TIMING_LOOPCHUNK");
+    subhalo_unbind_set_loop_chunk(!(lc && *lc && atoi(lc) == 0));
+    message(0, "Timing: energy-loop chunk %s\n", lc && *lc && atoi(lc) == 0 ? "256" : "adaptive");
+    const char * fx = getenv("SUBHALO_UNBIND_TIMING_FIXTURE");
+    const int sat = fx && !strcmp(fx, "sat");
+    const double vel0[3] = {Bulk[0] + 150., Bulk[1], Bulk[2]};
+    const double * vel = sat ? vel0 : Bulk;
+    int s, k, m;
+    for(s = 0; s < nsize; s++) {
+        const int64_t n = sizes[s];
+        setup_pman(n);
+        const double tg = MPI_Wtime();
+        if(sat)
+            make_host_satellite(n - n / 11, n / 11);
+        else
+            make_hernquist(0, n, HQ_M, HQ_A, HQ_RMAX, Centre, Bulk, 4242, 0);
+        message(0, "Timing: %ld particles (%s) sampled in %.1f s\n", (long) n, sat ? "host + satellite, frame 150 km/s off" : "sphere", MPI_Wtime() - tg);
+        struct SubhaloUnbindParams up = default_params();
+        up.SampleSize = 1000;
+        const char * sm = getenv("SUBHALO_UNBIND_TIMING_SAMPLED");
+        up.SampledFinalPass = sm && *sm && atoi(sm) != 0;   /* TIMING SAMPLED rows: the sampled final pass */
+        struct SubhaloArena arena = arena_alloc(n);
+        struct CandResult r0, r;
+        double tun[8][8], tfp[8][8];
+        for(m = 0; m < npm; m++)
+            for(k = 0; k < nth; k++)
+                tun[m][k] = tfp[m][k] = 1e30;
+        int have0 = 0;
+        for(k = 0; k < nth; k++)
+            for(rep = 0; rep < nrep; rep++)
+                for(m = 0; m < npm; m++) {
+                    if(nthl[k] == 1 && m > 0)
+                        continue;
+                    double a, b;
+                    subhalo_unbind_set_par_min(pms[m]);
+                    run_threads(have0 ? &r : &r0, (int) nthl[k], n, Centre, vel, 7, &up, &arena, &a, &b);
+                    subhalo_unbind_set_par_min(0);
+                    if(a < tun[m][k]) tun[m][k] = a;
+                    if(b < tfp[m][k]) tfp[m][k] = b;
+                    if(have0) {
+                        assert_same_result(&r0, &r);
+                        cand_result_free(&r);
+                    }
+                    have0 = 1;
+                }
+        /* the 1-thread time (any threshold) as the reference */
+        double t1un = 0, t1fp = 0;
+        for(k = 0; k < nth; k++)
+            if(nthl[k] == 1) {
+                t1un = tun[0][k];
+                t1fp = tfp[0][k];
+            }
+        for(m = 0; m < npm; m++)
+            for(k = 0; k < nth; k++) {
+                const int mm = nthl[k] == 1 ? 0 : m;
+                const double u = tun[mm][k], f = tfp[mm][k];
+                message(0, "TIMING%s N %8ld parmin %6ld threads %d: unbind %8.4f s  final pass %8.4f s  total %8.4f s  speedup %5.2f (unbind %5.2f, final pass %5.2f); Nbound %ld, %d iterations\n",
+                        up.SampledFinalPass ? " SAMPLED" : "", (long) n, (long) pms[m], (int) nthl[k], u, f, u + f, t1un > 0 ? (t1un + t1fp) / (u + f) : 0,
+                        t1un > 0 ? t1un / u : 0, t1fp > 0 ? t1fp / f : 0, (long) r0.Nbound, r0.Iterations);
+            }
+        cand_result_free(&r0);
+        myfree(arena.base);
+        teardown_pman();
+    }
+    subhalo_unbind_set_loop_chunk(1);
+    omp_set_num_threads(nmax0);
+}
+
+int main(void) {
+    const struct CMUnitTest tests[] = {
+        cmocka_unit_test(test_hernquist),
+        cmocka_unit_test(test_unbound_shell),
+        cmocka_unit_test(test_subsampling),
+        cmocka_unit_test(test_satellite),
+        cmocka_unit_test(test_scale_factor),
+        cmocka_unit_test(test_thermal),
+        cmocka_unit_test(test_periodic_gravity),
+        cmocka_unit_test(test_knn),
+        cmocka_unit_test(test_knn_scaling),
+        cmocka_unit_test(test_ties),
+        cmocka_unit_test(test_tree_order),
+        cmocka_unit_test(test_core_fill),
+        cmocka_unit_test(test_sink_forms),
+        cmocka_unit_test(test_sample_types),
+        cmocka_unit_test(test_death),
+        cmocka_unit_test(test_threads_bitwise),
+        cmocka_unit_test(test_threads_worker_region),
+        cmocka_unit_test(test_final_pass_sampled),
+        cmocka_unit_test(test_threads_par_min),
+        cmocka_unit_test(test_timing),
+    };
+    return cmocka_run_group_tests_mpi(tests, NULL, NULL);
+}
