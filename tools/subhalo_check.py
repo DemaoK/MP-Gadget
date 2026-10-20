@@ -2466,6 +2466,10 @@ def cmd_compare(args):
         return 2
     rtol = 0.0 if args.exact else args.rtol
     ignore = set(args.ignore or [])
+    # an incomplete PIG (a skipped call) carries the last complete call's table: say so first
+    for path, cat in ((args.pig_a, A), (args.pig_b, B)):
+        ck.check(cat.complete(), "%s: SubhaloStateComplete = %s (incomplete: the table is the last complete call's)"
+                 % (path, attr(cat.header, "SubhaloStateComplete")))
     for key in ("NumSubhalosTotal", "NumOrphansTotal", "NumTracksTotal", "SubhaloSchemaVersion", "SnapshotIndex"):
         if key in ignore:
             continue
