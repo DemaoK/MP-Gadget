@@ -80,6 +80,8 @@ Compile-time options may be set in Options.mk. The remaining compile time option
 - NO_OPENMP_SPINLOCK uses the OpenMP default locking routines. These are often much slower than the default pthread spinlocks. However, they are necessary for Mac, which does not provide pthreads.
 - EXCUR_REION enables the excursion set reionization model.
 - USE_CFITSIO enables the output of lenstools compatible potential planes using cfitsio,
+- SIDM enables scattering of equal-mass type-1 dark matter particles.
+- SIDMDEBUG adds SIDM conservation checks, detailed timers and counters; use with SIDM.
 
 If compilation fails with errors related to the GSL, you may also need to set the GSL_INC or GSL_LIB variables in Options.mk to the filesystem path containing the GSL headers and libraries.
 
@@ -121,6 +123,49 @@ Find examples in examples/.
 
 Control number of threads with `OMP_NUM_THREADS`. Generally the code is faster with more threads per rank, up to hardware limits. On Frontera we run optimally with 28 threads, the number of cpus per hardware socket.
 
+Self-interacting dark matter
+---------------------------
+
+Add ``OPT += -DSIDM`` to ``Options.mk`` and build with the usual compiler
+flags. For development diagnostics also add ``OPT += -DSIDMDEBUG``.
+At runtime, ``SIDMOn = 1`` requires ``SplitGravityTimestepsOn = 1``,
+``TreeGravOn = 1`` and ``ForceEqualTimesteps = 0``. SIDM uses separate source
+clocks within the existing split-gravity framework and a single kernel
+over equal-mass type-1 neighbors. Other species do not scatter.
+
+=========================  =======  ===========================================
+Parameter                  Default  Meaning
+=========================  =======  ===========================================
+SIDMOn                     0        Enable scattering
+vdSIDMOn                   0        Enable velocity-dependent cross section
+sigma0                     0        Cross section per unit mass, cm²/g
+wTurn                      0        Turnover speed, km/s; positive if vdSIDMOn=1
+SIDMNeighbors              38       Support neighbor rank, excluding self
+SIDMDirectedProbability    0.1      Directed trial probability bound, (0,1]
+SIDMTransportFraction      0.1      Relative-motion step fraction, (0,0.25]
+=========================  =======  ===========================================
+
+``SIDMDirectedProbability`` also limits future source exposure. Pairs whose
+accumulated exposure exceeds the trial bound use multiple trials. Restart
+snapshots must be synchronized PM outputs: the solver flushes all source
+intervals before writing them. With the runtime finder enabled, use the
+matching complete PIG as described below.
+
+The native ``dm-small`` helper can exercise both modules. It uses
+``SIDMDirectedProbability=0.5``, ``SIDMTransportFraction=0.2``, 38 neighbors,
+``vdSIDMOn=1``, ``sigma0=147.1`` and ``wTurn=120`` as test settings; these
+do not change the code defaults above. From a built checkout:
+
+.. code:: bash
+
+    python examples/sidm-cosmological/validate_dm_small.py --workdir build/dm-small-sidm --mode prepare
+    python examples/sidm-cosmological/validate_dm_small.py --workdir build/dm-small-sidm --mode release --binary gadget/MP-Gadget --halo-finder
+    python examples/sidm-cosmological/validate_dm_small.py --workdir build/dm-small-sidm --mode release --name restart --binary gadget/MP-Gadget --halo-finder --restart-from build/dm-small-sidm/release/output/PART_001
+
+The helper needs Python with NumPy, SciPy and bigfile. Each run
+uses a new directory. Restart setup links the matching PART/PIG pair and
+copies the power diagnostic so startup cannot overwrite its source.
+
 Runtime subhalo finder
 ----------------------
 
@@ -144,8 +189,27 @@ SubhaloSinkSymmetric                 0        SubhaloCoreSize           20      
 SubhaloNumNeighboursForReassignment  10       SubhaloUnbindWithThermal  0         SubhaloFieldSO                   1
 SubhaloSOBins                        64       SubhaloSOSearchFactor     2         SubhaloSOMaxDoublings            3
 SubhaloSORefineMinPart               1000     SubhaloMajorMergerRatio   0.3       SubhaloGeometricParents          0
-SubhaloDebugForceExchangeFailure     0
+SubhaloDebugForceExchangeFailure     0        SubhaloOrphanTracers      10
 ===================================  =======  ========================  ========  ===============================  =======
+
+With SIDM and the finder both enabled, each accepted collision adds one to
+both particles' transient ``TracerPenalty``. The finder uses
+``exp(-TracerPenalty)`` to weight tracer votes and orphan centres. Completed
+calls clear the counts; skipped calls keep them for the next call. The
+penalty is a tracking heuristic and does not alter scattering or gravity.
+
+Counts are not saved in PART or PIG. Restart from a matching PART/PIG pair
+whose PIG header has ``SubhaloStateComplete = 1``. Loading older finder
+state loses the intervening scattering counts. ``SubhaloRestartFresh = 1``
+allows new track identities when no complete state exists. Offline mode 3
+starts with zero counts and cannot reconstruct the weighted runtime votes.
+Likewise, the offline ``tracking`` and ``orphans --tracer-pos`` checks
+assume zero penalties; use structural checks for weighted SIDM catalogues.
+
+The HCI ``stop`` file requests PART without requesting PIG. To preserve a
+matched tracking checkpoint, request ``checkpoint``, wait for a complete
+PART/PIG pair, then request ``terminate``. ``TimeLimitCPU`` also requests
+both outputs when FOF is enabled.
 
 User Guide
 ----------

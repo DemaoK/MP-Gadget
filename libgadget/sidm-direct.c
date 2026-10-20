@@ -19,7 +19,10 @@ struct target {
     uint64_t id; /* Owner index is sufficient outside development audits. */
 #endif
 };
-struct reply { double v[3], max_sigma_v, max_relative_speed; int events; };
+struct reply {
+    double v[3], max_sigma_v, max_relative_speed;
+    int events; /* Accepted collisions of this remote source, including subdivisions. */
+};
 #ifdef SIDMDEBUG
 #define PROFILE(code) do { code; } while(0)
 #else
@@ -773,7 +776,7 @@ int sidm_direct_scatter(struct sidm_direct_particles p,int nlocal,
                             }
                             for(int b=0;b<n;b++) {
                                 struct packet a; memcpy(&a,buffer+at,sizeof(a)); at+=sizeof(a);
-                                double max_sv=0,max_u=0;int source_changed=0;
+                                double max_sv=0,max_u=0;
                                 int events=0;
                                 const struct group_evaluation *prediction=&Cache.groups[b];
                                 if(parallel && !failed && !prediction->hit && !prediction->bad) {
@@ -801,7 +804,7 @@ int sidm_direct_scatter(struct sidm_direct_particles p,int nlocal,
                                         fail(&failed,error,"Direct SIDM remote index/ID mismatch"); continue;
                                     }
 #endif
-                                    const struct pair_evaluation *cached=parallel && !source_changed && Cache.changed[e.index]!=epoch?
+                                    const struct pair_evaluation *cached=parallel && !events && Cache.changed[e.index]!=epoch?
                                         &Cache.pairs[b*SIDM_DIRECT_MAX_NEIGHBORS+k]:NULL;
 #ifdef SIDMDEBUG
                                     local.threaded_pairs+=parallel;
@@ -811,7 +814,7 @@ int sidm_direct_scatter(struct sidm_direct_particles p,int nlocal,
                                         sigma0,w,vd,pmax,j,p,-1,e.index,&max_sv,&max_u,&local,&failed,error,cached);
                                     events+=accepted;
                                     if(accepted && parallel) {
-                                        source_changed=1;epoch_changed=1;Cache.changed[e.index]=epoch;
+                                        epoch_changed=1;Cache.changed[e.index]=epoch;
                                     }
                                 }
                                 memcpy(returned[first+b].v,a.v,sizeof(a.v)); returned[first+b].max_sigma_v=max_sv;

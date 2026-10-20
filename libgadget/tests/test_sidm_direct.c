@@ -130,8 +130,12 @@ static void check(double pmax,int vd,int boost,int zero,int negative)
     if(negative==3&&rank==0&&ns) s[0].neighbors[1]=s[0].neighbors[0];
     if(negative==4&&rank==0&&ns) s[0].exposure=DBL_MAX;
     struct sidm_direct_stats actual,expected={0}; char error[256];
-    const struct sidm_direct_particles view={p,sizeof(*p),
-        offsetof(struct native,id),offsetof(struct native,v),record_penalties?offsetof(struct native,penalty):SIZE_MAX};
+    const struct sidm_direct_particles view={
+        .base=p, .stride=sizeof(*p),
+        .id_offset=offsetof(struct native,id),
+        .velocity_offset=offsetof(struct native,v),
+        .penalty_offset=record_penalties?offsetof(struct native,penalty):SIZE_MAX,
+    };
     int code=sidm_direct_scatter(view,n,s,ns,.3,2,vd,pmax,MPI_COMM_WORLD,&journal,&actual,error);
     for(int i=0;i<n;i++) assert(p[i].guard==UINT64_C(0x5a5a5a5a5a5a5a5a));
     if(negative) { assert(code!=0);if(!rank)printf("PASS direct negative %d: %s\n",negative,error);return; }
@@ -247,7 +251,12 @@ static void check_waves(void)
             }
         }
         struct sidm_direct_stats stats;char error[256];
-        const struct sidm_direct_particles view={p,sizeof(*p),offsetof(struct particle,id),offsetof(struct particle,v),offsetof(struct particle,penalty)};
+        const struct sidm_direct_particles view={
+            .base=p, .stride=sizeof(*p),
+            .id_offset=offsetof(struct particle,id),
+            .velocity_offset=offsetof(struct particle,v),
+            .penalty_offset=offsetof(struct particle,penalty),
+        };
         assert(!sidm_direct_scatter(view,LOCAL,s,GROUPS,.3,2,0,.1,MPI_COMM_WORLD,&journal,&stats,error));
         for(int i=0;i<LOCAL;i++) {
             if(!threaded) memcpy(reference[i],p[i].v,sizeof(reference[i]));

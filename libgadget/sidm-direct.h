@@ -83,6 +83,8 @@ struct sidm_direct_stats {
  * pmax must be in (0,1]. No speed ceiling, clipping, or outcome-dependent retry.
  *
  * Neighbor arrays must be disjoint between sources (sorted in parallel).
+ * An enabled penalty_offset accumulates accepted events on both endpoints;
+ * the caller owns initialization, persistence and interval resets.
  * With SIDMDEBUG, accepted updates are journaled before their first mutation.
  * The caller supplies identical parameters on all ranks and validates all
  * initial particle state and fixed equal mass, and provides a journal with
