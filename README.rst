@@ -199,8 +199,10 @@ calls clear the counts; skipped calls keep them for the next call. The
 penalty is a tracking heuristic and does not alter scattering or gravity.
 
 Counts are not saved in PART or PIG. Restart from a matching PART/PIG pair
-whose PIG header has ``SubhaloStateComplete = 1``. Loading older finder
-state loses the intervening scattering counts. ``SubhaloRestartFresh = 1``
+whose PIG header has ``SubhaloStateComplete = 1`` and whose saved times agree.
+Loading older finder state loses the intervening scattering counts;
+``SubhaloRestartFresh = 0`` still allows that fallback, so verify the
+loaded state in the startup log. ``SubhaloRestartFresh = 1``
 allows new track identities when no complete state exists. Offline mode 3
 starts with zero counts and cannot reconstruct the weighted runtime votes.
 Likewise, the offline ``tracking`` and ``orphans --tracer-pos`` checks
@@ -210,6 +212,8 @@ The HCI ``stop`` file requests PART without requesting PIG. To preserve a
 matched tracking checkpoint, request ``checkpoint``, wait for a complete
 PART/PIG pair, then request ``terminate``. ``TimeLimitCPU`` also requests
 both outputs when FOF is enabled.
+Such extra checkpoints increment the output file number, so identify a
+restart by its saved time rather than assuming its OutputList index.
 
 User Guide
 ----------
