@@ -1,5 +1,6 @@
 #include <mpi.h>
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -18,8 +19,49 @@
  *  This file delegates the functions to petaio and fof.
  */
 
+/* Snapshots.txt lists the written indices in order: lines with an index >= snapnum (a reused index,
+ * or the later outputs of an older run) are dropped, snapnum's line is added, and the file is replaced
+ * by one rename so a crash leaves either list intact. Rank 0 only. */
+static void
+append_snapshot_line(const char * OutputDir, const int snapnum, const double Time)
+{
+    char * buf = fastpm_strdup_printf("%s/Snapshots.txt", OutputDir);
+    char * tmp = fastpm_strdup_printf("%s.tmp", buf);
+    char * content = fastpm_file_get_content(buf);
+    if(!content && errno != ENOENT)
+        endrun(1, "Failed to read %s: %s\n", buf, strerror(errno));
+    FILE * fd = fopen(tmp, "w");
+    if(!fd)
+        endrun(1, "Failed to open %s\n", tmp);
+    int fail = 0;
+    if(content) {
+        char * line = content;
+        int lastnewline = 1;
+        while(*line) {
+            char * end = strchr(line, '\n');
+            size_t len = end ? (size_t) (end - line) + 1 : strlen(line);
+            int num;
+            if(!(1 == sscanf(line, "%d", &num) && num >= snapnum)) {
+                fail |= fwrite(line, 1, len, fd) != len;
+                lastnewline = (end != NULL);
+            }
+            line += len;
+        }
+        /* a kept last line without its newline gets one before snapnum's line */
+        if(!lastnewline)
+            fail |= fputc('\n', fd) == EOF;
+        myfree(content);
+    }
+    fail |= fprintf(fd, "%03d %g\n", snapnum, Time) < 0;
+    fail |= fclose(fd) != 0;
+    if(fail || rename(tmp, buf) != 0)
+        endrun(1, "Failed to write %s\n", buf);
+    myfree(tmp);
+    myfree(buf);
+}
+
 void
-write_checkpoint(int snapnum, int WriteGroupID, int MetalReturnOn, double Time, const Cosmology * CP, const char * OutputDir, const int OutputDebugFields)
+write_checkpoint(int snapnum, int WriteGroupID, int MetalReturnOn, double Time, const Cosmology * CP, const char * OutputDir, const int OutputDebugFields, const int Checkpoint)
 {
     /* write snapshot of particles */
     struct IOTable IOTable = {0};
@@ -27,7 +69,7 @@ write_checkpoint(int snapnum, int WriteGroupID, int MetalReturnOn, double Time, 
     if(OutputDebugFields)
         register_debug_io_blocks(&IOTable);
     char * fname = petaio_get_snapshot_fname(snapnum, OutputDir);
-    petaio_save_snapshot(fname, &IOTable, 1, Time, CP);
+    petaio_save_snapshot(fname, &IOTable, 1, Time, CP, Checkpoint);
     myfree(fname);
 
     destroy_io_blocks(&IOTable);
@@ -35,13 +77,8 @@ write_checkpoint(int snapnum, int WriteGroupID, int MetalReturnOn, double Time, 
 
     int ThisTask;
     MPI_Comm_rank(MPI_COMM_WORLD, &ThisTask);
-    if(ThisTask == 0) {
-        char * buf = fastpm_strdup_printf("%s/Snapshots.txt", OutputDir);
-        FILE * fd = fopen(buf, "a");
-        fprintf(fd, "%03d %g\n", snapnum, Time);
-        fclose(fd);
-        myfree(buf);
-    }
+    if(ThisTask == 0)
+        append_snapshot_line(OutputDir, snapnum, Time);
 }
 
 void
@@ -51,7 +88,7 @@ dump_snapshot(const char * dump, const double Time, const Cosmology * CP, const 
     register_io_blocks(&IOTable, 0, 1);
     register_debug_io_blocks(&IOTable);
     char * fname = fastpm_strdup_printf("%s/%s", OutputDir, dump);
-    petaio_save_snapshot(fname, &IOTable, 1, Time, CP);
+    petaio_save_snapshot(fname, &IOTable, 1, Time, CP, 0);
     destroy_io_blocks(&IOTable);
 }
 

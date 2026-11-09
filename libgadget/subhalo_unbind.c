@@ -1308,6 +1308,47 @@ subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * up, s
     return 1;
 }
 
+int
+subhalo_unbind_rescue(struct SubCandidate * c, int64_t K, const struct SubhaloUnbindParams * up, struct SubhaloArena * arena, int * tried)
+{
+    const size_t mark = arena->used;
+    const int64_t N = c->N;
+    int64_t i, nc = 0;
+    if(tried)
+        *tried = 0;
+    /* one buffer, the core list then the death order; with less arena left the kernel's source sort
+     * falls back to serial and its tree leaves widen until the nodes fit */
+    int64_t * buf = (int64_t *) arena_need(arena, sizeof(int64_t) * (N + 1), "rescue order");
+    for(i = 0; i < N; i++) {
+        const struct particle_data * p = &P[c->Index[i]];
+        if(p->TrackId == c->TrackId && p->BindRank >= 0 && p->BindRank < K)
+            buf[nc++] = c->Index[i];
+    }
+    double CorePos[3], CoreVel[3];
+    if(nc < 1 || nc < K / 2 || !(bound_frame(buf, nc, CorePos, CoreVel, up->BoxSize) > 0)) {
+        arena->used = mark;
+        return 0;
+    }
+    if(tried)
+        *tried = 1;
+    memcpy(buf, c->Index, sizeof(int64_t) * N);
+    const struct SubCandidate dead = *c;
+    int d;
+    for(d = 0; d < 3; d++) {
+        c->RefPos[d] = CorePos[d];
+        c->RefVel[d] = CoreVel[d];
+    }
+    const int alive = subhalo_unbind(c, up, arena);
+    if(alive)
+        c->Flags |= SUBHALO_FLAG_RESCUED;
+    else {
+        *c = dead;
+        memcpy(c->Index, buf, sizeof(int64_t) * N);
+    }
+    arena->used = mark;
+    return alive;
+}
+
 /* The head K of the sampled final pass: the shortest prefix with T = MARGIN * Kt tracers (all if
  * fewer, then subhalo_core's non-tracer fill up to T) and at least T particles. The margin
  * absorbs the loop order misplacing tracers by a few ranks. */

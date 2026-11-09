@@ -7,6 +7,10 @@
 #include <string.h>
 #include <stdarg.h>
 #include <omp.h>
+#include <dirent.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <bigfile-mpi.h>
 
@@ -20,6 +24,7 @@
 #include "config.h"
 #include "neutrinos_lra.h"
 #include "physconst.h"
+#include "subhalo.h"
 #include "utils/endrun.h"
 #include "utils/mymalloc.h"
 #include "utils/openmpsort.h"
@@ -87,8 +92,9 @@ int GetUsePeculiarVelocity(void)
     return IO.UsePeculiarVelocity;
 }
 
-static void petaio_write_header(BigFile * bf, const double atime, const int64_t * NTotal, const Cosmology * CP, const struct header_data * data);
+static void petaio_write_header(BigFile * bf, const double atime, const int64_t * NTotal, const Cosmology * CP, const struct header_data * data, const int Checkpoint);
 static void petaio_read_header_internal(BigFile * bf, Cosmology * CP, struct header_data * data);
+static void register_io_blocks_internal(struct IOTable * IOTable, int WriteGroupID, int MetalReturnOn, int PenaltyColumn);
 
 /* these are only used in reading in */
 void petaio_init(void) {
@@ -154,8 +160,62 @@ petaio_build_selection(int * selection,
     }
 }
 
+/* bigfile keeps the blocks a rewrite of the same file does not write: a penalty column left by an earlier
+ * write of this file is removed for every type the table has no TracerPenalty entry for. Collective. */
 void
-petaio_save_snapshot(const char * fname, struct IOTable * IOTable, int verbose, const double atime, const Cosmology * CP)
+petaio_remove_stale_penalty_blocks(BigFile * bf, const struct IOTable * IOTable, MPI_Comm Comm)
+{
+    int ThisTask;
+    MPI_Comm_rank(Comm, &ThisTask);
+    if(ThisTask == 0) {
+        int ptype, i;
+        for(ptype = 0; ptype < 6; ptype++) {
+            int registered = 0;
+            for(i = 0; i < IOTable->used; i++)
+                registered |= IOTable->ent[i].ptype == ptype && 0 == strcmp(IOTable->ent[i].name, "TracerPenalty");
+            if(registered)
+                continue;
+            char * dirname = fastpm_strdup_printf("%s/%d/TracerPenalty", bf->basename, ptype);
+            struct stat st;
+            if(0 != lstat(dirname, &st)) {
+                if(errno != ENOENT)
+                    endrun(1, "Failed to stat %s: %s\n", dirname, strerror(errno));
+            }
+            else if(S_ISLNK(st.st_mode)) {
+                /* a linked block: drop the link, never its target */
+                if(0 != unlink(dirname))
+                    endrun(1, "Failed to remove the stale block link %s: %s\n", dirname, strerror(errno));
+                message(0, "Removed the stale block link %s\n", dirname);
+            }
+            else {
+                DIR * dir = opendir(dirname);
+                if(!dir)
+                    endrun(1, "Failed to open the stale block %s: %s\n", dirname, strerror(errno));
+                struct dirent * de;
+                errno = 0;
+                while((de = readdir(dir))) {
+                    if(!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+                        continue;
+                    char * path = fastpm_strdup_printf("%s/%s", dirname, de->d_name);
+                    if(0 != unlink(path))
+                        endrun(1, "Failed to remove the stale block file %s: %s\n", path, strerror(errno));
+                    myfree(path);
+                    errno = 0;
+                }
+                if(errno != 0 || 0 != closedir(dir))
+                    endrun(1, "Failed to list the stale block %s: %s\n", dirname, strerror(errno));
+                if(0 != rmdir(dirname))
+                    endrun(1, "Failed to remove the stale block %s: %s\n", dirname, strerror(errno));
+                message(0, "Removed the stale block %s\n", dirname);
+            }
+            myfree(dirname);
+        }
+    }
+    MPI_Barrier(Comm);
+}
+
+void
+petaio_save_snapshot(const char * fname, struct IOTable * IOTable, int verbose, const double atime, const Cosmology * CP, const int Checkpoint)
 {
     message(0, "saving snapshot into %s\n", fname);
 
@@ -179,7 +239,8 @@ petaio_save_snapshot(const char * fname, struct IOTable * IOTable, int verbose, 
     conv.hubble = hubble_function(CP, atime);
     conv.hubbleparam = CP->HubbleParam;
 
-    petaio_write_header(&bf, atime, NTotal, CP, &Header);
+    petaio_write_header(&bf, atime, NTotal, CP, &Header, Checkpoint);
+    petaio_remove_stale_penalty_blocks(&bf, IOTable, MPI_COMM_WORLD);
 
     int i;
     for(i = 0; i < IOTable->used; i ++) {
@@ -298,8 +359,12 @@ petaio_read_snapshot(int num, const char * OutputDir, Cosmology * CP, struct hea
     int missing_mass_from_header[6] = {0};
     /* Always try to read the metal tables.
      * This lets us turn it off for a short period and then re-enable it.
-     * Note the metal fields are non-fatal so this does not break resuming without metals.*/
-    register_io_blocks(IOTable, 0, 1);
+     * Note the metal fields are non-fatal so this does not break resuming without metals.
+     * The penalty column is non-fatal too: a snapshot with it restores the penalties, one without leaves them zero.*/
+    register_io_blocks_internal(IOTable, 0, 1, 1);
+    #pragma omp parallel for
+    for(i = 0; i < PartManager->NumPart; i++)
+        PartManager->Base[i].TracerPenalty = 0;
 
     for(i = 0; i < IOTable->used; i ++) {
         /* only process the particle blocks */
@@ -401,7 +466,7 @@ petaio_read_snapshot(int num, const char * OutputDir, Cosmology * CP, struct hea
 }
 
 /* write a header block */
-static void petaio_write_header(BigFile * bf, const double atime, const int64_t * NTotal, const Cosmology * CP, const struct header_data * data) {
+static void petaio_write_header(BigFile * bf, const double atime, const int64_t * NTotal, const Cosmology * CP, const struct header_data * data, const int Checkpoint) {
     BigBlock bh;
     if(0 != big_file_mpi_create_block(bf, &bh, "Header", NULL, 0, 0, 0, MPI_COMM_WORLD)) {
         endrun(0, "Failed to create block at %s:%s\n", "Header",
@@ -446,6 +511,9 @@ static void petaio_write_header(BigFile * bf, const double atime, const int64_t 
         endrun(0, "Failed to write attributes %s\n",
                     big_file_get_error_message());
     }
+    /* Only from the caller: a header read at restart from a checkpoint never marks a later output. */
+    if(Checkpoint && 0 != big_block_set_attr(&bh, "Checkpoint", &Checkpoint, "i4", 1))
+        endrun(0, "Failed to write the Checkpoint attribute %s\n", big_file_get_error_message());
 
     if(0 != big_block_mpi_close(&bh, MPI_COMM_WORLD)) {
         endrun(0, "Failed to close block %s\n",
@@ -537,6 +605,7 @@ petaio_read_header_internal(BigFile * bf, Cosmology * CP, struct header_data * H
      * and v / sqrt(a) = sqrt(a) dx/dt in the ICs. Note that snapshots never match Gadget-2, which
      * saves physical peculiar velocity / sqrt(a) in both ICs and snapshots. */
     IO.UsePeculiarVelocity = _get_attr_int(&bh, "UsePeculiarVelocity", 0);
+    Header->Checkpoint = _get_attr_int(&bh, "Checkpoint", 0);
 
     if(0 != big_block_get_attr(&bh, "TotNumPartInit", Header->NTotalInit, "u8", 6)) {
         int ptype;
@@ -741,7 +810,17 @@ void io_register_io_block(const char * name,
     ent->setter = setter;
     ent->items = items;
     ent->required = required;
+    ent->snapshot_only = 0;
     IOTable->used ++;
+}
+
+void
+petaio_snapshot_only(struct IOTable * IOTable, const char * name)
+{
+    int i;
+    for(i = 0; i < IOTable->used; i++)
+        if(0 == strcmp(IOTable->ent[i].name, name))
+            IOTable->ent[i].snapshot_only = 1;
 }
 
 static void GTPosition(int i, double * out, void * baseptr, void * smanptr, const struct conversions * params) {
@@ -843,6 +922,7 @@ SIMPLE_GETTER(GTPotential, Potential, float, 1, struct particle_data)
 SIMPLE_GETTER(GTTimeBinHydro, TimeBinHydro, int, 1, struct particle_data)
 SIMPLE_GETTER(GTTimeBinGravity, TimeBinGravity, int, 1, struct particle_data)
 SIMPLE_PROPERTY(SmoothingLength, Hsml, float, 1)
+SIMPLE_PROPERTY(TracerPenalty, TracerPenalty, float, 1)
 SIMPLE_PROPERTY_PI(Density, Density, float, 1, struct sph_particle_data)
 SIMPLE_PROPERTY_PI(EgyWtDensity, EgyWtDensity, float, 1, struct sph_particle_data)
 SIMPLE_PROPERTY_PI(ElectronAbundance, Ne, float, 1, struct sph_particle_data)
@@ -1000,7 +1080,30 @@ static int order_by_type(const void *a, const void *b)
     return 0;
 }
 
+/* Whether a write carries the collision penalty column: the finder is on and some live particle
+ * holds a penalty not yet consumed after a complete finder call's PIG. Collective; runs without scatterings write nothing. */
+static int
+penalty_column_needed(void)
+{
+    if(!subhalo_finder_on())
+        return 0;
+    int any = 0;
+    int64_t i;
+    #pragma omp parallel for reduction(||: any)
+    for(i = 0; i < PartManager->NumPart; i++)
+        if(!P[i].IsGarbage && !P[i].Swallowed && P[i].TracerPenalty != 0)
+            any = 1;
+    MPI_Allreduce(MPI_IN_PLACE, &any, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD);
+    return any;
+}
+
 void register_io_blocks(struct IOTable * IOTable, int WriteGroupID, int MetalReturnOn)
+{
+    register_io_blocks_internal(IOTable, WriteGroupID, MetalReturnOn, penalty_column_needed());
+}
+
+static void
+register_io_blocks_internal(struct IOTable * IOTable, int WriteGroupID, int MetalReturnOn, int PenaltyColumn)
 {
     int i;
     IOTable->used = 0;
@@ -1022,6 +1125,8 @@ void register_io_blocks(struct IOTable * IOTable, int WriteGroupID, int MetalRet
             IO_REG_WRONLY(TimeBinHydro,       "u4", 1, i, IOTable);
             IO_REG_WRONLY(TimeBinGravity,       "u4", 1, i, IOTable);
         }
+        if(PenaltyColumn)
+            IO_REG_NONFATAL(TracerPenalty, "f4", 1, i, IOTable);
     }
 
 #ifdef SIDM
@@ -1031,6 +1136,10 @@ void register_io_blocks(struct IOTable * IOTable, int WriteGroupID, int MetalRet
         IO_REG_WRONLY(SIDMLastVisit, "i8", 1, 1, IOTable);
         IO_REG_WRONLY(TimeBinSIDM, "u4", 1, 1, IOTable);
     }
+    /* Restart bookkeeping of the scattering module: PART only, not the PIG. */
+    petaio_snapshot_only(IOTable, "SIDMSupport");
+    petaio_snapshot_only(IOTable, "SIDMLastVisit");
+    petaio_snapshot_only(IOTable, "TimeBinSIDM");
 #endif
 
     IO_REG(Generation,       "u1", 1, 0, IOTable);

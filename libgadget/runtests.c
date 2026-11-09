@@ -134,7 +134,7 @@ run_gravity_test(int RestartSnapNum, Cosmology * CP, const double Asmth, const i
     message(0, "GravShort Pairs %s\n", GDB_format_particle(0));
     char * fname = fastpm_strdup_printf("%s/PART-pairs-%03d", OutputDir, RestartSnapNum);
 
-    petaio_save_snapshot(fname, &IOTable, 0, header->TimeSnapshot, CP);
+    petaio_save_snapshot(fname, &IOTable, 0, header->TimeSnapshot, CP, 0);
 
     treeacc.ErrTolForceAcc = 0;
     treeacc.BHOpeningAngle = 0;
@@ -151,7 +151,7 @@ run_gravity_test(int RestartSnapNum, Cosmology * CP, const double Asmth, const i
 
     message(0, "GravShort Tree %s\n", GDB_format_particle(0));
     fname = fastpm_strdup_printf("%s/PART-tree-open-%03d", OutputDir, RestartSnapNum);
-    petaio_save_snapshot(fname, &IOTable, 0, header->TimeSnapshot, CP);
+    petaio_save_snapshot(fname, &IOTable, 0, header->TimeSnapshot, CP, 0);
 
     /* This checks tree force against tree force with zero error (which always opens).*/
     copy_and_mean_accn(PairAccn);
@@ -173,7 +173,7 @@ run_gravity_test(int RestartSnapNum, Cosmology * CP, const double Asmth, const i
     grav_short_tree(&Act, pm, &Tree, NULL, rho0, times.Ti_Current);
     grav_short_tree(&Act, pm, &Tree, NULL, rho0, times.Ti_Current);
     fname = fastpm_strdup_printf("%s/PART-tree-%03d", OutputDir, RestartSnapNum);
-    petaio_save_snapshot(fname, &IOTable, 0, header->TimeSnapshot, CP);
+    petaio_save_snapshot(fname, &IOTable, 0, header->TimeSnapshot, CP, 0);
 
     check_accns(&meanerr,&maxerr,&meanangle, &maxangle, PairAccn);
     message(0, "Force error, open tree vs tree. max : %g mean: %g angle %g max angle %g forcetol: %g\n", maxerr, meanerr, meanangle, maxangle, treeacc.ErrTolForceAcc);
@@ -189,7 +189,7 @@ run_gravity_test(int RestartSnapNum, Cosmology * CP, const double Asmth, const i
     grav_short_tree(&Act, pm, &Tree, NULL, rho0, times.Ti_Current);
     grav_short_tree(&Act, pm, &Tree, NULL, rho0, times.Ti_Current);
     fname = fastpm_strdup_printf("%s/PART-tree-rcut-%03d", OutputDir, RestartSnapNum);
-    petaio_save_snapshot(fname, &IOTable, 0, header->TimeSnapshot, CP);
+    petaio_save_snapshot(fname, &IOTable, 0, header->TimeSnapshot, CP, 0);
 
     check_accns(&meanerr,&maxerr,&meanangle, &maxangle, PairAccn);
     message(0, "Force error, Rcut=%g. max : %g mean: %g angle %g max angle %g\n", treeacc.Rcut, maxerr, meanerr, meanangle, maxangle);
@@ -210,7 +210,7 @@ run_gravity_test(int RestartSnapNum, Cosmology * CP, const double Asmth, const i
     grav_short_tree(&Act, pm, &Tree, NULL, rho0, times.Ti_Current);
     grav_short_tree(&Act, pm, &Tree, NULL, rho0, times.Ti_Current);
     fname = fastpm_strdup_printf("%s/PART-tree-nmesh2-%03d", OutputDir, RestartSnapNum);
-    petaio_save_snapshot(fname, &IOTable, 0, header->TimeSnapshot, CP);
+    petaio_save_snapshot(fname, &IOTable, 0, header->TimeSnapshot, CP, 0);
 
     check_accns(&meanerr,&maxerr,&meanangle, &maxangle, PairAccn);
     message(0, "Force error, nmesh %d vs %d: max : %g mean: %g angle %g max angle %g\n", Nmesh, Nmesh/2, maxerr, meanerr, meanangle, maxangle);

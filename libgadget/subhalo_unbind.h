@@ -34,7 +34,7 @@ struct SubCandidate {
     double RefVel[3];        /* frame: internal Vel units (a v_pec); in/out as above */
     double Mbound;
     int Iterations;
-    int Flags;               /* SUBHALO_FLAG_ITERCAP */
+    int Flags;               /* SUBHALO_FLAG_ITERCAP, SUBHALO_FLAG_RESCUED */
     uint64_t Seed;           /* subsampling RNG seed, set by the caller from (TrackId, SnapNum) */
     /* Diagnostics, written by the kernel and logged by the driver (design 7.4) */
     double ConvergenceRatio;  /* Nbound / Nlast of the last iteration (at the kill if it died), 0 if none ran */
@@ -81,6 +81,13 @@ struct SubhaloUnbindParams {
  * max(SampleSize, 0.1 Nbound) most bound re-ordered by exact self-energy, as HBT), then the unbound
  * in ascending Energy; RefPos/RefVel the bound CoM frame; Flags |= ITERCAP when MaxIter is hit. */
 int subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * up, struct SubhaloArena * arena);
+
+/* Core-frame rescue of a resolved track's candidate that subhalo_unbind killed from its mean frame. The core
+ * is the source's own-tag particles with 0 <= BindRank < K; with fewer than max(1, K/2) it returns 0, c untouched,
+ * *tried = 0 (tried may be NULL). Else c is unbound again from the core's frame, final: survival sets SUBHALO_FLAG_RESCUED,
+ * a death restores c's fields and Index order (Energy is scratch, undefined after a death as after subhalo_unbind). */
+int subhalo_unbind_rescue(struct SubCandidate * c, int64_t K, const struct SubhaloUnbindParams * up,
+                          struct SubhaloArena * arena, int * tried);
 
 /* Final pass over the bound prefix in its recomputed CoM frame: exact-mass energies, prefix sorted
  * by them; returns the count with E >= 0 (NboundPositive). Membership is unchanged. Sampled

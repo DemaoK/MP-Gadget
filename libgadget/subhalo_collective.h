@@ -40,6 +40,7 @@ struct SubhaloCollectiveStats {
     double Seconds[16];           /* wall time per round */
     int64_t NSunk;                /* descendants sunk into in-place candidates */
     int64_t NDied;                /* in-place candidates that died */
+    int64_t NDiedMeanFrame;       /* of which resolved tracks dead at their first unbinding, from the previous-bound frame (no rescue in place) */
     int64_t NAlive;
     int64_t NStolen;              /* serial own-tag particles taken over by an in-place ancestor */
     int64_t NJ2;                  /* claims across the final tree (J2) given to the binding owner */

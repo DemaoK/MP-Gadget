@@ -1,6 +1,6 @@
 /* Serial tests of the unbinding kernel (subhalo_unbind.c; design 7.4) and the k-nearest tracer
  * search: Hernquist haloes, unbound shells, subsampling, satellites, scale factor, thermal energy,
- * periodic gravity, ties, tree order, core fill, sinking, death; bitwise results at 1 to 8
+ * periodic gravity, ties, tree order, core fill, sinking, death, rescue; bitwise results at 1 to 8
  * threads and inside a worker region (decisions 37, 42.5); the sampled final pass (42.4).
  * test_timing takes sizes, thresholds, threads and the final-pass mode from SUBHALO_UNBIND_TIMING*.
  * Haloes sample the exact Hernquist distribution function (truncated at 100 scale radii) across a
@@ -1532,6 +1532,151 @@ test_death(void ** state)
     teardown_pman();
 }
 
+/* The rescue of a stripped satellite of track 0: a bound core of NC particles (own tag, BindRank
+ * 0 .. NC-1) plus a tail of 2 NC at 300 km/s, half of it own-tag beyond the core's BindRanks, half
+ * another track's with low BindRanks. The mean frame of the whole source unbinds everything; the
+ * core frame from the source keeps the core. Own-tag particles with core BindRanks outside the
+ * source, 500 km/s off, count for nothing. A gate or a rescue that fails leaves the candidate's
+ * fields and Index order as at its first death (Energy is scratch). */
+static void
+rescue_label(int64_t nc, int64_t n, int core_is_tail)
+{
+    int64_t i;
+    for(i = 0; i < n; i++) {
+        const int64_t j = i - nc;
+        P[i].TrackId = i < nc || j % 2 == 0 ? 0 : 5;
+        if(core_is_tail)
+            P[i].BindRank = i < nc ? (int32_t) (2 * n + i) : (int32_t) j;
+        else
+            P[i].BindRank = i < nc ? (int32_t) i : (int32_t) (j % 2 == 0 ? nc + j : j);
+    }
+}
+
+static void
+test_rescue(void ** state)
+{
+    const int64_t nc = 300, n = 3 * nc;
+    setup_pman(n + nc);
+    const double m = make_hernquist(0, nc, 0.01, 1.0, 20.0, Centre, Bulk, 31, 0);
+    gsl_rng * rng = gsl_rng_alloc(gsl_rng_mt19937);
+    gsl_rng_set(rng, 32);
+    int64_t i;
+    int d, tried;
+    for(i = nc; i < n; i++) {
+        double u[3];
+        random_direction(rng, u);
+        const double r = 5. * cbrt(gsl_rng_uniform(rng));
+        memset(&P[i], 0, sizeof(P[i]));
+        P[i].Type = 1;
+        P[i].Mass = m;
+        P[i].ID = i;
+        for(d = 0; d < 3; d++) {
+            P[i].Pos[d] = wrapb(Centre[d] + r * u[d]);
+            P[i].Vel[d] = Bulk[d] + (d == 0 ? 300. : 0) + gsl_ran_gaussian(rng, 60.);
+        }
+    }
+    gsl_rng_free(rng);
+    /* own-tag particles with core BindRanks that are not in the candidate's source */
+    for(i = n; i < n + nc; i++) {
+        memset(&P[i], 0, sizeof(P[i]));
+        P[i].Type = 1;
+        P[i].Mass = m;
+        P[i].ID = i;
+        P[i].TrackId = 0;
+        P[i].BindRank = (int32_t) (i - n);
+        for(d = 0; d < 3; d++) {
+            P[i].Pos[d] = wrapb(Centre[d] + (d == 0 ? 0.25 * BOXSIZE : 0));
+            P[i].Vel[d] = Bulk[d] + (d == 0 ? 500. : 0);
+        }
+    }
+    rescue_label(nc, n, 0);
+    /* the mean frame of the whole source and the reference frame of the core */
+    double mean[3], meanv[3], core[3], corev[3];
+    for(d = 0; d < 3; d++) {
+        double sx = 0, sv = 0, cx = 0, cv = 0;
+        for(i = 0; i < n; i++) {
+            const double dx = NEAREST(P[i].Pos[d] - Centre[d], BOXSIZE);
+            sx += dx;
+            sv += P[i].Vel[d];
+            if(i < nc) {
+                cx += dx;
+                cv += P[i].Vel[d];
+            }
+        }
+        mean[d] = wrapb(Centre[d] + sx / n);
+        meanv[d] = sv / n;
+        core[d] = wrapb(Centre[d] + cx / nc);
+        corev[d] = cv / nc;
+    }
+    struct SubhaloUnbindParams up = default_params();
+    struct SubhaloArena arena = arena_alloc(n);
+    struct TestCand t;
+    int64_t * order = (int64_t *) mymalloc("TestRescueOrder", sizeof(int64_t) * n);
+    struct SubCandidate dead;
+
+    /* the rescue keeps the core and nothing of the tail, within the kernel's scratch allowance */
+    cand_init(&t, 0, n, mean, meanv, 5);
+    assert_int_equal(subhalo_unbind(&t.c, &up, &arena), 0);
+    assert_int_equal(subhalo_unbind_rescue(&t.c, nc, &up, &arena, &tried), 1);
+    assert_int_equal(tried, 1);
+    assert_true(t.c.Flags & SUBHALO_FLAG_RESCUED);
+    assert_int_equal(arena.used, 0);
+    int64_t ntail = 0;
+    for(i = 0; i < t.c.Nbound; i++)
+        ntail += t.Index[i] >= nc;
+    message(0, "Rescue: Nbound %ld of a core of %ld, %ld tail particles bound, %d iterations\n", (long) t.c.Nbound, (long) nc, (long) ntail, t.c.Iterations);
+    assert_true(t.c.Nbound >= 0.8 * nc && ntail == 0);
+    assert_true(is_permutation(t.Index, n, 0) && is_sorted(t.Energy, t.Index, t.c.Nbound));
+    /* the frame is the in-source core's: the outside particles would move it by 250 km/s */
+    for(d = 0; d < 3; d++)
+        assert_true(fabs(NEAREST(t.c.RefPos[d] - core[d], BOXSIZE)) < 0.5 && fabs(t.c.RefVel[d] - corev[d]) < 10.);
+    cand_free(&t);
+
+    /* the gate: K = 2 N + 2 needs N + 1 core particles, the source holds 2 NC own-tag ones: nothing is unbound */
+    cand_init(&t, 0, n, mean, meanv, 5);
+    assert_int_equal(subhalo_unbind(&t.c, &up, &arena), 0);
+    memcpy(order, t.Index, sizeof(int64_t) * n);
+    dead = t.c;
+    assert_int_equal(subhalo_unbind_rescue(&t.c, 2 * n + 2, &up, &arena, &tried), 0);
+    assert_int_equal(tried, 0);
+    assert_true(memcmp(order, t.Index, sizeof(int64_t) * n) == 0 && memcmp(&dead, &t.c, sizeof(dead)) == 0);
+    assert_int_equal(arena.used, 0);
+    cand_free(&t);
+
+    /* a core in the hot tail fails: the fields and the order are those of the first death */
+    rescue_label(nc, n, 1);
+    cand_init(&t, 0, n, mean, meanv, 5);
+    assert_int_equal(subhalo_unbind(&t.c, &up, &arena), 0);
+    memcpy(order, t.Index, sizeof(int64_t) * n);
+    dead = t.c;
+    assert_int_equal(subhalo_unbind_rescue(&t.c, nc, &up, &arena, &tried), 0);
+    assert_int_equal(tried, 1);
+    assert_true(memcmp(order, t.Index, sizeof(int64_t) * n) == 0 && memcmp(&dead, &t.c, sizeof(dead)) == 0);
+    assert_false(t.c.Flags & SUBHALO_FLAG_RESCUED);
+    assert_int_equal(arena.used, 0);
+    cand_free(&t);
+
+    /* the gate counts the source only: nc/4 in-source core particles and nc outside do not make K/2 */
+    rescue_label(nc, n, 0);
+    for(i = nc / 4; i < nc; i++)
+        P[i].BindRank = (int32_t) (2 * n + i);
+    cand_init(&t, 0, n, mean, meanv, 5);
+    assert_int_equal(subhalo_unbind(&t.c, &up, &arena), 0);
+    memcpy(order, t.Index, sizeof(int64_t) * n);
+    dead = t.c;
+    assert_int_equal(subhalo_unbind_rescue(&t.c, nc, &up, &arena, &tried), 0);
+    assert_int_equal(tried, 0);
+    assert_true(memcmp(order, t.Index, sizeof(int64_t) * n) == 0 && memcmp(&dead, &t.c, sizeof(dead)) == 0);
+    assert_int_equal(arena.used, 0);
+    cand_free(&t);
+
+    /* K = max(SubhaloCoreSize, 0.1 NboundPrev) */
+    assert_true(subhalo_rescue_core_size(500, 20) == 50 && subhalo_rescue_core_size(100, 20) == 20 && subhalo_rescue_core_size(0, 1) == 1);
+    myfree(order);
+    myfree(arena.base);
+    teardown_pman();
+}
+
 /* ------------------------------------------------------------------ Phase 5b: intra-key threading */
 
 /* A host Hernquist sphere of nhost particles (IDs 0..) at Centre and a satellite of nsat (a
@@ -2430,6 +2575,7 @@ int main(void) {
         cmocka_unit_test(test_sink_forms),
         cmocka_unit_test(test_sample_types),
         cmocka_unit_test(test_death),
+        cmocka_unit_test(test_rescue),
         cmocka_unit_test(test_threads_bitwise),
         cmocka_unit_test(test_threads_worker_region),
         cmocka_unit_test(test_final_pass_sampled),

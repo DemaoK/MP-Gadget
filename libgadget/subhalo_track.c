@@ -290,14 +290,23 @@ final_ancestor(const struct SubNode * nd, int v, int b, int nn)
 }
 
 /* subhalo_unbind with the diagnostics: every unbinding counted, the iteration cap and the worst
- * convergence ratio recorded (the ITERCAP flag of this run only, ORed back afterwards). */
+ * convergence ratio recorded (the ITERCAP flag of this run only, ORed back afterwards). A resolved
+ * track's candidate (old) dead from its mean frame gets the core-frame rescue (subhalo_unbind_rescue). */
 static int
-unbind_counted(struct SubCandidate * c, const struct SubhaloUnbindParams * up, struct SubhaloArena * arena, struct SubhaloCallStats * ks)
+unbind_counted(struct SubCandidate * c, const struct SubTrack * old, const struct SubhaloUnbindParams * up, struct SubhaloArena * arena,
+               struct SubhaloCallStats * ks)
 {
     const int f0 = c->Flags;
     c->Flags = 0;
-    const int alive = subhalo_unbind(c, up, arena);
+    int alive = subhalo_unbind(c, up, arena);
     ks->NCandidates++;
+    if(!alive && old && old->NPrev > 0) {
+        int tried;
+        alive = subhalo_unbind_rescue(c, subhalo_rescue_core_size(old->NboundPrev, subhalo_get_params()->SubhaloCoreSize), up, arena, &tried);
+        ks->NCandidates += tried;
+        ks->NRescueTried += tried;
+        ks->NRescued += alive;
+    }
     if(c->Flags & SUBHALO_FLAG_ITERCAP) {
         ks->NItercap++;
         if(ks->WorstTrackId == -1 || c->ConvergenceRatio < ks->WorstConvRatio) {
@@ -322,6 +331,8 @@ stats_merge(struct SubhaloCallStats * to, const struct SubhaloCallStats * ks)
         to->NTailRejected += ks->NTailRejected;
         to->NFallbackField += ks->NFallbackField;
         to->NFallbackReleased += ks->NFallbackReleased;
+        to->NRescueTried += ks->NRescueTried;
+        to->NRescued += ks->NRescued;
         if(ks->NItercap > 0 && (to->WorstTrackId == -1 || ks->WorstConvRatio < to->WorstConvRatio
                                 || (ks->WorstConvRatio == to->WorstConvRatio && ks->WorstTrackId < to->WorstTrackId))) {
             to->WorstConvRatio = ks->WorstConvRatio;
@@ -640,19 +651,21 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
                 if(nd[v].kind != NODE_RESOLVED || m->Mbound < sp->SubhaloMajorProgenitorMassRatio * Mmax)
                     continue;
                 dist = m->NPrev > 0 ? kinetic_distance(m->RefPos, m->RefVel, xg, vg, up) : 1e299;
+                /* nodes are in TrackId order: strict < keeps the smaller TrackId on ties */
+                if(bi < 0 || dist < best) {
+                    best = dist;
+                    bi = v;
+                }
             }
             else if(nd[v].kind == NODE_ORPHAN) {
-                /* only orphans: every one is a candidate (their Mbound is 0), HBT resurrects the
-                 * one closest in the kinetic distance (FeedCentrals on an orphan-only list) */
+                /* only orphans: every one is a candidate (their Mbound is 0); the largest weight of markers in
+                 * the group wins, evidence of membership a stray marker cannot fake, then the kinetic distance */
                 double tp[3], tv[3];
                 dist = orphan_tracer(m, ctx, tp, tv) ? kinetic_distance(tp, tv, xg, vg, up) : 1e299;
-            }
-            else
-                continue;
-            /* nodes are in TrackId order: strict < keeps the smaller TrackId on ties */
-            if(bi < 0 || dist < best) {
-                best = dist;
-                bi = v;
+                if(bi < 0 || subhalo_orphan_ranks_before(m->MarkerWeight, dist, m->TrackId, nd[bi].old->MarkerWeight, best, nd[bi].TrackId)) {
+                    best = dist;
+                    bi = v;
+                }
             }
         }
         if(bi >= 0)
@@ -796,7 +809,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
                 x->c.Flags = 0;
                 const size_t mark = arena->used;
                 x->c.Energy = (double *) arena_need(arena, sizeof(double) * (cap + 1), g, "candidate energies");
-                int alive = unbind_counted(&x->c, up, arena, &ks);
+                int alive = unbind_counted(&x->c, x->kind == NODE_RESOLVED ? x->old : NULL, up, arena, &ks);
                 arena->used = mark;
                 if(alive)
                     x->state = ST_ALIVE;
@@ -818,7 +831,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
                 if(x->state == ST_ALIVE && MergeTrapped
                    && merge_subtree(nd, u, u, up, sp->SubhaloSinkSymmetric, TracerTypes)) {
                     x->c.Energy = (double *) arena_need(arena, sizeof(double) * (cap + 1), g, "candidate energies");
-                    alive = unbind_counted(&x->c, up, arena, &ks);
+                    alive = unbind_counted(&x->c, NULL, up, arena, &ks);
                     arena->used = mark;
                     x->state = alive ? ST_ALIVE : (x->kind == NODE_RESOLVED ? ST_DIED : ST_FAILED);
                     node_core(x, up, CoreSize);

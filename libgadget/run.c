@@ -105,6 +105,7 @@ static struct run_params
          FOFFileBase[100];
 
     int SnapshotWithFOF; /*Flag that doing FOF for snapshot outputs is on*/
+    int CheckpointOutOfSequence; /* Flag that HCI-requested writes are checkpoints outside the output sequence*/
     int ParticlesAlwaysSorted; /*Flag that particles should be Peano sorted after every domain exchange.*/
     uint64_t RandomSeed; /*Initial seed for the random number table*/
 
@@ -159,6 +160,7 @@ set_all_global_params(ParameterSet * ps)
         All.SlotsIncreaseFactor = param_get_double(ps, "SlotsIncreaseFactor");
 
         All.SnapshotWithFOF = param_get_int(ps, "SnapshotWithFOF");
+        All.CheckpointOutOfSequence = param_get_int(ps, "CheckpointOutOfSequence");
         All.ParticlesAlwaysSorted = param_get_int(ps, "ParticlesAlwaysSorted");
         All.RandomSeed = param_get_int(ps, "RandomSeed");
 
@@ -324,16 +326,20 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
     /*Is gas physics enabled?*/
     int GasEnabled = SlotsManager->info[0].enabled;
 
+    /* A checkpoint outside the output sequence holds no catalogue: the next output reuses its index. */
+    const int RestartCheckpoint = RestartSnapNum >= 0 && header->Checkpoint;
+    if(RestartCheckpoint)
+        message(0, "Restarting from checkpoint %d outside the output sequence: the next output takes its index.\n", RestartSnapNum);
     /* Subhalo finder: tags to -1, then (finder on) load the state of the latest complete PIG
-     * with number <= RestartSnapNum and join the tags onto the particles. */
-    subhalo_init(RestartSnapNum, RestartSnapNum, All.OutputDir, MPI_COMM_WORLD);
+     * with number <= RestartSnapNum (below it for a checkpoint) and join the tags onto the particles. */
+    subhalo_init(RestartSnapNum, RestartSnapNum - RestartCheckpoint, All.OutputDir, MPI_COMM_WORLD);
 
     HCIManager HCI_DEFAULT_MANAGER[1] = {0};
     hci_init(HCI_DEFAULT_MANAGER, All.OutputDir, All.TimeLimitCPU, All.AutoSnapshotTime, All.SnapshotWithFOF);
 
     const struct UnitSystem units = get_unitsystem(header->UnitLength_in_cm, header->UnitMass_in_g, header->UnitVelocity_in_cm_per_s);
 
-    int SnapshotFileCount = RestartSnapNum;
+    int SnapshotFileCount = RestartSnapNum - RestartCheckpoint;
 
     PetaPM pm = {0};
     gravpm_init_periodic(&pm, PartManager->BoxSize, All.Asmth, All.Nmesh, All.CP.GravInternal);
@@ -719,14 +725,23 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
          * synchronized in a consistent state in a K(KDDK)^mK scheme.
          */
 
+        /* With CheckpointOutOfSequence, a write requested by HCI (time limit, stop, checkpoint file,
+         * auto checkpoint) at a step without a planned output is a checkpoint: a PART with the next
+         * index, no FOF, finder or PIG, and no advance of the snapshot counter. */
+        int WriteCheckpoint = 0;
         if(is_PM) { /* the if here is unnecessary but to signify checkpointing occurs only at PM steps. */
-            WriteSnapshot |= action->write_snapshot;
-            WriteFOF |= action->write_fof;
+            if(All.CheckpointOutOfSequence && action->write_snapshot && !WriteSnapshot && !WriteFOF)
+                WriteCheckpoint = 1;
+            else {
+                WriteSnapshot |= action->write_snapshot;
+                WriteFOF |= action->write_fof;
+            }
             WritePlane |= action->write_plane;
         }
-        if(WriteSnapshot || WriteFOF) {
+        if(WriteSnapshot || WriteFOF || WriteCheckpoint) {
             /* Get a new snapshot*/
-            SnapshotFileCount++;
+            if(!WriteCheckpoint)
+                SnapshotFileCount++;
             /* The accel may have created garbage -- collect them before writing a snapshot.
              * If we do collect, reset active list size.*/
             int compact[6] = {0};
@@ -740,9 +755,13 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
         }
 
         /* WriteFOF just reminds the checkpoint code to save GroupID*/
-        if(WriteSnapshot) {
+        if(WriteSnapshot || WriteCheckpoint)
             sidm_local_assert_flushed(&times);
-            write_checkpoint(SnapshotFileCount, WriteFOF, All.MetalReturnOn, atime, &All.CP, All.OutputDir, All.OutputDebugFields);
+        if(WriteSnapshot)
+            write_checkpoint(SnapshotFileCount, WriteFOF, All.MetalReturnOn, atime, &All.CP, All.OutputDir, All.OutputDebugFields, 0);
+        if(WriteCheckpoint) {
+            message(0, "Writing checkpoint %d outside the output sequence at a = %g.\n", SnapshotFileCount + 1, atime);
+            write_checkpoint(SnapshotFileCount + 1, 0, All.MetalReturnOn, atime, &All.CP, All.OutputDir, All.OutputDebugFields, 1);
         }
 
         /* Subhalo finder (design D6): after the PART write, before the PIG write. It restores
@@ -753,6 +772,7 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
         /* Save FOF tables after checkpoint so that if there is a FOF save bug we have particle tables available to debug it*/
         if(WriteFOF) {
             int domain_needed = fof_save_groups(&fof, All.OutputDir, All.FOFFileBase, SnapshotFileCount, &All.CP, atime, header->MassTable, All.MetalReturnOn, MPI_COMM_WORLD);
+            subhalo_consume_penalties(SnapshotFileCount);
             /* In case we need to do a second exchange to get back to a sensible compact mass distribution*/
             fof_finish(&fof);
             if(domain_needed) {
@@ -869,6 +889,8 @@ runfof(const int RestartSnapNum, const inttime_t Ti_Current, const struct header
 {
     /* Offline subhalo finder mode: the state comes from the latest complete PIG before this
      * snapshot, and the finder recomputes the catalogue of snapshot RestartSnapNum. */
+    if(header->Checkpoint)
+        message(0, "WARNING: snapshot %d is a checkpoint outside the output sequence; its catalogue does not belong to the listed outputs.\n", RestartSnapNum);
     subhalo_init(RestartSnapNum, RestartSnapNum - 1, All.OutputDir, MPI_COMM_WORLD);
 
     /* FOF and the finder do not use PM forces, so omit FFT plans and mesh buffers. */
@@ -906,6 +928,7 @@ runfof(const int RestartSnapNum, const inttime_t Ti_Current, const struct header
     if(subhalo_finder_on())
         subhalo_find(&fof, ddecomp, RestartSnapNum, header->TimeSnapshot, &All.CP, All.MetalReturnOn, MPI_COMM_WORLD);
     fof_save_groups(&fof, All.OutputDir, All.FOFFileBase, RestartSnapNum, &All.CP, header->TimeSnapshot, header->MassTable, All.MetalReturnOn, MPI_COMM_WORLD);
+    subhalo_consume_penalties(RestartSnapNum);
     fof_finish(&fof);
 }
 
