@@ -127,7 +127,7 @@ int fof_save_particles(FOFGroups * fof, char * fname, int SaveParticles, Cosmolo
         register_io_blocks(&IOTable, 1, MetalReturnOn);
         if(finder)
             subhalo_register_particle_blocks(&IOTable);
-        petaio_remove_stale_penalty_blocks(&bf, &IOTable, Comm);
+        petaio_remove_stale_blocks(&bf, &IOTable, 1, Comm);
         struct part_manager_type * halo_pman = NULL;
         struct slots_manager_type * halo_sman = NULL;
         int64_t NpigLocal = 0;

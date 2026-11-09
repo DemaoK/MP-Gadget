@@ -160,10 +160,50 @@ petaio_build_selection(int * selection,
     }
 }
 
-/* bigfile keeps the blocks a rewrite of the same file does not write: a penalty column left by an earlier
- * write of this file is removed for every type the table has no TracerPenalty entry for. Collective. */
+/* Rank 0 removes block <ptype>/<name> of bf when it exists; a symlinked block is unlinked, never traversed. */
+static void
+remove_block(const BigFile * bf, const int ptype, const char * name)
+{
+    char * dirname = fastpm_strdup_printf("%s/%d/%s", bf->basename, ptype, name);
+    struct stat st;
+    if(0 != lstat(dirname, &st)) {
+        if(errno != ENOENT)
+            endrun(1, "Failed to stat %s: %s\n", dirname, strerror(errno));
+    }
+    else if(S_ISLNK(st.st_mode)) {
+        if(0 != unlink(dirname))
+            endrun(1, "Failed to remove the stale block link %s: %s\n", dirname, strerror(errno));
+        message(0, "Removed the stale block link %s\n", dirname);
+    }
+    else {
+        DIR * dir = opendir(dirname);
+        if(!dir)
+            endrun(1, "Failed to open the stale block %s: %s\n", dirname, strerror(errno));
+        struct dirent * de;
+        errno = 0;
+        while((de = readdir(dir))) {
+            if(!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+                continue;
+            char * path = fastpm_strdup_printf("%s/%s", dirname, de->d_name);
+            if(0 != unlink(path))
+                endrun(1, "Failed to remove the stale block file %s: %s\n", path, strerror(errno));
+            myfree(path);
+            errno = 0;
+        }
+        if(errno != 0 || 0 != closedir(dir))
+            endrun(1, "Failed to list the stale block %s: %s\n", dirname, strerror(errno));
+        if(0 != rmdir(dirname))
+            endrun(1, "Failed to remove the stale block %s: %s\n", dirname, strerror(errno));
+        message(0, "Removed the stale block %s\n", dirname);
+    }
+    myfree(dirname);
+}
+
+/* Blocks a rewrite of this file must not keep (bigfile keeps blocks a later write does not rewrite):
+ * the TracerPenalty column of every type without a registered entry and, in the FOF particle
+ * catalogue, the blocks of snapshot-only entries. Collective. */
 void
-petaio_remove_stale_penalty_blocks(BigFile * bf, const struct IOTable * IOTable, MPI_Comm Comm)
+petaio_remove_stale_blocks(BigFile * bf, const struct IOTable * IOTable, const int Catalogue, MPI_Comm Comm)
 {
     int ThisTask;
     MPI_Comm_rank(Comm, &ThisTask);
@@ -173,43 +213,13 @@ petaio_remove_stale_penalty_blocks(BigFile * bf, const struct IOTable * IOTable,
             int registered = 0;
             for(i = 0; i < IOTable->used; i++)
                 registered |= IOTable->ent[i].ptype == ptype && 0 == strcmp(IOTable->ent[i].name, "TracerPenalty");
-            if(registered)
-                continue;
-            char * dirname = fastpm_strdup_printf("%s/%d/TracerPenalty", bf->basename, ptype);
-            struct stat st;
-            if(0 != lstat(dirname, &st)) {
-                if(errno != ENOENT)
-                    endrun(1, "Failed to stat %s: %s\n", dirname, strerror(errno));
-            }
-            else if(S_ISLNK(st.st_mode)) {
-                /* a linked block: drop the link, never its target */
-                if(0 != unlink(dirname))
-                    endrun(1, "Failed to remove the stale block link %s: %s\n", dirname, strerror(errno));
-                message(0, "Removed the stale block link %s\n", dirname);
-            }
-            else {
-                DIR * dir = opendir(dirname);
-                if(!dir)
-                    endrun(1, "Failed to open the stale block %s: %s\n", dirname, strerror(errno));
-                struct dirent * de;
-                errno = 0;
-                while((de = readdir(dir))) {
-                    if(!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
-                        continue;
-                    char * path = fastpm_strdup_printf("%s/%s", dirname, de->d_name);
-                    if(0 != unlink(path))
-                        endrun(1, "Failed to remove the stale block file %s: %s\n", path, strerror(errno));
-                    myfree(path);
-                    errno = 0;
-                }
-                if(errno != 0 || 0 != closedir(dir))
-                    endrun(1, "Failed to list the stale block %s: %s\n", dirname, strerror(errno));
-                if(0 != rmdir(dirname))
-                    endrun(1, "Failed to remove the stale block %s: %s\n", dirname, strerror(errno));
-                message(0, "Removed the stale block %s\n", dirname);
-            }
-            myfree(dirname);
+            if(!registered)
+                remove_block(bf, ptype, "TracerPenalty");
         }
+        if(Catalogue)
+            for(i = 0; i < IOTable->used; i++)
+                if(IOTable->ent[i].snapshot_only && IOTable->ent[i].ptype >= 0 && IOTable->ent[i].ptype < 6)
+                    remove_block(bf, IOTable->ent[i].ptype, IOTable->ent[i].name);
     }
     MPI_Barrier(Comm);
 }
@@ -240,7 +250,7 @@ petaio_save_snapshot(const char * fname, struct IOTable * IOTable, int verbose, 
     conv.hubbleparam = CP->HubbleParam;
 
     petaio_write_header(&bf, atime, NTotal, CP, &Header, Checkpoint);
-    petaio_remove_stale_penalty_blocks(&bf, IOTable, MPI_COMM_WORLD);
+    petaio_remove_stale_blocks(&bf, IOTable, 0, MPI_COMM_WORLD);
 
     int i;
     for(i = 0; i < IOTable->used; i ++) {

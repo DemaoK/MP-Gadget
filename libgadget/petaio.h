@@ -93,8 +93,9 @@ int petaio_read_block(BigFile * bf, const char * blockname, BigArray * array, in
 
 /* Checkpoint = 1 writes the header attribute Checkpoint (a checkpoint outside the output sequence). */
 void petaio_save_snapshot(const char * fname, struct IOTable * IOTable, int verbose, const double atime, const Cosmology * CP, const int Checkpoint);
-/* Remove the TracerPenalty block of every type without such an entry in IOTable from the open file bf. Collective. */
-void petaio_remove_stale_penalty_blocks(BigFile * bf, const struct IOTable * IOTable, MPI_Comm Comm);
+/* Remove the blocks a rewrite of bf must not keep: a TracerPenalty column of a type without a registered
+ * entry and, with Catalogue = 1 (the FOF particle writer), the blocks of snapshot-only entries. Collective. */
+void petaio_remove_stale_blocks(BigFile * bf, const struct IOTable * IOTable, const int Catalogue, MPI_Comm Comm);
 void petaio_read_snapshot(int num, const char * OutputDir, Cosmology * CP, struct header_data * header, struct part_manager_type * PartManager, struct slots_manager_type * SlotsManager, MPI_Comm Comm);
 /* Returns a header struct. Note that this may also change the cosmology values in CP, if those are different from the ones in the parameter file*/
 struct header_data petaio_read_header(int num, const char * OutputDir, Cosmology * CP);
