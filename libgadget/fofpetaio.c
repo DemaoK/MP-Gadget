@@ -127,6 +127,7 @@ int fof_save_particles(FOFGroups * fof, char * fname, int SaveParticles, Cosmolo
         register_io_blocks(&IOTable, 1, MetalReturnOn);
         if(finder)
             subhalo_register_particle_blocks(&IOTable);
+        petaio_remove_stale_penalty_blocks(&bf, &IOTable, Comm);
         struct part_manager_type * halo_pman = NULL;
         struct slots_manager_type * halo_sman = NULL;
         int64_t NpigLocal = 0;
@@ -195,6 +196,9 @@ int fof_save_particles(FOFGroups * fof, char * fname, int SaveParticles, Cosmolo
             char blockname[128];
             int ptype = IOTable.ent[i].ptype;
             BigArray array = {0};
+            /* restart bookkeeping of a module belongs to the snapshot only */
+            if(IOTable.ent[i].snapshot_only)
+                continue;
             if(ptype < 6 && ptype >= 0) {
                 sprintf(blockname, "%d/%s", ptype, IOTable.ent[i].name);
                 petaio_build_buffer(&array, &IOTable.ent[i], selection + ptype_offset[ptype], ptype_count[ptype], halo_pman->Base, halo_sman, &conv);

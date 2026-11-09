@@ -204,6 +204,7 @@ create_gadget_parameter_set()
     param_declare_int(ps, "ParticlesAlwaysSorted", OPTIONAL, 0, "If enabled, peano-sort all particles after domain exchange. Much slower, but good for testing.");
 
     param_declare_int(ps, "SnapshotWithFOF", REQUIRED, 0, "Enable Friends-of-Friends halo finder.");
+    param_declare_int(ps, "CheckpointOutOfSequence", OPTIONAL, 0, "If 1, a snapshot requested by the time limit, a stop or checkpoint file or AutoSnapshotTime is a checkpoint PART with the next index, header attribute Checkpoint = 1, no FOF or PIG, that the next planned output overwrites.");
     param_declare_int(ps, "FOFPrimaryLinkTypes", OPTIONAL, 2, "2^ particle types to use as primary FOF targets.");
     param_declare_int(ps, "FOFSecondaryLinkTypes", OPTIONAL, 1+16+32, "2^ particle types to link to nearest primaries.");
     param_declare_int(ps, "FOFSaveParticles", OPTIONAL, 1, "Save particles in the FOF catalog.");

@@ -226,7 +226,8 @@ struct SubTrackTable * subhalo_get_table(void);
 
 /* After init(), in run() and runfof(): clear the tags, then, finder on, load the latest complete
  * state in PIG_m, m <= MaxStateSnapNum (design 11), and join its tags. No state is fatal unless
- * SubhaloRestartFresh or RestartSnapNum < 0 (fresh run). runfof passes RestartSnapNum - 1. Collective. */
+ * SubhaloRestartFresh or RestartSnapNum < 0 (fresh run). runfof, and run() from a checkpoint, pass
+ * RestartSnapNum - 1. The penalties read from the snapshot are kept unless the state is PIG_RestartSnapNum. Collective. */
 void subhalo_init(int RestartSnapNum, int MaxStateSnapNum, const char * OutputDir, MPI_Comm Comm);
 
 /* One finder call (design 7.2), between write_checkpoint and fof_save_groups, on the groups of
@@ -237,6 +238,8 @@ int subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double at
 
 /* Status accessors used by the writer. */
 int subhalo_last_call_complete(void);     /* 1 if the most recent subhalo_find completed */
+/* After the PIG write of snapshot SnapNum: zero every TracerPenalty if the call at SnapNum completed. */
+void subhalo_consume_penalties(int SnapNum);
 int subhalo_last_call_snapshot(void);     /* snapshot number of the most recent completed call, -1 if none */
 int subhalo_state_snapshot(void);         /* snapshot whose state the tags currently describe */
 double subhalo_state_time(void);          /* and its time */

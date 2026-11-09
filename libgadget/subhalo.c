@@ -1432,6 +1432,19 @@ subhalo_get_table(void)
 /* ------------------------------------------------------------------ status */
 
 int subhalo_last_call_complete(void) { return SubStatus.LastCallComplete; }
+
+/* The PIG of a complete call carries the interval's scatterings, consumed once it is written (also after a failed
+ * particle write: the continuing run starts from this call); a skipped or incomplete call keeps them. */
+void
+subhalo_consume_penalties(int SnapNum)
+{
+    if(!SubStatus.LastCallComplete || SubStatus.LastCallSnapshot != SnapNum)
+        return;
+    int64_t i;
+    #pragma omp parallel for
+    for(i = 0; i < PartManager->NumPart; i++)
+        P[i].TracerPenalty = 0;
+}
 int subhalo_last_call_snapshot(void) { return SubStatus.LastCallSnapshot; }
 int subhalo_state_snapshot(void) { return SubStatus.StateSnapshot; }
 double subhalo_state_time(void) { return SubStatus.StateTime; }
@@ -1497,7 +1510,6 @@ subhalo_init(int RestartSnapNum, int MaxStateSnapNum, const char * OutputDir, MP
         P[i].TrackId = -1;
         P[i].BindRank = -1;
         P[i].BoundTrackId = -1;
-        P[i].TracerPenalty = 0;
     }
     SubStatus.LastCallComplete = 0;
     SubStatus.LastCallSnapshot = -1;
@@ -1545,6 +1557,13 @@ subhalo_init(int RestartSnapNum, int MaxStateSnapNum, const char * OutputDir, MP
     myfree(pigname);
     SubStatus.StateSnapshot = m;
     SubStatus.LastCallSnapshot = m;
+    /* The snapshot's TracerPenalty column (zero when absent) holds the scatterings since the previous
+     * call; a complete call at the snapshot itself consumed them, any other state still needs them. */
+    if(m == RestartSnapNum) {
+        #pragma omp parallel for
+        for(i = 0; i < PartManager->NumPart; i++)
+            P[i].TracerPenalty = 0;
+    }
 
     int64_t inherited_tot = 0;
     MPI_Allreduce(&inherited, &inherited_tot, 1, MPI_INT64, MPI_SUM, Comm);
@@ -2816,10 +2835,6 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
             SubLastStats.NFinalPositive, SubLastStats.NFinalBound, SubLastStats.NTailRejected,
             SubLastStats.NFallbackField, SubLastStats.NFallbackReleased, norphsync_tot, SubLastStats.ArenaPeakFrac);
     log_tagged("after the call", Comm);
-    /* the votes consumed the scattering penalties; a skipped call returned above and keeps them */
-    #pragma omp parallel for
-    for(i = 0; i < PartManager->NumPart; i++)
-        P[i].TracerPenalty = 0;
 
     if(SubStatus.StateSnapshot >= 0 && SubStatus.StateTime > 0)
         SubStatus.TimeSincePrevious = atime - SubStatus.StateTime;

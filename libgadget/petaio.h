@@ -31,6 +31,8 @@ struct header_data
     double UnitVelocity_in_cm_per_s;
     /* Number of k values to use for the neutrinos.*/
     int neutrinonk;
+    /* 1 for a checkpoint written outside the output sequence (header attribute Checkpoint), 0 otherwise.*/
+    int Checkpoint;
 };
 
 /* Store parameters for unit conversions
@@ -55,6 +57,8 @@ typedef struct IOTableEntry {
     int required;
     property_getter getter;
     property_setter setter;
+    /* Restart bookkeeping of a module: written to the snapshot, skipped by the FOF particle writer.*/
+    int snapshot_only;
 } IOTableEntry;
 
 struct IOTable {
@@ -73,6 +77,8 @@ void register_io_blocks(struct IOTable * IOTable, int WriteGroupID, int MetalRet
 void register_debug_io_blocks(struct IOTable * IOTable);
 /* Free the entries in the IOTable.*/
 void destroy_io_blocks(struct IOTable * IOTable);
+/* Mark every entry called name as snapshot-only (see IOTableEntry.snapshot_only).*/
+void petaio_snapshot_only(struct IOTable * IOTable, const char * name);
 
 void set_petaio_params(ParameterSet *ps);
 int GetUsePeculiarVelocity(void);
@@ -85,7 +91,10 @@ void petaio_destroy_buffer(BigArray * array);
 void petaio_save_block(BigFile * bf, const char * blockname, BigArray * array, int verbose);
 int petaio_read_block(BigFile * bf, const char * blockname, BigArray * array, int required);
 
-void petaio_save_snapshot(const char * fname, struct IOTable * IOTable, int verbose, const double atime, const Cosmology * CP);
+/* Checkpoint = 1 writes the header attribute Checkpoint (a checkpoint outside the output sequence). */
+void petaio_save_snapshot(const char * fname, struct IOTable * IOTable, int verbose, const double atime, const Cosmology * CP, const int Checkpoint);
+/* Remove the TracerPenalty block of every type without such an entry in IOTable from the open file bf. Collective. */
+void petaio_remove_stale_penalty_blocks(BigFile * bf, const struct IOTable * IOTable, MPI_Comm Comm);
 void petaio_read_snapshot(int num, const char * OutputDir, Cosmology * CP, struct header_data * header, struct part_manager_type * PartManager, struct slots_manager_type * SlotsManager, MPI_Comm Comm);
 /* Returns a header struct. Note that this may also change the cosmology values in CP, if those are different from the ones in the parameter file*/
 struct header_data petaio_read_header(int num, const char * OutputDir, Cosmology * CP);

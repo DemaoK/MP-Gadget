@@ -68,8 +68,8 @@ struct particle_data
     int64_t TrackId;
     int32_t BindRank;
     /* (Expected) scatterings since the last complete finder call, summed by a scattering module, 0
-     * without one: the finder weights this tracer's votes by exp(-TracerPenalty) and every complete
-     * call zeroes it. Travels with the particle; never written (a restart starts at 0). */
+     * without one: the finder weights this tracer's votes by exp(-TracerPenalty); zeroed once the PIG of
+     * a complete call is written. Travels with the particle; a snapshot column when nonzero (petaio). */
     float TracerPenalty;
     int64_t BoundTrackId;
     MyFloat Potential;		/* Gravitational potential. This is the total potential only on a PM timestep,
