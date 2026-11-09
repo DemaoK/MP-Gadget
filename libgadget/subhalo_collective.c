@@ -3445,6 +3445,9 @@ run_round(struct Coll * C, int r, const int64_t * slotof, const struct SubTrack 
     }
     /* the unbinding loop */
     unbind_loop(C);
+    for(c = C->c0; c < C->c1; c++)
+        if(C->cs[c].state == SUBHALO_ST_DIED && plan->Members[plan->Cands[c].member].NPrev > 0)
+            CollStats.NDiedMeanFrame++;
     /* sinking of the descendants on the loop-order cores, then the absorbing candidates unbound
      * again from their whole source (as process_serial_key) */
     set_loop_cores(C);
@@ -3694,10 +3697,11 @@ subhalo_collective_run(struct SubhaloPlan * plan, struct SubhaloCallCtx * ctx, D
     int64_t iters = 0;
     for(r = 0; r < plan->NRounds && r < 16; r++)
         iters += CollStats.Iterations[r];
-    message(0, "Subhalo in place: %ld candidates in %d round(s), %ld tree builds and walks, %ld alive, %ld died, %ld descendants sunk; "
+    message(0, "Subhalo in place: %ld candidates in %d round(s), %ld tree builds and walks, %ld alive, %ld died (%ld resolved from the "
+               "previous-bound frame, not rescued in place), %ld descendants sunk; "
                "%ld serial own-tag particles taken by in-place candidates, %ld serial tails given to their binder, %ld claims given to the "
                "binding owner (J2); final tags %g s (serial repair of %ld tracks, %ld rank queries: %g s); %g s.\n",
-            ncand, plan->NRounds, iters, CollStats.NAlive, CollStats.NDied, CollStats.NSunk, CollStats.NStolen, CollStats.NAdded,
+            ncand, plan->NRounds, iters, CollStats.NAlive, CollStats.NDied, CollStats.NDiedMeanFrame, CollStats.NSunk, CollStats.NStolen, CollStats.NAdded,
             CollStats.NJ2, CollStats.TagSeconds, CollStats.NRepairTracks, CollStats.NRepairQueries, CollStats.RepairSeconds, MPI_Wtime() - t0);
 }
 

@@ -2746,11 +2746,10 @@ test_subhalo_unhosted_direct(void ** state)
     MPI_Allreduce(ntag, ntagtot, 6, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
     CHECK(ntagtot[1] == 2 && ntagtot[5] == 0, "tagged count: type 1 %ld type 5 %ld, expected 2 and 0\n", ntagtot[1], ntagtot[5]);
 
-    /* Collision penalties (SIDM): track 2's tracers of rank 0-4 are in group 7, 5-9 in group 8.
-     * Unpenalised, 7 wins (2.61 to 1.38); a penalty 0.1 on the first five keeps 7 (2.36), a
-     * penalty 5 (weight 0.0067) hands the vote to 8. */
+    /* Collision penalties (SIDM) do not enter the host vote: track 2's tracers of rank 0-4 are in
+     * group 7, 5-9 in group 8, and 7 wins by the rank weights (2.61 to 1.38) whatever the first five's penalty. */
     const float pen[3] = {0, 0.1f, 5};
-    const int64_t expect[3] = {7, 7, 8};
+    const int64_t expect[3] = {7, 7, 7};
     int c;
     for(c = 0; c < 3; c++) {
         PartManager->NumPart = 0;
@@ -2772,6 +2771,28 @@ test_subhalo_unhosted_direct(void ** state)
 
     subhalo_set_units(3.085678e21, 1.989e43, 1e5);
     teardown_pman();
+}
+
+/* The resurrection order of the orphans of a key without a resolved progenitor: larger membership
+ * weight M, then smaller kinetic distance, then smaller TrackId. */
+static void
+test_subhalo_resurrection_order(void ** state)
+{
+    /* M10: ten markers (ranks 0..9) in the group; M1: one marker, rank 9 */
+    double M10 = 0;
+    int j;
+    for(j = 0; j < 10; j++)
+        M10 += 1 / (1 + sqrt((double) j));
+    const double M1 = 1 / (1 + sqrt(9.));
+    /* an old orphan with one marker in the group, close in phase space, loses to ten markers far off */
+    CHECK(subhalo_orphan_ranks_before(M10, 500., 7, M1, 0.1, 3) && !subhalo_orphan_ranks_before(M1, 0.1, 3, M10, 500., 7),
+          "the larger M must win whatever the distance\n");
+    CHECK(subhalo_orphan_ranks_before(M1, 1., 7, M1, 2., 3) && !subhalo_orphan_ranks_before(M1, 2., 3, M1, 1., 7),
+          "equal M: the smaller kinetic distance must win\n");
+    CHECK(subhalo_orphan_ranks_before(M1, 1., 3, M1, 1., 7) && !subhalo_orphan_ranks_before(M1, 1., 7, M1, 1., 3)
+          && !subhalo_orphan_ranks_before(M1, 1., 3, M1, 1., 3), "full tie: the smaller TrackId, strictly\n");
+    /* a lost tracer (M = 0, distance 1e299) ranks after any found one */
+    CHECK(subhalo_orphan_ranks_before(M1, 1e3, 9, 0, 1e299, 1), "a lost orphan must rank last\n");
 }
 
 /* The shared weighted plurality of the host and descendant votes. */
@@ -5783,11 +5804,25 @@ test_subhalo_orphan_set_update(void ** state)
         h[0].Penalty = h[1].Penalty = 5;
         t = os_orphan(4, 1.0f);
         subhalo_orphan_update(&t, h, 4, off0, box, vfac, 4);
-        CHECK(t.Host == 8, "penalised host vote: Host %ld, expected 8\n", t.Host);
+        /* the membership weight M: rank weights of the markers in the Host only, no penalty */
+        const double M8 = 1 / (1 + sqrt(2.)) + 1 / (1 + sqrt(3.));
+        CHECK(t.Host == 8 && fabs(t.MarkerWeight - M8) < 1e-14, "penalised host vote: Host %ld, expected 8; M %.17g (%.17g)\n", t.Host, t.MarkerWeight, M8);
         h[0].Penalty = h[1].Penalty = 0;
         t = os_orphan(4, 1.0f);
         subhalo_orphan_update(&t, h, 4, off0, box, vfac, 4);
-        CHECK(t.Host == 4, "host vote: Host %ld, expected 4\n", t.Host);
+        CHECK(t.Host == 4 && fabs(t.MarkerWeight - 1.5) < 1e-14, "host vote: Host %ld, expected 4; M %g\n", t.Host, t.MarkerWeight);
+        /* one kept marker: its rank weight; none found: zero */
+        t = os_orphan(4, 1.0f);
+        h[0].found = h[1].found = h[3].found = 0;
+        subhalo_orphan_update(&t, h, 4, off0, box, vfac, 4);
+        CHECK(t.Host == 8 && t.NOrphanFound == 1 && fabs(t.MarkerWeight - 1 / (1 + sqrt(2.))) < 1e-14, "one marker: Host %ld M %g\n", t.Host, t.MarkerWeight);
+        h[2].found = 0;
+        t = os_orphan(4, 1.0f);
+        t.MarkerWeight = 1;
+        subhalo_orphan_update(&t, h, 4, off0, box, vfac, 4);
+        CHECK(t.MarkerWeight == 0, "no marker: M %g\n", t.MarkerWeight);
+        for(k = 0; k < 4; k++)
+            h[k].found = 1;
         /* penalties that underflow every weight: the rank weights alone */
         for(k = 0; k < 4; k++)
             h[k].Penalty = 1e30f;
@@ -6156,6 +6191,7 @@ int main(void) {
         cmocka_unit_test(test_subhalo_header_params),
         cmocka_unit_test(test_subhalo_sampled_default),
         cmocka_unit_test(test_subhalo_weighted_plurality),
+        cmocka_unit_test(test_subhalo_resurrection_order),
         cmocka_unit_test(test_subhalo_penalty_descendant),
         cmocka_unit_test(test_subhalo_orphan_set_death),
         cmocka_unit_test(test_subhalo_orphan_set_update),

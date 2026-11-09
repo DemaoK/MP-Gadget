@@ -94,6 +94,7 @@ const struct SubhaloParams * subhalo_get_params(void);
 #define SUBHALO_FLAG_PLANCENTRAL  (1 << 2)
 #define SUBHALO_FLAG_SOCUTOFF     (1 << 3)
 #define SUBHALO_FLAG_SONOCROSS    (1 << 4)
+#define SUBHALO_FLAG_RESCUED      (1 << 5)   /* survived only through the core-frame rescue of its unbinding */
 
 /* Particle block types for the finder's own IOTable entries (PTYPE_FOF_GROUP is 1024). */
 #define PTYPE_SUBHALO 1025
@@ -169,6 +170,7 @@ struct SubTrack {
     double RefPos[3], RefVel[3];
     int64_t NPrev;                   /* live particles with BoundTrackId == TrackId */
     double MPrev;                    /* and their mass */
+    double MarkerWeight;             /* orphan: rank weights of its kept markers in Host (resurrection order) */
     MyIDType TracerIDs[SUBHALO_MAXTRACERS];  /* step 0: the most-bound own tracers, rank order */
     int32_t NTracers;
     int32_t pad2a;

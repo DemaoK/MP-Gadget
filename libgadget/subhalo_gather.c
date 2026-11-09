@@ -136,10 +136,10 @@ subhalo_host_vote(struct SubTrackTable * tab, MPI_Comm Comm)
     qsort_openmp(in, nin, sizeof(struct TracerTuple), cmp_tracertuple);
     nin = keep_first_tracers(in, nin, K);
 
-    /* HBT's DecideLocalHostId: weight exp(-Penalty) / (1 + sqrt(i)) for the i-th tracer; the GrNr
-     * (-1: none) with the largest sum wins, ties to the smaller. A track without tuples keeps Host = -1. */
+    /* HBT's DecideLocalHostId: weight 1 / (1 + sqrt(i)) for the i-th tracer, the GrNr (-1: none) with the
+     * largest sum wins, ties to the smaller; no penalty, as a scattering changes velocities, not group
+     * membership. A track without tuples keeps Host = -1. */
     int64_t a = 0, nhosted = 0, nfield = 0, npen = 0;
-    double wsum = 0;
     int missing = 0;
     while(a < nin) {
         int64_t b = a;
@@ -152,10 +152,8 @@ subhalo_host_vote(struct SubTrackTable * tab, MPI_Comm Comm)
         for(j = 0; j < b - a; j++) {
             /* "no group" (-1) is a legitimate ballot: shift by one so that the helper counts it */
             cand[j] = in[a + j].GrNr + 1;
-            const double tw = subhalo_tracer_weight(in[a + j].Penalty);
-            w[j] = tw / (1.0 + sqrt((double) j));
+            w[j] = 1.0 / (1.0 + sqrt((double) j));
             npen += in[a + j].Penalty > 0;
-            wsum += tw;
             if(rec)
                 rec->TracerIDs[j] = in[a + j].ID;
         }
@@ -177,11 +175,8 @@ subhalo_host_vote(struct SubTrackTable * tab, MPI_Comm Comm)
 
     int64_t loc[4] = {nhosted, nfield, npen, nin}, tot[4];
     MPI_Allreduce(loc, tot, 4, MPI_INT64, MPI_SUM, Comm);
-    double wtot = 0;
-    MPI_Allreduce(&wsum, &wtot, 1, MPI_DOUBLE, MPI_SUM, Comm);
     message(0, "Subhalo host vote: %ld tracks hosted by a FOF group, %ld with no host group (tracer vote); "
-               "%ld of %ld tracers with a collision penalty, mean weight %.3f.\n",
-            tot[0], tot[1], tot[2], tot[3], tot[3] > 0 ? wtot / tot[3] : 1.0);
+               "%ld of %ld tracers with a collision penalty.\n", tot[0], tot[1], tot[2], tot[3]);
 }
 
 /* ------------------------------------------------------------------ step 3: previous-bound frames */
@@ -1351,6 +1346,7 @@ plan_gather_members(struct SubTrackTable * tab, const int64_t * O, int64_t nO, s
         m->MboundPrev = t->Mbound;
         m->VmaxPrev = t->Vmax;
         m->NPrev = t->NPrev;
+        m->MarkerWeight = t->MarkerWeight;
         int d;
         for(d = 0; d < 3; d++) {
             m->RefPos[d] = t->RefPos[d];
@@ -1570,6 +1566,10 @@ plan_decide(struct SubhaloMember ** memp, int64_t nmem, const int64_t * O, int64
                     if(nd[j].kind != SUBHALO_MEM_RESOLVED || nd[j].MboundPrev < sp->SubhaloMajorProgenitorMassRatio * Mmax)
                         continue;
                     dist = nd[j].NPrev > 0 ? plan_kinetic_distance(nd[j].RefPos, nd[j].RefVel, xg, vg) : 1e299;
+                    if(bi < 0 || dist < best) {
+                        best = dist;
+                        bi = j;
+                    }
                 }
                 else if(nd[j].kind == SUBHALO_MEM_ORPHAN) {
                     if(nd[j].SnapTracerLost >= 0)
@@ -1586,12 +1586,11 @@ plan_decide(struct SubhaloMember ** memp, int64_t nmem, const int64_t * O, int64
                         }
                         dist = plan_kinetic_distance(tp, tv, xg, vg);
                     }
-                }
-                else
-                    continue;
-                if(bi < 0 || dist < best) {
-                    best = dist;
-                    bi = j;
+                    if(bi < 0 || subhalo_orphan_ranks_before(nd[j].MarkerWeight, dist, nd[j].TrackId,
+                                                             nd[bi].MarkerWeight, best, nd[bi].TrackId)) {
+                        best = dist;
+                        bi = j;
+                    }
                 }
             }
             if(bi >= 0)
@@ -2370,8 +2369,8 @@ subhalo_plan_build(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubT
             if(kk < 0)
                 endrun(5, "Subhalo plan: in-place candidate %ld of key %ld that is not in place.\n", m->TrackId, m->g);
             int d;
-            /* the frame: the previous-bound frame, a resurrected orphan's tracer, else the key
-             * centre (process_serial_key) */
+            /* the frame as process_serial_key's, without the rescue: an in-place source exceeds a rank's budget (tens of
+             * millions of particles at 512^3), so its escape speed dwarfs a frame bias of a few km/s that kills small remnants */
             for(d = 0; d < 3; d++) {
                 C[c].RefPos[d] = cv[8 * kk + d];
                 C[c].RefVel[d] = cv[8 * kk + 3 + d];

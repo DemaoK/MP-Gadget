@@ -370,6 +370,7 @@ subhalo_track_clear(struct SubTrack * t, int64_t TrackId)
     t->Alive = 0;
     t->NPrev = 0;
     t->MPrev = 0;
+    t->MarkerWeight = 0;
     t->NTracers = 0;
     t->Key = -1;
 }
@@ -869,6 +870,7 @@ subhalo_orphan_update(struct SubTrack * t, const struct SubhaloIdHit * hit, int 
         t->SnapTracerLost = SnapNum;
         t->NOrphanFound = 0;
         t->OrphanSigmaX = -1;
+        t->MarkerWeight = 0;
         return 0;
     }
     /* positions unwrapped about the first found marker; the centre: one or two found, the first,
@@ -917,9 +919,10 @@ subhalo_orphan_update(struct SubTrack * t, const struct SubhaloIdHit * hit, int 
         }
         t->NOrphanFound = 1;
         t->OrphanSigmaX = -1;
+        t->MarkerWeight = 1.0 / (1.0 + sqrt((double) f[keep[0]]));
         return 1;
     }
-    /* weights as the host vote: exp(-penalty) / (1 + sqrt(rank in the followed set)) */
+    /* marker weights exp(-penalty) / (1 + sqrt(rank in the followed set)): a scattered marker traces the remnant less well */
     int64_t cand[SUBHALO_MAXTRACERS];
     double w[SUBHALO_MAXTRACERS], W = 0, mx[3] = {0, 0, 0}, mv[3] = {0, 0, 0};
     for(k = 0; k < nk; k++) {
@@ -951,6 +954,12 @@ subhalo_orphan_update(struct SubTrack * t, const struct SubhaloIdHit * hit, int 
             s2 += (x[keep[k]][d] - mx[d]) * (x[keep[k]][d] - mx[d]);
     }
     t->Host = subhalo_weighted_plurality(cand, w, nk, NULL, NULL) - 1;
+    /* the membership weight of the resurrection order: rank weights only, a scattered marker inside
+     * the group is still a member */
+    t->MarkerWeight = 0;
+    for(k = 0; k < nk; k++)
+        if(cand[k] - 1 == t->Host)
+            t->MarkerWeight += 1.0 / (1.0 + sqrt((double) f[keep[k]]));
     for(d = 0; d < 3; d++) {
         t->TracerPos[d] = subhalo_wrap_box(mx[d] - Offset[d], BoxSize);
         t->TracerVel[d] = mv[d] * vfac;
@@ -2261,9 +2270,9 @@ subhalo_last_call_stats(void)
 static void
 stats_reduce(const struct SubhaloCallStats * loc, struct SubhaloCallStats * tot, MPI_Comm Comm)
 {
-    int64_t a[7] = {loc->NCandidates, loc->NItercap, loc->NFinalPositive, loc->NFinalBound, loc->NTailRejected,
-                    loc->NFallbackField, loc->NFallbackReleased}, b[7];
-    MPI_Allreduce(a, b, 7, MPI_INT64, MPI_SUM, Comm);
+    int64_t a[9] = {loc->NCandidates, loc->NItercap, loc->NFinalPositive, loc->NFinalBound, loc->NTailRejected,
+                    loc->NFallbackField, loc->NFallbackReleased, loc->NRescueTried, loc->NRescued}, b[9];
+    MPI_Allreduce(a, b, 9, MPI_INT64, MPI_SUM, Comm);
     memset(tot, 0, sizeof(*tot));
     tot->NCandidates = b[0];
     tot->NItercap = b[1];
@@ -2272,6 +2281,8 @@ stats_reduce(const struct SubhaloCallStats * loc, struct SubhaloCallStats * tot,
     tot->NTailRejected = b[4];
     tot->NFallbackField = b[5];
     tot->NFallbackReleased = b[6];
+    tot->NRescueTried = b[7];
+    tot->NRescued = b[8];
     MPI_Allreduce(&loc->ArenaPeakFrac, &tot->ArenaPeakFrac, 1, MPI_DOUBLE, MPI_MAX, Comm);
     struct { double r; int rank; } in, out;
     int ThisTask;
@@ -2546,6 +2557,7 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
         t->Alive = 0;
         t->NPrev = 0;
         t->MPrev = 0;
+        t->MarkerWeight = 0;
         t->NTracers = 0;
         t->Key = -1;
         int d;
@@ -2796,9 +2808,11 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
             SnapNum, nnew, tot[0], tot[1], ndead, tot[2], tot[3], nhostless, tab->NTotal);
     subhalo_finish_call(SnapNum, 1, &locstats, &plan, sp->SubhaloFieldSO ? &sostats : NULL, Comm);
     message(0, "Subhalo diagnostics: %ld unbindings, %ld at the iteration cap (worst Nbound/Nlast %g, track %ld); "
+               "%ld of %ld tracks dead from the mean frame rescued from the core frame; "
                "%ld of %ld final-pass bound particles with E >= 0; %ld tail claims across the final branch dropped; "
                "in-place tags written %ld, field tags released %ld; %ld orphan hosts updated; arena high water %.3f.\n",
             SubLastStats.NCandidates, SubLastStats.NItercap, SubLastStats.WorstConvRatio, SubLastStats.WorstTrackId,
+            SubLastStats.NRescued, SubLastStats.NRescueTried,
             SubLastStats.NFinalPositive, SubLastStats.NFinalBound, SubLastStats.NTailRejected,
             SubLastStats.NFallbackField, SubLastStats.NFallbackReleased, norphsync_tot, SubLastStats.ArenaPeakFrac);
     log_tagged("after the call", Comm);

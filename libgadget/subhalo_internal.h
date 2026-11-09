@@ -223,6 +223,7 @@ struct SubhaloMember {
     int64_t NPrev;
     double RefPos[3], RefVel[3];         /* previous-bound frame (translated frame, internal Vel) */
     double TracerPos[3], TracerVel[3];   /* an orphan's tracer as in the record (output frame, km/s) */
+    double MarkerWeight;                 /* an orphan's membership weight in its Host (resurrection order) */
     /* this call: the serial sub-tree results (gathered after the serial keys) and the rounds */
     int32_t state;           /* SUBHALO_ST_* */
     int32_t Nbound;
@@ -430,11 +431,10 @@ struct SubhaloKeySeg {
  * the (BindRank, ID, GrNr) of the SubhaloNumTracerHostFinding lowest-BindRank live tracer-type
  * particles it holds with TrackId == BoundTrackId == T to T's home rank, which keeps the first
  * SubhaloNumTracerHostFinding by (BindRank, ID) as TracerIDs and sets Host to the GrNr (-1: no
- * group) with the largest weight sum exp(-TracerPenalty) / (1 + sqrt(i)), ties to the smaller
- * GrNr. Collective. */
+ * group) with the largest weight sum 1 / (1 + sqrt(i)), ties to the smaller GrNr. Collective. */
 void subhalo_host_vote(struct SubTrackTable * tab, MPI_Comm Comm);
-/* A tracer's vote weight exp(-TracerPenalty); exactly 1 for a zero (or negative) penalty, so
- * runs without a scattering module vote bit for bit as before. */
+/* exp(-TracerPenalty), exactly 1 for a zero (or negative) penalty: an orphan marker weighs exp(-penalty) /
+ * (1 + sqrt(rank)), a descendant vote exp(-penalty) alone, so zero penalties give it equal weights. */
 static inline double
 subhalo_tracer_weight(float penalty)
 {
@@ -448,6 +448,26 @@ int64_t subhalo_weighted_plurality(const int64_t * cand, const double * w, int n
  * nearest-image displacements from one common reference per track (the lowest (own tag, BindRank,
  * ID)), reduced on the home rank in rank order into RefPos, RefVel, NPrev, MPrev. Collective. */
 void subhalo_previous_frames(struct SubTrackTable * tab, MPI_Comm Comm);
+/* The core of the rescue frame: the 10 % most bound of the previous bound set, at least
+ * SubhaloCoreSize: large enough to average its sampling noise, deep inside a stripped envelope. */
+#define SUBHALO_RESCUE_CORE_FRACTION 0.1
+static inline int64_t
+subhalo_rescue_core_size(int64_t NboundPrev, int CoreSize)
+{
+    const int64_t kf = (int64_t) (SUBHALO_RESCUE_CORE_FRACTION * (double) NboundPrev);
+    return kf > CoreSize ? kf : CoreSize;
+}
+/* Resurrection order of the orphans of a key without a resolved progenitor: the larger membership
+ * weight M (MarkerWeight), then the smaller kinetic distance d, then the smaller TrackId. */
+static inline int
+subhalo_orphan_ranks_before(double Ma, double da, int64_t Ta, double Mb, double db, int64_t Tb)
+{
+    if(Ma != Mb)
+        return Ma > Mb;
+    if(da != db)
+        return da < db;
+    return Ta < Tb;
+}
 /* Step 3, keys of the tracks on the home ranks: Key = Host for a hosted resolved track, the
  * pseudo-key TotNgroups + 1 + ordinal for a hostless resolved track (ordinals in TrackId order
  * by an exclusive scan), -1 otherwise. Returns the global number of pseudo-keys. Collective. */
@@ -683,6 +703,8 @@ struct SubhaloCallStats {
     int64_t NTailRejected;   /* tail claims crossing the binding owner's final branch */
     int64_t NFallbackField;  /* particles of the oversized keys whose tags the final pass of the rounds wrote */
     int64_t NFallbackReleased; /* field particles of the oversized keys untagged instead (stale orphan tags, the central's); not in NFallbackField */
+    int64_t NRescueTried;    /* serial resolved candidates dead from the mean frame, unbound again from the core frame */
+    int64_t NRescued;        /* of which survived */
     double ArenaPeakFrac;    /* largest arena high-water mark of a key / its arena size */
     /* ---- instrumentation (global, set on every return path; a failed call keeps the wall times
      * and peaks of the stages that ran, zero counters and Complete 0) ---- */
