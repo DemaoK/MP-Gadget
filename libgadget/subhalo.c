@@ -2827,7 +2827,7 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
             SnapNum, nnew, tot[0], tot[1], ndead, tot[2], tot[3], nhostless, tab->NTotal);
     subhalo_finish_call(SnapNum, 1, &locstats, &plan, sp->SubhaloFieldSO ? &sostats : NULL, Comm);
     message(0, "Subhalo diagnostics: %ld unbindings, %ld at the iteration cap (worst Nbound/Nlast %g, track %ld); "
-               "%ld of %ld tracks dead from the mean frame rescued from the core frame; "
+               "%ld of %ld tracks dead from the mean frame rescued from the clipped core frame; "
                "%ld of %ld final-pass bound particles with E >= 0; %ld tail claims across the final branch dropped; "
                "in-place tags written %ld, field tags released %ld; %ld orphan hosts updated; arena high water %.3f.\n",
             SubLastStats.NCandidates, SubLastStats.NItercap, SubLastStats.WorstConvRatio, SubLastStats.WorstTrackId,

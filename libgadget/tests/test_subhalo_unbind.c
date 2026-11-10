@@ -1,7 +1,8 @@
 /* Serial tests of the unbinding kernel (subhalo_unbind.c; design 7.4) and the k-nearest tracer
  * search: Hernquist haloes, unbound shells, subsampling, satellites, scale factor, thermal energy,
- * periodic gravity, ties, tree order, core fill, sinking, death, rescue; bitwise results at 1 to 8
- * threads and inside a worker region (decisions 37, 42.5); the sampled final pass (42.4).
+ * periodic gravity, ties, tree order, core fill, sinking, death, rescue and its clipped core frame;
+ * bitwise results at 1 to 8 threads and inside a worker region (decisions 37, 42.5); the sampled
+ * final pass (42.4).
  * test_timing takes sizes, thresholds, threads and the final-pass mode from SUBHALO_UNBIND_TIMING*.
  * Haloes sample the exact Hernquist distribution function (truncated at 100 scale radii) across a
  * periodic boundary; a = 1, H = 0, units kpc/h, 1e10 Msun/h, km/s. Run as: mpirun -np 1. */
@@ -1532,10 +1533,41 @@ test_death(void ** state)
     teardown_pman();
 }
 
+/* An arena with the kernel's per-particle scratch budget beyond a caller's allocation already in it;
+ * *mark is that allocation's end, where every kernel call must leave the arena. */
+static struct SubhaloArena
+arena_alloc_marked(int64_t n, size_t * mark)
+{
+    struct SubhaloArena a = arena_alloc(n + 1);
+    a.peak = 0;
+    assert_non_null(subhalo_arena_get(&a, 40));
+    *mark = a.used;
+    return a;
+}
+
+/* Sentinel outputs: all six components set, so that an untouched return can be checked in full. */
+static void
+frame_sentinel(double pos[3], double vel[3])
+{
+    int d;
+    for(d = 0; d < 3; d++) {
+        pos[d] = -1. - d;
+        vel[d] = -10. - d;
+    }
+}
+
+static int
+frame_is_sentinel(const double pos[3], const double vel[3])
+{
+    double sp[3], sv[3];
+    frame_sentinel(sp, sv);
+    return memcmp(pos, sp, sizeof(sp)) == 0 && memcmp(vel, sv, sizeof(sv)) == 0;
+}
+
 /* The rescue of a stripped satellite of track 0: a bound core of NC particles (own tag, BindRank
  * 0 .. NC-1) plus a tail of 2 NC at 300 km/s, half of it own-tag beyond the core's BindRanks, half
  * another track's with low BindRanks. The mean frame of the whole source unbinds everything; the
- * core frame from the source keeps the core. Own-tag particles with core BindRanks outside the
+ * clipped core frame from the source keeps the core. Own-tag particles with core BindRanks outside the
  * source, 500 km/s off, count for nothing. A gate or a rescue that fails leaves the candidate's
  * fields and Index order as at its first death (Energy is scratch). */
 static void
@@ -1609,7 +1641,8 @@ test_rescue(void ** state)
         corev[d] = cv / nc;
     }
     struct SubhaloUnbindParams up = default_params();
-    struct SubhaloArena arena = arena_alloc(n);
+    size_t mark;
+    struct SubhaloArena arena = arena_alloc_marked(n, &mark);
     struct TestCand t;
     int64_t * order = (int64_t *) mymalloc("TestRescueOrder", sizeof(int64_t) * n);
     struct SubCandidate dead;
@@ -1620,7 +1653,7 @@ test_rescue(void ** state)
     assert_int_equal(subhalo_unbind_rescue(&t.c, nc, &up, &arena, &tried), 1);
     assert_int_equal(tried, 1);
     assert_true(t.c.Flags & SUBHALO_FLAG_RESCUED);
-    assert_int_equal(arena.used, 0);
+    assert_int_equal(arena.used, mark);
     int64_t ntail = 0;
     for(i = 0; i < t.c.Nbound; i++)
         ntail += t.Index[i] >= nc;
@@ -1640,7 +1673,7 @@ test_rescue(void ** state)
     assert_int_equal(subhalo_unbind_rescue(&t.c, 2 * n + 2, &up, &arena, &tried), 0);
     assert_int_equal(tried, 0);
     assert_true(memcmp(order, t.Index, sizeof(int64_t) * n) == 0 && memcmp(&dead, &t.c, sizeof(dead)) == 0);
-    assert_int_equal(arena.used, 0);
+    assert_int_equal(arena.used, mark);
     cand_free(&t);
 
     /* a core in the hot tail fails: the fields and the order are those of the first death */
@@ -1653,7 +1686,7 @@ test_rescue(void ** state)
     assert_int_equal(tried, 1);
     assert_true(memcmp(order, t.Index, sizeof(int64_t) * n) == 0 && memcmp(&dead, &t.c, sizeof(dead)) == 0);
     assert_false(t.c.Flags & SUBHALO_FLAG_RESCUED);
-    assert_int_equal(arena.used, 0);
+    assert_int_equal(arena.used, mark);
     cand_free(&t);
 
     /* the gate counts the source only: nc/4 in-source core particles and nc outside do not make K/2 */
@@ -1667,13 +1700,387 @@ test_rescue(void ** state)
     assert_int_equal(subhalo_unbind_rescue(&t.c, nc, &up, &arena, &tried), 0);
     assert_int_equal(tried, 0);
     assert_true(memcmp(order, t.Index, sizeof(int64_t) * n) == 0 && memcmp(&dead, &t.c, sizeof(dead)) == 0);
-    assert_int_equal(arena.used, 0);
+    assert_int_equal(arena.used, mark);
     cand_free(&t);
 
     /* K = max(SubhaloCoreSize, 0.1 NboundPrev) */
     assert_true(subhalo_rescue_core_size(500, 20) == 50 && subhalo_rescue_core_size(100, 20) == 20 && subhalo_rescue_core_size(0, 1) == 1);
     myfree(order);
     myfree(arena.base);
+    teardown_pman();
+}
+
+/* The rescue frame of a remnant of track 0: NR particles of a small Hernquist sphere, BindRank by
+ * radius (the core K = 20 innermost); NX non-members 500 km/s off; NI non-members inside the clip
+ * (at the core mean velocity + 2 km/s, 0.5 kpc off), one condition each: TrackId 5 with BoundTrackId
+ * 0 and a core rank, BoundTrackId 5 with own tag and a core rank, BindRank -1, BindRank >= K. Without
+ * outliers the frame is the core mean, bitwise the same with every non-member in the source and in
+ * any list order; the gates leave all six outputs alone. One to three core members kicked at 300 km/s
+ * carry the core mean off the remnant, which dies from it; the rescue leaves them out and binds the
+ * same set as an unbinding from the remnant's own centre. The arena returns to the caller's mark. */
+struct RadiusRank {
+    double r;
+    int64_t i;
+};
+
+static int
+cmp_radius_rank(const void * a, const void * b)
+{
+    const struct RadiusRank * x = (const struct RadiusRank *) a, * y = (const struct RadiusRank *) b;
+    return (x->r > y->r) - (x->r < y->r);
+}
+
+static int
+cmp_int64(const void * a, const void * b)
+{
+    const int64_t x = *(const int64_t *) a, y = *(const int64_t *) b;
+    return (x > y) - (x < y);
+}
+
+/* Mass-weighted frame of the particles of P[0, nr) with BindRank < K, relative to the one of rank 0. */
+static void
+core_mean(int64_t nr, int64_t K, double pos[3], double vel[3])
+{
+    int64_t i, first = -1;
+    int d;
+    for(i = 0; i < nr; i++)
+        if(P[i].BindRank == 0)
+            first = i;
+    double M = 0, mx[3] = {0, 0, 0}, mv[3] = {0, 0, 0};
+    for(i = 0; i < nr; i++) {
+        if(P[i].BindRank >= K)
+            continue;
+        M += P[i].Mass;
+        for(d = 0; d < 3; d++) {
+            mx[d] += P[i].Mass * NEAREST(P[i].Pos[d] - P[first].Pos[d], BOXSIZE);
+            mv[d] += P[i].Mass * P[i].Vel[d];
+        }
+    }
+    for(d = 0; d < 3; d++) {
+        pos[d] = wrapb(P[first].Pos[d] + mx[d] / M);
+        vel[d] = mv[d] / M;
+    }
+}
+
+static void
+test_rescue_frame(void ** state)
+{
+    const int64_t nr = 400, nx = 40, ni = 20, nf = nr + nx, n = nf + ni, K = 20;
+    setup_pman(n);
+    const double m = make_hernquist(0, nr, 0.002, 1.0, 20.0, Centre, Bulk, 51, 0);
+    struct RadiusRank * rr = (struct RadiusRank *) mymalloc("TestRadiusRank", sizeof(struct RadiusRank) * nr);
+    int64_t i;
+    int d, tried;
+    for(i = 0; i < nr; i++) {
+        double r2 = 0;
+        for(d = 0; d < 3; d++)
+            r2 += pow(NEAREST(P[i].Pos[d] - Centre[d], BOXSIZE), 2);
+        rr[i].r = sqrt(r2);
+        rr[i].i = i;
+    }
+    qsort(rr, nr, sizeof(struct RadiusRank), cmp_radius_rank);
+    for(i = 0; i < nr; i++)
+        P[rr[i].i].BindRank = (int32_t) i;
+    myfree(rr);
+    double cpos[3], cvel[3], pos[3], vel[3], pos2[3], vel2[3];
+    core_mean(nr, K, cpos, cvel);
+    for(i = nr; i < n; i++) {
+        const int kind = (int) (i % 4);
+        memset(&P[i], 0, sizeof(P[i]));
+        P[i].Type = 1;
+        P[i].Mass = m;
+        P[i].ID = i;
+        P[i].TrackId = kind == 0 ? 5 : 0;
+        P[i].BoundTrackId = kind == 1 ? 5 : 0;
+        P[i].BindRank = (int32_t) (kind == 2 ? -1 : (kind == 3 ? K + i : i % K));
+        for(d = 0; d < 3; d++) {
+            if(i < nf) {
+                P[i].Pos[d] = wrapb(Centre[d] + 0.1 * (double) (i % 7) - 0.3);
+                P[i].Vel[d] = Bulk[d] + (d == 0 ? 500. : 0);
+            }
+            else {
+                P[i].Pos[d] = wrapb(cpos[d] + (d == 0 ? 0.5 : 0));
+                P[i].Vel[d] = cvel[d] + (d == 0 ? 2. : 0);
+            }
+        }
+    }
+    MyFloat * vsave = (MyFloat *) mymalloc("TestRescueVel", sizeof(MyFloat) * 3 * nr);
+    for(i = 0; i < nr; i++)
+        for(d = 0; d < 3; d++)
+            vsave[3 * i + d] = P[i].Vel[d];
+    struct SubhaloUnbindParams up = default_params();
+    size_t mark;
+    struct SubhaloArena arena = arena_alloc_marked(n, &mark);
+    struct TestCand t;
+    int64_t * setc = (int64_t *) mymalloc("TestRescueSet", sizeof(int64_t) * n);
+
+    /* no outliers: the core mean to rounding; c and its Index untouched */
+    cand_init(&t, 0, nr, Centre, Bulk, 7);
+    const struct SubCandidate before = t.c;
+    assert_int_equal(subhalo_rescue_frame(&t.c, K, &up, &arena, pos, vel), 1);
+    assert_int_equal(arena.used, mark);
+    assert_true(memcmp(&before, &t.c, sizeof(before)) == 0);
+    for(i = 0; i < nr; i++)
+        assert_int_equal(t.Index[i], i);
+    for(d = 0; d < 3; d++)
+        assert_true(fabs(NEAREST(pos[d] - cpos[d], BOXSIZE)) < 1e-9 && fabs(vel[d] - cvel[d]) < 1e-9);
+    cand_free(&t);
+
+    /* every non-member, inside the clip or far off, and the list order change no bit */
+    cand_init(&t, 0, n, Centre, Bulk, 7);
+    for(i = 0; i < n; i++)
+        t.Index[i] = n - 1 - i;
+    assert_int_equal(subhalo_rescue_frame(&t.c, K, &up, &arena, pos2, vel2), 1);
+    assert_true(memcmp(pos, pos2, sizeof(pos)) == 0 && memcmp(vel, vel2, sizeof(vel)) == 0);
+    for(i = 0; i < n; i++)
+        t.Index[i] = (7 * i) % n;
+    assert_int_equal(subhalo_rescue_frame(&t.c, K, &up, &arena, pos2, vel2), 1);
+    assert_true(memcmp(pos, pos2, sizeof(pos)) == 0 && memcmp(vel, vel2, sizeof(vel)) == 0);
+    assert_int_equal(arena.used, mark);
+
+    /* gates, all outputs untouched: K = 2 n + 2; K/2 - 1 core members beside the non-members of core
+     * BindRank; a zero width */
+    frame_sentinel(pos2, vel2);
+    assert_int_equal(subhalo_rescue_frame(&t.c, 2 * n + 2, &up, &arena, pos2, vel2), 0);
+    assert_int_equal(arena.used, mark);
+    for(i = 0; i < nr; i++)
+        if(P[i].BindRank >= K / 2 - 1 && P[i].BindRank < K)
+            P[i].BindRank += (int32_t) nr;
+    assert_int_equal(subhalo_rescue_frame(&t.c, K, &up, &arena, pos2, vel2), 0);
+    assert_int_equal(arena.used, mark);
+    for(i = 0; i < nr; i++)
+        if(P[i].BindRank >= nr)
+            P[i].BindRank -= (int32_t) nr;
+    for(i = 0; i < nr; i++)
+        if(P[i].BindRank < K)
+            for(d = 0; d < 3; d++)
+                P[i].Vel[d] = Bulk[d];
+    assert_int_equal(subhalo_rescue_frame(&t.c, K, &up, &arena, pos2, vel2), 0);
+    assert_true(frame_is_sentinel(pos2, vel2));
+    assert_int_equal(arena.used, mark);
+    cand_free(&t);
+    for(i = 0; i < nr; i++)
+        for(d = 0; d < 3; d++)
+            P[i].Vel[d] = vsave[3 * i + d];
+
+    /* one to three of the 20 core members (ranks 2, 7, 13) kicked at 300 km/s; the candidate holds
+     * the remnant and the far non-members */
+    const int32_t kicked[3] = {2, 7, 13};
+    int nk;
+    for(nk = 1; nk <= 3; nk++) {
+        for(i = 0; i < nr; i++)
+            if(P[i].BindRank == kicked[nk - 1])
+                P[i].Vel[0] += 300.;
+        core_mean(nr, K, cpos, cvel);
+        cand_init(&t, 0, nf, Centre, Bulk, 9);
+        assert_int_equal(subhalo_unbind(&t.c, &up, &arena), 1);
+        const int64_t nbc = t.c.Nbound;
+        memcpy(setc, t.Index, sizeof(int64_t) * nbc);
+        qsort(setc, nbc, sizeof(int64_t), cmp_int64);
+        cand_free(&t);
+        cand_init(&t, 0, nf, cpos, cvel, 9);
+        const int alive = subhalo_unbind(&t.c, &up, &arena);
+        message(0, "Rescue frame, %d kicked: the core mean %.1f km/s off, %s from it\n", nk, fabs(cvel[0] - Bulk[0]),
+                alive ? "alive" : "dead");
+        assert_int_equal(alive, 0);
+        if(nk == 3)
+            assert_int_equal(subhalo_unbind_rescue(&t.c, K, &up, &arena, NULL), 1);
+        else {
+            assert_int_equal(subhalo_unbind_rescue(&t.c, K, &up, &arena, &tried), 1);
+            assert_int_equal(tried, 1);
+        }
+        assert_true(t.c.Flags & SUBHALO_FLAG_RESCUED);
+        assert_int_equal(arena.used, mark);
+        message(0, "Rescue frame, %d kicked: Nbound %ld (%ld from the centre)\n", nk, (long) t.c.Nbound, (long) nbc);
+        assert_int_equal(t.c.Nbound, nbc);
+        qsort(t.Index, nbc, sizeof(int64_t), cmp_int64);
+        assert_true(memcmp(t.Index, setc, sizeof(int64_t) * nbc) == 0);
+        for(i = 0; i < nbc; i++)
+            assert_true(setc[i] < nr && !(P[setc[i]].BindRank < K && P[setc[i]].Vel[0] > Bulk[0] + 200.));
+        cand_free(&t);
+    }
+    myfree(setc);
+    myfree(arena.base);
+    myfree(vsave);
+    teardown_pman();
+}
+
+/* Particle i of a hand-made core of track 0: x position x (y, z fixed), x velocity vx, y velocity vy,
+ * mass, tags, BindRank and ID. */
+static void
+core_particle(int64_t i, double x, double vx, double vy, double mass, int64_t track, int64_t bound, int32_t rank, int64_t id)
+{
+    memset(&P[i], 0, sizeof(P[i]));
+    P[i].Type = 1;
+    P[i].Mass = mass;
+    P[i].ID = id;
+    P[i].TrackId = track;
+    P[i].BoundTrackId = bound;
+    P[i].BindRank = rank;
+    P[i].Pos[0] = wrapb(x);
+    P[i].Pos[1] = 100.;
+    P[i].Pos[2] = 200.;
+    P[i].Vel[0] = vx;
+    P[i].Vel[1] = vy;
+    P[i].Vel[2] = 0;
+}
+
+/* Frame of the candidate over P[0, n) (Index reversed when rev) with core size K; the arena checked. */
+static int
+core_frame(int64_t n, int64_t K, int rev, double pos[3], double vel[3])
+{
+    struct SubhaloUnbindParams up = default_params();
+    size_t mark;
+    struct SubhaloArena arena = arena_alloc_marked(n, &mark);
+    struct TestCand t;
+    int64_t i;
+    cand_init(&t, 0, n, Centre, Bulk, 3);
+    if(rev)
+        for(i = 0; i < n; i++)
+            t.Index[i] = n - 1 - i;
+    const int ok = subhalo_rescue_frame(&t.c, K, &up, &arena, pos, vel);
+    assert_int_equal(arena.used, mark);
+    cand_free(&t);
+    myfree(arena.base);
+    return ok;
+}
+
+static double
+bits_double(uint64_t u)
+{
+    double x;
+    memcpy(&x, &u, sizeof(x));
+    return x;
+}
+
+/* Hand-made cores with analytic frames: (a) the re-centring drops a member the first clip kept,
+ * across the periodic edge; (b) an even core, its medians the means of the two middle values;
+ * (c) an odd core with outliers on both sides; (d) the membership gate at K/2 for even and odd K;
+ * (e) a non-finite velocity or position, an even median whose sum overflows and a frame whose sum
+ * overflows give no frame; (f) BindRank ties broken by ID: the same bits in either list order;
+ * (g) a core that needs all three re-centrings. */
+static void
+test_rescue_frame_cases(void ** state)
+{
+    setup_pman(16);
+    double pos[3], vel[3], pos2[3], vel2[3];
+    int64_t i;
+    const double B = BOXSIZE;
+
+    /* (a) vx -2..2, masses 100, 1, 1, 1, 1, x = B - 1.5 + j: seed 0, s 1, the first frame -198/104 keeps
+     * all five, the second drops the member at 2: -200/103 at x = B - 1.5 + 6/103 */
+    {
+        const double vx[5] = {-2, -1, 0, 1, 2}, ms[5] = {100, 1, 1, 1, 1};
+        for(i = 0; i < 5; i++)
+            core_particle(i, B - 1.5 + i, vx[i], 0, ms[i], 0, 0, (int32_t) i, 10 + i);
+        assert_int_equal(core_frame(5, 5, 0, pos, vel), 1);
+        message(0, "Rescue frame case (a): vx %.17g (-200/103 = %.17g)\n", vel[0], -200. / 103);
+        assert_true(fabs(vel[0] + 200. / 103) < 1e-12 && vel[1] == 0 && vel[2] == 0);
+        assert_true(fabs(NEAREST(pos[0] - wrapb(B - 1.5 + 6. / 103), B)) < 1e-9 && pos[1] == 100. && pos[2] == 200.);
+    }
+    /* (b) vx 0, 0, 0, 10, 10, 26, equal masses: seed 5, s 5, the member at 26 clipped: 4 at the mean x of
+     * the other five (the upper middle values would give 46/6) */
+    {
+        const double vx[6] = {0, 0, 0, 10, 10, 26};
+        for(i = 0; i < 6; i++)
+            core_particle(i, 50. + 2. * i, vx[i], 0, 1, 0, 0, (int32_t) i, 10 + i);
+        assert_int_equal(core_frame(6, 6, 0, pos, vel), 1);
+        assert_true(fabs(vel[0] - 4.) < 1e-12 && vel[1] == 0 && vel[2] == 0);
+        assert_true(fabs(pos[0] - 54.) < 1e-9 && pos[1] == 100. && pos[2] == 200.);
+    }
+    /* (c) vx 5, 1, 4, 2, 3, 40, -30 and vy 1, equal masses: seed (3, 1), s 2, the two outliers clipped:
+     * (3, 1) at the mean x of the first five */
+    {
+        const double vx[7] = {5, 1, 4, 2, 3, 40, -30};
+        for(i = 0; i < 7; i++)
+            core_particle(i, 50. + 2. * i, vx[i], 1, 1, 0, 0, (int32_t) i, 10 + i);
+        assert_int_equal(core_frame(7, 7, 0, pos, vel), 1);
+        assert_true(fabs(vel[0] - 3.) < 1e-12 && fabs(vel[1] - 1.) < 1e-12 && vel[2] == 0);
+        assert_true(fabs(pos[0] - 54.) < 1e-9 && pos[1] == 100. && pos[2] == 200.);
+    }
+    /* (d) the gate: K/2 = 5 members pass for K = 10 and K = 11, 4 do not */
+    {
+        int64_t Ks[2] = {10, 11};
+        int k;
+        for(k = 0; k < 2; k++) {
+            assert_int_equal(core_frame(5, Ks[k], 0, pos, vel), 1);
+            assert_true(fabs(vel[0] - 3.) < 1e-12);
+            frame_sentinel(pos, vel);
+            assert_int_equal(core_frame(4, Ks[k], 0, pos, vel), 0);
+            assert_true(frame_is_sentinel(pos, vel));
+        }
+    }
+    /* (e) NaN or Inf in one component of one member of core (c); identical vx 1e308 (an even median
+     * whose sum overflows; its width is 0) */
+    {
+        const uint64_t bad[3] = {0x7ff8000000000000ULL, 0x7ff0000000000000ULL, 0xfff0000000000000ULL};
+        int k;
+        for(k = 0; k < 3; k++) {
+            P[2].Vel[k % 2 ? 0 : 1] = bits_double(bad[k]);
+            frame_sentinel(pos, vel);
+            assert_int_equal(core_frame(7, 7, 0, pos, vel), 0);
+            assert_true(frame_is_sentinel(pos, vel));
+            P[2].Vel[0] = 4;
+            P[2].Vel[1] = 1;
+        }
+        assert_int_equal(core_frame(7, 7, 0, pos, vel), 1);
+        for(i = 0; i < 4; i++)
+            core_particle(i, 50. + 2. * i, 1e308, 0, 1e-10, 0, 0, (int32_t) i, 10 + i);
+        frame_sentinel(pos, vel);
+        assert_int_equal(core_frame(4, 4, 0, pos, vel), 0);
+        assert_true(frame_is_sentinel(pos, vel));
+    }
+    /* (e) a non-finite position (Inf, NaN) of one member of core (c) gives no frame */
+    {
+        const double vx[7] = {5, 1, 4, 2, 3, 40, -30};
+        const uint64_t bad[2] = {0x7ff0000000000000ULL, 0x7ff8000000000000ULL};
+        int k;
+        for(i = 0; i < 7; i++)
+            core_particle(i, 50. + 2. * i, vx[i], 1, 1, 0, 0, (int32_t) i, 10 + i);
+        for(k = 0; k < 2; k++) {
+            P[3].Pos[k] = bits_double(bad[k]);
+            frame_sentinel(pos, vel);
+            assert_int_equal(core_frame(7, 7, 0, pos, vel), 0);
+            assert_true(frame_is_sentinel(pos, vel));
+            P[3].Pos[0] = 56.;
+            P[3].Pos[1] = 100.;
+        }
+        assert_int_equal(core_frame(7, 7, 0, pos, vel), 1);
+    }
+    /* (e) vx 0.7e308 for all three, vy 0, 1, 2: the width is 1 (spread in vx would overflow the squared
+     * speeds and the width), and the frame's vx sum overflows: no frame */
+    {
+        for(i = 0; i < 3; i++)
+            core_particle(i, 50. + 2. * i, 0.7e308, (double) i, 1, 0, 0, (int32_t) i, 10 + i);
+        frame_sentinel(pos, vel);
+        assert_int_equal(core_frame(3, 3, 0, pos, vel), 0);
+        assert_true(frame_is_sentinel(pos, vel));
+    }
+    /* (f) six equal-mass members sharing BindRank 0, vx 0.3, 0.7, -0.7, -0.5, -0.1, 0.8, all inside every
+     * clip: summed in list order the two orders differ in the last bit (0.08333333333333336 against
+     * 0.08333333333333333); the ID order makes them the same */
+    {
+        const double vx[6] = {0.3, 0.7, -0.7, -0.5, -0.1, 0.8};
+        for(i = 0; i < 6; i++)
+            core_particle(i, B - 3. + 0.7 * i, vx[i], 0, 1, 0, 0, 0, 100 - i);
+        assert_int_equal(core_frame(6, 6, 0, pos, vel), 1);
+        assert_int_equal(core_frame(6, 6, 1, pos2, vel2), 1);
+        message(0, "Rescue frame case (f): vx %.17g and %.17g\n", vel[0], vel2[0]);
+        assert_true(memcmp(pos, pos2, sizeof(pos)) == 0 && memcmp(vel, vel2, sizeof(vel)) == 0);
+    }
+    /* (g) vx -30, -23, -19, -12, -1, 0, 23, masses 10, 1, 10, 10, 100, 10, 100: seed -12, s 11, the clip 33;
+     * the first frame -733/141 leaves out 23, the second 1567/241 keeps all seven, the third 1867/231 leaves
+     * out -30 (three re-centrings needed), at x = 50 + 2 * 1101/231 */
+    {
+        const double vx[7] = {-30, -23, -19, -12, -1, 0, 23}, ms[7] = {10, 1, 10, 10, 100, 10, 100};
+        for(i = 0; i < 7; i++)
+            core_particle(i, 50. + 2. * i, vx[i], 0, ms[i], 0, 0, (int32_t) i, 10 + i);
+        assert_int_equal(core_frame(7, 7, 0, pos, vel), 1);
+        message(0, "Rescue frame case (g): vx %.17g (1867/231 = %.17g; 1567/241 = %.17g)\n", vel[0], 1867. / 231,
+                1567. / 241);
+        assert_true(fabs(vel[0] - 1867. / 231) < 1e-12 && vel[1] == 0 && vel[2] == 0);
+        assert_true(fabs(pos[0] - (50. + 2. * 1101. / 231)) < 1e-9 && pos[1] == 100. && pos[2] == 200.);
+    }
     teardown_pman();
 }
 
@@ -2576,6 +2983,8 @@ int main(void) {
         cmocka_unit_test(test_sample_types),
         cmocka_unit_test(test_death),
         cmocka_unit_test(test_rescue),
+        cmocka_unit_test(test_rescue_frame),
+        cmocka_unit_test(test_rescue_frame_cases),
         cmocka_unit_test(test_threads_bitwise),
         cmocka_unit_test(test_threads_worker_region),
         cmocka_unit_test(test_final_pass_sampled),

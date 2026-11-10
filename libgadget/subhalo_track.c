@@ -291,7 +291,8 @@ final_ancestor(const struct SubNode * nd, int v, int b, int nn)
 
 /* subhalo_unbind with the diagnostics: every unbinding counted, the iteration cap and the worst
  * convergence ratio recorded (the ITERCAP flag of this run only, ORed back afterwards). A resolved
- * track's candidate (old) dead from its mean frame gets the core-frame rescue (subhalo_unbind_rescue). */
+ * track's candidate (old) dead from its mean frame gets the rescue from the clipped frame of its core
+ * (subhalo_unbind_rescue). */
 static int
 unbind_counted(struct SubCandidate * c, const struct SubTrack * old, const struct SubhaloUnbindParams * up, struct SubhaloArena * arena,
                struct SubhaloCallStats * ks)

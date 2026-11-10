@@ -82,10 +82,20 @@ struct SubhaloUnbindParams {
  * in ascending Energy; RefPos/RefVel the bound CoM frame; Flags |= ITERCAP when MaxIter is hit. */
 int subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * up, struct SubhaloArena * arena);
 
-/* Core-frame rescue of a resolved track's candidate that subhalo_unbind killed from its mean frame. The core
- * is the source's own-tag particles with 0 <= BindRank < K; with fewer than max(1, K/2) it returns 0, c untouched,
- * *tried = 0 (tried may be NULL). Else c is unbound again from the core's frame, final: survival sets SUBHALO_FLAG_RESCUED,
- * a death restores c's fields and Index order (Energy is scratch, undefined after a death as after subhalo_unbind). */
+/* Frame of the rescue: the core is c's particles with TrackId == BoundTrackId == c->TrackId and
+ * 0 <= BindRank < K, in (BindRank, ID) order; the seed is the core's component-wise median velocity,
+ * the width s the median core speed about it; then SUBHALO_RESCUE_ITERATIONS times the core members
+ * within SUBHALO_RESCUE_CLIP s of the centre give the next centre (their CoM frame). Pos, Vel: the last
+ * such frame (a set of fewer than 3, without mass or with sums that overflow ends the iteration). Returns
+ * 0 (outputs untouched) when the core has fewer than max(1, K/2) members or a member with a non-finite
+ * position or velocity, s is not finite and > 0, or no frame was formed. c is unchanged; arena restored. */
+int subhalo_rescue_frame(const struct SubCandidate * c, int64_t K, const struct SubhaloUnbindParams * up,
+                         struct SubhaloArena * arena, double Pos[3], double Vel[3]);
+
+/* Rescue of a resolved track's candidate that subhalo_unbind killed from its mean frame. Without a
+ * subhalo_rescue_frame it returns 0, c untouched, *tried = 0 (tried may be NULL). Else c is unbound again
+ * from that frame, final: survival sets SUBHALO_FLAG_RESCUED, a death restores c's fields and Index order
+ * (Energy is scratch, undefined after a death as after subhalo_unbind). */
 int subhalo_unbind_rescue(struct SubCandidate * c, int64_t K, const struct SubhaloUnbindParams * up,
                           struct SubhaloArena * arena, int * tried);
 

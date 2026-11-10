@@ -94,7 +94,7 @@ const struct SubhaloParams * subhalo_get_params(void);
 #define SUBHALO_FLAG_PLANCENTRAL  (1 << 2)
 #define SUBHALO_FLAG_SOCUTOFF     (1 << 3)
 #define SUBHALO_FLAG_SONOCROSS    (1 << 4)
-#define SUBHALO_FLAG_RESCUED      (1 << 5)   /* survived only through the core-frame rescue of its unbinding */
+#define SUBHALO_FLAG_RESCUED      (1 << 5)   /* survived only through the rescue of its unbinding (clipped core frame) */
 
 /* Particle block types for the finder's own IOTable entries (PTYPE_FOF_GROUP is 1024). */
 #define PTYPE_SUBHALO 1025

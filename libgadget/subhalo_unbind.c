@@ -1308,29 +1308,139 @@ subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * up, s
     return 1;
 }
 
+/* A rescue core member and its sort key: BindRank, then ID. */
+struct RescueMember {
+    int64_t rank;
+    int64_t idx;
+};
+
+static int
+cmp_rescue_member(const void * a, const void * b)
+{
+    const struct RescueMember * x = (const struct RescueMember *) a, * y = (const struct RescueMember *) b;
+    if(x->rank != y->rank)
+        return (x->rank > y->rank) - (x->rank < y->rank);
+    return (P[x->idx].ID > P[y->idx].ID) - (P[x->idx].ID < P[y->idx].ID);
+}
+
+static int
+cmp_double(const void * a, const void * b)
+{
+    const double x = *(const double *) a, y = *(const double *) b;
+    return (x > y) - (x < y);
+}
+
+/* Median of x[0, n), n >= 1 (x sorted in place): the middle value, the mean of the two middle ones for even n. */
+static double
+median_sorted(double * x, int64_t n)
+{
+    qsort(x, n, sizeof(double), cmp_double);
+    return (n % 2) ? x[n / 2] : 0.5 * (x[n / 2 - 1] + x[n / 2]);
+}
+
+static int
+frame_isfinite(const double Pos[3], const double Vel[3])
+{
+    int d;
+    for(d = 0; d < 3; d++)
+        if(!subhalo_isfinite(Pos[d]) || !subhalo_isfinite(Vel[d]))
+            return 0;
+    return 1;
+}
+
+static double
+speed_about(const MyFloat v[3], const double c[3])
+{
+    const double a = v[0] - c[0], b = v[1] - c[1], e = v[2] - c[2];
+    return sqrt(a * a + b * b + e * e);
+}
+
 int
-subhalo_unbind_rescue(struct SubCandidate * c, int64_t K, const struct SubhaloUnbindParams * up, struct SubhaloArena * arena, int * tried)
+subhalo_rescue_frame(const struct SubCandidate * c, int64_t K, const struct SubhaloUnbindParams * up,
+                     struct SubhaloArena * arena, double Pos[3], double Vel[3])
 {
     const size_t mark = arena->used;
-    const int64_t N = c->N;
-    int64_t i, nc = 0;
-    if(tried)
-        *tried = 0;
-    /* one buffer, the core list then the death order; with less arena left the kernel's source sort
-     * falls back to serial and its tree leaves widen until the nodes fit */
-    int64_t * buf = (int64_t *) arena_need(arena, sizeof(int64_t) * (N + 1), "rescue order");
+    const int64_t N = c->N, T = c->TrackId;
+    int64_t i, nc = 0, nkept = 0;
+    int d, it;
+    struct RescueMember * m = (struct RescueMember *) arena_need(arena, sizeof(struct RescueMember) * (N + 1), "rescue core");
     for(i = 0; i < N; i++) {
         const struct particle_data * p = &P[c->Index[i]];
-        if(p->TrackId == c->TrackId && p->BindRank >= 0 && p->BindRank < K)
-            buf[nc++] = c->Index[i];
+        if(p->TrackId == T && p->BoundTrackId == T && p->BindRank >= 0 && p->BindRank < K) {
+            m[nc].rank = p->BindRank;
+            m[nc].idx = c->Index[i];
+            nc++;
+        }
     }
-    double CorePos[3], CoreVel[3];
-    if(nc < 1 || nc < K / 2 || !(bound_frame(buf, nc, CorePos, CoreVel, up->BoxSize) > 0)) {
+    if(nc < 1 || nc < K / 2) {
         arena->used = mark;
         return 0;
     }
+    /* a non-finite position or velocity gives no frame: no median, clip distance or wrapped centre */
+    for(i = 0; i < nc; i++)
+        for(d = 0; d < 3; d++)
+            if(!subhalo_isfinite(P[m[i].idx].Vel[d]) || !subhalo_isfinite(P[m[i].idx].Pos[d])) {
+                arena->used = mark;
+                return 0;
+            }
+    /* (BindRank, ID) order: the medians, the clip and the sums do not depend on the list order */
+    qsort(m, nc, sizeof(struct RescueMember), cmp_rescue_member);
+    int64_t * kept = (int64_t *) arena_need(arena, sizeof(int64_t) * (nc + 1), "rescue core kept");
+    double * w = (double *) arena_need(arena, sizeof(double) * (nc + 1), "rescue core speeds");
+    double cv[3], cp[3] = {0, 0, 0};
+    for(d = 0; d < 3; d++) {
+        for(i = 0; i < nc; i++)
+            w[i] = P[m[i].idx].Vel[d];
+        cv[d] = median_sorted(w, nc);
+    }
+    for(i = 0; i < nc; i++)
+        w[i] = speed_about(P[m[i].idx].Vel, cv);
+    const double s = median_sorted(w, nc);
+    if(!(s > 0) || !subhalo_isfinite(s)) {
+        arena->used = mark;
+        return 0;
+    }
+    const double r = SUBHALO_RESCUE_CLIP * s;
+    for(it = 0; it < SUBHALO_RESCUE_ITERATIONS; it++) {
+        int64_t nk = 0;
+        for(i = 0; i < nc; i++)
+            if(speed_about(P[m[i].idx].Vel, cv) <= r)
+                kept[nk++] = m[i].idx;
+        double tp[3], tv[3];
+        /* fewer than 3 within the clip, or a frame whose sums overflow: the last frame stands */
+        if(nk < 3 || !(bound_frame(kept, nk, tp, tv, up->BoxSize) > 0) || !frame_isfinite(tp, tv))
+            break;
+        for(d = 0; d < 3; d++) {
+            cp[d] = tp[d];
+            cv[d] = tv[d];
+        }
+        nkept = nk;
+    }
+    arena->used = mark;
+    if(nkept == 0)
+        return 0;
+    for(d = 0; d < 3; d++) {
+        Pos[d] = cp[d];
+        Vel[d] = cv[d];
+    }
+    return 1;
+}
+
+int
+subhalo_unbind_rescue(struct SubCandidate * c, int64_t K, const struct SubhaloUnbindParams * up, struct SubhaloArena * arena, int * tried)
+{
+    if(tried)
+        *tried = 0;
+    double CorePos[3], CoreVel[3];
+    if(!subhalo_rescue_frame(c, K, up, arena, CorePos, CoreVel))
+        return 0;
     if(tried)
         *tried = 1;
+    const size_t mark = arena->used;
+    const int64_t N = c->N;
+    /* the death order; with less arena left the kernel's source sort falls back to serial and its
+     * tree leaves widen until the nodes fit */
+    int64_t * buf = (int64_t *) arena_need(arena, sizeof(int64_t) * (N + 1), "rescue order");
     memcpy(buf, c->Index, sizeof(int64_t) * N);
     const struct SubCandidate dead = *c;
     int d;

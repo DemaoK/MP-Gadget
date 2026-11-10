@@ -457,6 +457,12 @@ subhalo_rescue_core_size(int64_t NboundPrev, int CoreSize)
     const int64_t kf = (int64_t) (SUBHALO_RESCUE_CORE_FRACTION * (double) NboundPrev);
     return kf > CoreSize ? kf : CoreSize;
 }
+/* The rescue frame clips the core at SUBHALO_RESCUE_CLIP median core speeds about a median seed, re-centred
+ * this many times: a self-interacting satellite's core holds a few members scattered out of it at about the
+ * orbital speed, which the median seed and the clip leave out; a core whose members all stay inside every
+ * clip keeps its mean. */
+#define SUBHALO_RESCUE_CLIP 3.0
+#define SUBHALO_RESCUE_ITERATIONS 3
 /* Resurrection order of the orphans of a key without a resolved progenitor: the larger membership
  * weight M (MarkerWeight), then the smaller kinetic distance d, then the smaller TrackId. */
 static inline int
@@ -703,7 +709,7 @@ struct SubhaloCallStats {
     int64_t NTailRejected;   /* tail claims crossing the binding owner's final branch */
     int64_t NFallbackField;  /* particles of the oversized keys whose tags the final pass of the rounds wrote */
     int64_t NFallbackReleased; /* field particles of the oversized keys untagged instead (stale orphan tags, the central's); not in NFallbackField */
-    int64_t NRescueTried;    /* serial resolved candidates dead from the mean frame, unbound again from the core frame */
+    int64_t NRescueTried;    /* serial resolved candidates dead from the mean frame, unbound again from the clipped core frame */
     int64_t NRescued;        /* of which survived */
     double ArenaPeakFrac;    /* largest arena high-water mark of a key / its arena size */
     /* ---- instrumentation (global, set on every return path; a failed call keeps the wall times
