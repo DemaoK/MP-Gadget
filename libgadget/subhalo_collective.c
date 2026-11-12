@@ -2359,8 +2359,9 @@ round_commit(struct Coll * C, const struct CoreOut * fin)
     const int NR = C->up->MinNumTracerPart;
     int64_t i, c;
     int q;
-    /* the round's receivers that take an admitted particle, counted once as in a serial key */
-    int * took = C->AdmAny ? ta_malloc("SubCollAdmTook", int, nc + 1) : NULL;
+    /* the round's receivers that take an admitted particle, counted once as in a serial key (one
+     * int per candidate, inside SUBHALO_INPLACE_CAND_BYTES) */
+    int * took = C->AdmAny ? (int *) mymalloc("SubCollAdmTook", sizeof(int) * (nc + 1)) : NULL;
     if(took)
         memset(took, 0, sizeof(int) * (nc + 1));
     for(c = 0; c < nc; c++) {
@@ -2409,7 +2410,7 @@ round_commit(struct Coll * C, const struct CoreOut * fin)
         MPI_Allreduce(MPI_IN_PLACE, took, nc, MPI_INT, MPI_MAX, C->Comm);
         for(c = 0; c < nc; c++)
             C->NAdmRecv += took[c];
-        ta_free(took);
+        myfree(took);
     }
 }
 
@@ -3527,7 +3528,7 @@ _Static_assert(sizeof(struct SubhaloInplaceKey) + 8 + 4 * 16 <= SUBHALO_INPLACE_
                "SUBHALO_INPLACE_KEY_BYTES does not cover the per-key vectors");
 _Static_assert(sizeof(struct SubhaloInplaceCand) + sizeof(struct CandState)
                + 8 * (NHS + 2 + CORE_ND + 1 + 2 * SUBHALO_MAXTRACERS + 2 * SUBHALO_NSO + 8 + 9 + 8 + 2 * NSUM + 12 + 4 + 4 + 3 * 12 + 2 + 1)
-               + 4 * 10 <= SUBHALO_INPLACE_CAND_BYTES, "SUBHALO_INPLACE_CAND_BYTES does not cover the per-candidate vectors");
+               + 4 * 11 <= SUBHALO_INPLACE_CAND_BYTES, "SUBHALO_INPLACE_CAND_BYTES does not cover the per-candidate vectors");
 _Static_assert(sizeof(struct SubhaloMember) + sizeof(struct SerialInfo) + 32 <= SUBHALO_INPLACE_MEMBER_BYTES,
                "SUBHALO_INPLACE_MEMBER_BYTES does not cover the member table");
 

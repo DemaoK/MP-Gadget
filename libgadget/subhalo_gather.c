@@ -2305,6 +2305,10 @@ plan_vote(const struct SubhaloMember * mem, int64_t nmem, const int64_t * centra
           struct SubhaloOffer ** offers, int64_t * noffers, MPI_Comm Comm)
 {
     const struct SubhaloParams * sp = subhalo_get_params();
+    *offers = NULL;
+    *noffers = 0;
+    if(nO == 0 || !(sp->SubhaloAdmitShare > 0) || !ddecomp)
+        return 0;
     const int64_t NumPart = PartManager->NumPart;
     const int TracerTypes = sp->SubhaloTracerTypes, kk = sp->SubhaloNumNeighboursForReassignment;
     const int need = subhalo_admit_need(sp->SubhaloAdmitShare, kk);
@@ -2312,10 +2316,6 @@ plan_vote(const struct SubhaloMember * mem, int64_t nmem, const int64_t * centra
     int ThisTask;
     MPI_Comm_rank(Comm, &ThisTask);
     int64_t i, k, j, kO;
-    *offers = NULL;
-    *noffers = 0;
-    if(nO == 0 || !(sp->SubhaloAdmitShare > 0) || !ddecomp)
-        return 0;
     int64_t nt = 0;
     for(i = 0; i < NumPart; i++)
         nt += vote_owner(&P[i], mem, nmem, centralT, O, nO, TotNgroups, fkmap, nfk, TracerTypes, &kO) >= 0;
@@ -2464,7 +2464,7 @@ home_offer(const struct SubhaloPlan * plan, const struct SubhaloOffer * o)
 }
 
 /* The serial sub-tree key that processes offer o once the plan is settled (the key the encoding
- * marks it for), -1 if no serial key serves it. */
+ * marks it for), NULL if no serial key serves it. */
 static const struct SubhaloLocalKey *
 served_key(const struct SubhaloPlan * plan, const struct SubhaloOffer * o, const struct SubhaloOffer * offers, int64_t noff)
 {

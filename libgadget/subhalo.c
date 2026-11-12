@@ -2674,8 +2674,8 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     int failure = subhalo_plan_exchange(&plan, Comm);
     stage_end(SUBHALO_STAGE_EXCHANGE);
 
-    /* Step 5: commit point; nothing persistent changed yet (the orphans' tracer state is redone
-     * by the next complete call). */
+    /* Step 5: commit point; particle tags and GrNr are unchanged so far, and the track table holds
+     * this call's orphan lookup (marker positions and velocities, lost markers). */
     if(MPIU_Any(failure, Comm)) {
         message(0, "Subhalo finder: the particle exchange failed for snapshot %d; restoring the domain. Particle tags and "
                    "GrNr are unchanged; the track table keeps this call's orphan lookup; this PIG will be marked incomplete.\n",

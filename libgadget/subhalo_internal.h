@@ -844,7 +844,8 @@ struct SubhaloCallStats {
     double TreeBytes;                       /* the admission's tree-stage estimate of the rounds, max over the ranks */
     int FieldSOPass1Walks, FieldSOPass2Walks, FieldSOBins;
     int64_t FieldSOCentrals;
-    /* admission by neighbour majority (SubhaloAdmitShare), serial keys */
+    /* admission by neighbour majority (SubhaloAdmitShare): serial keys, serial sub-tree keys and
+     * in-place receivers */
     int64_t NAdmitted;       /* particles of an ancestor admitted to a satellite's source */
     int64_t NAdmitTaken;     /* of which bound by the satellite and taken by it */
     int64_t NAdmitReceivers; /* satellites that took at least one */
