@@ -44,8 +44,9 @@ sphere of our centrals (every particle inside RSO[vir], Rockstar's host set): Rs
 rs), Rs_Klypin(SO) (RsKlypinSO against rs_klypin), Klypin(SO)/fit (RsKlypinSO against rs), Vmax(SO)
 (VmaxSO against vmax); Vrms, Spin (SpinPeebles), Spin_Bullock, b_to_a,
 c_to_a, b_to_a(500c), c_to_a(500c), Xoff, Voff (VmaxVir, Vrms and Voff are physical km/s in our
-catalogue as in Rockstar's, so they are not converted); p10/p50/p90 of each ratio over pairs where both sides are
-defined (> 0), with the counts of pairs where our value is undefined (-1, not computed), Rockstar's is (0), or our column is absent from the file. Rockstar's values are
+catalogue as in Rockstar's, so they are not converted); p10/p50/p90 of each ratio over pairs where
+both sides are defined (> 0), with the counts of pairs where our value is undefined (-1, not
+computed), Rockstar's is (0), or our column is absent from the file. Rockstar's values are
 bound-only (BOUND_PROPS 1); its host's set includes its subhalos' particles while our central's
 bound set does not (design 4.1, D10), and our central's source is its FOF group only (D3, HBT
 FeedCentrals), so central masses are expected slightly below Rockstar's.
@@ -72,7 +73,7 @@ quantity computed on Rockstar's host set), falling back to the bound-set Rs(fit)
 catalogue without RsSO; --rs-bound-median-tol (default 0, off) adds the bound-set Rs(fit) target; or
 --report-only is given; 1 otherwise; 2 when an input could not be read.
 
-One-subhalo-per-group catalogues (every FOF group one subhalo): pass --phase1 so that only section 0
+FOF-as-subhalo catalogues (every FOF group one subhalo): pass --phase1 so that only section 0
 of the particle blocks is read, and --mass Mbound, since their MBoundSO is -1.
 
 Examples:
@@ -803,14 +804,14 @@ def main(argv=None):
     p.add_argument("--match", choices=["auto", "ids", "position"], default="auto",
                    help="ids when the .bin files exist (auto), else position")
     p.add_argument("--mass", default="MBoundSO[0]", help="our mass compared with Rockstar's Mvir (default MBoundSO[0]; "
-                   "Mbound for catalogues without MBoundSO)")
+                   "Mbound for catalogues whose MBoundSO is -1)")
     p.add_argument("--rtol", type=float, default=0.5, help="centre distance tolerance in units of R (default 0.5)")
     p.add_argument("--mass-factor", type=float, default=2.0, help="mass ratio tolerance factor (default 2)")
     p.add_argument("--ntracers", type=int, default=10, help="tracers per subhalo for the ID match (default 10)")
     p.add_argument("--min-np", type=int, default=100, help="our Nbound threshold of the summary (default 100)")
     p.add_argument("--accept-frac", type=float, default=0.9, help="target matched fraction of centrals (default 0.9)")
-    # the FOF-only central source puts the median Mvir ratio to Rockstar at 0.90-0.97 over the
-    # 512^3 run, so the target is 20 %
+    # a central's source is its FOF group only, which puts the median Mvir ratio a few per cent
+    # to 10 % below Rockstar's; the target leaves room for it
     p.add_argument("--median-tol", type=float, default=0.2,
                    help="target |median ratio - 1| for Mvir and, with --field, MSO[0]; <= 0 disables (default 0.2)")
     p.add_argument("--rs-median-tol", type=float, default=0.2,
@@ -822,7 +823,7 @@ def main(argv=None):
                    help="target |median Vrms ratio - 1| (default 0.05; <= 0 disables)")
     p.add_argument("--rs-snap", type=int, default=None, help="Rockstar snapshot number (default: SnapshotIndex + offset)")
     p.add_argument("--rs-snap-offset", type=int, default=0, help="Rockstar snapshot minus our SnapshotIndex (default 0)")
-    p.add_argument("--phase1", action="store_true", help="one-subhalo-per-group catalogue: read section 0 of the particle blocks only")
+    p.add_argument("--phase1", action="store_true", help="FOF-as-subhalo catalogue: read section 0 of the particle blocks only")
     p.add_argument("--report-only", action="store_true", help="exit 0 whatever the figures")
     p.add_argument("--pairs-out", default=None, help="write every matched pair to this text file")
     args = p.parse_args(argv)

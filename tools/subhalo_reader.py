@@ -120,8 +120,8 @@ ORPHAN_SET_COLUMNS = [
 ORPHAN_COLUMNS = ORPHAN_COLUMNS + ORPHAN_SET_COLUMNS
 NO_ID = np.uint64(0xFFFFFFFFFFFFFFFF)
 
-# Appendix B marks these optional; a catalogue may lack the SO profile columns or the orphan set
-# (read leniently: the props rules then skip them).
+# Appendix B marks these optional. A catalogue may lack the SO profile columns (the props rules
+# then skip them) or the orphan set (filled as a schema 1 state reads: MostBoundID alone).
 OPTIONAL_COLUMNS = ("GeomParentTrackId", "GeomUpParentTrackId", "RsSO", "RsKlypinSO", "VmaxSO", "RmaxSO") \
     + tuple(c[0] for c in ORPHAN_SET_COLUMNS)
 
@@ -498,7 +498,7 @@ class SubhaloCatalogue(object):
            track's own energy order is not recorded; they follow in (BindRank in their tag's list,
            ID) order.
 
-        The first entries (the most-bound tracers, reserved for the track by the D10 tag rule) are
+        The first entries (the most-bound tracers, reserved for the track by the tag rule of design D10) are
         therefore exact. Returns an int64/uint64 ID array, and with return_types the type of each.
         """
         rank, ids, types, overlap = [], [], [], []
