@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Compare the runtime subhalo finder's catalogue in a PIG_xxx with HBT-BF's SubSnap_xxx
-(halofinder_phase2a_plan.md section 6, halofinder_design.md section 13 and D3).
+(halofinder_design.md section 13 and D3).
 
 Usage:
   subhalo_compare_hbt.py PIG_xxx HBT [options]
@@ -33,7 +33,7 @@ Per matched pair: the Jaccard index of the full bound sets (ours: every row with
 TrackId, i.e. SubhaloCatalogue.full_bound; HBT's: SubhaloParticles), Nbound(ours)/Nbound(HBT), and
 Vmax(ours)/VmaxPhysical(HBT) where our Vmax is set (> 0). Summary: matched fractions overall and
 above --min-np HBT particles, Jaccard and ratio quantiles, unmatched counts both ways, and the
-Phase 2a acceptance figure: the fraction of HBT subhalos above --min-np that are matched with
+acceptance figure: the fraction of HBT subhalos above --min-np that are matched with
 Jaccard >= --jaccard-min and |Nbound ratio - 1| <= --nbound-tol (target --accept-frac). Pairs and
 HBT subhalos that miss it are classified by the D3 deviations: subsampled (either Nbound above
 SubhaloPotentialSampleSize), in place (Flags), iteration cap (Flags), few tracers (fewer than
@@ -80,7 +80,7 @@ Exit status: 0 when the acceptance figure (and, with --track-pairs, the persiste
 against --persist-frac) is met or --report-only is given; 1 when it is not; 2 when an input could
 not be read.
 
-Phase 1 catalogues (every FOF group one subhalo, field particles keeping stale tags): pass
+Catalogues of FOF groups only (every FOF group one subhalo, field particles keeping stale tags): pass
 --phase1 so that only section 0 (the FOF groups) is read; matching by tracer IDs still works.
 
 Examples:
@@ -1142,7 +1142,7 @@ def main(argv=None):
     p.add_argument("--persist-frac", type=float, default=0.9)
     p.add_argument("--hbt-snap-offset", type=int, default=0,
                    help="HBT snapshot index minus our SnapshotIndex (0 when HBT ran on the same outputs)")
-    p.add_argument("--phase1", action="store_true", help="Phase 1 catalogue: read section 0 only")
+    p.add_argument("--phase1", action="store_true", help="catalogue of FOF groups only: read section 0 only")
     p.add_argument("--report-only", action="store_true", help="exit 0 whatever the figures")
     p.add_argument("--show", type=int, default=0, help="print the N pairs with the lowest Jaccard")
     p.add_argument("--pairs-out", default=None, help="write every matched pair to this text file")

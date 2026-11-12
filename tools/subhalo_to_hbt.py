@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Convert the runtime subhalo finder's catalogue of a PIG_xxx into HBT's SubSnap layout
-(halofinder_phase4_plan.md section 1 item 1, halofinder_design.md section 9).
+(halofinder_design.md section 9).
 
 Usage:
   subhalo_to_hbt.py PIG_xxx [PIG_yyy ...] -o OUTDIR [--bigfile] [--no-orphans]

@@ -26,7 +26,7 @@ Layout of a PIG written with SubhaloFinderOn = 1:
                          SubhaloWallTime (s, max over ranks), SubhaloPeakBytes (main-allocator
                          used high water, max over ranks), SubhaloPeakIncrementBytes (the finder's
                          own increment: high water without the field SO walks' elastic export
-                         tables minus the usage at entry, max over ranks and stages; Phase 5d)
+                         tables minus the usage at entry, max over ranks and stages)
                          of the last finder call, ...
 
 A track's in-group slice in <t>/ is rows [SliceOffsetByType[t], + SliceLengthByType[t]) and its
@@ -109,7 +109,7 @@ ORPHAN_COLUMNS = [
     ("SnapLastIsolation", "i4", 1), ("SnapTracerLost", "i4", 1),
 ] + _GROUP_E
 
-# Schema 2 (decision 70): the particles an orphan follows. OrphanIDs (MostBoundID first, then the
+# Schema 2: the particles an orphan follows. OrphanIDs (MostBoundID first, then the
 # first step-0 tracers, UINT64_MAX padded), their count, the markers kept at the last lookup, the
 # rms spread of the kept set about TracerPos and the clip scale fixed at death (-1: none).
 MAXTRACERS = 16
@@ -120,8 +120,8 @@ ORPHAN_SET_COLUMNS = [
 ORPHAN_COLUMNS = ORPHAN_COLUMNS + ORPHAN_SET_COLUMNS
 NO_ID = np.uint64(0xFFFFFFFFFFFFFFFF)
 
-# Appendix B marks these optional; the decision-44 SO profile columns are absent from catalogues
-# written before them (read leniently: the props rules then skip them).
+# Appendix B marks these optional; a catalogue may lack the SO profile columns or the orphan set
+# (read leniently: the props rules then skip them).
 OPTIONAL_COLUMNS = ("GeomParentTrackId", "GeomUpParentTrackId", "RsSO", "RsKlypinSO", "VmaxSO", "RmaxSO") \
     + tuple(c[0] for c in ORPHAN_SET_COLUMNS)
 
@@ -472,7 +472,7 @@ class SubhaloCatalogue(object):
             parts.append(idx[bound[s] == trackid])
         return np.concatenate(parts) if parts else np.zeros(0, dtype=np.int64)
 
-    # ------------------------------------------------------------------ bound ID lists (Phase 4)
+    # ------------------------------------------------------------------ bound ID lists
     @property
     def snapshot(self):
         """SnapshotIndex of the Header (the PIG number)."""
