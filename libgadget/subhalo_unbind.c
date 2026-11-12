@@ -1427,36 +1427,46 @@ subhalo_rescue_frame(const struct SubCandidate * c, int64_t K, const struct Subh
 }
 
 int
-subhalo_unbind_rescue(struct SubCandidate * c, int64_t K, const struct SubhaloUnbindParams * up, struct SubhaloArena * arena, int * tried)
+subhalo_unbind_rescue(struct SubCandidate * c, int alive, int64_t NPrev, int64_t K, const struct SubhaloUnbindParams * up,
+                      struct SubhaloArena * arena, struct SubhaloSecondAttempt * sa)
 {
-    if(tried)
-        *tried = 0;
+    if(sa)
+        memset(sa, 0, sizeof(*sa));
+    if(alive && !subhalo_rescue_large_loss(c->Nbound, NPrev))
+        return alive;
     double CorePos[3], CoreVel[3];
     if(!subhalo_rescue_frame(c, K, up, arena, CorePos, CoreVel))
-        return 0;
-    if(tried)
-        *tried = 1;
+        return alive;
     const size_t mark = arena->used;
     const int64_t N = c->N;
-    /* the death order; with less arena left the kernel's source sort falls back to serial and its
-     * tree leaves widen until the nodes fit */
+    /* the first result's order; with less arena left the kernel's source sort falls back to serial and
+     * its tree leaves widen until the nodes fit */
     int64_t * buf = (int64_t *) arena_need(arena, sizeof(int64_t) * (N + 1), "rescue order");
     memcpy(buf, c->Index, sizeof(int64_t) * N);
-    const struct SubCandidate dead = *c;
+    const struct SubCandidate first = *c;
     int d;
     for(d = 0; d < 3; d++) {
         c->RefPos[d] = CorePos[d];
         c->RefVel[d] = CoreVel[d];
     }
-    const int alive = subhalo_unbind(c, up, arena);
-    if(alive)
+    /* the cap flag of the result that stands is its own attempt's */
+    c->Flags &= ~SUBHALO_FLAG_ITERCAP;
+    const int second = subhalo_unbind(c, up, arena);
+    const int stood = second && (!alive || c->Nbound > first.Nbound);
+    if(sa) {
+        sa->tried = 1;
+        sa->stood = stood;
+        sa->Itercap = (c->Flags & SUBHALO_FLAG_ITERCAP) != 0;
+        sa->ConvergenceRatio = c->ConvergenceRatio;
+    }
+    if(stood)
         c->Flags |= SUBHALO_FLAG_RESCUED;
     else {
-        *c = dead;
+        *c = first;
         memcpy(c->Index, buf, sizeof(int64_t) * N);
     }
     arena->used = mark;
-    return alive;
+    return alive || stood;
 }
 
 /* The head K of the sampled final pass: the shortest prefix with T = MARGIN * Kt tracers (all if

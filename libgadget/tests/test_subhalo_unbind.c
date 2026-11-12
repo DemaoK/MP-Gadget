@@ -1,7 +1,7 @@
 /* Serial tests of the unbinding kernel (subhalo_unbind.c; design 7.4) and the k-nearest tracer
  * search: Hernquist haloes, unbound shells, subsampling, satellites, scale factor, thermal energy,
- * periodic gravity, ties, tree order, core fill, sinking, death, rescue and its clipped core frame;
- * bitwise results at 1 to 8 threads and inside a worker region (decisions 37, 42.5); the sampled
+ * periodic gravity, ties, tree order, core fill, sinking, death, rescue and its clipped core frame, the
+ * second attempt after a large loss; bitwise results at 1 to 8 threads and inside a worker region (decisions 37, 42.5); the sampled
  * final pass (42.4).
  * test_timing takes sizes, thresholds, threads and the final-pass mode from SUBHALO_UNBIND_TIMING*.
  * Haloes sample the exact Hernquist distribution function (truncated at 100 scale radii) across a
@@ -1593,7 +1593,8 @@ test_rescue(void ** state)
     gsl_rng * rng = gsl_rng_alloc(gsl_rng_mt19937);
     gsl_rng_set(rng, 32);
     int64_t i;
-    int d, tried;
+    int d;
+    struct SubhaloSecondAttempt sa;
     for(i = nc; i < n; i++) {
         double u[3];
         random_direction(rng, u);
@@ -1650,9 +1651,9 @@ test_rescue(void ** state)
     /* the rescue keeps the core and nothing of the tail, within the kernel's scratch allowance */
     cand_init(&t, 0, n, mean, meanv, 5);
     assert_int_equal(subhalo_unbind(&t.c, &up, &arena), 0);
-    assert_int_equal(subhalo_unbind_rescue(&t.c, nc, &up, &arena, &tried), 1);
-    assert_int_equal(tried, 1);
-    assert_true(t.c.Flags & SUBHALO_FLAG_RESCUED);
+    assert_int_equal(subhalo_unbind_rescue(&t.c, 0, n, nc, &up, &arena, &sa), 1);
+    assert_true(sa.tried == 1 && sa.stood == 1 && sa.Itercap == 0 && sa.ConvergenceRatio == t.c.ConvergenceRatio);
+    assert_true(t.c.Flags == SUBHALO_FLAG_RESCUED);
     assert_int_equal(arena.used, mark);
     int64_t ntail = 0;
     for(i = 0; i < t.c.Nbound; i++)
@@ -1670,8 +1671,8 @@ test_rescue(void ** state)
     assert_int_equal(subhalo_unbind(&t.c, &up, &arena), 0);
     memcpy(order, t.Index, sizeof(int64_t) * n);
     dead = t.c;
-    assert_int_equal(subhalo_unbind_rescue(&t.c, 2 * n + 2, &up, &arena, &tried), 0);
-    assert_int_equal(tried, 0);
+    assert_int_equal(subhalo_unbind_rescue(&t.c, 0, n, 2 * n + 2, &up, &arena, &sa), 0);
+    assert_true(sa.tried == 0 && sa.stood == 0 && sa.Itercap == 0 && sa.ConvergenceRatio == 0);
     assert_true(memcmp(order, t.Index, sizeof(int64_t) * n) == 0 && memcmp(&dead, &t.c, sizeof(dead)) == 0);
     assert_int_equal(arena.used, mark);
     cand_free(&t);
@@ -1682,8 +1683,8 @@ test_rescue(void ** state)
     assert_int_equal(subhalo_unbind(&t.c, &up, &arena), 0);
     memcpy(order, t.Index, sizeof(int64_t) * n);
     dead = t.c;
-    assert_int_equal(subhalo_unbind_rescue(&t.c, nc, &up, &arena, &tried), 0);
-    assert_int_equal(tried, 1);
+    assert_int_equal(subhalo_unbind_rescue(&t.c, 0, n, nc, &up, &arena, &sa), 0);
+    assert_true(sa.tried == 1 && sa.stood == 0);
     assert_true(memcmp(order, t.Index, sizeof(int64_t) * n) == 0 && memcmp(&dead, &t.c, sizeof(dead)) == 0);
     assert_false(t.c.Flags & SUBHALO_FLAG_RESCUED);
     assert_int_equal(arena.used, mark);
@@ -1697,8 +1698,8 @@ test_rescue(void ** state)
     assert_int_equal(subhalo_unbind(&t.c, &up, &arena), 0);
     memcpy(order, t.Index, sizeof(int64_t) * n);
     dead = t.c;
-    assert_int_equal(subhalo_unbind_rescue(&t.c, nc, &up, &arena, &tried), 0);
-    assert_int_equal(tried, 0);
+    assert_int_equal(subhalo_unbind_rescue(&t.c, 0, n, nc, &up, &arena, &sa), 0);
+    assert_int_equal(sa.tried, 0);
     assert_true(memcmp(order, t.Index, sizeof(int64_t) * n) == 0 && memcmp(&dead, &t.c, sizeof(dead)) == 0);
     assert_int_equal(arena.used, mark);
     cand_free(&t);
@@ -1770,7 +1771,8 @@ test_rescue_frame(void ** state)
     const double m = make_hernquist(0, nr, 0.002, 1.0, 20.0, Centre, Bulk, 51, 0);
     struct RadiusRank * rr = (struct RadiusRank *) mymalloc("TestRadiusRank", sizeof(struct RadiusRank) * nr);
     int64_t i;
-    int d, tried;
+    int d;
+    struct SubhaloSecondAttempt sa;
     for(i = 0; i < nr; i++) {
         double r2 = 0;
         for(d = 0; d < 3; d++)
@@ -1884,10 +1886,10 @@ test_rescue_frame(void ** state)
                 alive ? "alive" : "dead");
         assert_int_equal(alive, 0);
         if(nk == 3)
-            assert_int_equal(subhalo_unbind_rescue(&t.c, K, &up, &arena, NULL), 1);
+            assert_int_equal(subhalo_unbind_rescue(&t.c, 0, nr, K, &up, &arena, NULL), 1);
         else {
-            assert_int_equal(subhalo_unbind_rescue(&t.c, K, &up, &arena, &tried), 1);
-            assert_int_equal(tried, 1);
+            assert_int_equal(subhalo_unbind_rescue(&t.c, 0, nr, K, &up, &arena, &sa), 1);
+            assert_true(sa.tried == 1 && sa.stood == 1);
         }
         assert_true(t.c.Flags & SUBHALO_FLAG_RESCUED);
         assert_int_equal(arena.used, mark);
@@ -2081,6 +2083,234 @@ test_rescue_frame_cases(void ** state)
         assert_true(fabs(vel[0] - 1867. / 231) < 1e-12 && vel[1] == 0 && vel[2] == 0);
         assert_true(fabs(pos[0] - (50. + 2. * 1101. / 231)) < 1e-9 && pos[1] == 100. && pos[2] == 200.);
     }
+    teardown_pman();
+}
+
+/* A cold clump in P[first, first + n): mass m each, uniform in a sphere of radius R about cen, velocities
+ * vel plus 1 km/s Gaussian per component, IDs id0 + j, track 0's own tags with BindRank rank0 + j. */
+static void
+make_clump(int64_t first, int64_t n, double m, double R, const double cen[3], const double vel[3], unsigned long seed,
+           int64_t id0, int32_t rank0)
+{
+    gsl_rng * rng = gsl_rng_alloc(gsl_rng_mt19937);
+    gsl_rng_set(rng, seed);
+    int64_t i;
+    int d;
+    for(i = first; i < first + n; i++) {
+        double u[3];
+        random_direction(rng, u);
+        const double r = R * cbrt(gsl_rng_uniform(rng));
+        memset(&P[i], 0, sizeof(P[i]));
+        P[i].Type = 1;
+        P[i].Mass = m;
+        P[i].ID = id0 + (i - first);
+        P[i].BindRank = rank0 + (int32_t) (i - first);
+        for(d = 0; d < 3; d++) {
+            P[i].Pos[d] = wrapb(cen[d] + r * u[d]);
+            P[i].Vel[d] = vel[d] + gsl_ran_gaussian(rng, 1.);
+        }
+    }
+    gsl_rng_free(rng);
+}
+
+/* c and b hold the same result: every field (the list pointers aside), Index[0, N) and, when ne > 0, Energy[0, ne). */
+static int
+same_result(const struct SubCandidate * c, const struct SubCandidate * b, int64_t ne)
+{
+    struct SubCandidate x = *c, y = *b;
+    x.Index = y.Index = NULL;
+    x.Energy = y.Energy = NULL;
+    return memcmp(&x, &y, sizeof(x)) == 0 && memcmp(c->Index, b->Index, sizeof(int64_t) * c->N) == 0
+           && (ne <= 0 || memcmp(c->Energy, b->Energy, sizeof(double) * ne) == 0);
+}
+
+/* Unbinding of track 0's candidate over P[0, n) from the first frame (pos, vel), seed 13. */
+static int
+first_attempt(struct TestCand * t, int64_t n, const double pos[3], const double vel[3], const struct SubhaloUnbindParams * up,
+              struct SubhaloArena * arena)
+{
+    cand_init(t, 0, n, pos, vel, 13);
+    return subhalo_unbind(&t->c, up, arena);
+}
+
+/* The second attempt after a large loss. (a) A core clump of na (BindRank from 0) and a fragment clump of nb (BindRank
+ * beyond K) 20 kpc and 400 km/s off, the first frame the fragment's: the first attempt keeps the fragment. With
+ * na > nb the core frame's larger set stands, RESCUED; with na < nb the first result is restored bitwise and its
+ * final pass equals that of a candidate never tried. (b) 2 Nbound == NPrev gets no second attempt, NPrev one more
+ * does. (c) One clump from a frame 1 km/s off: both attempts bind it all; the tie keeps the first. (d) One clump
+ * from a frame that keeps its inner part, MaxIter 1: the first attempt stops at the cap, the second converges; the
+ * result that stands carries RESCUED only. (e) No rescue frame: c untouched, nothing tried. NPrev is three times the
+ * source unless stated (the rest stripped); the arena returns to the caller's mark throughout. */
+static void
+test_rescue_loss(void ** state)
+{
+    const int64_t nmax = 400, K = 20;
+    const double m = 1e-3, sep = 20., dv = 400.;
+    setup_pman(nmax);
+    struct SubhaloUnbindParams up = default_params();
+    size_t mark;
+    struct SubhaloArena arena = arena_alloc_marked(nmax, &mark);
+    struct TestCand t, u;
+    struct SubhaloSecondAttempt sa;
+    struct SubCandidate first;
+    int64_t * order = (int64_t *) mymalloc("TestLossOrder", sizeof(int64_t) * nmax);
+    double fpos[3], fvel[3];
+    int64_t i, nb1;
+    int d, k;
+
+    /* the threshold in integers is SUBHALO_RESCUE_LOSS of NPrev */
+    for(i = 0; i <= 200; i++)
+        for(k = 0; k <= i + 2; k++)
+            assert_int_equal(subhalo_rescue_large_loss(k, i), (double) k < SUBHALO_RESCUE_LOSS * (double) i);
+
+    /* (a) */
+    const int64_t sizes[2][2] = {{300, 60}, {40, 200}};
+    for(k = 0; k < 2; k++) {
+        const int64_t na = sizes[k][0], nb = sizes[k][1], n = na + nb;
+        for(d = 0; d < 3; d++) {
+            fpos[d] = wrapb(Centre[d] + (d == 0 ? sep : 0));
+            fvel[d] = Bulk[d] + (d == 0 ? dv : 0);
+        }
+        make_clump(0, na, m, 3., Centre, Bulk, 61 + k, 0, 0);
+        make_clump(na, nb, m, 3., fpos, fvel, 71 + k, na, 10000);
+        assert_int_equal(first_attempt(&t, n, fpos, fvel, &up, &arena), 1);
+        nb1 = t.c.Nbound;
+        for(i = 0; i < nb1; i++)
+            assert_true(t.Index[i] >= na);
+        assert_true(nb1 >= nb - 2 && subhalo_rescue_large_loss(nb1, 3 * n));
+        first = t.c;
+        memcpy(order, t.Index, sizeof(int64_t) * n);
+        assert_int_equal(subhalo_unbind_rescue(&t.c, 1, 3 * n, K, &up, &arena, &sa), 1);
+        assert_int_equal(arena.used, mark);
+        assert_true(sa.tried == 1 && sa.Itercap == 0 && sa.ConvergenceRatio > 0);
+        assert_true(is_permutation(t.Index, n, 0));
+        if(na > nb) {
+            message(0, "Rescue after a loss: first %ld of the fragment, second %ld of a core of %ld\n", (long) nb1,
+                    (long) t.c.Nbound, (long) na);
+            assert_int_equal(sa.stood, 1);
+            assert_true(t.c.Flags == SUBHALO_FLAG_RESCUED && t.c.Nbound > nb1 && t.c.Nbound >= na - 2);
+            for(i = 0; i < t.c.Nbound; i++)
+                assert_true(t.Index[i] < na);
+            assert_true(is_sorted(t.Energy, t.Index, t.c.Nbound));
+        }
+        else {
+            assert_int_equal(sa.stood, 0);
+            assert_true(memcmp(&first, &t.c, sizeof(first)) == 0 && memcmp(order, t.Index, sizeof(int64_t) * n) == 0);
+            assert_false(t.c.Flags & SUBHALO_FLAG_RESCUED);
+            /* the core frame alone binds the smaller core */
+            assert_int_equal(subhalo_rescue_frame(&t.c, K, &up, &arena, fpos, fvel), 1);
+            assert_int_equal(first_attempt(&u, n, fpos, fvel, &up, &arena), 1);
+            message(0, "Rescue after a loss: first %ld of the fragment kept, the core frame binds %ld\n", (long) nb1,
+                    (long) u.c.Nbound);
+            assert_true(u.c.Nbound > 0 && u.c.Nbound <= na);
+            cand_free(&u);
+            /* the final pass of the restored result is that of a candidate never tried */
+            for(d = 0; d < 3; d++) {
+                fpos[d] = wrapb(Centre[d] + (d == 0 ? sep : 0));
+                fvel[d] = Bulk[d] + (d == 0 ? dv : 0);
+            }
+            assert_int_equal(first_attempt(&u, n, fpos, fvel, &up, &arena), 1);
+            assert_true(same_result(&t.c, &u.c, 0));
+            subhalo_final_pass(&t.c, &up, &arena);
+            subhalo_final_pass(&u.c, &up, &arena);
+            assert_int_equal(arena.used, mark);
+            assert_true(same_result(&t.c, &u.c, t.c.Nbound));
+            cand_free(&u);
+        }
+        cand_free(&t);
+    }
+
+    /* (b) and (e) on the first case of (a) */
+    {
+        const int64_t na = 300, nb = 60, n = na + nb;
+        for(d = 0; d < 3; d++) {
+            fpos[d] = wrapb(Centre[d] + (d == 0 ? sep : 0));
+            fvel[d] = Bulk[d] + (d == 0 ? dv : 0);
+        }
+        make_clump(0, na, m, 3., Centre, Bulk, 61, 0, 0);
+        make_clump(na, nb, m, 3., fpos, fvel, 71, na, 10000);
+        assert_int_equal(first_attempt(&t, n, fpos, fvel, &up, &arena), 1);
+        nb1 = t.c.Nbound;
+        first = t.c;
+        memcpy(order, t.Index, sizeof(int64_t) * n);
+        assert_int_equal(subhalo_unbind_rescue(&t.c, 1, 2 * nb1, K, &up, &arena, &sa), 1);
+        assert_true(sa.tried == 0 && sa.stood == 0 && sa.Itercap == 0 && sa.ConvergenceRatio == 0);
+        assert_true(memcmp(&first, &t.c, sizeof(first)) == 0 && memcmp(order, t.Index, sizeof(int64_t) * n) == 0);
+        assert_int_equal(subhalo_unbind_rescue(&t.c, 1, 3 * n, 2 * n + 2, &up, &arena, &sa), 1);
+        assert_true(sa.tried == 0 && sa.stood == 0 && sa.Itercap == 0 && sa.ConvergenceRatio == 0);
+        assert_true(memcmp(&first, &t.c, sizeof(first)) == 0 && memcmp(order, t.Index, sizeof(int64_t) * n) == 0);
+        assert_int_equal(arena.used, mark);
+        assert_int_equal(subhalo_unbind_rescue(&t.c, 1, 2 * nb1 + 1, K, &up, &arena, NULL), 1);
+        assert_true(t.c.Flags == SUBHALO_FLAG_RESCUED && t.c.Nbound > nb1);
+        assert_int_equal(arena.used, mark);
+        cand_free(&t);
+    }
+
+    /* (c) */
+    {
+        const int64_t n = 100;
+        make_clump(0, n, m, 3., Centre, Bulk, 81, 0, 0);
+        for(d = 0; d < 3; d++)
+            fvel[d] = Bulk[d] + (d == 0 ? 1. : 0);
+        assert_int_equal(first_attempt(&t, n, Centre, fvel, &up, &arena), 1);
+        assert_int_equal(t.c.Nbound, n);
+        first = t.c;
+        memcpy(order, t.Index, sizeof(int64_t) * n);
+        /* the second attempt binds all n as well: its frame, from the first result's order */
+        assert_int_equal(subhalo_rescue_frame(&t.c, K, &up, &arena, fpos, fvel), 1);
+        cand_init(&u, 0, n, fpos, fvel, 13);
+        memcpy(u.Index, order, sizeof(int64_t) * n);
+        assert_int_equal(subhalo_unbind(&u.c, &up, &arena), 1);
+        assert_int_equal(u.c.Nbound, n);
+        cand_free(&u);
+        assert_int_equal(subhalo_unbind_rescue(&t.c, 1, 3 * n, K, &up, &arena, &sa), 1);
+        assert_true(sa.tried == 1 && sa.stood == 0);
+        assert_true(memcmp(&first, &t.c, sizeof(first)) == 0 && memcmp(order, t.Index, sizeof(int64_t) * n) == 0);
+        assert_int_equal(arena.used, mark);
+        cand_free(&t);
+    }
+
+    /* (d) a clump of 400 in 10 kpc: from 67 km/s off only its inner part is bound */
+    {
+        const int64_t n = 400;
+        struct SubhaloUnbindParams up1 = up;
+        up1.MaxIter = 1;
+        make_clump(0, n, m, 10., Centre, Bulk, 91, 0, 0);
+        for(d = 0; d < 3; d++)
+            fvel[d] = Bulk[d] + (d == 0 ? 67. : 0);
+        assert_int_equal(first_attempt(&t, n, Centre, fvel, &up1, &arena), 1);
+        nb1 = t.c.Nbound;
+        message(0, "Rescue after a loss at the iteration cap: first %ld of %ld\n", (long) nb1, (long) n);
+        assert_true(t.c.Flags == SUBHALO_FLAG_ITERCAP && subhalo_rescue_large_loss(nb1, n));
+        first = t.c;
+        memcpy(order, t.Index, sizeof(int64_t) * n);
+        assert_int_equal(subhalo_unbind_rescue(&t.c, 1, n, K, &up1, &arena, &sa), 1);
+        assert_true(sa.tried == 1 && sa.stood == 1 && sa.Itercap == 0 && sa.ConvergenceRatio == 1.);
+        assert_true(t.c.Flags == SUBHALO_FLAG_RESCUED && t.c.Nbound == n);
+        assert_int_equal(arena.used, mark);
+        cand_free(&t);
+        /* restored after a second attempt at the cap: the first's ITERCAP stays, the second's is reported */
+        make_clump(0, n / 2, m, 10., Centre, Bulk, 92, 0, 0);
+        for(d = 0; d < 3; d++) {
+            fpos[d] = wrapb(Centre[d] + (d == 0 ? 2 * sep : 0));
+            fvel[d] = Bulk[d] + (d == 0 ? dv : 0);
+        }
+        make_clump(n / 2, n / 2, m, 3., fpos, fvel, 93, n / 2, 10000);
+        for(i = 0; i < n / 4; i++)
+            P[i].Vel[1] += dv;
+        assert_int_equal(first_attempt(&t, n, fpos, fvel, &up1, &arena), 1);
+        first = t.c;
+        memcpy(order, t.Index, sizeof(int64_t) * n);
+        message(0, "Rescue after a loss at the iteration cap: first %ld of %ld, flags %d\n", (long) t.c.Nbound, (long) n, t.c.Flags);
+        assert_true(t.c.Flags == SUBHALO_FLAG_ITERCAP && subhalo_rescue_large_loss(t.c.Nbound, 3 * n));
+        assert_int_equal(subhalo_unbind_rescue(&t.c, 1, 3 * n, K, &up1, &arena, &sa), 1);
+        assert_true(sa.tried == 1 && sa.stood == 0 && sa.Itercap == 1 && sa.ConvergenceRatio < 1.);
+        assert_true(memcmp(&first, &t.c, sizeof(first)) == 0 && memcmp(order, t.Index, sizeof(int64_t) * n) == 0);
+        assert_int_equal(arena.used, mark);
+        cand_free(&t);
+    }
+    myfree(order);
+    myfree(arena.base);
     teardown_pman();
 }
 
@@ -2985,6 +3215,7 @@ int main(void) {
         cmocka_unit_test(test_rescue),
         cmocka_unit_test(test_rescue_frame),
         cmocka_unit_test(test_rescue_frame_cases),
+        cmocka_unit_test(test_rescue_loss),
         cmocka_unit_test(test_threads_bitwise),
         cmocka_unit_test(test_threads_worker_region),
         cmocka_unit_test(test_final_pass_sampled),

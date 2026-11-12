@@ -289,10 +289,23 @@ final_ancestor(const struct SubNode * nd, int v, int b, int nn)
     return 0;
 }
 
-/* subhalo_unbind with the diagnostics: every unbinding counted, the iteration cap and the worst
- * convergence ratio recorded (the ITERCAP flag of this run only, ORed back afterwards). A resolved
- * track's candidate (old) dead from its mean frame gets the rescue from the clipped frame of its core
- * (subhalo_unbind_rescue). */
+/* One unbinding of track T in the diagnostics: counted, with its iteration cap and convergence ratio. */
+static void
+count_unbinding(int itercap, double ratio, int64_t T, struct SubhaloCallStats * ks)
+{
+    ks->NCandidates++;
+    if(itercap) {
+        ks->NItercap++;
+        if(ks->WorstTrackId == -1 || ratio < ks->WorstConvRatio) {
+            ks->WorstConvRatio = ratio;
+            ks->WorstTrackId = T;
+        }
+    }
+}
+
+/* subhalo_unbind with the diagnostics: every unbinding counted with its own iteration cap (the ITERCAP flag
+ * of this run only, ORed back afterwards). A resolved track's candidate (old) dead from its mean frame, or
+ * alive below SUBHALO_RESCUE_LOSS of NPrev, gets the second attempt of subhalo_unbind_rescue. */
 static int
 unbind_counted(struct SubCandidate * c, const struct SubTrack * old, const struct SubhaloUnbindParams * up, struct SubhaloArena * arena,
                struct SubhaloCallStats * ks)
@@ -300,19 +313,22 @@ unbind_counted(struct SubCandidate * c, const struct SubTrack * old, const struc
     const int f0 = c->Flags;
     c->Flags = 0;
     int alive = subhalo_unbind(c, up, arena);
-    ks->NCandidates++;
-    if(!alive && old && old->NPrev > 0) {
-        int tried;
-        alive = subhalo_unbind_rescue(c, subhalo_rescue_core_size(old->NboundPrev, subhalo_get_params()->SubhaloCoreSize), up, arena, &tried);
-        ks->NCandidates += tried;
-        ks->NRescueTried += tried;
-        ks->NRescued += alive;
-    }
-    if(c->Flags & SUBHALO_FLAG_ITERCAP) {
-        ks->NItercap++;
-        if(ks->WorstTrackId == -1 || c->ConvergenceRatio < ks->WorstConvRatio) {
-            ks->WorstConvRatio = c->ConvergenceRatio;
-            ks->WorstTrackId = c->TrackId;
+    count_unbinding((c->Flags & SUBHALO_FLAG_ITERCAP) != 0, c->ConvergenceRatio, c->TrackId, ks);
+    if(old && old->NPrev > 0) {
+        const int first = alive;
+        struct SubhaloSecondAttempt sa;
+        alive = subhalo_unbind_rescue(c, first, old->NPrev, subhalo_rescue_core_size(old->NboundPrev, subhalo_get_params()->SubhaloCoreSize),
+                                      up, arena, &sa);
+        if(sa.tried) {
+            count_unbinding(sa.Itercap, sa.ConvergenceRatio, c->TrackId, ks);
+            if(first) {
+                ks->NLossTried++;
+                ks->NLossRescued += sa.stood;
+            }
+            else {
+                ks->NRescueTried++;
+                ks->NRescued += sa.stood;
+            }
         }
     }
     c->Flags |= f0;
@@ -334,6 +350,8 @@ stats_merge(struct SubhaloCallStats * to, const struct SubhaloCallStats * ks)
         to->NFallbackReleased += ks->NFallbackReleased;
         to->NRescueTried += ks->NRescueTried;
         to->NRescued += ks->NRescued;
+        to->NLossTried += ks->NLossTried;
+        to->NLossRescued += ks->NLossRescued;
         if(ks->NItercap > 0 && (to->WorstTrackId == -1 || ks->WorstConvRatio < to->WorstConvRatio
                                 || (ks->WorstConvRatio == to->WorstConvRatio && ks->WorstTrackId < to->WorstTrackId))) {
             to->WorstConvRatio = ks->WorstConvRatio;

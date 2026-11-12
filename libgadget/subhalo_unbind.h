@@ -92,12 +92,23 @@ int subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * u
 int subhalo_rescue_frame(const struct SubCandidate * c, int64_t K, const struct SubhaloUnbindParams * up,
                          struct SubhaloArena * arena, double Pos[3], double Vel[3]);
 
-/* Rescue of a resolved track's candidate that subhalo_unbind killed from its mean frame. Without a
- * subhalo_rescue_frame it returns 0, c untouched, *tried = 0 (tried may be NULL). Else c is unbound again
- * from that frame, final: survival sets SUBHALO_FLAG_RESCUED, a death restores c's fields and Index order
- * (Energy is scratch, undefined after a death as after subhalo_unbind). */
-int subhalo_unbind_rescue(struct SubCandidate * c, int64_t K, const struct SubhaloUnbindParams * up,
-                          struct SubhaloArena * arena, int * tried);
+/* The second unbinding of subhalo_unbind_rescue: tried, 1 when it ran; stood, 1 when its result stands;
+ * Itercap and ConvergenceRatio, its own diagnostics (as subhalo_unbind's SUBHALO_FLAG_ITERCAP and ratio). */
+struct SubhaloSecondAttempt {
+    int tried, stood, Itercap;
+    double ConvergenceRatio;
+};
+
+/* Rescue of a resolved track's candidate c after its first subhalo_unbind (alive: its return), from the mean
+ * frame of the NPrev previously bound particles. The second attempt runs when c died or survived with
+ * subhalo_rescue_large_loss(Nbound, NPrev), and a subhalo_rescue_frame with core size K exists: c is unbound
+ * again from that frame, starting from the first result's Index order and flags without SUBHALO_FLAG_ITERCAP.
+ * Its result stands when it survives and the first died or bound fewer particles; it then carries
+ * SUBHALO_FLAG_RESCUED. Otherwise c's fields and Index order are restored to the first result bitwise (Energy is
+ * scratch: undefined after a death as after subhalo_unbind, stale after a restored survival). Returns whether the
+ * result that stands survives; sa (NULL allowed) gets what the second attempt did, all zero when it did not run. */
+int subhalo_unbind_rescue(struct SubCandidate * c, int alive, int64_t NPrev, int64_t K, const struct SubhaloUnbindParams * up,
+                          struct SubhaloArena * arena, struct SubhaloSecondAttempt * sa);
 
 /* Final pass over the bound prefix in its recomputed CoM frame: exact-mass energies, prefix sorted
  * by them; returns the count with E >= 0 (NboundPositive). Membership is unchanged. Sampled

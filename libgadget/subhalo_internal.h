@@ -463,6 +463,15 @@ subhalo_rescue_core_size(int64_t NboundPrev, int CoreSize)
  * clip keeps its mean. */
 #define SUBHALO_RESCUE_CLIP 3.0
 #define SUBHALO_RESCUE_ITERATIONS 3
+/* A first attempt that keeps fewer than this share of NPrev is unbound again from the rescue frame, as a death is: a
+ * mean frame off the core after a pericentre keeps a fragment; the larger set stands, the core frame alone can bind less. */
+#define SUBHALO_RESCUE_LOSS 0.5
+/* Nbound < SUBHALO_RESCUE_LOSS NPrev, in integers so that no rounding decides the threshold. */
+static inline int
+subhalo_rescue_large_loss(int64_t Nbound, int64_t NPrev)
+{
+    return 2 * Nbound < NPrev;
+}
 /* Resurrection order of the orphans of a key without a resolved progenitor: the larger membership
  * weight M (MarkerWeight), then the smaller kinetic distance d, then the smaller TrackId. */
 static inline int
@@ -711,6 +720,8 @@ struct SubhaloCallStats {
     int64_t NFallbackReleased; /* field particles of the oversized keys untagged instead (stale orphan tags, the central's); not in NFallbackField */
     int64_t NRescueTried;    /* serial resolved candidates dead from the mean frame, unbound again from the clipped core frame */
     int64_t NRescued;        /* of which survived */
+    int64_t NLossTried;      /* serial resolved candidates alive from the mean frame below SUBHALO_RESCUE_LOSS NPrev, unbound again from it */
+    int64_t NLossRescued;    /* of which the second attempt bound more and stands */
     double ArenaPeakFrac;    /* largest arena high-water mark of a key / its arena size */
     /* ---- instrumentation (global, set on every return path; a failed call keeps the wall times
      * and peaks of the stages that ran, zero counters and Complete 0) ---- */

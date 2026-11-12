@@ -2289,9 +2289,10 @@ subhalo_last_call_stats(void)
 static void
 stats_reduce(const struct SubhaloCallStats * loc, struct SubhaloCallStats * tot, MPI_Comm Comm)
 {
-    int64_t a[9] = {loc->NCandidates, loc->NItercap, loc->NFinalPositive, loc->NFinalBound, loc->NTailRejected,
-                    loc->NFallbackField, loc->NFallbackReleased, loc->NRescueTried, loc->NRescued}, b[9];
-    MPI_Allreduce(a, b, 9, MPI_INT64, MPI_SUM, Comm);
+    int64_t a[11] = {loc->NCandidates, loc->NItercap, loc->NFinalPositive, loc->NFinalBound, loc->NTailRejected,
+                     loc->NFallbackField, loc->NFallbackReleased, loc->NRescueTried, loc->NRescued, loc->NLossTried,
+                     loc->NLossRescued}, b[11];
+    MPI_Allreduce(a, b, 11, MPI_INT64, MPI_SUM, Comm);
     memset(tot, 0, sizeof(*tot));
     tot->NCandidates = b[0];
     tot->NItercap = b[1];
@@ -2302,6 +2303,8 @@ stats_reduce(const struct SubhaloCallStats * loc, struct SubhaloCallStats * tot,
     tot->NFallbackReleased = b[6];
     tot->NRescueTried = b[7];
     tot->NRescued = b[8];
+    tot->NLossTried = b[9];
+    tot->NLossRescued = b[10];
     MPI_Allreduce(&loc->ArenaPeakFrac, &tot->ArenaPeakFrac, 1, MPI_DOUBLE, MPI_MAX, Comm);
     struct { double r; int rank; } in, out;
     int ThisTask;
@@ -2828,10 +2831,11 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     subhalo_finish_call(SnapNum, 1, &locstats, &plan, sp->SubhaloFieldSO ? &sostats : NULL, Comm);
     message(0, "Subhalo diagnostics: %ld unbindings, %ld at the iteration cap (worst Nbound/Nlast %g, track %ld); "
                "%ld of %ld tracks dead from the mean frame rescued from the clipped core frame; "
+               "%ld of %ld tracks alive below half their previous bound number from the mean frame bound more from the clipped core frame; "
                "%ld of %ld final-pass bound particles with E >= 0; %ld tail claims across the final branch dropped; "
                "in-place tags written %ld, field tags released %ld; %ld orphan hosts updated; arena high water %.3f.\n",
             SubLastStats.NCandidates, SubLastStats.NItercap, SubLastStats.WorstConvRatio, SubLastStats.WorstTrackId,
-            SubLastStats.NRescued, SubLastStats.NRescueTried,
+            SubLastStats.NRescued, SubLastStats.NRescueTried, SubLastStats.NLossRescued, SubLastStats.NLossTried,
             SubLastStats.NFinalPositive, SubLastStats.NFinalBound, SubLastStats.NTailRejected,
             SubLastStats.NFallbackField, SubLastStats.NFallbackReleased, norphsync_tot, SubLastStats.ArenaPeakFrac);
     log_tagged("after the call", Comm);
