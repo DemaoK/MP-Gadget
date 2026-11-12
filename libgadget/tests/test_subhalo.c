@@ -5088,14 +5088,39 @@ test_subhalo_mixed_call(void ** state)
 #define AD_NT 24
 
 /* AD_REST: S at rest in H's frame, so that H would bind what S takes; AD_LOSS: S's previous bound set also
- * holds a fragment of 60 (the S2 ids) at 20 times the mass, 300 km/s across, in S's ball */
-enum { AD_SLOW = 1, AD_FAST = 2, AD_SHELL = 4, AD_NESTED = 8, AD_SIBLING = 16, AD_HOT = 32, AD_REST = 64, AD_LOSS = 128 };
+ * holds a fragment of 60 (the S2 ids) at 20 times the mass, 300 km/s across, in S's ball; AD_SINK: the nested
+ * S2 may sink into S. AD_TWIN: the H-owned candidate Z (X's id, Y's with reverse) at exactly the position of
+ * W, an S-bound tracer (the other id), in X's shell with shell tracers 0, 1, 2 and 8 bound to S, the rest to
+ * H: Z's ten neighbours are W and shell tracers 0-8, five for S. AD_SMALL: one key of nh H tracers in 1 kpc,
+ * AD_NSMALL S tracers and Z at S's centre; every other id is alone in the field. */
+enum { AD_SLOW = 1, AD_FAST = 2, AD_SHELL = 4, AD_NESTED = 8, AD_SIBLING = 16, AD_HOT = 32, AD_REST = 64, AD_LOSS = 128,
+       AD_SINK = 256, AD_TWIN = 512, AD_SMALL = 1024 };
+#define AD_NSMALL 34
 
 struct AdUd {
     int mode;
     int xs2;            /* of X's ten shell tracers, those bound to S2 at the previous call (the rest to S) */
-    int reverse;        /* M's previous BindRanks in reverse order */
+    int reverse;        /* M's previous BindRanks in reverse order; AD_TWIN: Z has the larger id */
+    int kk;             /* SubhaloNumNeighboursForReassignment, 0 for 10 */
+    int star;           /* AD_TWIN: 1 Z, 2 W a star, outside the tracer types (DM only) */
+    int nh;             /* AD_SMALL: H's tracers */
 };
+
+/* The neighbour number of a fixture, and whether its particle id is a star (a non-tracer). */
+static int
+ad_k(const struct AdUd * ud)
+{
+    return ud->kk ? ud->kk : 10;
+}
+
+static int
+ad_star(const struct AdUd * ud, MyIDType id)
+{
+    if(!(ud->mode & AD_TWIN) || !ud->star)
+        return 0;
+    const MyIDType z = ud->reverse ? AD_Y : AD_X;
+    return id == (ud->star == 1 ? z : AD_X + AD_Y - z);
+}
 
 static void
 ad_particle(MyIDType id, double atime, struct SynPart * s, void * ud_)
@@ -5109,6 +5134,26 @@ ad_particle(MyIDType id, double atime, struct SynPart * s, void * ud_)
     const double zero[3] = {0, 0, 0}, vS[3] = {0, vy, 0}, vF[3] = {300, vy, 0};
     const int two = ud->mode & (AD_NESTED | AD_SIBLING);
     int park = 0;
+    if(ud->mode & AD_SMALL) {
+        int d;
+        if(id < (MyIDType) ud->nh) {
+            syn_ball(id, 41, cH, 1.0, zero, 5, atime, s);
+            s->tag = s->bound = 0; s->rank = id;
+        } else if(id >= AD_S0 && id < AD_S0 + AD_NSMALL) {
+            syn_ball(id, 42, cS, 0.3, vS, 5, atime, s);
+            s->tag = s->bound = 1; s->rank = id - AD_S0;
+        } else if(id == AD_X) {
+            for(d = 0; d < 3; d++) {
+                s->pos[d] = cS[d];
+                s->vel[d] = atime * vS[d];
+            }
+            s->tag = s->bound = 0; s->rank = 450;
+        } else
+            /* 45 kpc/h from the lattice, 62.5 kpc/h from each other: no group */
+            for(d = 0; d < 3; d++)
+                s->pos[d] = 5 + 62.5 * ((d == 0 ? id : (d == 1 ? id / 16 : id / 256)) % 16);
+        return;
+    }
     if(id < AD_S0) {
         syn_ball(id, 41, cH, 3.0, zero, 5, atime, s);
         s->tag = s->bound = 0; s->rank = id;
@@ -5152,7 +5197,21 @@ ad_particle(MyIDType id, double atime, struct SynPart * s, void * ud_)
         /* X and Y with their shells of ten tracers at 10-19 pc */
         const int isx = id == AD_X || (id >= AD_XS0 && id < AD_YS0);
         const int isy = id == AD_Y || id >= AD_YS0;
-        if((isx && two) || (isy && (ud->mode & AD_SIBLING))) {
+        if((ud->mode & AD_TWIN) && id < AD_YS0) {
+            const MyIDType z = ud->reverse ? AD_Y : AD_X;
+            const double c[3] = {cS[0] + 0.05 * a1, cS[1], cS[2]};
+            /* Z and W at c exactly, the shell as X's */
+            const int j = id < AD_XS0 ? -1 : (int) (id - AD_XS0);
+            const double z1 = 1 - (2 * j + 1) / 10., rho = j < 0 ? 0 : sqrt(1 - z1 * z1), phi = 2.399963229728653 * j;
+            const double dir[3] = {rho * cos(phi), rho * sin(phi), z1}, rp = j < 0 ? 0 : 0.010 + 0.001 * j;
+            int d;
+            for(d = 0; d < 3; d++) {
+                s->pos[d] = c[d] + rp * dir[d] * a1;
+                s->vel[d] = atime * vS[d];
+            }
+            s->tag = s->bound = j < 0 ? id != z : (j < 3 || j == 8);
+            s->rank = s->bound ? 300 + (j < 0 ? 10 : j) : 1000 + id;
+        } else if((isx && two) || (isy && (ud->mode & AD_SIBLING))) {
             double c[3] = {cS[0] + (isx ? 0.05 : -0.1) * a1, cS[1], cS[2]};
             int d;
             if(id == AD_X || id == AD_Y) {
@@ -5191,15 +5250,19 @@ ad_particle(MyIDType id, double atime, struct SynPart * s, void * ud_)
 static void
 ad_predict(const struct AdUd * ud, double atime, const int64_t * parent, int ntracks, int need, int * recv, int * votes)
 {
-    const int kk = 10;
+    const int kk = ad_k(ud);
     struct SynPart * s = calloc(AD_END, sizeof(struct SynPart));
-    int64_t i, j;
+    int64_t i, j, nkey = 0;
     for(i = 0; i < AD_END; i++) {
         s[i].tag = s[i].bound = -1;
         ad_particle(i, atime, &s[i], (void *) ud);
         int d;
         for(d = 0; d < 3; d++)
             s[i].pos[d] = p2_wrap(s[i].pos[d]);
+        /* the key's tracers: owned, not a star */
+        if(ad_star(ud, i))
+            s[i].tag = -1;
+        nkey += s[i].tag >= 0;
     }
     double * d2 = malloc(AD_END * sizeof(double));
     int64_t * nb = malloc(AD_END * sizeof(int64_t));
@@ -5207,6 +5270,9 @@ ad_predict(const struct AdUd * ud, double atime, const int64_t * parent, int ntr
         recv[i] = -1;
         votes[i] = -1;
         const int64_t A = s[i].tag;
+        /* fewer than k other tracers in the key: no candidate */
+        if(A < 0 || nkey <= kk)
+            continue;
         /* a candidate: its owner is a proper ancestor of a receiver (every track but H is one) */
         int t, isanc = 0;
         for(t = 1; t < ntracks; t++) {
@@ -5218,7 +5284,7 @@ ad_predict(const struct AdUd * ud, double atime, const int64_t * parent, int ntr
             continue;
         int64_t m = 0;
         for(j = 0; j < AD_END; j++) {
-            if(j == i) continue;
+            if(j == i || s[j].tag < 0) continue;
             double r2 = 0;
             int d;
             for(d = 0; d < 3; d++) {
@@ -5280,9 +5346,12 @@ ad_run(const struct AdUd * ud, double share, int T, struct AdOut * out)
     omp_set_num_threads(T);
     struct SubhaloParams sp = default_subhalo_params();
     sp.SubhaloAdmitShare = share;
+    sp.SubhaloNumNeighboursForReassignment = ad_k(ud);
     /* concentric satellites, and S at rest in H, stay apart */
-    if(ud->mode & (AD_NESTED | AD_SIBLING | AD_REST))
+    if((ud->mode & (AD_NESTED | AD_SIBLING | AD_REST)) && !(ud->mode & AD_SINK))
         sp.SubhaloMergeTrapped = 0;
+    if(ud->star)
+        sp.SubhaloTracerTypes = 2;
     syn_setup(&CP, AD_END + SYN_NFIELD, sp);
     CHECK(subhalo_arena_bytes_per_part() == (size_t) (SUBHALO_ARENA_FIXED_BYTES_PER_PART + 24 + (share > 0 ? SUBHALO_ADMIT_BYTES_PER_PART : 0)),
           "admission: arena %lu bytes per particle at share %g\n", (unsigned long) subhalo_arena_bytes_per_part(), share);
@@ -5297,7 +5366,13 @@ ad_run(const struct AdUd * ud, double share, int T, struct AdOut * out)
     syn_records(recs, out->ntracks);
     const double atime = 0.55;
     syn_place(ad_particle, (void *) ud, atime, 1);
-    int64_t ng, nempty;
+    int64_t i, ng, nempty;
+    for(i = 0; i < PartManager->NumPart; i++)
+        if(ad_star(ud, P[i].ID)) {
+            slots_convert(i, 4, -1, PartManager, SlotsManager);
+            memset(&STARP(i), 0, sizeof(struct star_particle_data));
+        }
+    slots_setup_id(PartManager, SlotsManager);
     const int64_t kb0 = subhalo_knn_build_count();
     int ret = lifecycle_call(1, atime, &CP, 0, NULL, &ng, &nempty);
     const int64_t kb = subhalo_knn_build_count() - kb0;
@@ -5307,9 +5382,9 @@ ad_run(const struct AdUd * ud, double share, int T, struct AdOut * out)
     out->r = gather_tags(&out->n);
     out->rec = fetch_all_tracks(out->ntracks);
     CHECK(p2_check_tags(out->r, out->n, out->rec, out->ntracks, "admission") == 0, "admission mode %d: tag invariants\n", ud->mode);
-    int64_t i;
     for(i = 1; i < AD_END; i++)
-        CHECK(out->r[i].GrNr == out->r[0].GrNr, "admission: particle %ld in group %ld, not %ld\n", i, out->r[i].GrNr, out->r[0].GrNr);
+        if(!(ud->mode & AD_SMALL) || i < ud->nh || (i >= AD_S0 && i < AD_S0 + AD_NSMALL) || i == AD_X)
+            CHECK(out->r[i].GrNr == out->r[0].GrNr, "admission: particle %ld in group %ld, not %ld\n", i, out->r[i].GrNr, out->r[0].GrNr);
     syn_teardown();
     omp_set_num_threads(saved);
 }
@@ -5372,15 +5447,20 @@ test_subhalo_admit_take(void ** state)
     int bad = 0;
     ad_run(&slow, 0.5, 1, &on);
     int * recv = ad_check_count(&slow, &on, 5, "slow");
+    int64_t ntaken = 0;
     for(i = AD_M0; i < AD_F0; i++) {
         LOCAL_CHECK(bad, recv[i] == 1, "slow: particle %ld is not admitted by the brute force\n", i);
         LOCAL_CHECK(bad, on.r[i].TrackId == 1 && on.r[i].BoundTrackId == 1, "slow: particle %ld tagged %ld bound %ld, expected S (1)\n", i,
                     on.r[i].TrackId, on.r[i].BoundTrackId);
     }
+    /* taken: the admitted particles that end in their receiver's bound set */
+    for(i = 0; i < AD_END; i++)
+        ntaken += recv[i] >= 0 && on.r[i].BoundTrackId == recv[i];
     free(recv);
     CHECK(bad == 0, "slow: the admitted particles\n");
-    CHECK(on.st.NAdmitTaken >= AD_NM && on.st.NAdmitReceivers == 1 && on.knnbuilds > 0,
-          "slow: %ld taken by %ld receivers, %ld neighbour trees\n", on.st.NAdmitTaken, on.st.NAdmitReceivers, on.knnbuilds);
+    CHECK(on.st.NAdmitTaken == ntaken && ntaken >= AD_NM && on.st.NAdmitReceivers == 1 && on.knnbuilds > 0,
+          "slow: %ld taken (%ld in S's bound set) by %ld receivers, %ld neighbour trees\n", on.st.NAdmitTaken, ntaken,
+          on.st.NAdmitReceivers, on.knnbuilds);
     /* the order of the key and the threads (the admission's threaded loops forced) */
     ad_run(&slowrev, 0.5, 1, &rev);
     CHECK(ad_compare(&on, &rev, "slow, M in reverse BindRank order") == 0, "slow: the result depends on the key order\n");
@@ -5516,6 +5596,81 @@ test_subhalo_admit_votes(void ** state)
         CHECK(ad_compare(&on, &off, "hot, rule on and off") == 0, "hot: the dead satellite's admitted particles changed the call\n");
         ad_free(&on);
         ad_free(&off);
+    }
+}
+
+/* The threshold at k = 7, the candidate's exclusion from its own neighbours, non-tracers, the key's size
+ * at k = 64, and a receiver that takes a particle and sinks into an intermediate ancestor. */
+static void
+test_subhalo_admit_rules(void ** state)
+{
+    struct AdOut on;
+    int64_t i;
+    int k;
+    /* k = 7: s = 0.5 needs 4, s = 3/7 needs 3, s just above 3/7 needs 4 */
+    {
+        struct AdUd sh = {AD_SHELL, 0, 0, 7, 0, 0};
+        int64_t parent[3] = {-1, 0, 0};
+        int * recv = malloc(AD_END * sizeof(int)), * votes = malloc(AD_END * sizeof(int));
+        ad_predict(&sh, 0.55, parent, 2, 4, recv, votes);
+        int h3 = 0, h4 = 0;
+        for(i = 0; i < AD_END; i++) {
+            h3 += votes[i] == 3;
+            h4 += votes[i] == 4;
+        }
+        CHECK(h3 > 0 && h4 > 0, "k = 7: %d candidates at 3 votes, %d at 4\n", h3, h4);
+        free(recv);
+        free(votes);
+        const double shares[3] = {0.5, 3. / 7, (3. / 7) * (1 + 1e-9)};
+        const int need[3] = {4, 3, 4};
+        for(k = 0; k < 3; k++) {
+            char what[48];
+            snprintf(what, sizeof(what), "k = 7, share %.12g", shares[k]);
+            ad_run(&sh, shares[k], 1, &on);
+            free(ad_check_count(&sh, &on, need[k], what));
+            ad_free(&on);
+        }
+    }
+    /* Z coincident with W, Z's id below and above W's: five votes of ten, admitted and taken; a star W does not
+     * vote, a star Z is no candidate */
+    for(k = 0; k < 6; k++) {
+        struct AdUd tw = {AD_TWIN, 0, k % 2, 0, k / 2, 0};
+        const MyIDType z = tw.reverse ? AD_Y : AD_X;
+        char what[48];
+        snprintf(what, sizeof(what), "twin, Z id %lu, star %d", (unsigned long) z, tw.star);
+        ad_run(&tw, 0.5, 1, &on);
+        int * recv = ad_check_count(&tw, &on, 5, what);
+        const int want = tw.star ? -1 : 1;
+        CHECK(recv[z] == want && (want < 0 || on.r[z].BoundTrackId == 1), "%s: Z predicted %d (expected %d), bound to %ld\n", what,
+              recv[z], want, on.r[z].BoundTrackId);
+        free(recv);
+        ad_free(&on);
+    }
+    /* k = 64: a key of 64 tracers admits nothing and builds no tree; one tracer more, every H-owned one is
+     * a candidate with the 34 votes of S */
+    for(k = 0; k < 2; k++) {
+        struct AdUd sm = {AD_SMALL, 0, 0, 64, 0, 29 + k};
+        char what[32];
+        snprintf(what, sizeof(what), "k = 64, %d tracers", 29 + k + AD_NSMALL + 1);
+        ad_run(&sm, 0.5, 1, &on);
+        free(ad_check_count(&sm, &on, 32, what));
+        CHECK(k ? on.st.NAdmitted == sm.nh + 1 && on.st.NAdmitTaken >= 1 : on.st.NAdmitted == 0 && on.knnbuilds == 0,
+              "%s: %ld admitted, %ld taken, %ld neighbour trees\n", what, on.st.NAdmitted, on.st.NAdmitTaken, on.knnbuilds);
+        CHECK((on.r[AD_X].BoundTrackId == 1) == k, "%s: Z bound to %ld\n", what, on.r[AD_X].BoundTrackId);
+        ad_free(&on);
+    }
+    /* X taken by S2, which sinks into S below H in the same call: X is bound once, to S, the tags hold (ad_run) */
+    {
+        struct AdUd sk = {AD_NESTED | AD_SINK, 6, 0, 0, 0, 0};
+        ad_run(&sk, 0.5, 1, &on);
+        free(ad_check_count(&sk, &on, 5, "nested, S2 sinks"));
+        message(0, "Admission, S2 sinks: S2 Nbound %d SinkTrackId %ld, X tagged %ld bound %ld, %ld taken\n", on.rec[2].Nbound,
+                on.rec[2].SinkTrackId, on.r[AD_X].TrackId, on.r[AD_X].BoundTrackId, on.st.NAdmitTaken);
+        CHECK(on.rec[2].Nbound == 0 && on.rec[2].SinkTrackId == 1 && on.st.NAdmitTaken >= 1, "S2 sinks: S2 Nbound %d SinkTrackId %ld, %ld taken\n",
+              on.rec[2].Nbound, on.rec[2].SinkTrackId, on.st.NAdmitTaken);
+        CHECK(on.r[AD_X].TrackId == 1 && on.r[AD_X].BoundTrackId == 1, "S2 sinks: X tagged %ld bound %ld\n", on.r[AD_X].TrackId,
+              on.r[AD_X].BoundTrackId);
+        ad_free(&on);
     }
 }
 
@@ -6921,6 +7076,7 @@ int main(void) {
         cmocka_unit_test(test_subhalo_mixed_call),
         cmocka_unit_test(test_subhalo_admit_take),
         cmocka_unit_test(test_subhalo_admit_votes),
+        cmocka_unit_test(test_subhalo_admit_rules),
         cmocka_unit_test(test_subhalo_rescue_loss_call),
         cmocka_unit_test(test_subhalo_nocentral),
         cmocka_unit_test(test_subhalo_fallback),
