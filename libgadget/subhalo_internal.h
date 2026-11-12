@@ -340,6 +340,10 @@ struct SubhaloPlan {
      * main stack, after the four above) */
     struct SubhaloAdmitRec * AdmitRecs;
     int64_t NAdmitRecs;
+    /* the records of this rank's particles offered to in-place receivers, sorted by ID (top, after
+     * AdmitRecs) */
+    struct SubhaloHomeRec * HomeRecs;
+    int64_t NHomeRecs;
     int VoteFailed;                         /* 1: the admission vote did not fit on some rank */
 };
 
@@ -551,6 +555,7 @@ struct SubhaloVoteStats {
     int64_t NOffered;          /* of which offered to a receiver */
     int64_t NOfferedInplace;   /* of which owned by an in-place candidate */
     int64_t NServed;           /* of which taken to their receivers' serial sub-tree keys */
+    int64_t NHome;             /* of which offered to in-place receivers (they stay home) */
     int64_t NGuests;           /* of which owned outside that key (they travel there) */
     double Seconds;            /* wall time of the vote in all passes of the plan, the largest over the ranks */
     double WorstShort;         /* the memory check: the largest shortfall over the ranks (> 0: the call fails) */
@@ -561,6 +566,12 @@ struct SubhaloVoteStats {
 struct SubhaloAdmitRec {
     MyIDType ID;
     int64_t Receiver;
+};
+/* The record of a particle offered to an in-place receiver, on its home rank. */
+struct SubhaloHomeRec {
+    MyIDType ID;
+    int64_t Receiver;
+    int64_t Owner;
 };
 const struct SubhaloVoteStats * subhalo_plan_last_vote(void);
 /* Test hook: bytes added to every rank's need in the vote's memory check (0 by default). */

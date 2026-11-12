@@ -2440,6 +2440,21 @@ cmp_admitrec_id(const void * a, const void * b)
 }
 
 static int
+cmp_homerec_id(const void * a, const void * b)
+{
+    const struct SubhaloHomeRec * x = (const struct SubhaloHomeRec *) a, * y = (const struct SubhaloHomeRec *) b;
+    return (x->ID > y->ID) - (x->ID < y->ID);
+}
+
+/* 1 if the offer goes to an in-place receiver from an in-place owner (the rounds serve it). */
+static int
+home_offer(const struct SubhaloPlan * plan, const struct SubhaloOffer * o)
+{
+    const struct SubhaloMember * r = subhalo_plan_member(plan, o->receiver), * w = subhalo_plan_member(plan, o->owner);
+    return r && w && r->cand >= 0 && w->cand >= 0;
+}
+
+static int
 cmp_cand_order(const void * a, const void * b)
 {
     const struct SubhaloInplaceCand * x = (const struct SubhaloInplaceCand *) a, * y = (const struct SubhaloInplaceCand *) b;
@@ -2983,6 +2998,22 @@ subhalo_plan_build(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubT
         MPI_Allreduce(MPI_IN_PLACE, cg, 2, MPI_INT64, MPI_SUM, Comm);
         LastVote.NServed = cg[0];
         LastVote.NGuests = cg[1];
+        /* the offers to in-place receivers stay home, with records for the rounds' sources */
+        int64_t nh = 0;
+        for(i = 0; i < noff; i++)
+            nh += home_offer(plan, &offers[i]);
+        plan->HomeRecs = (struct SubhaloHomeRec *) mymalloc2("SubVoteHome", sizeof(struct SubhaloHomeRec) * (nh + 1));
+        nh = 0;
+        for(i = 0; i < noff; i++)
+            if(home_offer(plan, &offers[i])) {
+                struct SubhaloHomeRec * e = &plan->HomeRecs[nh++];
+                e->ID = P[offers[i].index].ID;
+                e->Receiver = offers[i].receiver;
+                e->Owner = offers[i].owner;
+            }
+        plan->NHomeRecs = nh;
+        qsort(plan->HomeRecs, nh, sizeof(struct SubhaloHomeRec), cmp_homerec_id);
+        MPI_Allreduce(&nh, &LastVote.NHome, 1, MPI_INT64, MPI_SUM, Comm);
     }
     if(offers)
         myfree(offers);
@@ -3028,6 +3059,10 @@ subhalo_restore_field_grnr(const struct SubhaloPlan * plan)
 void
 subhalo_plan_free(struct SubhaloPlan * plan)
 {
+    if(plan->HomeRecs)
+        myfree(plan->HomeRecs);
+    plan->HomeRecs = NULL;
+    plan->NHomeRecs = 0;
     if(plan->AdmitRecs)
         myfree(plan->AdmitRecs);
     plan->AdmitRecs = NULL;

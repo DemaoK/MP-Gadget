@@ -4016,6 +4016,139 @@ test_collective_vote_subtree_majority(void ** state)
     AvN = AvMax = 0;
 }
 
+/* ---- receivers in place ----
+ * A (0, 2000) the central; B (1, 600) its satellite 1.5 kpc away on +x, at rest; E (2, 200) B's
+ * satellite 2.5 kpc away on -x. At SubhaloCollectiveMinPart = 100 all three are in place. A's
+ * tracers inside E vote for E (and those inside B for B). E drifting at 30 km/s binds them (taken);
+ * E at 300 km/s binds none, and they must return to their owner A, not to E's parent B (which
+ * would bind them), with the tags of the rule-off run. The serial stage's tags are those of the
+ * rule-off run, and the offered pairs those of the group as one serial key. */
+#define IR_B0 2000
+#define IR_E0 2600
+#define IR_END 2800
+
+static void
+ir_particle(MyIDType id, double atime, struct SynPart * s, void * ud)
+{
+    const int c = *(const int *) ud;
+    const double cA[3] = {500, 500, 500}, cB[3] = {500 + 1.5 / atime, 500, 500}, cE[3] = {500 - 2.5 / atime, 500, 500};
+    const double zero[3] = {0, 0, 0}, vslow[3] = {0, 30, 0}, vfast[3] = {0, 300, 0};
+    if(id >= IR_END)
+        return;
+    if(id < IR_B0) {
+        syn_ball(id, 91, cA, 3.0, zero, 20, atime, s);
+        s->tag = s->bound = 0;
+        s->rank = id;
+    }
+    else if(id < IR_E0) {
+        syn_ball(id, 92, cB, 0.8, zero, 15, atime, s);
+        s->tag = s->bound = 1;
+        s->rank = id - IR_B0;
+    }
+    else {
+        syn_ball(id, 93, cE, 0.5, c == TK_UNBOUND ? vfast : vslow, 8, atime, s);
+        s->tag = s->bound = 2;
+        s->rank = id - IR_E0;
+    }
+}
+
+static void
+ir_run(int64_t collective, double share, int c, struct Outcome * o)
+{
+    Cosmology CP;
+    struct SubhaloParams sp = default_subhalo_params();
+    sp.SubhaloFieldSO = 1;
+    sp.SubhaloPotentialSampleSize = 0;
+    sp.SubhaloTreeOpenAngle = COLL_TEST_THETA;
+    sp.SubhaloCollectiveMinPart = collective;
+    sp.SubhaloAdmitShare = share;
+    syn_setup(&CP, IR_END + SYN_NFIELD, sp);
+    struct SubTrack recs[3];
+    recs[0] = syn_rec(0, 2000, 0.2, -1, 0, 0, 0);
+    recs[1] = syn_rec(1, 600, 0.06, 0, 0, 1, 1);
+    recs[2] = syn_rec(2, 200, 0.02, 1, 0, 2, 2);
+    syn_records(recs, 3);
+    syn_place(ir_particle, &c, 0.55, 1);
+    AvN = 0;
+    subhalo_set_admit_hook(av_hook);
+    subhalo_collective_set_pretag_hook(tk_pretag);
+    int64_t ng;
+    const int ret = run_finder_call(1, &CP, &ng);
+    subhalo_collective_set_pretag_hook(NULL);
+    subhalo_set_admit_hook(NULL);
+    CHECK(ret == 1 && ng == 1, "in-place receivers: %ld groups\n", ng);
+    outcome_take(o);
+    syn_teardown();
+}
+
+static void
+test_collective_vote_inplace_receivers(void ** state)
+{
+    const char * name[2] = {"taken", "unbound"};
+    int c;
+    for(c = 0; c < 2; c++) {
+        struct Outcome son, fon, foff;
+        int64_t ns, np, i;
+        ir_run(0, 0.5, c, &son);
+        free(TkPre);
+        TkPre = NULL;
+        struct AdmPair * ser = av_gather(SUBHALO_ADMIT_KEY, &ns);
+        ir_run(100, 0.5, c, &fon);
+        struct tagrec * preon = TkPre;
+        const int64_t npreon = TkPreN;
+        TkPre = NULL;
+        struct AdmPair * pl = av_gather(SUBHALO_ADMIT_PLAN, &np);
+        const struct SubhaloVoteStats vs = *subhalo_plan_last_vote();
+        const int64_t ncands = subhalo_plan_last_summary()->NCands;
+        ir_run(100, 0, c, &foff);
+        struct tagrec * preoff = TkPre;
+        const int64_t npreoff = TkPreN;
+        TkPre = NULL;
+        int64_t bad = 0, toE = 0, toB = 0, takenE = 0, tdE = 0;
+        for(i = 0; i < ns && i < np; i++)
+            bad += ser[i].ID != pl[i].ID || ser[i].Receiver != pl[i].Receiver;
+        for(i = 0; i < np; i++) {
+            struct tagrec key;
+            key.ID = pl[i].ID;
+            const struct tagrec * t = bsearch(&key, fon.r, fon.n, sizeof(struct tagrec), cmp_tagrec_id);
+            toE += pl[i].Receiver == 2;
+            if(pl[i].Receiver == 2 && t && t->BoundTrackId == 1)
+                toB++;
+            const struct tagrec * t0 = bsearch(&key, foff.r, foff.n, sizeof(struct tagrec), cmp_tagrec_id);
+            if(pl[i].Receiver == 2 && (!t || !t0 || t->TrackId != t0->TrackId || t->BoundTrackId != t0->BoundTrackId))
+                tdE++;
+            if(t && t->TrackId == 2 && t->BoundTrackId == 2)
+                takenE++;
+        }
+        int64_t tdP = npreon == npreoff && preon && preoff ? 0 : -1;
+        for(i = 0; tdP >= 0 && i < npreon; i++)
+            tdP += preon[i].ID != preoff[i].ID || preon[i].TrackId != preoff[i].TrackId || preon[i].BoundTrackId != preoff[i].BoundTrackId
+                   || preon[i].BindRank != preoff[i].BindRank || preon[i].GrNr != preoff[i].GrNr;
+        const int64_t tdF = tk_tag_diff(&fon, &foff);
+        message(0, "in-place receivers (%s): %ld candidates; %ld pairs serial, %ld plan (%ld to E, %ld home, %ld mismatches); "
+                   "of those to E: %ld taken, %ld bound to B, %ld tagged unlike the rule-off run; Nbound(E) %d; particles whose tags "
+                   "differ from the rule-off run: %ld final, %ld before the final pass\n",
+                name[c], ncands, ns, np, toE, vs.NHome, bad, takenE, toB, tdE, fon.rec[2].Nbound, tdF, tdP);
+        CHECK(ncands == 3 && ns == np && bad == 0 && toE > 0 && vs.NHome == np && toB == 0,
+              "in-place receivers (%s): %ld candidates, %ld / %ld pairs, %ld mismatches, %ld home, %ld bound to B\n",
+              name[c], ncands, ns, np, bad, vs.NHome, toB);
+        if(c == TK_TAKEN)
+            CHECK(takenE > 0, "in-place receivers (taken): none taken\n");
+        else
+            CHECK(takenE == 0 && tdE == 0 && tdP == 0, "in-place receivers (unbound): %ld taken, %ld / %ld tags differ\n", takenE, tdE, tdP);
+        free(preoff);
+        free(preon);
+        free(pl);
+        free(ser);
+        outcome_free(&foff);
+        outcome_free(&fon);
+        outcome_free(&son);
+    }
+    free(AvPairs);
+    AvPairs = NULL;
+    AvN = AvMax = 0;
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_collective_serial_vs_inplace),
@@ -4041,6 +4174,7 @@ int main(void) {
         cmocka_unit_test(test_collective_vote_receivers),
         cmocka_unit_test(test_collective_vote_plan),
         cmocka_unit_test(test_collective_vote_subtree_majority),
+        cmocka_unit_test(test_collective_vote_inplace_receivers),
     };
     const char * only = getenv("SUBHALO_TEST_ONLY");
     if(only && only[0]) {
