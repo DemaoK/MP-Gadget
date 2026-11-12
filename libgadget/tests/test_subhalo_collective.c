@@ -4311,7 +4311,8 @@ test_collective_vote_plan(void ** state)
                "in-place stage failed %d on rank %d, vote short %g; charge left out: ret %d, taken %ld\n", on.recv_rank, on.nrecv,
             on.nsend_at_recv, rf.ret, rf.adm.reserve_failed, rf.adm.reserve_rank, rf.adm.failed, rf.adm.failrank, rf.vs.WorstShort,
             r0.ret, r0.taken);
-    CHECK(on.recv_rank >= 0 && on.nrecv == on.npairs && on.nsend_at_recv < on.nrecv,
+    /* on several ranks the rank that receives the records sent only a part of them */
+    CHECK(on.recv_rank >= 0 && on.nrecv == on.npairs && (get_ntask() == 1 || on.nsend_at_recv < on.nrecv),
           "vote plan: rank %d received %ld records and sent %ld\n", on.recv_rank, on.nrecv, on.nsend_at_recv);
     CHECK(rf.ret == 0 && !rf.complete && rf.nchanged == 0 && rf.nrecchanged == 0 && rf.vs.WorstShort <= 0 && rf.adm.reserve_failed
           && rf.adm.reserve_rank == on.recv_rank && (!rf.adm.failed || rf.adm.failrank == on.recv_rank),
