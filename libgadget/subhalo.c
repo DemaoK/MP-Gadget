@@ -2650,14 +2650,16 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
                     subhalo_plan_last_vote()->WorstRank, subhalo_plan_last_vote()->WorstShort / 1048576.);
         else if(plan.Admit.failed)
             message(0, "Subhalo finder: the in-place stage of snapshot %d does not fit in memory on rank %d (stage: %s)%s; the call is "
-                       "skipped before the exchange. Tags and track table are unchanged; this PIG will be marked incomplete. "
-                       "Run with more memory per rank or more ranks.\n", SnapNum, plan.Admit.failrank,
+                       "skipped before the exchange. Particle tags and GrNr are unchanged; the track table keeps this call's "
+                       "orphan lookup; this PIG will be marked incomplete. Run with more memory per rank or more ranks.\n",
+                    SnapNum, plan.Admit.failrank,
                     plan.Admit.failstage >= 0 ? SubhaloCollStageName[plan.Admit.failstage] : "?",
                     plan.Admit.reserve_failed ? " and the reserve admission failed too" : "");
         else
             message(0, "Subhalo finder: the reserve admission of snapshot %d failed: rank %d is %g MB short of the plan's reserve; the "
-                       "call is skipped before the exchange. Tags and track table are unchanged; this PIG will be marked incomplete. "
-                       "Run with more memory per rank or more ranks.\n", SnapNum, plan.Admit.reserve_rank,
+                       "call is skipped before the exchange. Particle tags and GrNr are unchanged; the track table keeps this "
+                       "call's orphan lookup; this PIG will be marked incomplete. Run with more memory per rank or more ranks.\n",
+                    SnapNum, plan.Admit.reserve_rank,
                     plan.Admit.reserve_short / 1048576.);
         subhalo_restore_field_grnr(&plan);
         subhalo_plan_free(&plan);
@@ -2675,8 +2677,9 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     /* Step 5: commit point; nothing persistent changed yet (the orphans' tracer state is redone
      * by the next complete call). */
     if(MPIU_Any(failure, Comm)) {
-        message(0, "Subhalo finder: the particle exchange failed for snapshot %d; restoring the domain. "
-                   "Tags and track table are unchanged; this PIG will be marked incomplete.\n", SnapNum);
+        message(0, "Subhalo finder: the particle exchange failed for snapshot %d; restoring the domain. Particle tags and "
+                   "GrNr are unchanged; the track table keeps this call's orphan lookup; this PIG will be marked incomplete.\n",
+                SnapNum);
         subhalo_restore_field_grnr(&plan);
         subhalo_plan_free(&plan);
         subhalo_restore_domain(ddecomp);
