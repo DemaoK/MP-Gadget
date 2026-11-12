@@ -445,7 +445,7 @@ test_nfw_fit(void ** state)
         assert_true(subhalo_nfw_fit(2, en, 6, 0) == -1);
         double ei[7] = {0, 1, 2, 3, 4, 5, INFINITY};
         assert_true(subhalo_nfw_fit(2, ei, 6, 0) == -1);
-        /* a nonfinite start on valid edges falls back to the middle edge as before */
+        /* a nonfinite start on valid edges falls back to the middle edge, as above */
         double eg[7] = {0, 1, 2, 3, 4, 5, 6};
         const double f = subhalo_nfw_fit(NAN, eg, 6, 0);
         assert_true(f > 0 && f < 6);
