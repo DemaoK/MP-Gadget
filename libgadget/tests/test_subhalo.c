@@ -5092,9 +5092,10 @@ test_subhalo_mixed_call(void ** state)
  * S2 may sink into S. AD_TWIN: the H-owned candidate Z (X's id, Y's with reverse) at exactly the position of
  * W, an S-bound tracer (the other id), in X's shell with shell tracers 0, 1, 2 and 8 bound to S, the rest to
  * H: Z's ten neighbours are W and shell tracers 0-8, five for S. AD_SMALL: one key of nh H tracers in 1 kpc,
- * AD_NSMALL S tracers and Z at S's centre; every other id is alone in the field. */
+ * AD_NSMALL S tracers and Z at S's centre; every other id is alone in the field. AD_TRIPLE (with AD_TWIN):
+ * the H-owned tracer AD_X - 1 at Z and W too, so that a Z of the largest id is third in its own query. */
 enum { AD_SLOW = 1, AD_FAST = 2, AD_SHELL = 4, AD_NESTED = 8, AD_SIBLING = 16, AD_HOT = 32, AD_REST = 64, AD_LOSS = 128,
-       AD_SINK = 256, AD_TWIN = 512, AD_SMALL = 1024 };
+       AD_SINK = 256, AD_TWIN = 512, AD_SMALL = 1024, AD_TRIPLE = 2048 };
 #define AD_NSMALL 34
 
 struct AdUd {
@@ -5152,6 +5153,15 @@ ad_particle(MyIDType id, double atime, struct SynPart * s, void * ud_)
             /* 45 kpc/h from the lattice, 62.5 kpc/h from each other: no group */
             for(d = 0; d < 3; d++)
                 s->pos[d] = 5 + 62.5 * ((d == 0 ? id : (d == 1 ? id / 16 : id / 256)) % 16);
+        return;
+    }
+    if((ud->mode & AD_TRIPLE) && id == AD_X - 1) {
+        int d;
+        for(d = 0; d < 3; d++) {
+            s->pos[d] = cS[d] + (d == 0 ? 0.05 * a1 : 0);
+            s->vel[d] = atime * vS[d];
+        }
+        s->tag = s->bound = 0; s->rank = 1000 + id;
         return;
     }
     if(id < AD_S0) {
@@ -5646,6 +5656,17 @@ test_subhalo_admit_rules(void ** state)
         free(recv);
         ad_free(&on);
     }
+    /* three coincident tracers, Z of the largest id third in its own query: Z's eleven neighbours are AD_X - 1
+     * (H), W and shell tracers 0-8, five for S, exactly the threshold of 5 / 11 */
+    {
+        struct AdUd tr = {AD_TWIN | AD_TRIPLE, 0, 1, 11, 0, 0};
+        ad_run(&tr, 5. / 11, 1, &on);
+        int * recv = ad_check_count(&tr, &on, 5, "triple, Z third");
+        CHECK(recv[AD_Y] == 1 && on.r[AD_Y].BoundTrackId == 1, "triple: Z predicted %d, bound to %ld\n", recv[AD_Y],
+              on.r[AD_Y].BoundTrackId);
+        free(recv);
+        ad_free(&on);
+    }
     /* k = 64: a key of 64 tracers admits nothing and builds no tree; one tracer more, every H-owned one is
      * a candidate with the 34 votes of S */
     for(k = 0; k < 2; k++) {
@@ -5659,11 +5680,23 @@ test_subhalo_admit_rules(void ** state)
         CHECK((on.r[AD_X].BoundTrackId == 1) == k, "%s: Z bound to %ld\n", what, on.r[AD_X].BoundTrackId);
         ad_free(&on);
     }
+    /* k = 64 at the share 34 / 64: every candidate has exactly the 34 votes it needs, all 64 neighbours count */
+    {
+        struct AdUd sm = {AD_SMALL, 0, 0, 64, 0, 30};
+        ad_run(&sm, 34. / 64, 1, &on);
+        free(ad_check_count(&sm, &on, 34, "k = 64, 34 votes needed"));
+        CHECK(on.st.NAdmitted == sm.nh + 1, "k = 64, 34 votes needed: %ld admitted\n", on.st.NAdmitted);
+        ad_free(&on);
+    }
     /* X taken by S2, which sinks into S below H in the same call: X is bound once, to S, the tags hold (ad_run) */
     {
         struct AdUd sk = {AD_NESTED | AD_SINK, 6, 0, 0, 0, 0};
         ad_run(&sk, 0.5, 1, &on);
-        free(ad_check_count(&sk, &on, 5, "nested, S2 sinks"));
+        int * recv = ad_check_count(&sk, &on, 5, "nested, S2 sinks");
+        /* the 16 that S2 binds count as taken by S2, although S2 then sinks and S holds them */
+        CHECK(recv[AD_X] == 2 && on.st.NAdmitTaken == 16 && on.st.NAdmitReceivers == 1,
+              "S2 sinks: X admitted to %d, %ld taken by %ld receivers\n", recv[AD_X], on.st.NAdmitTaken, on.st.NAdmitReceivers);
+        free(recv);
         message(0, "Admission, S2 sinks: S2 Nbound %d SinkTrackId %ld, X tagged %ld bound %ld, %ld taken\n", on.rec[2].Nbound,
                 on.rec[2].SinkTrackId, on.r[AD_X].TrackId, on.r[AD_X].BoundTrackId, on.st.NAdmitTaken);
         CHECK(on.rec[2].Nbound == 0 && on.rec[2].SinkTrackId == 1 && on.st.NAdmitTaken >= 1, "S2 sinks: S2 Nbound %d SinkTrackId %ld, %ld taken\n",
@@ -5695,6 +5728,8 @@ test_subhalo_rescue_loss_call(void ** state)
     CHECK(o.st.NLossTried == 1 && o.st.NLossRescued == 1 && o.st.NRescueTried == 0 && o.st.NRescued == 0,
           "loss: loss tried %ld rescued %ld, death tried %ld rescued %ld\n", o.st.NLossTried, o.st.NLossRescued, o.st.NRescueTried,
           o.st.NRescued);
+    /* each unbinding is counted once: H's, and S's first and second attempts */
+    CHECK(o.st.NCandidates == 3, "loss: %ld unbindings counted, %ld capped\n", o.st.NCandidates, o.st.NItercap);
     ad_free(&o);
 }
 

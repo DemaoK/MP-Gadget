@@ -2327,6 +2327,12 @@ test_rescue_loss(void ** state)
         assert_true(sa.tried == 1 && sa.stood == 0 && sa.Itercap == 1 && sa.ConvergenceRatio < 1.);
         assert_true(memcmp(&first, &t.c, sizeof(first)) == 0 && memcmp(order, t.Index, sizeof(int64_t) * n) == 0);
         assert_int_equal(arena.used, mark);
+        /* the reported ratio is the second attempt's own: the same attempt standing for a dead first gives it */
+        struct SubhaloSecondAttempt sb;
+        assert_int_equal(subhalo_unbind_rescue(&t.c, 0, 3 * n, K, &up1, &arena, &sb), 1);
+        message(0, "Second attempt at the cap: ratio %.6f, the first's %.6f\n", sb.ConvergenceRatio, first.ConvergenceRatio);
+        assert_true(sb.stood == 1 && t.c.ConvergenceRatio == sa.ConvergenceRatio && sa.ConvergenceRatio != first.ConvergenceRatio);
+        assert_int_equal(arena.used, mark);
         cand_free(&t);
     }
 
