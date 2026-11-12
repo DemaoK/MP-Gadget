@@ -305,6 +305,28 @@ class Rockstar(object):
         """Rockstar row of the halo whose .bin list holds each particle ID, -1 for none."""
         return _lookup(self.pids, self.p_owner_row, ids)
 
+    def restrict(self, keep):
+        """Keep the catalogue rows of the mask `keep` and their particle lists; pid by the parents.c rule
+        over the kept rows, so that no kept halo points at a dropped one."""
+        keep = np.asarray(keep, bool)
+        self.columns = {k: v[keep] for k, v in self.columns.items()}
+        self.n = int(np.count_nonzero(keep))
+        self.id = self.id[keep]
+        self.pos = self.pos[keep]
+        self.mvir, self.rvir_kpc, self.vmax = self.columns["mvir"], self.columns["rvir"], self.columns["vmax"]
+        self.type = self.type[keep]
+        if not np.isfinite(self.box_mpc):
+            raise InputError("%s: no box size to compute PIDs" % self.catfile)
+        self.pid = _parents_rule(self.pos, self.rvir_kpc * 1e-3, self.vmax, self.id, self.box_mpc)
+        self.pid_source = "computed (parents.c rule over the kept halos)"
+        self.host = self.pid < 0
+        o = np.argsort(self.id, kind="stable")
+        self._id_sorted, self._id_row = self.id[o], o.astype(np.int64)
+        if self.pids.size:
+            lk = keep[self.p_owner_row]
+            self.pids, self.p_owner = self.pids[lk], self.p_owner[lk]
+            self.p_owner_row = self.row(self.p_owner)
+
 
 # ---------------------------------------------------------------------------------- our side
 def parse_column(spec):

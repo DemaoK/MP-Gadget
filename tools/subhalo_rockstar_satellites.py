@@ -5,19 +5,30 @@
 Usage:
   subhalo_rockstar_satellites.py --ours PIGDIR --rockstar OUTBASE --hlists HLISTDIR --out DIR
       [--census 128,140,152] [--anchors 128,140] [--steps 1,2,5] [--rs-snap-offset 0]
-      [--maxset 20000] [--no-unbind] [--min-np 20] [--nproc N]
+      [--maxset 20000] [--no-unbind] [--min-np 20] [--nproc N] [--reference hlist|outlist]
 
 Inputs. Ours: PIGDIR/PIG_k (the Ours reader of subhalo_compare_hbt.py) and PIGDIR/PART_k (type 1, for the
 independent unbinding). Rockstar: OUTBASE/out_N.list and halos_*.bin of N = k + --rs-snap-offset (the
-Rockstar reader of subhalo_compare_rockstar.py: pid by the parents.c rule, unique particle membership
-from the .bin files; a particle ID listed more than once, a halo with Np > 0 and no listed particle (a
-missing .bin chunk), a halo or parent ID that is not an integer below 2**53 in magnitude (the parser reads
-IDs through float64) and a pid >= 0 absent from the catalogue are input errors). consistent-trees: HLISTDIR/hlist_<scale>.list, the hlist of output k being the one within 2e-5 in
+Rockstar reader of subhalo_compare_rockstar.py: pid from the catalogue's PID column when it has one, else
+by the parents.c rule; unique particle membership from the .bin files; a catalogue without halos, a
+particle ID listed more than once, a halo with Np > 0 and no listed particle (a missing .bin chunk), a halo
+or parent ID that is not an integer below 2**53 in magnitude (the parser reads IDs through float64), a
+pid >= 0 absent from the catalogue and a pid chain that reaches no host are input errors). consistent-trees: HLISTDIR/hlist_<scale>.list, the hlist of output k being the one within 2e-5 in
 scale of PIG_k's Time (hlist scales carry five decimals); a row continues at the next hlist as the row with
 id == desc_id when mmp? == 1, and a desc_id >= 0 absent from the next hlist is an input error (a missing
 hlist when desc_scale is not that hlist's scale, else an inconsistent tree). Real hlist rows carry the
 Rockstar ID in Orig_halo_ID; phantom rows carry a number with no Rockstar halo behind it (counted in the
 report). A particle ID in more than one of our exclusive sets is an input error.
+
+Reference (--reference). hlist (default): the Rockstar halos compared are those consistent-trees keeps,
+since a halo it drops is no halo of the merger trees. At every output read, right after the catalogue and
+the lists are read and checked, each Rockstar halo whose ID is not the Orig_halo_ID of a real row of that
+output's hlist is removed with its particle list (those particles are then listed by no halo), and pid is
+the parents.c rule over the kept halos; everything below runs on this catalogue. The census header counts
+the halos read, kept and removed, the removed subhaloes (by the full list's pid) of the universe by bin,
+the listed IDs dropped, and the kept halos whose subhalo flag differs from the full list's pid and from the
+hlist's pid. The input errors above are checked on the full list; hlists that keep no halo of a non-empty
+list are an input error. outlist: every halo of out_N.list.
 
 Matching: mutual election (match_ids): our ten most-bound tracers vote with weights 1/(1 + sqrt(i)) for
 the Rockstar halo listing them; every listed particle the PIG saves votes for our subhalo binding it.
@@ -70,7 +81,7 @@ Census categories (census outputs):
       Rvir (mass factor 3).
 
 Identity (anchors k0, steps j): every A pair (t, r) at k0, r followed through the hlists to k0 + j.
-  E0  r has no row in the hlist of k0.
+  E0  r has no row in the hlist of k0 (none under --reference hlist).
   E1  both alive and (t, chain row) a pair at k0 + j (election, central rule or footprint; the cases
       that are E1 only through an added pair are counted with the E2 label they would carry).
   E2  both alive, not paired with each other; self-overlaps |B_t(k0) & B_t(k0+j)| / |B_t(k0)| (exclusive
@@ -483,10 +494,26 @@ def parent_rows(rs):
     return prow
 
 
+def top_host_rows(rs):
+    """catalogue row of each halo's top host (its own row for a host), by pointer doubling; a pid chain that
+    reaches no host (a pid cycle) is an input error"""
+    prow = parent_rows(rs)
+    top = np.where(prow >= 0, prow, np.arange(rs.n))
+    for _ in range(64):
+        nxt = top[top]
+        if np.array_equal(nxt, top):
+            break
+        top = nxt
+    cyc = int(np.count_nonzero(prow[top] >= 0)) if rs.n else 0
+    if cyc:
+        raise InputError("%s: %d halos whose pid chain reaches no host (a pid cycle)" % (rs.catfile, cyc))
+    return top
+
+
 class Output(object):
     """Our catalogue and Rockstar's at one output, the votes, pairs and destination tables."""
 
-    def __init__(self, k, args):
+    def __init__(self, k, args, hl):
         t0 = time.time()
         self.k = k
         self.pigdir = os.path.join(args.ours, "PIG_%03d" % k)
@@ -507,11 +534,24 @@ class Output(object):
         if np.isfinite(rs.a) and abs(rs.a - u.a) > 1e-3 * u.a:
             raise InputError("%s is at a = %.5f, the PIG at a = %.5f" % (rs.catfile, rs.a, u.a))
         check_rockstar_ids(rs)
+        if rs.n == 0:
+            raise InputError("%s holds no halo: nothing to compare at output %d" % (rs.catfile, k))
         if rs.nduplicate:
             raise InputError("%s: %d particle IDs listed more than once in the halos_*.bin lists (ambiguous "
                              "ownership)" % (rs.catfile, rs.nduplicate))
         log("output %d (a = %.4f): read %d subhalos, %d orphans, %d Rockstar halos, %d listed IDs in %.0f s" % (
             k, u.a, ours.tid.size, ours.otid.size, rs.n, rs.pids.size, time.time() - t0))
+        # with unique membership a listed halo holds all its particles: Np > 0 and none listed is a lost chunk
+        np_read = rs.columns["np"].astype(np.int64) if "np" in rs.columns else np.zeros(rs.n, np.int64)
+        nolist = int(np.count_nonzero((np_read > 0) & (np.bincount(rs.p_owner_row, minlength=rs.n) == 0)))
+        if nolist:
+            raise InputError("%s: %d halos with Np > 0 have no particle in the %d halos_*.bin files read (a missing "
+                             "chunk)" % (rs.catfile, nolist, len(rs.bin_files)))
+        self.rs_id_all = rs.id                   # every ID of out_N.list: a phantom's number must match none of them
+        if args.reference == "hlist":
+            self.ref_lines = self._hlist_reference(hl, args.min_np)
+        else:
+            self.ref_lines = ["  reference outlist: every halo of %s" % os.path.basename(rs.catfile)]
         S = ours.S
         self.nO, self.nR = ours.tid.size, rs.n
         self.depth = S["Depth"].astype(np.int64)
@@ -529,29 +569,51 @@ class Output(object):
         self.rsize = rs.mvir / self.mp
         self.sub = rs.pid != -1
         self.np_rs = rs.columns["np"].astype(np.int64) if "np" in rs.columns else np.zeros(rs.n, np.int64)
-        # with unique membership a listed halo holds all its particles: Np > 0 and none listed is a lost chunk
-        nolist = int(np.count_nonzero((self.np_rs > 0) & (np.bincount(rs.p_owner_row, minlength=rs.n) == 0)))
-        if nolist:
-            raise InputError("%s: %d halos with Np > 0 have no particle in the %d halos_*.bin files read (a missing "
-                             "chunk)" % (rs.catfile, nolist, len(rs.bin_files)))
-        prow = parent_rows(rs)
-        self.pid_missing = 0                     # parent_rows rejects a pid absent from the catalogue
-        # top host by pointer doubling; a top that still has a parent lies on a pid cycle
-        top = np.where(prow >= 0, prow, np.arange(rs.n))
-        for _ in range(64):
-            nxt = top[top]
-            if np.array_equal(nxt, top):
-                break
-            top = nxt
-        cyc = int(np.count_nonzero(prow[top] >= 0)) if rs.n else 0
-        if cyc:
-            raise InputError("%s: %d halos whose pid chain reaches no host (a pid cycle)" % (rs.catfile, cyc))
-        self.top = top
+        self.pid_missing = 0                     # top_host_rows rejects a pid absent from the catalogue
+        self.top = top_host_rows(rs)
         t1 = time.time()
         self._exclusive()
         self._votes()
         self._rs_lists()
         log("output %d: exclusive sets, votes, pairs and destinations in %.0f s" % (k, time.time() - t1))
+
+    def _hlist_reference(self, hl, mn):
+        """Restrict Rockstar's catalogue to the halos consistent-trees keeps as real rows of the hlist of this
+        output (rows and particle lists), pid by the parents.c rule over them; returns the report lines."""
+        rs = self.rs
+        top_host_rows(rs)                        # the list's own pid is checked before it is replaced
+        pid_full = rs.pid_source
+        i = hl.index_of(self.a, self.k)
+        hd = hl.read(i)
+        hrow = hl.row_of_rockstar(i, rs.id)
+        keep = hrow >= 0
+        if rs.n and not keep.any():
+            raise InputError("%s: none of the %d Rockstar halos is the Orig_halo_ID of a real row of %s (the hlists "
+                             "are not those of this Rockstar run)" % (rs.catfile, rs.n, os.path.basename(hl.files[i])))
+        rem = ~keep
+        rsize = rs.mvir / self.mp
+        sub_full = rs.pid != -1
+        b = size_bin(rsize[rem & sub_full & (rsize >= mn)])
+        below = int(np.count_nonzero(b < 0))
+        ndrop = int(np.count_nonzero(rem[rs.p_owner_row]))
+        nread = rs.n
+        rs.restrict(keep)
+        sub_full, hrow = sub_full[keep], hrow[keep]
+        sub = rs.pid != -1
+        hsub = hd["pid"][hrow] != -1
+        log("output %d: hlist reference %s keeps %d of %d Rockstar halos" % (self.k, os.path.basename(hl.files[i]),
+                                                                            rs.n, nread))
+        return ["  reference hlist %s: Rockstar halos read %d, kept %d (Orig_halo_ID of a real row), removed %d with %d "
+                "listed IDs" % (os.path.basename(hl.files[i]), nread, rs.n, nread - rs.n, ndrop),
+                "    removed subhaloes of the full list (pid: %s) with Mvir/m_p >= %d: %d (%s%s)" % (
+                    pid_full, mn, b.size, ", ".join("%s %d" % (bn, int(np.count_nonzero(b == x))) for x, bn in enumerate(BIN_NAMES)),
+                    "; %d below %d" % (below, EDGES[0]) if below else ""),
+                "    kept halos, subhalo flag of the parents rule over the kept halos: as the full list's pid for %d of %d "
+                "(host there, subhalo here %d; subhalo there, host here %d); as the hlist pid for %d (hlist host, subhalo "
+                "here %d; hlist subhalo, host here %d)" % (
+                    int(np.count_nonzero(sub == sub_full)), rs.n, int(np.count_nonzero(sub & ~sub_full)),
+                    int(np.count_nonzero(~sub & sub_full)), int(np.count_nonzero(sub == hsub)),
+                    int(np.count_nonzero(sub & ~hsub)), int(np.count_nonzero(~sub & hsub)))]
 
     def _exclusive(self):
         """exclusive bound sets: the bound prefix of the in-group slice and of the field slice"""
@@ -812,6 +874,7 @@ class Census(object):
         univ_r = s.sub & (s.rsize >= mn)
         univ_o = s.sat
         P("census at output %d (a = %.4f): %s, Rockstar %s" % (s.k, s.a, s.pigdir, rs.catfile))
+        self.lines.extend(s.ref_lines)
         P("  ours: %d rows, %d satellites (Depth >= 1), %d centrals, %d hostless; Rockstar: %d halos, %d subhaloes "
           "(pid != -1, %s), %d with Mvir/m_p >= %d; m_p = %.6g Msun/h" % (
               s.nO, int(univ_o.sum()), int(s.cen.sum()), int(s.hostless.sum()), s.nR, int(s.sub.sum()), rs.pid_source,
@@ -1011,13 +1074,13 @@ class Census(object):
         orig_ph = hd["Orig_halo_ID"][allph]
         orig_real = hd["Orig_halo_ID"][hd["phantom"] == 0]
         self.rs_in_hlist = np.isin(rs.id, orig_real)      # Rockstar halo kept by consistent-trees as a real row
-        n_ph_in_rs = int(np.count_nonzero(rs.row(orig_ph) >= 0))
-        n_real_in_rs = int(np.count_nonzero(rs.row(orig_real) >= 0))
+        n_ph_in_rs = int(np.count_nonzero(np.isin(orig_ph, s.rs_id_all)))
+        n_real_in_rs = int(np.count_nonzero(np.isin(orig_real, s.rs_id_all)))
         self.phantom_note = ("hlist %s: %d rows, %d phantom; real rows' Orig_halo_ID found among Rockstar IDs: %d of %d; "
                              "phantom rows' Orig_halo_ID %s (Rockstar IDs of out_%d: %d..%d), %d of them equal to a Rockstar ID"
                              % (os.path.basename(self.hlist_file), hd["n"], allph.size, n_real_in_rs, orig_real.size,
                                 "%d..%d" % (orig_ph.min(), orig_ph.max()) if orig_ph.size else "-", rs.snap,
-                                rs.id.min(), rs.id.max(), n_ph_in_rs))
+                                s.rs_id_all.min(), s.rs_id_all.max(), n_ph_in_rs))
         satrows = np.flatnonzero(s.sat)
         near_sat = {}               # our satellite row -> nearby phantom rows
         ph_has = np.zeros(ph.size, bool)
@@ -1521,6 +1584,8 @@ class Anchor(object):
         P("identity from anchor %d (a = %.4f, %s): %d A pairs (our satellite, Rockstar subhalo); %d of their Rockstar "
           "halos have no row in that hlist (E0)" % (self.k0, self.a0, os.path.basename(self.hfile0), self.n,
                                                      int(np.count_nonzero(~self.in_hlist))))
+        P("  reference %s: %s" % (args.reference, "the Rockstar catalogue of every output restricted to the real rows of "
+                                  "its hlist" if args.reference == "hlist" else "every halo of each out_N.list"))
         P("  bins by our Nbound at %d: %s" % (self.k0, ", ".join("%s %d" % (bn, int(np.count_nonzero(self.bin == x)))
                                                                for x, bn in enumerate(BIN_NAMES))))
         P("  anchor pairs: election %d, footprint %d" % (int(np.count_nonzero(self.src == SRC_ELECTION)),
@@ -1538,7 +1603,8 @@ class Anchor(object):
             P("")
             P("  step j = %d -> output %d (a = %.4f, %s)%s" % (
                 j, st["k"], st["a"], os.path.basename(st["hfile"]),
-                "; WARNING: %d real chain rows whose Orig_halo_ID is not in out_%d" % (st["real_missing"], st["k"])
+                "; WARNING: %d real chain rows whose Orig_halo_ID is not in out_%d" % (st["real_missing"],
+                                                                                    st["k"] + args.rs_snap_offset)
                 if st["real_missing"] else ""))
             P(bin_header(width=40, what="category (bins: our Nbound at k0)"))
             for c, l in order:
@@ -1649,6 +1715,8 @@ def main(argv=None):
     p.add_argument("--no-unbind", action="store_true", help="skip the independent unbinding (no PART is read)")
     p.add_argument("--min-np", type=int, default=20, help="Rockstar satellite universe: Mvir / m_p >= this (default 20)")
     p.add_argument("--nproc", type=int, default=0, help="unbinding workers (default: the CPUs of this process)")
+    p.add_argument("--reference", choices=("hlist", "outlist"), default="hlist",
+                   help="Rockstar halos compared: those kept as real hlist rows (default) or every out_N.list halo")
     args = p.parse_args(argv)
     census, anchors, steps = parse_list(args.census), parse_list(args.anchors), parse_list(args.steps)
     if args.nproc <= 0:
@@ -1657,13 +1725,13 @@ def main(argv=None):
     try:
         hl = Hlists(args.hlists)
         need = sorted(set(census) | set(anchors) | set(k0 + j for k0 in anchors for j in steps))
-        log("outputs %s; census %s, anchors %s, steps %s; unbinding %s (%d workers, maxset %d)" % (
-            need, census, anchors, steps, "off" if args.no_unbind else "on", args.nproc, args.maxset))
+        log("outputs %s; census %s, anchors %s, steps %s; unbinding %s (%d workers, maxset %d); reference %s" % (
+            need, census, anchors, steps, "off" if args.no_unbind else "on", args.nproc, args.maxset, args.reference))
         texts = {}
         open_anchors = {}
         for k in need:
             tk = time.time()
-            s = Output(k, args)
+            s = Output(k, args, hl)
             sets = {}
             cen = None
             if k in census:
@@ -1698,8 +1766,8 @@ def main(argv=None):
             log("output %d done in %.0f s" % (k, time.time() - tk))
         summary = ["subhalo_rockstar_satellites: ours %s, Rockstar %s (snapshot offset %d), hlists %s" % (
             args.ours, args.rockstar, args.rs_snap_offset, args.hlists),
-            "census %s, anchors %s, steps %s, min-np %d, unbinding %s (maxset %d)"
-            % (census, anchors, steps, args.min_np, "off" if args.no_unbind else "on", args.maxset), ""]
+            "census %s, anchors %s, steps %s, min-np %d, unbinding %s (maxset %d), reference %s"
+            % (census, anchors, steps, args.min_np, "off" if args.no_unbind else "on", args.maxset, args.reference), ""]
         for k in census:
             summary.append(texts.get("census_%d" % k, "census_%d: not produced\n" % k))
         for k0 in anchors:
