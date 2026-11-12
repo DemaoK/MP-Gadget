@@ -2177,11 +2177,13 @@ plan_admit(struct SubhaloPlan * plan, const struct SubhaloDirKey * dk, int64_t n
                           omp_get_max_threads());
     a->persist += rec_rounds;
     a->need += rec_rounds;
+    /* what the serial stage keeps, read before its table is freed; the free bytes after */
+    const double kept = mine[0];
     myfree(hg);
     myfree(hv);
     myfree(vg);
     myfree(v);
-    a->avail = (double) mymalloc_freebytes() - mine[0] - growth - rec_held;
+    a->avail = (double) mymalloc_freebytes() - kept - growth - rec_held;
     /* the worst rank, its largest stage */
     struct { double v; int r; } sh = {a->need - a->avail, ThisTask}, wsh;
     MPI_Allreduce(&sh, &wsh, 1, MPI_DOUBLE_INT, MPI_MAXLOC, Comm);
