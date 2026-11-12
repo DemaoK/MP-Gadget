@@ -810,8 +810,8 @@ def main(argv=None):
     p.add_argument("--ntracers", type=int, default=10, help="tracers per subhalo for the ID match (default 10)")
     p.add_argument("--min-np", type=int, default=100, help="our Nbound threshold of the summary (default 100)")
     p.add_argument("--accept-frac", type=float, default=0.9, help="target matched fraction of centrals (default 0.9)")
-    # a central's source is its FOF group only, which puts the median Mvir ratio a few per cent
-    # to 10 % below Rockstar's; the target leaves room for it
+    # with a central's source limited to its FOF group the median Mvir ratio to Rockstar measured
+    # on a 512^3 run is 0.90-0.97; the target leaves room for it
     p.add_argument("--median-tol", type=float, default=0.2,
                    help="target |median ratio - 1| for Mvir and, with --field, MSO[0]; <= 0 disables (default 0.2)")
     p.add_argument("--rs-median-tol", type=float, default=0.2,

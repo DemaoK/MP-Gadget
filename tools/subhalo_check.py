@@ -1407,8 +1407,8 @@ def cmd_hierarchy(args):
 # ---------------------------------------------------------------------------------- tags
 def check_tags(pigdir, ck, ntracers=None, tracer_rank=True, mass_rtol=1e-4, phase1=False):
     """With phase1, section 1 is ignored: a FOF-as-subhalo catalogue never retags field particles,
-    which keep the TrackId, BindRank and BoundTrackId of the last call that processed them, and its
-    Nbound and NboundExclusive count the in-group slice only."""
+    which keep the TrackId, BindRank and BoundTrackId of the last call that processed them, and the
+    Nbound and NboundExclusive of a hosted track count its in-group slice only."""
     try:
         cat = SubhaloCatalogue(pigdir)
         P = particles(cat, extra=("Mass",))
