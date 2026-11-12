@@ -755,7 +755,7 @@ struct SubhaloAdmitTree {
  * choice of every admission vote, so that all of them decide alike. */
 int64_t subhalo_admit_choice(const int64_t * btid, int kk, int64_t A, int need, const struct SubhaloAdmitTree * at);
 /* Every offered pair (particle ID, receiver TrackId) of a vote, reported to an optional hook with its
- * source: a serial key's vote or the plan's vote across ranks (diagnostics and tests; NULL: none). */
+ * source: a serial key's vote or the plan's vote across ranks (unit tests; NULL: none). */
 enum { SUBHALO_ADMIT_KEY = 0, SUBHALO_ADMIT_PLAN = 1 };
 typedef void (*subhalo_admit_hook)(MyIDType ID, int64_t Receiver, int source);
 void subhalo_set_admit_hook(subhalo_admit_hook fn);

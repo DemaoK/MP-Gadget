@@ -2547,14 +2547,6 @@ subhalo_finish_call(int SnapNum, int complete, const struct SubhaloCallStats * l
 
 /* ------------------------------------------------------------------ the driver */
 
-static FILE * AdmitDumpFile = NULL;
-
-static void
-admit_dump(MyIDType ID, int64_t Receiver, int source)
-{
-    fprintf(AdmitDumpFile, "%d %lu %ld\n", source, (unsigned long) ID, (long) Receiver);
-}
-
 int
 subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime, Cosmology * CP, int MetalReturnOn, MPI_Comm Comm)
 {
@@ -2573,23 +2565,6 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
 
     message(0, "Subhalo finder: call for snapshot %d at a = %g, %ld tracks, %ld FOF groups.\n",
             SnapNum, atime, tab->NTotal, fof->TotNgroups);
-    /* SUBHALO_ADMIT_DUMP=<dir>: every offered pair of the call, as "source ID receiver" lines, into
-     * <dir>/admit_<snapshot>_<rank>.txt (a diagnostic of the admission votes) */
-    {
-        const char * dumpdir = getenv("SUBHALO_ADMIT_DUMP");
-        if(dumpdir && dumpdir[0] && sp->SubhaloAdmitShare > 0) {
-            if(AdmitDumpFile)
-                fclose(AdmitDumpFile);
-            char * fn = fastpm_strdup_printf("%s/admit_%03d_%d.txt", dumpdir, SnapNum, ThisTask);
-            AdmitDumpFile = fopen(fn, "w");
-            if(!AdmitDumpFile)
-                endrun(1, "Cannot open the admission dump %s.\n", fn);
-            setvbuf(AdmitDumpFile, NULL, _IOLBF, 0);
-            myfree(fn);
-            subhalo_set_admit_hook(admit_dump);
-        }
-    }
-
     /* Tags must reference existing tracks. */
     int badtag = 0;
     #pragma omp parallel for reduction(+: badtag)
