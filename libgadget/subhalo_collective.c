@@ -2914,7 +2914,7 @@ tagrec_radix(const void * a, void * radix, void * arg)
     memcpy(radix, ((const struct TagRec *) a)->key, 24);
 }
 
-/* The final tag of one particle of an oversized key (design 7.2 step 9): a reserved tracer, else a
+/* The final tag of one particle of an oversized key (design 7.2 step 9, D10): a reserved tracer, else a
  * valid serial claim, else the deepest alive in-place claim; a claim across the final tree goes to the
  * binder; a serial tail whose claimant sank goes to its surviving serial binder. */
 struct TagDec {
@@ -3703,7 +3703,8 @@ gather_serial(struct Coll * C)
 
 /* Every particle of an oversized key to one candidate's source (design 7.8): own tags, serial sub-tree
  * remainders to the candidate above the root (serially bound ones excluded), other group particles to
- * the central; field particles tagged by the central (its source is its FOF group) or an orphan are released. */
+ * the central; field particles tagged by the central (its source is its FOF group) or an orphan are
+ * released. */
 static void
 init_sources(struct Coll * C)
 {

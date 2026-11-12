@@ -1068,7 +1068,7 @@ subhalo_read_state_checked(const char * pigname, struct SubTrackTable * tab, dou
        (0 != big_block_get_attr(&bh, "SubhaloSchemaVersion", &schema, "i4", 1)) ||
        (0 != big_block_get_attr(&bh, "SubhaloStateTime", &StateTime, "f8", 1)))
         SUBHALO_STATE_FATAL(pigname, "Subhalo state attributes missing in %s: %s\n", pigname, big_file_get_error_message());
-    /* the SO thresholds of the state's call (optional: absent before they were written) */
+    /* the SO thresholds of the state's call (optional: -1, unknown, in a state without them) */
     {
         double so[SUBHALO_NSO];
         if(0 == big_block_get_attr(&bh, "SOThresholds", so, "f8", SUBHALO_NSO))

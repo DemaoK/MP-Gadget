@@ -1,4 +1,4 @@
-/* Subhalo properties of a bound set (design 7.5, section 8; declared in subhalo_unbind.h): the
+/* Subhalo properties of a bound set (design 7.5, D4, section 8; declared in subhalo_unbind.h): the
  * HBT set, Rockstar's recipes, the deferred NFW fit and velocities, and the baryonic sums.
  * Input: a candidate after subhalo_final_pass, Index[0, Nbound) in final-pass binding order (with the
  * sampled final pass: the loop's order, energies unsorted estimates read only by order-free sums). */
@@ -166,7 +166,7 @@ subhalo_props_hbt(struct SubTrack * rec, const struct SubCandidate * c, const st
 }
 
 /* ================================================================== Rockstar recipes
- * Rockstar's properties on the HBT bound set (design 4.3, 7.10), after Rockstar-BigFile properties.c,
+ * Rockstar's properties on the HBT bound set (design D4, 4.3, 7.10), after Rockstar-BigFile properties.c,
  * nfw.c and groupies.c: bound SO, VmaxVir, Rhalf, J, spins, Xoff/Voff, Klypin Rs, shapes, inertia. */
 
 void

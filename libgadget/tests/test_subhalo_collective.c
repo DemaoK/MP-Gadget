@@ -561,7 +561,7 @@ p2_teardown(void)
     teardown_pman();
 }
 
-/* The tag invariants on the gathered particles against the records: own-tag BindRank dense with
+/* The invariants of design D10 on the gathered particles against the records: own-tag BindRank dense with
  * the exclusive bound rows first; BindRank is the energy order of all own-tag particles,
  * so the reservation shows only as: the first min(10, own-tag tracers) tracer-type (type 1)
  * particles in rank order are bound to the track, and MostBoundID is the first of them;
@@ -651,7 +651,8 @@ p2_check_tags(const struct tagrec * r, int64_t n, const struct SubTrack * rec, i
 }
 
 /* B at 5 kpc/h (physical) from A's centre on a circular orbit, 60 of its particles pulled to
- * A's centre (the overlap scenario: a stripped tail re-bound by the parent), positions and velocities for atime. */
+ * A's centre (the overlap scenario: a stripped tail re-bound by the parent), positions and
+ * velocities for atime. */
 static void
 p2_infall(Cosmology * CP, double atime)
 {
@@ -1603,7 +1604,7 @@ test_collective_binder(void ** state)
             }
         }
     }
-    /* the ID order of T against its rank order (appending by ID would follow it) */
+    /* T's rank order against its ID order (ranks assigned in ID order would agree in every pair) */
     for(i = 0; i < b.n; i++) {
         int g, g2;
         int64_t j, j2, k;

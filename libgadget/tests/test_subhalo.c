@@ -2187,8 +2187,8 @@ test_subhalo_plan_pack(void ** state)
     }
 
     /* (c) cost balance: 8 head keys of 1000 particles, 120 of 100, a tail of 300 keys of
-     * 20, held round-robin; rank 0 has ten times the particle budget of the others. A greedy by
-     * most free budget would put the whole head on rank 0; the cost-aware head and the water-filled
+     * 20, held round-robin; rank 0 has ten times the particle budget of the others. A greedy
+     * choice by most free budget would put the whole head on rank 0; the cost-aware head and the water-filled
      * tail must leave every rank within a few per cent of the mean estimated cost, inside the
      * capacities. */
     {
@@ -2237,7 +2237,7 @@ test_subhalo_plan_pack(void ** state)
                 nhead[0], nhead[1], nhead[2], nhead[3], mx / (tot / 4));
         CHECK(stats.NSerial == nkeys && stats.NOversized == 0, "cost balance: %ld serial, %ld in place\n", stats.NSerial, stats.NOversized);
         CHECK(mx / (tot / 4) < 1.03, "cost balance: the most loaded rank has %.4f x the mean cost\n", mx / (tot / 4));
-        /* every rank gets head keys (a greedy by free budget would give all of them to rank 0) */
+        /* every rank gets head keys (a greedy choice by free budget would give all of them to rank 0) */
         CHECK(nhead[1] > 0 && nhead[2] > 0 && nhead[3] > 0, "cost balance: head keys per rank %ld %ld %ld %ld\n", nhead[0], nhead[1],
               nhead[2], nhead[3]);
         free(oversized);
