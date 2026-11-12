@@ -1659,8 +1659,8 @@ subhalo_knn_build_count(void)
 
 /* Neighbour list of one query: sorted ascending by (d2, ID, P index), at most k entries. */
 struct KnnList {
-    double d2[SUBHALO_KNN_MAXK];
-    int64_t p[SUBHALO_KNN_MAXK];
+    double d2[SUBHALO_KNN_MAXK + 1];
+    int64_t p[SUBHALO_KNN_MAXK + 1];
     int n, k;
 };
 
@@ -1842,8 +1842,8 @@ void
 subhalo_knn_query(const struct SubhaloKnnTree * kt, const int64_t * query, int64_t nq, int k, int64_t * out)
 {
     int64_t i;
-    if(k > SUBHALO_KNN_MAXK)
-        endrun(1, "Subhalo kernel: k = %d nearest neighbours exceeds SUBHALO_KNN_MAXK = %d\n", k, SUBHALO_KNN_MAXK);
+    if(k > SUBHALO_KNN_MAXK + 1)
+        endrun(1, "Subhalo kernel: k = %d nearest neighbours exceeds SUBHALO_KNN_MAXK + 1 = %d\n", k, SUBHALO_KNN_MAXK + 1);
     if(k <= 0)
         return;
     if(kt->t.ns <= 0) {
@@ -1875,8 +1875,8 @@ void
 subhalo_knn_tracers(const int64_t * query, int64_t nq, const int64_t * tr, int64_t nt, int k,
                     int64_t * out, double BoxSize, struct SubhaloArena * arena)
 {
-    if(k > SUBHALO_KNN_MAXK)
-        endrun(1, "Subhalo kernel: k = %d nearest neighbours exceeds SUBHALO_KNN_MAXK = %d\n", k, SUBHALO_KNN_MAXK);
+    if(k > SUBHALO_KNN_MAXK + 1)
+        endrun(1, "Subhalo kernel: k = %d nearest neighbours exceeds SUBHALO_KNN_MAXK + 1 = %d\n", k, SUBHALO_KNN_MAXK + 1);
     if(k <= 0)
         return;
     const size_t mark = arena->used;

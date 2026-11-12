@@ -635,7 +635,7 @@ admit_choice(const int64_t * row, int64_t self, int kk, int A, const struct SubN
 }
 
 /* Admission by neighbour majority (SubhaloAdmitShare = s): a tracer owned by node A joins the source of
- * the receiver below A to which at least ceil(s k) of its k nearest owned tracers were bound at the
+ * the receiver below A to which at least the share s of its k nearest owned tracers were bound at the
  * previous call (BoundTrackId, not yet rewritten). Receivers are the resolved members with a previous
  * bound set below the key's root. Admission needs the owner and the receiver in one key, so particles
  * of an in-place candidate are never admitted. Returns the count; the owner map becomes the admission
@@ -646,10 +646,10 @@ admit_particles(int32_t * owner, struct SubNode * nd, int nn, int ci, int64_t st
                 int32_t ** admlist)
 {
     const int kk = sp->SubhaloNumNeighboursForReassignment;
-    /* the integer threshold, safe from the rounding of s k */
-    int need = (int) ceil(sp->SubhaloAdmitShare * kk - 1e-9);
-    if(need < 1)
-        need = 1;
+    /* the threshold is the share itself: the fewest votes n with n / k >= s */
+    int need = 1;
+    while(need < kk && (double) need / kk < sp->SubhaloAdmitShare)
+        need++;
     int64_t i, nt = 0, nc = 0, nadm = 0;
     int v, u, nrecv = 0;
     for(v = 0; v < nn; v++)

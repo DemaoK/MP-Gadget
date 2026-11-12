@@ -67,7 +67,8 @@ struct SubhaloUnbindParams {
  * exact energies, so the head holds MARGIN * Kt tracers. */
 #define SUBHALO_FINAL_REFINE_MIN 20
 #define SUBHALO_FINAL_REFINE_MARGIN 5
-/* Largest k accepted by subhalo_knn_query (the per-query list lives on the thread stack). */
+/* Largest neighbour number of a parameter. subhalo_knn_query accepts one more, for a query that finds
+ * the particle itself (the per-query list lives on the thread stack). */
 #define SUBHALO_KNN_MAXK 64
 
 /* Arena bytes per candidate particle: the caller's Index and Energy (16), plus the kernel's

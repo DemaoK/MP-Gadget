@@ -101,10 +101,6 @@ subhalo_validate_params(const struct SubhaloParams * sp)
                sp->SubhaloNumNeighboursForReassignment, SUBHALO_KNN_MAXK);
     if(!subhalo_isfinite(sp->SubhaloAdmitShare) || !(sp->SubhaloAdmitShare >= 0 && sp->SubhaloAdmitShare <= 1))
         endrun(1, "SubhaloAdmitShare = %g must be in [0, 1].\n", sp->SubhaloAdmitShare);
-    /* the admission queries one neighbour more than k: the particle finds itself */
-    if(sp->SubhaloAdmitShare > 0 && sp->SubhaloNumNeighboursForReassignment >= SUBHALO_KNN_MAXK)
-        endrun(1, "SubhaloAdmitShare > 0 needs SubhaloNumNeighboursForReassignment = %d below %d.\n",
-               sp->SubhaloNumNeighboursForReassignment, SUBHALO_KNN_MAXK);
     if(sp->SubhaloCoreSize < 1 || sp->SubhaloPotentialSampleSize < 0 || sp->SubhaloMaxUnbindIterations < 1)
         endrun(1, "SubhaloCoreSize = %d and SubhaloMaxUnbindIterations = %d must be at least 1, SubhaloPotentialSampleSize = %d not negative.\n",
                sp->SubhaloCoreSize, sp->SubhaloMaxUnbindIterations, sp->SubhaloPotentialSampleSize);
@@ -2297,10 +2293,10 @@ subhalo_last_call_stats(void)
 static void
 stats_reduce(const struct SubhaloCallStats * loc, struct SubhaloCallStats * tot, MPI_Comm Comm)
 {
-    int64_t a[11] = {loc->NCandidates, loc->NItercap, loc->NFinalPositive, loc->NFinalBound, loc->NTailRejected,
+    int64_t a[14] = {loc->NCandidates, loc->NItercap, loc->NFinalPositive, loc->NFinalBound, loc->NTailRejected,
                      loc->NFallbackField, loc->NFallbackReleased, loc->NRescueTried, loc->NRescued, loc->NLossTried,
-                     loc->NLossRescued}, b[11];
-    MPI_Allreduce(a, b, 11, MPI_INT64, MPI_SUM, Comm);
+                     loc->NLossRescued, loc->NAdmitted, loc->NAdmitTaken, loc->NAdmitReceivers}, b[14];
+    MPI_Allreduce(a, b, 14, MPI_INT64, MPI_SUM, Comm);
     memset(tot, 0, sizeof(*tot));
     tot->NCandidates = b[0];
     tot->NItercap = b[1];
@@ -2313,12 +2309,10 @@ stats_reduce(const struct SubhaloCallStats * loc, struct SubhaloCallStats * tot,
     tot->NRescued = b[8];
     tot->NLossTried = b[9];
     tot->NLossRescued = b[10];
+    tot->NAdmitted = b[11];
+    tot->NAdmitTaken = b[12];
+    tot->NAdmitReceivers = b[13];
     MPI_Allreduce(&loc->ArenaPeakFrac, &tot->ArenaPeakFrac, 1, MPI_DOUBLE, MPI_MAX, Comm);
-    int64_t adm[3] = {loc->NAdmitted, loc->NAdmitTaken, loc->NAdmitReceivers}, admtot[3];
-    MPI_Allreduce(adm, admtot, 3, MPI_INT64, MPI_SUM, Comm);
-    tot->NAdmitted = admtot[0];
-    tot->NAdmitTaken = admtot[1];
-    tot->NAdmitReceivers = admtot[2];
     struct { double r; int rank; } in, out;
     int ThisTask;
     MPI_Comm_rank(Comm, &ThisTask);
