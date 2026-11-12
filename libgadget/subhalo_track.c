@@ -583,64 +583,164 @@ reassign_particles(int32_t * owner, int64_t start, int64_t n, int TracerTypes, c
     }
 }
 
+struct SerialAdmitTree {
+    const struct SubNode * nd;
+    int nn;
+};
+
 /* The admission map (the owner map's memory once the own sources are grouped): the receiver's node
  * of a particle admitted and not yet decided, ADM_TAKEN once its receiver bound it, -1 otherwise. */
 #define ADM_TAKEN INT32_MAX
 
+static subhalo_admit_hook AdmitHook = NULL;
+
+void
+subhalo_set_admit_hook(subhalo_admit_hook fn)
+{
+    AdmitHook = fn;
+}
+
+void
+subhalo_admit_report(MyIDType ID, int64_t Receiver, int source)
+{
+    if(!AdmitHook)
+        return;
+    /* keys run concurrently on threads */
+    #pragma omp critical(subhalo_admit_hook)
+    AdmitHook(ID, Receiver, source);
+}
+
 /* 1 if a is a proper ancestor of v in the processing tree. */
 static int
-proper_ancestor(const struct SubNode * nd, int a, int v)
+admit_ancestor(const struct SubhaloAdmitTree * at, int64_t a, int64_t v)
 {
-    int u;
-    for(u = nd[v].parent; u >= 0 && nd[u].depth >= nd[a].depth; u = nd[u].parent)
+    const int da = at->depth(at->t, a);
+    int64_t u;
+    for(u = at->parent(at->t, v); u >= 0 && at->depth(at->t, u) >= da; u = at->parent(at->t, u))
         if(u == a)
             return 1;
     return 0;
 }
 
-/* The receiver below A that the most of the k neighbours in row (the k + 1 nearest tracers, self
- * dropped by value wherever its tie order puts it) were bound to, if at least need of them; ties to
- * the deeper receiver, then the smaller TrackId. -1 if none. */
-static int
-admit_choice(const int64_t * row, int64_t self, int kk, int A, const struct SubNode * nd, int nn, int need)
+int64_t
+subhalo_admit_choice(const int64_t * btid, int kk, int64_t A, int need, const struct SubhaloAdmitTree * at)
 {
-    int lab[SUBHALO_KNN_MAXK];
-    int nl = 0, used = 0, c, a, b;
-    for(c = 0; c <= kk && used < kk; c++) {
-        const int64_t p = row[c];
-        if(p < 0 || p == self)
-            continue;
-        used++;
-        const int r = P[p].BoundTrackId >= 0 ? node_index(nd, nn, P[p].BoundTrackId) : -1;
-        if(r >= 0 && nd[r].admit_recv)
+    int64_t lab[SUBHALO_KNN_MAXK];
+    int nl = 0, c, a, b;
+    for(c = 0; c < kk; c++) {
+        const int64_t r = btid[c] >= 0 ? at->receiver(at->t, btid[c]) : -1;
+        if(r >= 0)
             lab[nl++] = r;
     }
-    int best = -1, bestv = 0;
+    int64_t best = -1;
+    int bestv = 0;
     for(a = 0; a < nl; a++) {
-        const int r = lab[a];
+        const int64_t r = lab[a];
         int votes = 0, seen = 0;
         for(b = 0; b < nl; b++)
             if(lab[b] == r) {
                 votes++;
                 seen |= b < a;
             }
-        if(seen || !proper_ancestor(nd, A, r))
+        if(seen || !admit_ancestor(at, A, r))
             continue;
-        if(best < 0 || votes > bestv || (votes == bestv && (nd[r].depth > nd[best].depth
-                                         || (nd[r].depth == nd[best].depth && nd[r].TrackId < nd[best].TrackId)))) {
-            best = r;
-            bestv = votes;
+        if(best >= 0 && votes == bestv) {
+            const int dr = at->depth(at->t, r), db = at->depth(at->t, best);
+            if(dr < db || (dr == db && at->trackid(at->t, r) > at->trackid(at->t, best)))
+                continue;
         }
+        else if(best >= 0 && votes < bestv)
+            continue;
+        best = r;
+        bestv = votes;
     }
     return bestv >= need ? best : -1;
+}
+
+/* The admission tree of a serial key: its nodes, receivers flagged by admit_recv. */
+static int64_t
+key_receiver(const void * t, int64_t TrackId)
+{
+    const struct SerialAdmitTree * kt = (const struct SerialAdmitTree *) t;
+    const int r = node_index(kt->nd, kt->nn, TrackId);
+    return r >= 0 && kt->nd[r].admit_recv ? r : -1;
+}
+static int64_t
+key_parent(const void * t, int64_t v)
+{
+    return ((const struct SerialAdmitTree *) t)->nd[v].parent;
+}
+static int
+key_depth(const void * t, int64_t v)
+{
+    return ((const struct SerialAdmitTree *) t)->nd[v].depth;
+}
+static int64_t
+key_trackid(const void * t, int64_t v)
+{
+    return ((const struct SerialAdmitTree *) t)->nd[v].TrackId;
+}
+
+/* The choice of a serial key from a row of the k + 1 nearest tracers (self dropped by value
+ * wherever its tie order puts it): the k others' previous tags. */
+static int
+admit_choice(const int64_t * row, int64_t self, int kk, int A, const struct SubhaloAdmitTree * at, int need)
+{
+    int64_t btid[SUBHALO_KNN_MAXK];
+    int used = 0, c;
+    for(c = 0; c <= kk && used < kk; c++) {
+        const int64_t p = row[c];
+        if(p < 0 || p == self)
+            continue;
+        btid[used++] = P[p].BoundTrackId;
+    }
+    for(c = used; c < kk; c++)
+        btid[c] = -1;
+    return (int) subhalo_admit_choice(btid, kk, A, need, at);
+}
+
+/* The admitted particles (owner map entries -2 - receiver) grouped by receiver in key order
+ * (adm_off, adm_n); the owner map becomes the admission map (receiver, -1 otherwise). */
+static int32_t *
+admit_lists(int32_t * owner, struct SubNode * nd, int nn, int64_t n, int64_t nadm, struct SubhaloArena * arena, int64_t g)
+{
+    int64_t i, o = 0;
+    int v;
+    for(i = 0; i < n; i++)
+        if(owner[i] <= -2)
+            nd[-2 - owner[i]].adm_n++;
+    for(v = 0; v < nn; v++) {
+        nd[v].adm_off = o;
+        o += nd[v].adm_n;
+        nd[v].adm_n = 0;
+    }
+    int32_t * al = (int32_t *) arena_need(arena, sizeof(int32_t) * (nadm + 1), g, "admission lists");
+    for(i = 0; i < n; i++) {
+        if(owner[i] <= -2) {
+            struct SubNode * r = &nd[-2 - owner[i]];
+            al[r->adm_off + r->adm_n++] = (int32_t) i;
+            owner[i] = -2 - owner[i];
+        }
+        else
+            owner[i] = -1;
+    }
+    return al;
+}
+
+static int
+cmp_admitrec_id(const void * a, const void * b)
+{
+    const struct SubhaloAdmitRec * x = (const struct SubhaloAdmitRec *) a, * y = (const struct SubhaloAdmitRec *) b;
+    return (x->ID > y->ID) - (x->ID < y->ID);
 }
 
 /* Admission by neighbour majority (SubhaloAdmitShare = s): a tracer owned by node A joins the source of
  * the receiver below A to which at least the share s of its k nearest owned tracers were bound at the
  * previous call (BoundTrackId, not yet rewritten). Receivers are the resolved members with a previous
- * bound set below the key's root. Admission needs the owner and the receiver in one key, so particles
- * of an in-place candidate are never admitted. Returns the count; the owner map becomes the admission
- * map and *admlist holds the admitted particles grouped by receiver (adm_off, adm_n), in key order. */
+ * bound set below the key's root. The vote of a whole key (a group or pseudo-key processed serially);
+ * an oversized group's is taken by the plan across ranks (plan_vote). Returns the count; the owner map
+ * becomes the admission map and *admlist holds the admitted particles grouped by receiver (adm_off,
+ * adm_n), in key order. */
 static int64_t
 admit_particles(int32_t * owner, struct SubNode * nd, int nn, int ci, int64_t start, int64_t n, int TracerTypes,
                 const struct SubhaloParams * sp, const struct SubhaloCallCtx * ctx, struct SubhaloArena * arena, int64_t g,
@@ -648,6 +748,8 @@ admit_particles(int32_t * owner, struct SubNode * nd, int nn, int ci, int64_t st
 {
     const int kk = sp->SubhaloNumNeighboursForReassignment;
     const int need = subhalo_admit_need(sp->SubhaloAdmitShare, kk);
+    const struct SerialAdmitTree st = {nd, nn};
+    const struct SubhaloAdmitTree at = {key_receiver, key_parent, key_depth, key_trackid, &st};
     int64_t i, nt = 0, nc = 0, nadm = 0;
     int v, u, nrecv = 0;
     for(v = 0; v < nn; v++)
@@ -693,15 +795,16 @@ admit_particles(int32_t * owner, struct SubNode * nd, int nn, int ci, int64_t st
             if(nb > subhalo_unbind_get_par_min() && !omp_in_parallel() && omp_get_max_threads() > 1) {
                 #pragma omp parallel for schedule(static)
                 for(a = 0; a < nb; a++)
-                    got[a] = admit_choice(out + a * kq, q[a], kk, owner[q[a] - start], nd, nn, need);
+                    got[a] = admit_choice(out + a * kq, q[a], kk, owner[q[a] - start], &at, need);
             }
             else
                 for(a = 0; a < nb; a++)
-                    got[a] = admit_choice(out + a * kq, q[a], kk, owner[q[a] - start], nd, nn, need);
+                    got[a] = admit_choice(out + a * kq, q[a], kk, owner[q[a] - start], &at, need);
             /* a decided candidate is never read again: its entry holds -2 - receiver */
             for(a = 0; a < nb; a++)
                 if(got[a] >= 0) {
                     owner[q[a] - start] = -2 - got[a];
+                    subhalo_admit_report(P[q[a]].ID, nd[got[a]].TrackId, SUBHALO_ADMIT_KEY);
                     nadm++;
                 }
             nb = 0;
@@ -710,26 +813,36 @@ admit_particles(int32_t * owner, struct SubNode * nd, int nn, int ci, int64_t st
     arena->used = mark;
     if(nadm == 0)
         return 0;
-    for(i = 0; i < n; i++)
-        if(owner[i] <= -2)
-            nd[-2 - owner[i]].adm_n++;
-    int64_t o = 0;
-    for(v = 0; v < nn; v++) {
-        nd[v].adm_off = o;
-        o += nd[v].adm_n;
-        nd[v].adm_n = 0;
-    }
-    int32_t * al = (int32_t *) arena_need(arena, sizeof(int32_t) * (nadm + 1), g, "admission lists");
+    *admlist = admit_lists(owner, nd, nn, n, nadm, arena, g);
+    return nadm;
+}
+
+/* The admission of a serial sub-tree key: the offers of its oversized group's vote, found by the
+ * mark in GrNr and the record of the particle's ID (the key's root receives too, from above it).
+ * Marks the owner map as admit_particles does and returns the count. */
+static int64_t
+admit_records(int32_t * owner, struct SubNode * nd, int nn, int64_t start, int64_t n, const struct SubhaloPlan * plan,
+              struct SubhaloArena * arena, int64_t g, int32_t ** admlist)
+{
+    int64_t i, nadm = 0;
     for(i = 0; i < n; i++) {
-        if(owner[i] <= -2) {
-            struct SubNode * r = &nd[-2 - owner[i]];
-            al[r->adm_off + r->adm_n++] = (int32_t) i;
-            owner[i] = -2 - owner[i];
-        }
-        else
-            owner[i] = -1;
+        const struct particle_data * p = &P[start + i];
+        if(!(p->GrNr < -1 && ((-(p->GrNr + 2)) & SUBHALO_KEY_OFFERBIT)))
+            continue;
+        struct SubhaloAdmitRec key;
+        key.ID = p->ID;
+        const struct SubhaloAdmitRec * rec = (const struct SubhaloAdmitRec *)
+            bsearch(&key, plan->AdmitRecs, plan->NAdmitRecs, sizeof(struct SubhaloAdmitRec), cmp_admitrec_id);
+        const int r = rec ? node_index(nd, nn, rec->Receiver) : -1;
+        if(r < 0)
+            endrun(5, "Sub-tree key %ld: offered particle %ld has no record or a receiver %ld outside the key.\n",
+                   g, (long) p->ID, rec ? rec->Receiver : -1L);
+        owner[i] = -2 - r;
+        nadm++;
     }
-    *admlist = al;
+    if(nadm == 0)
+        return 0;
+    *admlist = admit_lists(owner, nd, nn, n, nadm, arena, g);
     return nadm;
 }
 
@@ -923,7 +1036,11 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
      * map is not read again) */
     int32_t * adm = NULL, * admlist = NULL;
     if(sp->SubhaloAdmitShare > 0) {
-        ks.NAdmitted = admit_particles(owner, nd, nn, ci, start, n, TracerTypes, sp, ctx, arena, g, &admlist);
+        /* a sub-tree key takes its group's vote, taken across ranks by the plan */
+        if(subkey)
+            ks.NAdmitted = admit_records(owner, nd, nn, start, n, ctx->plan, arena, g, &admlist);
+        else
+            ks.NAdmitted = admit_particles(owner, nd, nn, ci, start, n, TracerTypes, sp, ctx, arena, g, &admlist);
         if(ks.NAdmitted > 0)
             adm = owner;
     }
@@ -1325,9 +1442,12 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
         if(subkey && v == ci)
             rootkeep = (int32_t) ntl;
     }
-    /* everything else in the key is untagged (swallowed particles keep their tags) */
+    /* everything else in the key is untagged (swallowed particles keep their tags); a guest its
+     * receiver did not take leaves with the tags it came with, its owner's */
     for(i = 0; i < n; i++) {
         if(tagnode[i] >= 0 || !part_live(&P[start + i]))
+            continue;
+        if(P[start + i].GrNr < -1 && ((-(P[start + i].GrNr + 2)) & SUBHALO_KEY_GUESTBIT))
             continue;
         P[start + i].TrackId = -1;
         P[start + i].BindRank = -1;

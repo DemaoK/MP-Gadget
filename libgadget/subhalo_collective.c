@@ -514,6 +514,277 @@ subhalo_collective_test_walk(DomainDecomp * ddecomp, const int32_t * label, int6
     myfree(C.cs);
 }
 
+/* ------------------------------------------------------------------ the k-nearest walk */
+
+typedef struct {
+    TreeWalkQueryBase base;
+    double H;                /* the search radius of this pass */
+    int32_t Label;           /* the query's label: only particles of the same label are neighbours */
+    int32_t Index;           /* the query particle on its home rank */
+} TreeWalkQueryKnn;
+
+typedef struct {
+    TreeWalkResultBase base;
+    int32_t n, pad;
+    struct SubhaloKnnHit h[];  /* k entries, sorted by (d2, ID) */
+} TreeWalkResultKnn;
+
+struct KnnWalkPriv {
+    const int32_t * label;
+    const int32_t * slot;    /* query slot of a local particle */
+    const double * H;
+    struct SubhaloKnnHit * hits;
+    int32_t * nhit;
+    int k;
+    double slack;
+};
+#define KNN_PRIV(tw) ((struct KnnWalkPriv *) ((tw)->priv))
+
+static inline int
+knn_hit_before(const struct SubhaloKnnHit * a, const struct SubhaloKnnHit * b)
+{
+    return a->d2 < b->d2 || (a->d2 == b->d2 && a->ID < b->ID);
+}
+
+/* Inserts e into the sorted list h[0..*n) of at most k entries; a particle met twice counts once. */
+static inline void
+knn_hit_insert(struct SubhaloKnnHit * h, int32_t * n, int k, const struct SubhaloKnnHit * e)
+{
+    int j;
+    if(*n == k && !knn_hit_before(e, &h[k - 1]))
+        return;
+    for(j = 0; j < *n; j++)
+        if(h[j].ID == e->ID)
+            return;
+    j = *n < k ? (*n)++ : k - 1;
+    while(j > 0 && knn_hit_before(e, &h[j - 1])) {
+        h[j] = h[j - 1];
+        j--;
+    }
+    h[j] = *e;
+}
+
+/* Lower bound of the periodic distance from q to the cube of node nop, less a slack that covers
+ * the rounding of the node geometry. */
+static inline double
+knn_cube_dist2(const struct NODE * nop, const double q[3], double BoxSize, double slack)
+{
+    double r2 = 0;
+    int d;
+    for(d = 0; d < 3; d++) {
+        const double g = fabs(NEAREST(nop->center[d] - q[d], BoxSize)) - 0.5 * nop->len - slack;
+        if(g > 0)
+            r2 += g * g;
+    }
+    return r2;
+}
+
+static void
+knn_fill(int i, TreeWalkQueryKnn * I, TreeWalk * tw)
+{
+    const struct KnnWalkPriv * pv = KNN_PRIV(tw);
+    I->H = pv->H[pv->slot[i]];
+    I->Label = pv->label[i];
+    I->Index = i;
+}
+
+static void
+knn_reduce(int i, TreeWalkResultKnn * O, enum TreeWalkReduceMode mode, TreeWalk * tw)
+{
+    struct KnnWalkPriv * pv = KNN_PRIV(tw);
+    const int32_t s = pv->slot[i];
+    int j;
+    (void) mode;
+    for(j = 0; j < O->n; j++)
+        knn_hit_insert(pv->hits + (int64_t) s * pv->k, &pv->nhit[s], pv->k, &O->h[j]);
+}
+
+/* The neighbours of one query within its radius H on this rank (the structure of coll_visit):
+ * nodes of other labels and nodes farther than H, or than the k-th found, are skipped. */
+static int
+knn_visit(TreeWalkQueryKnn * I, TreeWalkResultKnn * O, LocalTreeWalk * lv)
+{
+    const ForceTree * tree = lv->tw->tree;
+    const struct KnnWalkPriv * pv = KNN_PRIV(lv->tw);
+    const double BoxSize = tree->BoxSize;
+    const int k = pv->k, label = I->Label;
+    /* the query meets itself only on its home rank, in the primary walk */
+    const int self = lv->mode == TREEWALK_PRIMARY ? I->Index : -1;
+    const double * inpos = I->base.Pos;
+    const double H2 = I->H * I->H;
+    int64_t ninter = 0;
+    int listindex;
+    O->n = 0;
+    for(listindex = 0; listindex < NODELISTLENGTH; listindex++) {
+        int no = I->base.NodeList[listindex];
+        const int startno = no;
+        if(no < 0)
+            break;
+        while(no >= 0) {
+            const struct NODE * nop = &tree->Nodes[no];
+            if(lv->mode == TREEWALK_GHOSTS && nop->f.TopLevel && no != startno)
+                break;
+            const int nl = node_label(nop);
+            double lim2 = H2;
+            if(O->n == k && O->h[k - 1].d2 < lim2)
+                lim2 = O->h[k - 1].d2;
+            if(nl == -2 || (nl >= 0 && nl != label) || knn_cube_dist2(nop, inpos, BoxSize, pv->slack) > lim2) {
+                no = nop->sibling;
+                continue;
+            }
+            if(lv->mode == TREEWALK_TOPTREE) {
+                if(nop->f.ChildType == PSEUDO_NODE_TYPE) {
+                    if(-1 == treewalk_export_particle(lv, nop->s.suns[0]))
+                        return -1;
+                    no = nop->sibling;
+                    continue;
+                }
+                if(nop->f.TopLevel && !nop->f.InternalTopLevel) {
+                    no = nop->sibling;
+                    continue;
+                }
+                no = nop->s.suns[0];
+            }
+            else {
+                if(nop->f.ChildType == PARTICLE_NODE_TYPE) {
+                    int i;
+                    for(i = 0; i < nop->s.noccupied; i++) {
+                        const int pp = nop->s.suns[i];
+                        if(pp == self || pv->label[pp] != label)
+                            continue;
+                        struct SubhaloKnnHit e;
+                        e.d2 = subhalo_knn_r2(P[pp].Pos, inpos, BoxSize);
+                        e.ID = P[pp].ID;
+                        e.BoundTrackId = P[pp].BoundTrackId;
+                        knn_hit_insert(O->h, &O->n, k, &e);
+                        ninter++;
+                    }
+                    no = nop->sibling;
+                }
+                else if(nop->f.ChildType == PSEUDO_NODE_TYPE)
+                    no = nop->sibling;
+                else
+                    no = nop->s.suns[0];
+            }
+        }
+    }
+    treewalk_add_counters(lv, ninter);
+    return 1;
+}
+
+size_t
+subhalo_collective_knn_walk_bytes(int k)
+{
+    const size_t q = sizeof(TreeWalkQueryKnn), r = sizeof(TreeWalkResultKnn) + sizeof(struct SubhaloKnnHit) * (size_t) k;
+    const size_t bpb = sizeof(struct data_index) + q + r + (size_t) ceil(CollImportBufferBoost * (q + r));
+    const int64_t nthr = omp_get_max_threads();
+    const int64_t nbuf = 4096 * 10 + (4096 + 1 > 100 * nthr ? 4096 + 1 : 100 * nthr);
+    return (size_t) nbuf * bpb;
+}
+
+static int64_t KnnExportRounds = 0;
+
+int64_t
+subhalo_collective_knn_export_rounds(void)
+{
+    return KnnExportRounds;
+}
+
+int
+subhalo_collective_knn(DomainDecomp * ddecomp, const int32_t * label, const int * tl, int64_t nt,
+                       const int * ql, int64_t nq, int k, struct SubhaloKnnHit * hits, int32_t * nhit)
+{
+    const int64_t NumPart = PartManager->NumPart;
+    const double BoxSize = PartManager->BoxSize;
+    int64_t i;
+    if(k < 1 || k > SUBHALO_KNN_MAXK + 1)
+        endrun(1, "Subhalo k-nearest walk: k = %d outside [1, %d].\n", k, SUBHALO_KNN_MAXK + 1);
+    int32_t * slot = (int32_t *) mymalloc("SubKnnSlot", sizeof(int32_t) * (NumPart + 1));
+    double * H = (double *) mymalloc("SubKnnH", sizeof(double) * (nq + 1));
+    int * act = (int *) mymalloc("SubKnnActive", sizeof(int) * (nq + 1));
+    ActiveParticles ap;
+    memset(&ap, 0, sizeof(ap));
+    ap.ActiveParticle = (int *) tl;
+    ap.NumActiveParticle = nt;
+    ap.MaxActiveParticle = nt;
+    ap.Particles = PartManager->Base;
+    ForceTree tree;
+    memset(&tree, 0, sizeof(tree));
+    /* force_tree_build sizes its node block by NumPart: raised for the build only on a nearly empty
+     * rank, as in coll_walk */
+    {
+        const int nthr = omp_get_max_threads();
+        int ThisTask;
+        MPI_Comm_rank(MPI_COMM_WORLD, &ThisTask);
+        const int64_t nleaf = ddecomp->Tasks[ThisTask].EndLeaf - ddecomp->Tasks[ThisTask].StartLeaf;
+        int64_t need = 2048 + 512 * (int64_t) nthr + 4 * nleaf * nthr;
+        if(need > PartManager->MaxPart)
+            need = PartManager->MaxPart;
+        if(PartManager->NumPart < need)
+            PartManager->NumPart = need;
+    }
+    force_tree_active_moments(&tree, ddecomp, &ap, 0, 1, NULL);
+    PartManager->NumPart = NumPart;
+    label_tree(&tree, ddecomp, label, 0);
+    /* the first radius is the side of the query's tree leaf, doubled until the k-th neighbour lies
+     * strictly inside it, or until it exceeds the box (which then holds every nearest image) */
+    for(i = 0; i < nq; i++) {
+        const int f = force_get_father(ql[i], &tree);
+        H[i] = f >= tree.firstnode ? tree.Nodes[f].len : BoxSize / 64;
+        if(!(H[i] > 0))
+            H[i] = BoxSize / 64;
+        slot[ql[i]] = (int32_t) i;
+        act[i] = ql[i];
+    }
+    struct KnnWalkPriv pv;
+    pv.label = label;
+    pv.slot = slot;
+    pv.H = H;
+    pv.hits = hits;
+    pv.nhit = nhit;
+    pv.k = k;
+    pv.slack = 1e-9 * BoxSize;
+    TreeWalk tw[1];
+    memset(tw, 0, sizeof(tw));
+    tw->ev_label = "SUBHALO_KNN";
+    tw->type = TREEWALK_ACTIVE;
+    tw->visit = (TreeWalkVisitFunction) knn_visit;
+    tw->NoNgblist = 1;
+    tw->fill = (TreeWalkFillQueryFunction) knn_fill;
+    tw->reduce = (TreeWalkReduceResultFunction) knn_reduce;
+    tw->query_type_elsize = sizeof(TreeWalkQueryKnn);
+    tw->result_type_elsize = sizeof(TreeWalkResultKnn) + sizeof(struct SubhaloKnnHit) * (size_t) k;
+    tw->priv = &pv;
+    tw->tree = &tree;
+    int64_t na = nq, natot;
+    int npass = 0;
+    MPI_Allreduce(&na, &natot, 1, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
+    KnnExportRounds = 0;
+    while(natot > 0) {
+        for(i = 0; i < na; i++)
+            nhit[slot[act[i]]] = 0;
+        treewalk_run(tw, act, na);
+        KnnExportRounds += tw->Nexportfull;
+        npass++;
+        int64_t nn = 0;
+        for(i = 0; i < na; i++) {
+            const int32_t s = slot[act[i]];
+            const int32_t n = nhit[s];
+            if(H[s] > BoxSize || (n == k && hits[(int64_t) s * k + k - 1].d2 < H[s] * H[s]))
+                continue;
+            H[s] *= 2;
+            act[nn++] = act[i];
+        }
+        na = nn;
+        MPI_Allreduce(&na, &natot, 1, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
+    }
+    force_tree_free(&tree);
+    myfree(act);
+    myfree(H);
+    myfree(slot);
+    return npass;
+}
+
 /* ------------------------------------------------------------------ the unbinding loop */
 
 static inline int

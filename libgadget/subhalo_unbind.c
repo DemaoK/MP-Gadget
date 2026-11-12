@@ -1657,6 +1657,14 @@ subhalo_knn_build_count(void)
     return n;
 }
 
+/* The neighbour distance of every k-nearest search, one compiled copy: under -ffast-math an
+ * inlined copy could round differently in each caller, and the searches must agree bitwise. */
+double __attribute__((noinline))
+subhalo_knn_r2(const double x[3], const double y[3], double BoxSize)
+{
+    return pair_r2(x, y, BoxSize, 1);
+}
+
 /* Neighbour list of one query: sorted ascending by (d2, ID, P index), at most k entries. */
 struct KnnList {
     double d2[SUBHALO_KNN_MAXK + 1];
@@ -1731,7 +1739,7 @@ knn_rec(const struct SubhaloKnnTree * kt, int64_t n, const double q[3], const do
     if(t->sk[n].skip == n + 1) {
         int64_t j;
         for(j = t->sk[n].first; j < t->sk[n].first + t->sk[n].count; j++)
-            knn_insert(L, periodic_r2(t->src[j].x, qa, t->BoxSize), t->src[j].p);
+            knn_insert(L, subhalo_knn_r2(t->src[j].x, qa, t->BoxSize), t->src[j].p);
         return;
     }
     int64_t ch[8];

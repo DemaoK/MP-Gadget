@@ -68,6 +68,24 @@ const struct SubhaloCollectiveStats * subhalo_collective_last_stats(void);
 void subhalo_collective_run(struct SubhaloPlan * plan, struct SubhaloCallCtx * ctx, DomainDecomp * ddecomp,
                             struct SubTrackTable * tab, MPI_Comm Comm);
 
+/* One neighbour of a k-nearest search: squared distance (subhalo_knn_r2), ID and previous tag. */
+struct SubhaloKnnHit {
+    double d2;
+    MyIDType ID;
+    int64_t BoundTrackId;
+};
+/* The k nearest particles of tl[0..nt) with the query's label to each query ql[0..nq) (labels in
+ * label[], dense, below 2^24), the query itself excluded: hits[k q ..] sorted by (d2, ID), nhit[q]
+ * of them (fewer only when the label has fewer). Exact on any layout: the radius of a query doubles
+ * per pass until its k-th neighbour lies strictly inside. Needs a decomposed domain with every
+ * particle on its domain rank. Collective over MPI_COMM_WORLD; returns the number of passes. */
+int subhalo_collective_knn(DomainDecomp * ddecomp, const int32_t * label, const int * tl, int64_t nt,
+                           const int * ql, int64_t nq, int k, struct SubhaloKnnHit * hits, int32_t * nhit);
+/* Export rounds of the last subhalo_collective_knn on this rank, summed over its passes. */
+int64_t subhalo_collective_knn_export_rounds(void);
+/* Bytes treewalk.c reserves for one pass of that walk with k neighbours. */
+size_t subhalo_collective_knn_walk_bytes(int k);
+
 /* ---- test hooks ---- */
 /* The walk alone: out[i] = sum_j m_j W(r_ij, h) over the other live PotentialTypes particles of
  * label[i] in [0, nlabels), out[i] untouched for the others. Needs a decomposed domain. Collective. */

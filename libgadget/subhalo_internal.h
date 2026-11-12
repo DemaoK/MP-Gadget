@@ -336,6 +336,11 @@ struct SubhaloPlan {
     struct SubhaloCollAdmit Admit;          /* the admission of the collective stage */
     double PackFreeBytes;                   /* this rank: mymalloc_freebytes() at the last packing */
     int64_t ExchOut, ExchIn;                /* this rank: live particles sent and received by subhalo_plan_exchange */
+    /* the admission records of the serial sub-tree keys processed here, sorted by ID (top of the
+     * main stack, after the four above) */
+    struct SubhaloAdmitRec * AdmitRecs;
+    int64_t NAdmitRecs;
+    int VoteFailed;                         /* 1: the admission vote did not fit on some rank */
 };
 
 /* ---- the packing as a particle-free function (unit-testable with synthetic inputs) ---- */
@@ -533,6 +538,33 @@ struct SubhaloPlanSummary {
     int Admitted;                    /* 0: the collective admission failed (nothing encoded) */
 };
 const struct SubhaloPlanSummary * subhalo_plan_last_summary(void);
+/* A particle offered by the admission vote of an oversized key: its index in P, its receiver's and
+ * its owner's TrackIds. */
+struct SubhaloOffer {
+    int64_t index;
+    int64_t receiver;
+    int64_t owner;
+};
+/* The admission vote of the oversized keys in the last plan (sums over the ranks; zero without one). */
+struct SubhaloVoteStats {
+    int64_t NQueries;          /* tracers whose owner has a receiver below it */
+    int64_t NOffered;          /* of which offered to a receiver */
+    int64_t NOfferedInplace;   /* of which owned by an in-place candidate */
+    int64_t NServed;           /* of which taken to their receivers' serial sub-tree keys */
+    int64_t NGuests;           /* of which owned outside that key (they travel there) */
+    double Seconds;            /* wall time of the vote in all passes of the plan, the largest over the ranks */
+    double WorstShort;         /* the memory check: the largest shortfall over the ranks (> 0: the call fails) */
+    int WorstRank;
+    int Passes;                /* radius passes of the k-nearest walks */
+};
+/* The record of an offered particle on its sub-tree key's processing rank. */
+struct SubhaloAdmitRec {
+    MyIDType ID;
+    int64_t Receiver;
+};
+const struct SubhaloVoteStats * subhalo_plan_last_vote(void);
+/* Test hook: bytes added to every rank's need in the vote's memory check (0 by default). */
+void subhalo_plan_set_vote_extra_bytes(double bytes);
 /* Binary search of the member table, NULL if absent. */
 const struct SubhaloMember * subhalo_plan_member(const struct SubhaloPlan * plan, int64_t TrackId);
 /* The in-place key g in plan->Inplace, -1 if g is not in place. */
@@ -540,6 +572,10 @@ int64_t subhalo_plan_inplace_index(const struct SubhaloPlan * plan, int64_t g);
 /* The processing key of a particle after subhalo_plan_build: GrNr for a group particle, the
  * encoded key of a travelling field particle, -1 otherwise. */
 #define SUBHALO_KEY_FOFBIT (1LL << 52)
+/* Marks of an offered particle in its travelling GrNr, above the key bits (every decoder masks
+ * them): offered by its oversized key's admission vote; a guest, whose owner is outside the key. */
+#define SUBHALO_KEY_OFFERBIT (1LL << 53)
+#define SUBHALO_KEY_GUESTBIT (1LL << 54)
 static inline int64_t subhalo_particle_key(const struct particle_data * p) {
     if(p->GrNr >= 0) return p->GrNr;
     if(p->GrNr < -1) return (-(p->GrNr + 2)) & (SUBHALO_KEY_FOFBIT - 1);
@@ -692,6 +728,27 @@ void subhalo_orphan_lookup(struct SubTrackTable * tab, int SnapNum, double atime
 int subhalo_orphan_update(struct SubTrack * t, const struct SubhaloIdHit * hit, int n, const double Offset[3], double BoxSize, double vfac, int SnapNum);
 
 /* ------------------------------------------------------------------ per-key processing (subhalo_track.c) */
+
+/* The processing tree the admission's choice reads, whatever holds it (a serial key's nodes, the
+ * plan's member table): the receiver node of a previous tag (-1 if that track is no receiver of the
+ * tree), a node's parent (-1 at the root), depth and TrackId. */
+struct SubhaloAdmitTree {
+    int64_t (*receiver)(const void * t, int64_t TrackId);
+    int64_t (*parent)(const void * t, int64_t v);
+    int (*depth)(const void * t, int64_t v);
+    int64_t (*trackid)(const void * t, int64_t v);
+    const void * t;
+};
+/* The receiver below owner A that the most of the k neighbours' previous tags btid[0..k) name, if
+ * at least need of them; ties to the deeper receiver, then the smaller TrackId; -1 if none. The one
+ * choice of every admission vote, so that all of them decide alike. */
+int64_t subhalo_admit_choice(const int64_t * btid, int kk, int64_t A, int need, const struct SubhaloAdmitTree * at);
+/* Every offered pair (particle ID, receiver TrackId) of a vote, reported to an optional hook with its
+ * source: a serial key's vote or the plan's vote across ranks (diagnostics and tests; NULL: none). */
+enum { SUBHALO_ADMIT_KEY = 0, SUBHALO_ADMIT_PLAN = 1 };
+typedef void (*subhalo_admit_hook)(MyIDType ID, int64_t Receiver, int source);
+void subhalo_set_admit_hook(subhalo_admit_hook fn);
+void subhalo_admit_report(MyIDType ID, int64_t Receiver, int source);
 
 /* One record emitted by the key processing (one per member hosted by a serial key, resolved or
  * orphan, at most one newborn per key, one winner per in-place key on its deciding rank). */

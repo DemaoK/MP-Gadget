@@ -138,6 +138,9 @@ struct SubhaloKnnTree;
 struct SubhaloKnnTree * subhalo_knn_build(const int64_t * tr, int64_t nt, double BoxSize, struct SubhaloArena * arena);
 void subhalo_knn_query(const struct SubhaloKnnTree * t, const int64_t * query, int64_t nq, int k, int64_t * out);
 int64_t subhalo_knn_build_count(void);
+/* |NEAREST(x - y)|^2 with x the neighbour and y the query, absolute positions: the distance of
+ * every k-nearest search of the finder (not inlined, so that all of them round alike). */
+double subhalo_knn_r2(const double x[3], const double y[3], double BoxSize);
 void subhalo_knn_tracers(const int64_t * query, int64_t nq, const int64_t * tr, int64_t nt, int k,
                          int64_t * out, double BoxSize, struct SubhaloArena * arena);
 

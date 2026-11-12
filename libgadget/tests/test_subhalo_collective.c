@@ -28,6 +28,7 @@
 #include <cmocka.h>
 #include <math.h>
 #include <mpi.h>
+#include <omp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -3259,6 +3260,762 @@ test_collective_admission_props(void ** state)
     syn_teardown();
 }
 
+/* ---- the k-nearest walk across ranks against the per-key search ----
+ * Labelled sets: a lattice with distance ties and coincident pairs (label 0), a ball across the
+ * periodic boundary (1), a wide ball over several domains (2), a set of fewer than k (3), and a
+ * dense core inside a sparse halo (4). Every labelled particle queries its label. The reference is
+ * the per-key search (subhalo_knn_tracers over a label's particles gathered on every rank, k + 1
+ * nearest with the query dropped by value); the walk must return the same k neighbours with the
+ * same squared distances and previous tags, on any layout and export buffer. */
+#define KN_LAT 6
+#define KN_N0 (KN_LAT * KN_LAT * KN_LAT + 40)
+#define KN_N1 700
+#define KN_N2 1500
+#define KN_N3 7
+#define KN_N4 1200
+#define KN_END (KN_N0 + KN_N1 + KN_N2 + KN_N3 + KN_N4)
+
+static int
+kn_label(MyIDType id)
+{
+    if(id < KN_N0) return 0;
+    if(id < KN_N0 + KN_N1) return 1;
+    if(id < KN_N0 + KN_N1 + KN_N2) return 2;
+    if(id < KN_N0 + KN_N1 + KN_N2 + KN_N3) return 3;
+    if(id < KN_END) return 4;
+    return -1;
+}
+
+static void
+kn_particle(MyIDType id, double atime, struct SynPart * s, void * ud)
+{
+    const double zero[3] = {0, 0, 0};
+    const double c1[3] = {0.1, 300, 300}, c2[3] = {500, 500, 500}, c3[3] = {700, 200, 800}, c4[3] = {250, 750, 250};
+    (void) ud;
+    if(id >= KN_END)
+        return;
+    const int l = kn_label(id);
+    if(l == 0) {
+        /* a lattice of spacing 0.25 (exact in binary), the last 40 ids on lattice points */
+        const int64_t j = id < KN_LAT * KN_LAT * KN_LAT ? (int64_t) id : (int64_t) (id * 7) % (KN_LAT * KN_LAT * KN_LAT);
+        s->pos[0] = 100 + 0.25 * (j % KN_LAT);
+        s->pos[1] = 100 + 0.25 * ((j / KN_LAT) % KN_LAT);
+        s->pos[2] = 100 + 0.25 * (j / (KN_LAT * KN_LAT));
+    }
+    else if(l == 1)
+        syn_ball(id, 151, c1, 0.3, zero, 0, atime, s);
+    else if(l == 2)
+        syn_ball(id, 152, c2, 0.5 * 300 * atime, zero, 0, atime, s);
+    else if(l == 3)
+        syn_ball(id, 153, c3, 0.5, zero, 0, atime, s);
+    else {
+        syn_ball(id, 154, c4, (id % 5 == 0 ? 20.0 : 0.2) * atime, zero, 0, atime, s);
+    }
+    /* previous tags: a few tracks per label */
+    s->bound = (id % 3 == 0) ? -1 : 1000 + l * 10 + (int64_t) (id % 4);
+}
+
+struct KnPart {
+    MyIDType ID;
+    double Pos[3];
+    int64_t BoundTrackId;
+    int32_t label, pad;
+};
+
+static int
+cmp_knpart_id(const void * a, const void * b)
+{
+    const struct KnPart * x = a, * y = b;
+    return (x->ID > y->ID) - (x->ID < y->ID);
+}
+
+/* The walk on the current layout against the gathered per-key search; returns the mismatches. */
+static int64_t
+kn_check(int k, const char * what)
+{
+    DomainDecomp ddecomp = {0};
+    domain_decompose_full(&ddecomp, MPI_COMM_WORLD);
+    const int64_t n = PartManager->NumPart;
+    int32_t * label = malloc(sizeof(int32_t) * (n + 1));
+    int * ql = malloc(sizeof(int) * (n + 1));
+    int64_t i, nq = 0;
+    for(i = 0; i < n; i++) {
+        label[i] = kn_label(P[i].ID);
+        P[i].BoundTrackId = (P[i].ID % 3 == 0 || label[i] < 0) ? -1 : 1000 + label[i] * 10 + (int64_t) (P[i].ID % 4);
+        if(label[i] >= 0)
+            ql[nq++] = (int) i;
+    }
+    struct SubhaloKnnHit * hits = malloc(sizeof(struct SubhaloKnnHit) * (nq * k + 1));
+    int32_t * nhit = malloc(sizeof(int32_t) * (nq + 1));
+    const int npass = subhalo_collective_knn(&ddecomp, label, ql, nq, ql, nq, k, hits, nhit);
+    /* every labelled particle on every rank, sorted by ID */
+    const int NTask = get_ntask();
+    struct KnPart * loc = malloc(sizeof(struct KnPart) * (nq + 1));
+    for(i = 0; i < nq; i++) {
+        const int p = ql[i];
+        memset(&loc[i], 0, sizeof(loc[i]));
+        loc[i].ID = P[p].ID;
+        int d;
+        for(d = 0; d < 3; d++)
+            loc[i].Pos[d] = P[p].Pos[d];
+        loc[i].BoundTrackId = P[p].BoundTrackId;
+        loc[i].label = label[p];
+    }
+    int nb = nq * sizeof(struct KnPart);
+    int * counts = malloc(NTask * sizeof(int)), * displ = malloc(NTask * sizeof(int));
+    MPI_Allgather(&nb, 1, MPI_INT, counts, 1, MPI_INT, MPI_COMM_WORLD);
+    int64_t tot = 0;
+    int r;
+    for(r = 0; r < NTask; r++) {
+        displ[r] = (int) tot;
+        tot += counts[r];
+    }
+    struct KnPart * all = malloc(tot + sizeof(struct KnPart));
+    MPI_Allgatherv(loc, nb, MPI_BYTE, all, counts, displ, MPI_BYTE, MPI_COMM_WORLD);
+    const int64_t nall = tot / sizeof(struct KnPart);
+    qsort(all, nall, sizeof(struct KnPart), cmp_knpart_id);
+    /* the reference particles in a table of their own, searched by label as one serial key */
+    struct particle_data * saved = PartManager->Base;
+    const int64_t savedn = PartManager->NumPart;
+    struct particle_data * ref = calloc(nall + 1, sizeof(struct particle_data));
+    for(i = 0; i < nall; i++) {
+        ref[i].ID = all[i].ID;
+        ref[i].Type = 1;
+        ref[i].Mass = 1;
+        ref[i].BoundTrackId = all[i].BoundTrackId;
+        int d;
+        for(d = 0; d < 3; d++)
+            ref[i].Pos[d] = all[i].Pos[d];
+    }
+    int64_t * refout = malloc(sizeof(int64_t) * (nall * (k + 1) + 1));
+    int64_t * tr = malloc(sizeof(int64_t) * (nall + 1));
+    struct SubhaloArena arena;
+    arena.size = (size_t) 64 * 1024 * 1024;
+    arena.base = malloc(arena.size);
+    arena.used = arena.peak = 0;
+    PartManager->Base = ref;
+    PartManager->NumPart = nall;
+    int l;
+    for(l = 0; l < 5; l++) {
+        int64_t nt = 0;
+        for(i = 0; i < nall; i++)
+            if(all[i].label == l)
+                tr[nt++] = i;
+        /* rows of the label's particles, written at their table positions */
+        int64_t * out = malloc(sizeof(int64_t) * (nt * (k + 1) + 1));
+        subhalo_knn_tracers(tr, nt, tr, nt, k + 1, out, BOXSIZE, &arena);
+        int64_t a;
+        for(a = 0; a < nt; a++)
+            memcpy(refout + tr[a] * (k + 1), out + a * (k + 1), sizeof(int64_t) * (k + 1));
+        free(out);
+    }
+    int64_t bad = 0, nties = 0, nshort = 0;
+    for(i = 0; i < nq; i++) {
+        struct KnPart key;
+        key.ID = saved[ql[i]].ID;
+        const struct KnPart * f = bsearch(&key, all, nall, sizeof(struct KnPart), cmp_knpart_id);
+        const int64_t self = f - all;
+        int64_t row[SUBHALO_KNN_MAXK + 1];
+        int used = 0, c;
+        for(c = 0; c <= k && used < k; c++) {
+            const int64_t p = refout[self * (k + 1) + c];
+            if(p < 0 || p == self)
+                continue;
+            row[used++] = p;
+        }
+        if(used < k)
+            nshort++;
+        LOCAL_CHECK(bad, nhit[i] == used, "%s: particle %ld has %d neighbours from the walk, %d from the key\n",
+                    what, (long) key.ID, nhit[i], used);
+        for(c = 0; c < used && c < nhit[i]; c++) {
+            const struct SubhaloKnnHit * h = &hits[i * k + c];
+            const double d2 = subhalo_knn_r2(ref[row[c]].Pos, ref[self].Pos, BOXSIZE);
+            if(c > 0 && h->d2 == hits[i * k + c - 1].d2)
+                nties++;
+            LOCAL_CHECK(bad, h->ID == ref[row[c]].ID && h->d2 == d2 && h->BoundTrackId == ref[row[c]].BoundTrackId,
+                        "%s: particle %ld neighbour %d: walk %ld (%.17g) key %ld (%.17g)\n", what, (long) key.ID, c,
+                        (long) h->ID, h->d2, (long) ref[row[c]].ID, d2);
+        }
+    }
+    PartManager->Base = saved;
+    PartManager->NumPart = savedn;
+    int64_t g[4] = {bad, nties, nshort, nq}, gs[4], xr = subhalo_collective_knn_export_rounds(), xrmax;
+    MPI_Allreduce(g, gs, 4, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(&xr, &xrmax, 1, MPI_INT64, MPI_MAX, MPI_COMM_WORLD);
+    message(0, "k-nearest walk %s, k = %d: %ld queries, %d pass(es), %ld export rounds, %ld tied neighbours, %ld queries with fewer than k, %ld mismatches\n",
+            what, k, gs[3], npass, xrmax, gs[1], gs[2], gs[0]);
+    free(arena.base);
+    free(tr);
+    free(refout);
+    free(ref);
+    free(all);
+    free(displ);
+    free(counts);
+    free(loc);
+    free(nhit);
+    free(hits);
+    free(ql);
+    free(label);
+    domain_free(&ddecomp);
+    CHECK(gs[3] == KN_END && gs[1] > 0 && gs[2] == KN_N3, "%s: %ld queries, %ld ties, %ld short\n", what, gs[3], gs[1], gs[2]);
+    return gs[0];
+}
+
+static void
+test_collective_knn_identity(void ** state)
+{
+    Cosmology CP;
+    struct SubhaloParams sp = default_subhalo_params();
+    syn_setup(&CP, KN_END + SYN_NFIELD, sp);
+    syn_place(kn_particle, NULL, 0.55, 0);
+    assert_true(kn_check(10, "default buffer") == 0);
+    assert_true(kn_check(SUBHALO_KNN_MAXK, "default buffer") == 0);
+    /* about two hundred exports per thread and round (the treewalk needs 100) */
+    treewalk_set_max_export_buffer(12500 * omp_get_max_threads());
+    assert_true(kn_check(10, "small buffer") == 0);
+    treewalk_set_max_export_buffer(3584 * 1024 * 1024L);
+    syn_teardown();
+}
+
+/* ---- the admission vote of an oversized group against the vote of its serial key ----
+ * The hierarchy of test 2 (A central; B, C its satellites; D B's satellite; S, B's particles at A's
+ * centre) with SubhaloAdmitShare = 0.5: A's tracers among S vote for B. The group as one serial key
+ * (SubhaloCollectiveMinPart 0) and in place with serial sub-tree keys (1000) must offer the same
+ * pairs (particle, receiver): the per-key vote of the first, the plan's vote across ranks of the
+ * second. */
+struct AdmPair {
+    MyIDType ID;
+    int64_t Receiver;
+    int32_t source, pad;
+};
+static struct AdmPair * AvPairs = NULL;
+static int64_t AvN = 0, AvMax = 0;
+
+static void
+av_hook(MyIDType ID, int64_t Receiver, int source)
+{
+    if(AvN == AvMax) {
+        AvMax = 2 * AvMax + 64;
+        AvPairs = realloc(AvPairs, sizeof(struct AdmPair) * AvMax);
+    }
+    AvPairs[AvN].ID = ID;
+    AvPairs[AvN].Receiver = Receiver;
+    AvPairs[AvN].source = source;
+    AvPairs[AvN].pad = 0;
+    AvN++;
+}
+
+static int
+cmp_admpair(const void * a, const void * b)
+{
+    const struct AdmPair * x = a, * y = b;
+    if(x->source != y->source) return (x->source > y->source) - (x->source < y->source);
+    if(x->ID != y->ID) return (x->ID > y->ID) - (x->ID < y->ID);
+    return (x->Receiver > y->Receiver) - (x->Receiver < y->Receiver);
+}
+
+/* Every rank's pairs of one source, on every rank, sorted by ID. */
+static struct AdmPair *
+av_gather(int source, int64_t * n)
+{
+    const int NTask = get_ntask();
+    int64_t i, m = 0;
+    for(i = 0; i < AvN; i++)
+        if(AvPairs[i].source == source)
+            m++;
+    struct AdmPair * loc = malloc(sizeof(struct AdmPair) * (m + 1));
+    m = 0;
+    for(i = 0; i < AvN; i++)
+        if(AvPairs[i].source == source)
+            loc[m++] = AvPairs[i];
+    int nb = m * sizeof(struct AdmPair);
+    int * counts = malloc(NTask * sizeof(int)), * displ = malloc(NTask * sizeof(int));
+    MPI_Allgather(&nb, 1, MPI_INT, counts, 1, MPI_INT, MPI_COMM_WORLD);
+    int64_t tot = 0;
+    int r;
+    for(r = 0; r < NTask; r++) {
+        displ[r] = (int) tot;
+        tot += counts[r];
+    }
+    struct AdmPair * all = malloc(tot + sizeof(struct AdmPair));
+    MPI_Allgatherv(loc, nb, MPI_BYTE, all, counts, displ, MPI_BYTE, MPI_COMM_WORLD);
+    *n = tot / sizeof(struct AdmPair);
+    qsort(all, *n, sizeof(struct AdmPair), cmp_admpair);
+    free(displ);
+    free(counts);
+    free(loc);
+    return all;
+}
+
+static void
+av_run(int64_t collective, double share, struct Outcome * o)
+{
+    Cosmology CP;
+    struct SubhaloParams sp = default_subhalo_params();
+    sp.SubhaloFieldSO = 1;
+    sp.SubhaloPotentialSampleSize = 0;
+    sp.SubhaloTreeOpenAngle = COLL_TEST_THETA;
+    sp.SubhaloCollectiveMinPart = collective;
+    sp.SubhaloAdmitShare = share;
+    syn_setup(&CP, ST_END + SYN_NFIELD, sp);
+    struct SubTrack recs[4];
+    recs[0] = syn_rec(0, 2000, 0.2, -1, 0, 0, 0);
+    recs[1] = syn_rec(1, 360, 0.036, 0, 0, 1, 1);
+    recs[2] = syn_rec(2, 200, 0.02, 0, 0, 2, 1);
+    recs[3] = syn_rec(3, 100, 0.01, 1, 0, 3, 2);
+    syn_records(recs, 4);
+    syn_place(st_particle, NULL, 0.55, 1);
+    AvN = 0;
+    subhalo_set_admit_hook(av_hook);
+    int64_t ng;
+    const int ret = run_finder_call(1, &CP, &ng);
+    subhalo_set_admit_hook(NULL);
+    CHECK(ret == 1 && ng == 1, "admission vote: %ld groups\n", ng);
+    if(o)
+        outcome_take(o);
+    syn_teardown();
+}
+
+static void
+test_collective_vote_identity(void ** state)
+{
+    int64_t ns, np, nk, i;
+    av_run(0, 0.5, NULL);
+    struct AdmPair * ser = av_gather(SUBHALO_ADMIT_KEY, &ns);
+    av_run(1000, 0.5, NULL);
+    struct AdmPair * pl = av_gather(SUBHALO_ADMIT_PLAN, &np);
+    struct AdmPair * sub = av_gather(SUBHALO_ADMIT_KEY, &nk);
+    const struct SubhaloVoteStats * vs = subhalo_plan_last_vote();
+    int64_t bad = 0, toB = 0;
+    for(i = 0; i < ns && i < np; i++) {
+        LOCAL_CHECK(bad, ser[i].ID == pl[i].ID && ser[i].Receiver == pl[i].Receiver,
+                    "admission vote: pair %ld: serial (%ld, %ld) plan (%ld, %ld)\n", i, (long) ser[i].ID, ser[i].Receiver,
+                    (long) pl[i].ID, pl[i].Receiver);
+        toB += ser[i].Receiver == 1;
+    }
+    message(0, "admission vote: %ld pairs from the serial key (%ld to B), %ld from the plan's vote (%ld queried, %ld by in-place owners, "
+               "%d passes), %ld from the sub-tree keys' own votes; %ld mismatches\n",
+            ns, toB, np, vs->NQueries, vs->NOfferedInplace, vs->Passes, nk, bad);
+    CHECK(ns == np && bad == 0 && ns > 0 && vs->NOffered == np, "admission vote: %ld serial, %ld plan pairs, %ld mismatches\n", ns, np, bad);
+    free(sub);
+    free(pl);
+    free(ser);
+    free(AvPairs);
+    AvPairs = NULL;
+    AvN = AvMax = 0;
+}
+
+/* ---- what the receivers of an oversized group do with the offered particles ----
+ * A (0, 2000 particles) the central, B (1, 300) a dense satellite 1.5 kpc from A's centre: A's
+ * tracers inside B vote for B. Three cases: B at rest in A's frame binds the A particles offered
+ * (taken), B at 300 km/s binds none of them (unbound), B with a 2000 km/s dispersion dies (dead).
+ * Each case runs as one serial key (SubhaloCollectiveMinPart 0) and in place with B in a serial
+ * sub-tree key (1000), with the rule on and off. */
+#define TK_B0 2000
+#define TK_END 2300
+enum { TK_TAKEN = 0, TK_UNBOUND, TK_DEAD };
+
+static void
+tk_particle(MyIDType id, double atime, struct SynPart * s, void * ud)
+{
+    const int c = *(const int *) ud;
+    const double cA[3] = {500, 500, 500}, cB[3] = {500 + 1.5 / atime, 500, 500};
+    const double zero[3] = {0, 0, 0}, vfast[3] = {0, 300, 0};
+    if(id >= TK_END)
+        return;
+    if(id < TK_B0) {
+        syn_ball(id, 71, cA, 3.0, zero, 20, atime, s);
+        s->tag = s->bound = 0;
+        s->rank = id;
+    }
+    else {
+        syn_ball(id, 72, cB, 0.6, c == TK_UNBOUND ? vfast : zero, c == TK_DEAD ? 2000 : 8, atime, s);
+        s->tag = s->bound = 1;
+        s->rank = id - TK_B0;
+    }
+}
+
+/* The tags after the serial stage, before the in-place final tag pass rewrites the oversized key's. */
+static struct tagrec * TkPre = NULL;
+static int64_t TkPreN = 0;
+
+static void
+tk_pretag(const struct SubhaloCallCtx * ctx, const struct SubhaloPlan * plan)
+{
+    (void) ctx;
+    (void) plan;
+    TkPre = gather_tags(&TkPreN);
+}
+
+static void
+tk_run(int64_t collective, double share, int c, struct Outcome * o)
+{
+    Cosmology CP;
+    struct SubhaloParams sp = default_subhalo_params();
+    sp.SubhaloFieldSO = 1;
+    sp.SubhaloPotentialSampleSize = 0;
+    sp.SubhaloTreeOpenAngle = COLL_TEST_THETA;
+    sp.SubhaloCollectiveMinPart = collective;
+    sp.SubhaloAdmitShare = share;
+    syn_setup(&CP, TK_END + SYN_NFIELD, sp);
+    struct SubTrack recs[2];
+    recs[0] = syn_rec(0, 2000, 0.2, -1, 0, 0, 0);
+    recs[1] = syn_rec(1, 300, 0.03, 0, 0, 1, 1);
+    syn_records(recs, 2);
+    syn_place(tk_particle, &c, 0.55, 1);
+    AvN = 0;
+    subhalo_set_admit_hook(av_hook);
+    subhalo_collective_set_pretag_hook(tk_pretag);
+    int64_t ng;
+    const int ret = run_finder_call(1, &CP, &ng);
+    subhalo_collective_set_pretag_hook(NULL);
+    subhalo_set_admit_hook(NULL);
+    CHECK(ret == 1 && ng == 1, "offered particles: %ld groups\n", ng);
+    outcome_take(o);
+    syn_teardown();
+}
+
+/* Particles whose tags or GrNr differ between two outcomes of the same particles. */
+static int64_t
+tk_tag_diff(const struct Outcome * a, const struct Outcome * b)
+{
+    int64_t i, nd = 0;
+    if(a->n != b->n)
+        return -1;
+    for(i = 0; i < a->n; i++)
+        nd += a->r[i].ID != b->r[i].ID || a->r[i].TrackId != b->r[i].TrackId || a->r[i].BoundTrackId != b->r[i].BoundTrackId
+              || a->r[i].BindRank != b->r[i].BindRank || a->r[i].GrNr != b->r[i].GrNr;
+    return nd;
+}
+
+/* Particles bound to track T in one outcome and not in the other. */
+static int64_t
+tk_bound_diff(const struct Outcome * a, const struct Outcome * b, int64_t T)
+{
+    int64_t i, nd = 0;
+    for(i = 0; i < a->n && i < b->n; i++)
+        nd += (a->r[i].BoundTrackId == T) != (b->r[i].BoundTrackId == T);
+    return nd;
+}
+
+/* Offered particles (pairs) tagged and bound to their receiver in an outcome. */
+static int64_t
+tk_taken(const struct Outcome * o, const struct AdmPair * pr, int64_t np)
+{
+    int64_t i, n = 0;
+    for(i = 0; i < np; i++) {
+        struct tagrec key;
+        key.ID = pr[i].ID;
+        const struct tagrec * t = bsearch(&key, o->r, o->n, sizeof(struct tagrec), cmp_tagrec_id);
+        n += t && t->TrackId == pr[i].Receiver && t->BoundTrackId == pr[i].Receiver;
+    }
+    return n;
+}
+
+static void
+test_collective_vote_receivers(void ** state)
+{
+    const char * name[3] = {"taken", "unbound", "dead"};
+    int c;
+    for(c = 0; c < 3; c++) {
+        struct Outcome son, soff, fon, foff;
+        int64_t ns, np, i;
+        tk_run(0, 0.5, c, &son);
+        struct AdmPair * ser = av_gather(SUBHALO_ADMIT_KEY, &ns);
+        tk_run(1000, 0.5, c, &fon);
+        struct tagrec * preon = TkPre;
+        const int64_t npreon = TkPreN;
+        TkPre = NULL;
+        struct AdmPair * pl = av_gather(SUBHALO_ADMIT_PLAN, &np);
+        const struct SubhaloVoteStats vs = *subhalo_plan_last_vote();
+        tk_run(0, 0, c, &soff);
+        tk_run(1000, 0, c, &foff);
+        struct tagrec * preoff = TkPre;
+        const int64_t npreoff = TkPreN;
+        TkPre = NULL;
+        /* the tags the serial stage leaves for the rounds */
+        int64_t tdP = npreon == npreoff && preon && preoff ? 0 : -1;
+        for(i = 0; tdP >= 0 && i < npreon; i++)
+            tdP += preon[i].ID != preoff[i].ID || preon[i].TrackId != preoff[i].TrackId || preon[i].BoundTrackId != preoff[i].BoundTrackId
+                   || preon[i].BindRank != preoff[i].BindRank || preon[i].GrNr != preoff[i].GrNr;
+        int64_t bad = 0;
+        for(i = 0; i < ns && i < np; i++)
+            bad += ser[i].ID != pl[i].ID || ser[i].Receiver != pl[i].Receiver;
+        const int64_t tser = tk_taken(&son, ser, ns), tpl = tk_taken(&fon, pl, np);
+        const int64_t dOff = tk_bound_diff(&soff, &foff, 1), dOn = tk_bound_diff(&son, &fon, 1);
+        const int64_t tdF = tk_tag_diff(&fon, &foff), tdS = tk_tag_diff(&son, &soff);
+        message(0, "offered particles (%s): %ld pairs serial, %ld plan (%ld guests, %ld mismatches); taken %ld serial, %ld in place; "
+                   "B's bound set: serial vs in place %ld differ with the rule, %ld without; Nbound(B) %d / %d; "
+                   "particles whose tags differ from the rule-off run: %ld in place, %ld serial\n",
+                name[c], ns, np, vs.NGuests, bad, tser, tpl, dOn, dOff, son.rec[1].Nbound, fon.rec[1].Nbound, tdF, tdS);
+        CHECK(ns == np && bad == 0 && ns > 0 && vs.NGuests == np, "offered particles (%s): %ld serial, %ld plan pairs, %ld mismatches\n",
+              name[c], ns, np, bad);
+        CHECK(p2_check_tags(fon.r, fon.n, fon.rec, fon.nt, "offered particles") == 0, "offered particles: tag invariants\n");
+        if(c == TK_TAKEN) {
+            /* the satellite of the sub-tree key equals the serial one exactly when it does without the rule */
+            CHECK(tser > 0 && tser == tpl && (dOff > 0 || dOn == 0) && son.rec[1].Nbound == fon.rec[1].Nbound,
+                  "offered particles (taken): taken %ld / %ld, bound sets differ by %ld (rule off %ld)\n", tser, tpl, dOn, dOff);
+        }
+        else {
+            /* nothing taken: every tag and GrNr as with the rule off, in either mode */
+            message(0, "offered particles (%s): %ld particles whose tags differ from the rule-off run before the final tag pass\n", name[c], tdP);
+            CHECK(tser == 0 && tpl == 0 && tdF == 0 && tdS == 0 && tdP == 0, "offered particles (%s): taken %ld / %ld, %ld / %ld / %ld tags differ\n",
+                  name[c], tser, tpl, tdF, tdS, tdP);
+            for(i = 0; i < fon.nt && i < foff.nt; i++)
+                CHECK(fon.rec[i].Nbound == foff.rec[i].Nbound && fon.rec[i].Mbound == foff.rec[i].Mbound,
+                      "offered particles (%s): track %ld Nbound %d / %d\n", name[c], i, fon.rec[i].Nbound, foff.rec[i].Nbound);
+        }
+        free(pl);
+        free(ser);
+        free(preoff);
+        free(preon);
+        outcome_free(&foff);
+        outcome_free(&soff);
+        outcome_free(&fon);
+        outcome_free(&son);
+    }
+    free(AvPairs);
+    AvPairs = NULL;
+    AvN = AvMax = 0;
+}
+
+/* ---- the plan's handling of the vote, on the hierarchy of the receivers test (taken case) ----
+ * Offered particles are counted in their receiver's sub-tree key; a sub-tree key they push over
+ * SubhaloCollectiveMinPart goes in place (its receiver then takes none in a serial key); a forced
+ * exchange failure, and a vote that does not fit in memory, leave every tag and GrNr as they were;
+ * with the rule off the plan takes no vote. */
+static int64_t TkKeyLen = -1;
+
+static void
+tp_keylen(const struct SubhaloCallCtx * ctx, const struct SubhaloPlan * plan)
+{
+    int64_t j, len = -1;
+    (void) ctx;
+    for(j = 0; j < plan->NLocalKeys; j++)
+        if(plan->LocalKeys[j].g == plan->SubKeyBase && plan->LocalKeys[j].Length > len)
+            len = plan->LocalKeys[j].Length;
+    MPI_Allreduce(&len, &TkKeyLen, 1, MPI_INT64, MPI_MAX, MPI_COMM_WORLD);
+}
+
+struct TpCall {
+    int ret;
+    int complete;
+    int64_t nchanged;        /* particles whose tags or GrNr the call changed */
+    int64_t keylen;          /* the length of the first sub-tree key (-1 without one) */
+    int64_t ncands;
+    struct SubhaloVoteStats vs;
+    struct SubTrack recB;
+};
+
+static void
+tp_call(int64_t collective, double share, int fail, struct TpCall * out)
+{
+    Cosmology CP;
+    struct SubhaloParams sp = default_subhalo_params();
+    sp.SubhaloFieldSO = 1;
+    sp.SubhaloPotentialSampleSize = 0;
+    sp.SubhaloTreeOpenAngle = COLL_TEST_THETA;
+    sp.SubhaloCollectiveMinPart = collective;
+    sp.SubhaloAdmitShare = share;
+    sp.SubhaloDebugForceExchangeFailure = fail;
+    syn_setup(&CP, TK_END + SYN_NFIELD, sp);
+    struct SubTrack recs[2];
+    recs[0] = syn_rec(0, 2000, 0.2, -1, 0, 0, 0);
+    recs[1] = syn_rec(1, 300, 0.03, 0, 0, 1, 1);
+    syn_records(recs, 2);
+    int c = TK_TAKEN;
+    syn_place(tk_particle, &c, 0.55, 1);
+    struct FailSnap pre = {NULL, 0};
+    int64_t ng;
+    TkKeyLen = -1;
+    subhalo_collective_set_pretag_hook(tp_keylen);
+    out->ret = run_finder_call_ex(1, &CP, &ng, fail_pre, NULL, &pre);
+    subhalo_collective_set_pretag_hook(NULL);
+    out->complete = subhalo_last_call_complete();
+    out->keylen = TkKeyLen;
+    out->ncands = subhalo_plan_last_summary()->NCands;
+    out->vs = *subhalo_plan_last_vote();
+    int64_t n, i;
+    struct tagrec * post = gather_tags(&n);
+    out->nchanged = n == pre.n ? 0 : -1;
+    for(i = 0; out->nchanged >= 0 && i < n; i++)
+        out->nchanged += post[i].ID != pre.r[i].ID || post[i].GrNr != pre.r[i].GrNr || post[i].TrackId != pre.r[i].TrackId
+                         || post[i].BindRank != pre.r[i].BindRank || post[i].BoundTrackId != pre.r[i].BoundTrackId;
+    struct SubTrack * after = fetch_all_tracks(2);
+    out->recB = after[1];
+    free(after);
+    free(post);
+    free(pre.r);
+    syn_teardown();
+}
+
+static void
+test_collective_vote_plan(void ** state)
+{
+    struct TpCall on, off, prom, promoff, xf, mem;
+    tp_call(1000, 0.5, 0, &on);
+    tp_call(1000, 0, 0, &off);
+    message(0, "vote plan: sub-tree key of %ld particles with the rule (%ld offered, %ld guests), %ld without; "
+               "rule off: %ld queries, %d passes\n", on.keylen, on.vs.NOffered, on.vs.NGuests, off.keylen, off.vs.NQueries, off.vs.Passes);
+    CHECK(on.ret == 1 && off.ret == 1 && on.vs.NGuests > 0 && on.keylen - off.keylen == on.vs.NGuests,
+          "vote plan: key length %ld / %ld, %ld guests\n", on.keylen, off.keylen, on.vs.NGuests);
+    CHECK(off.vs.NQueries == 0 && off.vs.Passes == 0 && off.vs.NOffered == 0, "vote plan: a vote with the rule off\n");
+    /* B's key holds 300 of its own and 49 guests: at 320 it goes in place with the rule only */
+    tp_call(320, 0.5, 0, &prom);
+    tp_call(320, 0, 0, &promoff);
+    message(0, "vote plan, knob 320: %ld candidates with the rule (B flags %d, %ld offered, %ld taken to sub-tree keys), %ld without (B flags %d)\n",
+            prom.ncands, prom.recB.Flags, prom.vs.NOffered, prom.vs.NServed, promoff.ncands, promoff.recB.Flags);
+    CHECK(prom.ret == 1 && prom.ncands == 2 && (prom.recB.Flags & SUBHALO_FLAG_INPLACE) && prom.vs.NOffered == on.vs.NOffered
+          && prom.vs.NServed == 0 && promoff.ncands == 1 && !(promoff.recB.Flags & SUBHALO_FLAG_INPLACE),
+          "vote plan: promotion by guests (%ld / %ld candidates)\n", prom.ncands, promoff.ncands);
+    /* a forced exchange failure after the vote and the encoding */
+    tp_call(1000, 0.5, 1, &xf);
+    CHECK(xf.ret == 0 && !xf.complete && xf.nchanged == 0 && xf.vs.NServed > 0,
+          "vote plan: exchange failure ret %d, %ld particles changed\n", xf.ret, xf.nchanged);
+    /* a vote that does not fit: the call fails before the exchange */
+    subhalo_plan_set_vote_extra_bytes(1e18);
+    tp_call(1000, 0.5, 0, &mem);
+    subhalo_plan_set_vote_extra_bytes(0);
+    message(0, "vote plan: memory check short by %g MB on rank %d: ret %d, %ld particles changed\n", mem.vs.WorstShort / 1048576.,
+            mem.vs.WorstRank, mem.ret, mem.nchanged);
+    CHECK(mem.ret == 0 && !mem.complete && mem.nchanged == 0 && mem.vs.WorstShort > 0 && mem.vs.NQueries == 0,
+          "vote plan: memory failure ret %d\n", mem.ret);
+}
+
+/* ---- a majority among a sub-tree's own tracers that is not one among its group's ----
+ * A's 2000 particles and a dense core of 2000 more at X, B (1, 300) 1.5 kpc away with 30 of its
+ * particles spread around X, D (2, 30) B's satellite at X. Among B's and D's tracers alone most of
+ * the strays at X have a majority of D-bound neighbours; among the group's, A's core outvotes
+ * them. Nothing may be offered to D, in either mode. */
+#define SM_C0 2000
+#define SM_B0 4000
+#define SM_S0 4300
+#define SM_D0 4330
+#define SM_END 4360
+
+static void
+sm_particle(MyIDType id, double atime, struct SynPart * s, void * ud)
+{
+    const double cA[3] = {500, 500, 500}, X[3] = {500 - 1.0 / atime, 500, 500}, cB[3] = {500 + 1.5 / atime, 500, 500};
+    const double zero[3] = {0, 0, 0};
+    (void) ud;
+    if(id >= SM_END)
+        return;
+    if(id < SM_C0) {
+        syn_ball(id, 81, cA, 3.0, zero, 20, atime, s);
+        s->tag = s->bound = 0;
+        s->rank = id;
+    }
+    else if(id < SM_B0) {
+        syn_ball(id, 82, X, 0.3, zero, 20, atime, s);
+        s->tag = s->bound = 0;
+        s->rank = id;
+    }
+    else if(id < SM_D0) {
+        syn_ball(id, 83, id < SM_S0 ? cB : X, id < SM_S0 ? 0.6 : 0.2, zero, 8, atime, s);
+        s->tag = s->bound = 1;
+        s->rank = id - SM_B0;
+    }
+    else {
+        syn_ball(id, 84, X, 0.15, zero, 3, atime, s);
+        s->tag = s->bound = 2;
+        s->rank = id - SM_D0;
+    }
+}
+
+static void
+sm_run(int64_t collective, struct Outcome * o)
+{
+    Cosmology CP;
+    struct SubhaloParams sp = default_subhalo_params();
+    sp.SubhaloFieldSO = 1;
+    sp.SubhaloPotentialSampleSize = 0;
+    sp.SubhaloTreeOpenAngle = COLL_TEST_THETA;
+    sp.SubhaloCollectiveMinPart = collective;
+    sp.SubhaloAdmitShare = 0.5;
+    syn_setup(&CP, SM_END + SYN_NFIELD, sp);
+    struct SubTrack recs[3];
+    recs[0] = syn_rec(0, 4000, 0.4, -1, 0, 0, 0);
+    recs[1] = syn_rec(1, 330, 0.033, 0, 0, 1, 1);
+    recs[2] = syn_rec(2, 30, 0.003, 1, 0, 2, 2);
+    syn_records(recs, 3);
+    syn_place(sm_particle, NULL, 0.55, 1);
+    AvN = 0;
+    subhalo_set_admit_hook(av_hook);
+    int64_t ng;
+    const int ret = run_finder_call(1, &CP, &ng);
+    subhalo_set_admit_hook(NULL);
+    CHECK(ret == 1 && ng == 1, "sub-tree majority: %ld groups\n", ng);
+    outcome_take(o);
+    syn_teardown();
+}
+
+static void
+test_collective_vote_subtree_majority(void ** state)
+{
+    struct Outcome ser, inp;
+    int64_t ns, np, nk, i, j;
+    sm_run(0, &ser);
+    struct AdmPair * sp0 = av_gather(SUBHALO_ADMIT_KEY, &ns);
+    sm_run(1000, &inp);
+    struct AdmPair * pl = av_gather(SUBHALO_ADMIT_PLAN, &np);
+    struct AdmPair * sk = av_gather(SUBHALO_ADMIT_KEY, &nk);
+    /* the vote among B's and D's tracers alone, by brute force on the input tags */
+    const int kk = default_subhalo_params().SubhaloNumNeighboursForReassignment;
+    const int need = subhalo_admit_need(0.5, kk);
+    int64_t nsub = 0;
+    for(i = 0; i < ser.n; i++) {
+        if(ser.r[i].ID < SM_S0 || ser.r[i].ID >= SM_D0)
+            continue;
+        double d2[SUBHALO_KNN_MAXK];
+        int isD[SUBHALO_KNN_MAXK], m = 0, a;
+        for(j = 0; j < ser.n; j++) {
+            if(j == i || ser.r[j].ID < SM_B0 || ser.r[j].ID >= SM_END)
+                continue;
+            double r2 = 0;
+            int d;
+            for(d = 0; d < 3; d++) {
+                const double x = NEAREST(ser.r[j].Pos[d] - ser.r[i].Pos[d], BOXSIZE);
+                r2 += x * x;
+            }
+            if(m == kk && r2 >= d2[kk - 1])
+                continue;
+            a = m < kk ? m++ : kk - 1;
+            while(a > 0 && d2[a - 1] > r2) {
+                d2[a] = d2[a - 1];
+                isD[a] = isD[a - 1];
+                a--;
+            }
+            d2[a] = r2;
+            isD[a] = ser.r[j].ID >= SM_D0;
+        }
+        int votes = 0;
+        for(a = 0; a < m; a++)
+            votes += isD[a];
+        nsub += votes >= need;
+    }
+    int64_t toDs = 0, toDp = 0;
+    for(i = 0; i < ns; i++)
+        toDs += sp0[i].Receiver == 2;
+    for(i = 0; i < np; i++)
+        toDp += pl[i].Receiver == 2;
+    message(0, "sub-tree majority: %ld of B's strays have a D majority among B's and D's tracers; offered to D: %ld serial, %ld in place; "
+               "%ld / %ld pairs, %ld from the sub-tree keys' own votes; D bound %d / %d\n", nsub, toDs, toDp, ns, np, nk,
+            ser.rec[2].Nbound, inp.rec[2].Nbound);
+    CHECK(nsub > 0 && toDs == 0 && toDp == 0 && nk == 0 && ns == np, "sub-tree majority: %ld strays, %ld / %ld offered to D, %ld key pairs\n",
+          nsub, toDs, toDp, nk);
+    for(i = 0; i < ns && i < np; i++)
+        CHECK(sp0[i].ID == pl[i].ID && sp0[i].Receiver == pl[i].Receiver, "sub-tree majority: pair %ld differs\n", i);
+    free(sk);
+    free(pl);
+    free(sp0);
+    outcome_free(&inp);
+    outcome_free(&ser);
+    free(AvPairs);
+    AvPairs = NULL;
+    AvN = AvMax = 0;
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_collective_serial_vs_inplace),
@@ -3279,6 +4036,11 @@ int main(void) {
         cmocka_unit_test(test_collective_walk_theta),
         cmocka_unit_test(test_collective_props_identity),
         cmocka_unit_test(test_collective_central_source),
+        cmocka_unit_test(test_collective_knn_identity),
+        cmocka_unit_test(test_collective_vote_identity),
+        cmocka_unit_test(test_collective_vote_receivers),
+        cmocka_unit_test(test_collective_vote_plan),
+        cmocka_unit_test(test_collective_vote_subtree_majority),
     };
     const char * only = getenv("SUBHALO_TEST_ONLY");
     if(only && only[0]) {

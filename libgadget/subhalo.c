@@ -2547,6 +2547,14 @@ subhalo_finish_call(int SnapNum, int complete, const struct SubhaloCallStats * l
 
 /* ------------------------------------------------------------------ the driver */
 
+static FILE * AdmitDumpFile = NULL;
+
+static void
+admit_dump(MyIDType ID, int64_t Receiver, int source)
+{
+    fprintf(AdmitDumpFile, "%d %lu %ld\n", source, (unsigned long) ID, (long) Receiver);
+}
+
 int
 subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime, Cosmology * CP, int MetalReturnOn, MPI_Comm Comm)
 {
@@ -2565,6 +2573,22 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
 
     message(0, "Subhalo finder: call for snapshot %d at a = %g, %ld tracks, %ld FOF groups.\n",
             SnapNum, atime, tab->NTotal, fof->TotNgroups);
+    /* SUBHALO_ADMIT_DUMP=<dir>: every offered pair of the call, as "source ID receiver" lines, into
+     * <dir>/admit_<snapshot>_<rank>.txt (a diagnostic of the admission votes) */
+    {
+        const char * dumpdir = getenv("SUBHALO_ADMIT_DUMP");
+        if(dumpdir && dumpdir[0] && sp->SubhaloAdmitShare > 0) {
+            if(AdmitDumpFile)
+                fclose(AdmitDumpFile);
+            char * fn = fastpm_strdup_printf("%s/admit_%03d_%d.txt", dumpdir, SnapNum, ThisTask);
+            AdmitDumpFile = fopen(fn, "w");
+            if(!AdmitDumpFile)
+                endrun(1, "Cannot open the admission dump %s.\n", fn);
+            setvbuf(AdmitDumpFile, NULL, _IOLBF, 0);
+            myfree(fn);
+            subhalo_set_admit_hook(admit_dump);
+        }
+    }
 
     /* Tags must reference existing tracks. */
     int badtag = 0;
@@ -2639,9 +2663,14 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     struct SubhaloPlan plan = {0};
     subhalo_plan_set_frame(atime, hubble_function(CP, atime));
     if(subhalo_plan_build(&plan, fof, tab, NHostless, ddecomp, Comm)) {
-        /* the in-place stage or the plan's reserve does not fit on some rank; P is unchanged so
-         * far, so the domain needs no restore */
-        if(plan.Admit.failed)
+        /* the admission vote, the in-place stage or the plan's reserve does not fit on some rank; P
+         * is unchanged so far, so the domain needs no restore */
+        if(plan.VoteFailed)
+            message(0, "Subhalo finder: the admission vote of the oversized keys of snapshot %d does not fit in memory on rank %d "
+                       "(%g MB short); the call is skipped before the exchange. Tags and track table are unchanged; this PIG will be "
+                       "marked incomplete. Run with more memory per rank or more ranks.\n", SnapNum,
+                    subhalo_plan_last_vote()->WorstRank, subhalo_plan_last_vote()->WorstShort / 1048576.);
+        else if(plan.Admit.failed)
             message(0, "Subhalo finder: the in-place stage of snapshot %d does not fit in memory on rank %d (stage: %s)%s; the call is "
                        "skipped before the exchange. Tags and track table are unchanged; this PIG will be marked incomplete. "
                        "Run with more memory per rank or more ranks.\n", SnapNum, plan.Admit.failrank,
@@ -2848,6 +2877,12 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     if(sp->SubhaloAdmitShare > 0)
         message(0, "Subhalo admission: %ld particles of ancestors admitted to satellites by neighbour majority, %ld taken, by %ld satellites.\n",
                 SubLastStats.NAdmitted, SubLastStats.NAdmitTaken, SubLastStats.NAdmitReceivers);
+    if(sp->SubhaloAdmitShare > 0 && subhalo_plan_last_vote()->NQueries > 0) {
+        const struct SubhaloVoteStats * vs = subhalo_plan_last_vote();
+        message(0, "Subhalo admission vote of the oversized keys across ranks: %ld tracers queried, %ld offered (%ld by in-place owners), "
+                   "%ld taken to their receivers' sub-tree keys (%ld guests); %d radius pass(es), %.3g s.\n",
+                vs->NQueries, vs->NOffered, vs->NOfferedInplace, vs->NServed, vs->NGuests, vs->Passes, vs->Seconds);
+    }
     log_tagged("after the call", Comm);
 
     if(SubStatus.StateSnapshot >= 0 && SubStatus.StateTime > 0)
