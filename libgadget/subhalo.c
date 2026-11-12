@@ -99,6 +99,12 @@ subhalo_validate_params(const struct SubhaloParams * sp)
     if(sp->SubhaloNumNeighboursForReassignment < 1 || sp->SubhaloNumNeighboursForReassignment > SUBHALO_KNN_MAXK)
         endrun(1, "SubhaloNumNeighboursForReassignment = %d must be in [1, %d].\n",
                sp->SubhaloNumNeighboursForReassignment, SUBHALO_KNN_MAXK);
+    if(!subhalo_isfinite(sp->SubhaloAdmitShare) || !(sp->SubhaloAdmitShare >= 0 && sp->SubhaloAdmitShare <= 1))
+        endrun(1, "SubhaloAdmitShare = %g must be in [0, 1].\n", sp->SubhaloAdmitShare);
+    /* the admission queries one neighbour more than k: the particle finds itself */
+    if(sp->SubhaloAdmitShare > 0 && sp->SubhaloNumNeighboursForReassignment >= SUBHALO_KNN_MAXK)
+        endrun(1, "SubhaloAdmitShare > 0 needs SubhaloNumNeighboursForReassignment = %d below %d.\n",
+               sp->SubhaloNumNeighboursForReassignment, SUBHALO_KNN_MAXK);
     if(sp->SubhaloCoreSize < 1 || sp->SubhaloPotentialSampleSize < 0 || sp->SubhaloMaxUnbindIterations < 1)
         endrun(1, "SubhaloCoreSize = %d and SubhaloMaxUnbindIterations = %d must be at least 1, SubhaloPotentialSampleSize = %d not negative.\n",
                sp->SubhaloCoreSize, sp->SubhaloMaxUnbindIterations, sp->SubhaloPotentialSampleSize);
@@ -140,7 +146,8 @@ subhalo_set_arena_bytes(const struct SubhaloParams * sp)
     double R = sp->SubhaloSourceRelaxFactor;
     if(!(R >= 1)) R = 1;
     if(R > SUBHALO_MAX_RELAX_FACTOR) R = SUBHALO_MAX_RELAX_FACTOR;
-    SubArenaBytesPerPart = SUBHALO_ARENA_FIXED_BYTES_PER_PART + (size_t) ceil(8. * R);
+    SubArenaBytesPerPart = SUBHALO_ARENA_FIXED_BYTES_PER_PART + (size_t) ceil(8. * R)
+                           + (sp->SubhaloAdmitShare > 0 ? SUBHALO_ADMIT_BYTES_PER_PART : 0);
 }
 
 /* A double parameter that must hold a non-negative integer, checked before the conversion. */
@@ -187,6 +194,7 @@ set_subhalo_params(ParameterSet * ps)
         SubParams.SubhaloCoreSize = param_get_int(ps, "SubhaloCoreSize");
         SubParams.SubhaloReassignGas = param_get_int(ps, "SubhaloReassignGas");
         SubParams.SubhaloNumNeighboursForReassignment = param_get_int(ps, "SubhaloNumNeighboursForReassignment");
+        SubParams.SubhaloAdmitShare = param_get_double(ps, "SubhaloAdmitShare");
         SubParams.SubhaloUnbindWithThermal = param_get_int(ps, "SubhaloUnbindWithThermal");
         SubParams.SubhaloFieldSO = param_get_int(ps, "SubhaloFieldSO");
         SubParams.SubhaloSOBins = param_get_int(ps, "SubhaloSOBins");
@@ -2306,6 +2314,11 @@ stats_reduce(const struct SubhaloCallStats * loc, struct SubhaloCallStats * tot,
     tot->NLossTried = b[9];
     tot->NLossRescued = b[10];
     MPI_Allreduce(&loc->ArenaPeakFrac, &tot->ArenaPeakFrac, 1, MPI_DOUBLE, MPI_MAX, Comm);
+    int64_t adm[3] = {loc->NAdmitted, loc->NAdmitTaken, loc->NAdmitReceivers}, admtot[3];
+    MPI_Allreduce(adm, admtot, 3, MPI_INT64, MPI_SUM, Comm);
+    tot->NAdmitted = admtot[0];
+    tot->NAdmitTaken = admtot[1];
+    tot->NAdmitReceivers = admtot[2];
     struct { double r; int rank; } in, out;
     int ThisTask;
     MPI_Comm_rank(Comm, &ThisTask);
@@ -2838,6 +2851,9 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
             SubLastStats.NRescued, SubLastStats.NRescueTried, SubLastStats.NLossRescued, SubLastStats.NLossTried,
             SubLastStats.NFinalPositive, SubLastStats.NFinalBound, SubLastStats.NTailRejected,
             SubLastStats.NFallbackField, SubLastStats.NFallbackReleased, norphsync_tot, SubLastStats.ArenaPeakFrac);
+    if(sp->SubhaloAdmitShare > 0)
+        message(0, "Subhalo admission: %ld particles of ancestors admitted to satellites by neighbour majority, %ld taken, by %ld satellites.\n",
+                SubLastStats.NAdmitted, SubLastStats.NAdmitTaken, SubLastStats.NAdmitReceivers);
     log_tagged("after the call", Comm);
 
     if(SubStatus.StateSnapshot >= 0 && SubStatus.StateTime > 0)

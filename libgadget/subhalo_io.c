@@ -710,6 +710,10 @@ subhalo_format_params(char * buf, size_t size)
         sp->SubhaloSOBins, sp->SubhaloSOSearchFactor, sp->SubhaloSOMaxDoublings,
         sp->SubhaloSORefineMinPart, sp->SubhaloMajorMergerRatio, sp->SubhaloGeometricParents,
         sp->SubhaloDebugForceExchangeFailure);
+    /* written only when the admission is on, so the header of a run without it is unchanged */
+    const size_t len = strlen(buf);
+    if(sp->SubhaloAdmitShare > 0 && len < size)
+        snprintf(buf + len, size - len, "SubhaloAdmitShare = %.17g\n", sp->SubhaloAdmitShare);
 }
 
 void

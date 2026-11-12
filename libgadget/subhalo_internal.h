@@ -13,10 +13,15 @@
  * (SUBHALO_UNBIND_BYTES_PER_PART, whose scratch the properties reuse), 8 for the owner map and
  * grouped sources, 8 for completed nodes' lists awaiting their parent, 8 R for the survivors'
  * relaxed sources (R = SubhaloSourceRelaxFactor rounded up to 1/8; bound sets are disjoint), plus
- * SUBHALO_ARENA_NODE_BYTES per candidate node: subhalo_arena_bytes_per_part() = 128 + 8 R. */
+ * SUBHALO_ARENA_NODE_BYTES per candidate node: subhalo_arena_bytes_per_part() = 128 + 8 R, plus
+ * SUBHALO_ADMIT_BYTES_PER_PART with the admission. */
 #define SUBHALO_ARENA_FIXED_BYTES_PER_PART 128
 #define SUBHALO_ARENA_NODE_BYTES 64
 #define SUBHALO_MAX_RELAX_FACTOR 10.
+/* Added with SubhaloAdmitShare > 0: the admitted particles grouped by receiver (4 bytes each, at most
+ * one per particle) and their alignment. The neighbour tree of the admission is built and released
+ * before the unbinding starts, inside the kernel's allowance. */
+#define SUBHALO_ADMIT_BYTES_PER_PART 8
 size_t subhalo_arena_bytes_per_part(void);
 /* Main-stack bytes per candidate node of a serial key (struct SubNode in subhalo_track.c;
  * checked there by a static assertion), charged by the plan per member track. */
@@ -755,6 +760,10 @@ struct SubhaloCallStats {
     double TreeBytes;                       /* the admission's tree-stage estimate of the rounds, max over the ranks */
     int FieldSOPass1Walks, FieldSOPass2Walks, FieldSOBins;
     int64_t FieldSOCentrals;
+    /* admission by neighbour majority (SubhaloAdmitShare), serial keys */
+    int64_t NAdmitted;       /* particles of an ancestor admitted to a satellite's source */
+    int64_t NAdmitTaken;     /* of which bound by the satellite and taken by it */
+    int64_t NAdmitReceivers; /* satellites that took at least one */
 };
 /* The statistics of the last completed subhalo_find (global; for the tests and the log). */
 const struct SubhaloCallStats * subhalo_last_call_stats(void);

@@ -47,6 +47,7 @@ struct SubhaloParams {
     int    SubhaloCoreSize;              /* 20 */
     int    SubhaloReassignGas;           /* 1 */
     int    SubhaloNumNeighboursForReassignment; /* 10 (HBT NumNeighboursForReassignment) */
+    double SubhaloAdmitShare;            /* 0 = off: share of the k nearest tracers bound to a satellite that admits an ancestor's particle to its source */
     int    SubhaloUnbindWithThermal;     /* 0 */
     int    SubhaloFieldSO;               /* 1 */
     int    SubhaloSOBins;                /* 64 */

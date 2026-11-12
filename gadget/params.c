@@ -238,6 +238,7 @@ create_gadget_parameter_set()
     param_declare_int(ps, "SubhaloCoreSize", OPTIONAL, 20, "Core particles for the centre and sinking.");
     param_declare_int(ps, "SubhaloReassignGas", OPTIONAL, 1, "HBT ReassignParticles for non-tracers (serial groups only).");
     param_declare_int(ps, "SubhaloNumNeighboursForReassignment", OPTIONAL, 10, "Nearest tracers searched by SubhaloReassignGas (HBT NumNeighboursForReassignment).");
+    param_declare_double(ps, "SubhaloAdmitShare", OPTIONAL, 0, "In [0, 1], 0 = off. A tracer owned by an ancestor of a satellite joins the satellite's source when at least this share of its SubhaloNumNeighboursForReassignment nearest tracers were bound to the satellite at the previous call; it stays only if the unbinding binds it.");
     param_declare_int(ps, "SubhaloUnbindWithThermal", OPTIONAL, 0, "Add the gas internal energy to the kinetic term when unbinding.");
     param_declare_int(ps, "SubhaloFieldSO", OPTIONAL, 1, "Run the field spherical overdensity tree walk for centrals.");
     param_declare_int(ps, "SubhaloSOBins", OPTIONAL, 64, "Logarithmic radial bins of the field SO pass 1.");
