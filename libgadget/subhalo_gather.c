@@ -2054,10 +2054,13 @@ subhalo_plan_last_summary(void)
 /* Admission of the final plan. Every plan: the free bytes at pack time must cover the reserve and
  * the per-MaxPart sort bytes (a->reserve_failed). With in-place candidates: the collective stage's
  * peak (subhalo_coll_estimate) must fit the free bytes less what the serial stage keeps until the
- * collective call and the slot growth. Returns 1 on every rank if some rank fails. Collective. */
+ * collective call and the slot growth. The admission vote's records count in both: rec_held bytes
+ * from the encoding to the end of the call (rec_build at their exchange), rec_rounds through the
+ * rounds. Returns 1 on every rank if some rank fails. Collective. */
 static int
 plan_admit(struct SubhaloPlan * plan, const struct SubhaloDirKey * dk, int64_t ndir, const struct SubhaloDirMsg * in,
-           const struct SubhaloTrackKey * fkmap, int64_t nfk, const DomainDecomp * ddecomp, MPI_Comm Comm)
+           const struct SubhaloTrackKey * fkmap, int64_t nfk, const DomainDecomp * ddecomp, double rec_held, double rec_build,
+           double rec_rounds, MPI_Comm Comm)
 {
     const int NTask = plan->NTask, ThisTask = plan->ThisTask;
     struct SubhaloCollAdmit * a = &plan->Admit;
@@ -2066,7 +2069,7 @@ plan_admit(struct SubhaloPlan * plan, const struct SubhaloDirKey * dk, int64_t n
     struct SubhaloPlanCfg cfg;
     subhalo_plan_default_cfg(&cfg, plan->TotKeys, NTask);
     {
-        a->reserve_need = cfg.ReserveBytes + cfg.SortBytesPerPart * (double) PartManager->MaxPart;
+        a->reserve_need = cfg.ReserveBytes + cfg.SortBytesPerPart * (double) PartManager->MaxPart + rec_held + rec_build;
         a->pack_free = plan->PackFreeBytes;
         struct { double v; int r; } rs = {a->reserve_need - a->pack_free, ThisTask}, wrs;
         MPI_Allreduce(&rs, &wrs, 1, MPI_DOUBLE_INT, MPI_MAXLOC, Comm);
@@ -2076,8 +2079,8 @@ plan_admit(struct SubhaloPlan * plan, const struct SubhaloDirKey * dk, int64_t n
         a->reserve_rank = wrs.r;
         a->reserve_failed = wrs.v > 0;
         if(a->reserve_failed)
-            message(0, "Subhalo plan: rank %d is short of the plan's reserve by %g MB: it needs %g MB (the constant reserve and the "
-                       "per-particle sort bytes) and had %g MB free when the plan was packed. The call fails before the exchange.\n",
+            message(0, "Subhalo plan: rank %d is short of the plan's reserve by %g MB: it needs %g MB (the constant reserve, the "
+                       "per-particle sort bytes and the admission vote's records) and had %g MB free when the plan was packed. The call fails before the exchange.\n",
                     wrs.r, wrs.v / 1048576., rinfo[0] / 1048576., rinfo[1] / 1048576.);
     }
     if(plan->NCands == 0) {
@@ -2172,11 +2175,13 @@ plan_admit(struct SubhaloPlan * plan, const struct SubhaloDirKey * dk, int64_t n
     subhalo_coll_estimate(a, PartManager->NumPart, PartManager->MaxPart, nuniv, (int64_t) mine[7], nowned, recv, plan->NCands,
                           plan->NMembers, plan->NMembers, NTopNodes, NTopLeaves, NLocalLeaves, force_tree_get_alloc_factor(),
                           omp_get_max_threads());
+    a->persist += rec_rounds;
+    a->need += rec_rounds;
     myfree(hg);
     myfree(hv);
     myfree(vg);
     myfree(v);
-    a->avail = (double) mymalloc_freebytes() - mine[0] - growth;
+    a->avail = (double) mymalloc_freebytes() - mine[0] - growth - rec_held;
     /* the worst rank, its largest stage */
     struct { double v; int r; } sh = {a->need - a->avail, ThisTask}, wsh;
     MPI_Allreduce(&sh, &wsh, 1, MPI_DOUBLE_INT, MPI_MAXLOC, Comm);
@@ -2283,13 +2288,15 @@ subhalo_plan_last_vote(void)
     return &LastVote;
 }
 
-/* The admission vote of the oversized keys, the one their serial key would take: the tracers with
- * an owner vote, exactly across ranks, for the tracers whose owner has a receiver below it. It
- * depends on the keys' particles and trees only, so every pass of the plan finds the same offers.
+/* The admission vote of the oversized keys: the tracers with an owner vote, exactly across ranks,
+ * for the tracers whose owner has a receiver below it. For the processing tree the plan derives it
+ * offers the pairs the key's serial vote offers on that tree. It depends on the keys' particles and
+ * trees only, so every pass of the plan finds the same offers.
  * Needs every particle on its domain rank with its previous tags (before the exchange). Allocates
  * *offers on the bottom of the stack: the local particles offered, in P order, with their
  * receivers' TrackIds (*noff of them). The memory is checked first: returns 1 on every rank if
- * some rank cannot hold the vote (nothing is allocated then). Collective. */
+ * some rank cannot hold the vote (nothing is allocated then); the records of the offers are charged
+ * by plan_admit once their keys' ranks are known. Collective. */
 static int
 plan_vote(const struct SubhaloMember * mem, int64_t nmem, const int64_t * centralT, const int64_t * O, int64_t nO,
           int64_t TotNgroups, const struct SubhaloTrackKey * fkmap, int64_t nfk, const DomainDecomp * ddecomp,
@@ -2452,6 +2459,44 @@ home_offer(const struct SubhaloPlan * plan, const struct SubhaloOffer * o)
 {
     const struct SubhaloMember * r = subhalo_plan_member(plan, o->receiver), * w = subhalo_plan_member(plan, o->owner);
     return r && w && r->cand >= 0 && w->cand >= 0;
+}
+
+/* The serial sub-tree key that processes offer o once the plan is settled (the key the encoding
+ * marks it for), -1 if no serial key serves it. */
+static const struct SubhaloLocalKey *
+served_key(const struct SubhaloPlan * plan, const struct SubhaloOffer * o, const struct SubhaloOffer * offers, int64_t noff)
+{
+    const int64_t okey = offer_key(o->index, offers, noff, plan->Members, plan->NMembers);
+    const struct SubhaloLocalKey * ok = okey >= 0 ? local_key(plan, okey) : NULL;
+    return ok && !ok->oversized ? ok : NULL;
+}
+
+/* The bytes of the vote's records on this rank, counted before any is made: *held the records
+ * received for the sub-tree keys processed here (whatever the senders) and the home records, kept
+ * to the end of the call; *build the send buffer of their exchange; *rounds the rounds' list of
+ * this rank's admitted particles (at most one per home record). Collective. */
+static void
+vote_record_bytes(const struct SubhaloPlan * plan, const struct SubhaloOffer * offers, int64_t noff, double * held, double * build,
+                  double * rounds, MPI_Comm Comm)
+{
+    const int NTask = plan->NTask;
+    int64_t * cnt = ta_malloc("SubVoteRecCnt", int64_t, NTask);
+    memset(cnt, 0, sizeof(int64_t) * NTask);
+    int64_t i, nout = 0, nh = 0;
+    for(i = 0; i < noff; i++) {
+        const struct SubhaloLocalKey * ok = served_key(plan, &offers[i], offers, noff);
+        if(ok) {
+            cnt[ok->target]++;
+            nout++;
+        }
+        nh += home_offer(plan, &offers[i]);
+    }
+    MPI_Allreduce(MPI_IN_PLACE, cnt, NTask, MPI_INT64, MPI_SUM, Comm);
+    const int64_t nin = cnt[plan->ThisTask];
+    ta_free(cnt);
+    *held = sizeof(struct SubhaloAdmitRec) * (double) (nin + 1) + sizeof(struct SubhaloHomeRec) * (double) (nh + 1);
+    *build = sizeof(struct SubhaloAdmitRec) * (double) (nout + 1);
+    *rounds = SUBHALO_INPLACE_ADM_BYTES * (double) (nh + 1);
 }
 
 static int
@@ -2876,7 +2921,14 @@ subhalo_plan_build(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubT
     }
 
     /* ---- the admission, before anything in P changes ---- */
-    const int noadmit = plan_admit(plan, dk, ndir, in, fkmap, nfk, ddecomp, Comm);
+    double rec_held = 0, rec_build = 0, rec_rounds = 0;
+    if(sp->SubhaloAdmitShare > 0 && nO > 0 && ddecomp) {
+        vote_record_bytes(plan, offers, noff, &rec_held, &rec_build, &rec_rounds, Comm);
+        double rb = rec_held + rec_rounds;
+        MPI_Allreduce(MPI_IN_PLACE, &rb, 1, MPI_DOUBLE, MPI_SUM, Comm);
+        LastVote.RecordBytes = rb;
+    }
+    const int noadmit = plan_admit(plan, dk, ndir, in, fkmap, nfk, ddecomp, rec_held, rec_build, rec_rounds, Comm);
     memset(&LastSummary, 0, sizeof(LastSummary));
     LastSummary.NSerial = plan->Stats.NSerial;
     LastSummary.NOversized = plan->Stats.NOversized;
@@ -2885,6 +2937,20 @@ subhalo_plan_build(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubT
     LastSummary.NRounds = plan->NRounds;
     LastSummary.Admitted = !noadmit;
 
+    if(noadmit) {
+        myfree(dk);
+        myfree(in);
+        myfree(msg);
+        if(offers)
+            myfree(offers);
+        myfree(sk);
+        myfree(mem);
+        myfree(centralT);
+        myfree(cv);
+        myfree(st);
+        myfree(fkmap);
+        return 1;
+    }
     /* the offers outlive the pass's tables: through the top while those are freed */
     struct SubhaloOffer * otmp = NULL;
     if(offers) {
@@ -2901,13 +2967,6 @@ subhalo_plan_build(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubT
     myfree(mem);
     myfree(centralT);
     myfree(cv);
-    if(noadmit) {
-        if(otmp)
-            myfree(otmp);
-        myfree(st);
-        myfree(fkmap);
-        return 1;
-    }
     if(otmp) {
         offers = (struct SubhaloOffer *) mymalloc("SubVoteOffers", sizeof(struct SubhaloOffer) * (noff + 1));
         memcpy(offers, otmp, sizeof(struct SubhaloOffer) * noff);

@@ -34,6 +34,9 @@ size_t subhalo_arena_bytes_per_part(void);
 /* Transient per-candidate scratch of a round's properties on every rank (static assertions in
  * subhalo_collective.c); charged by the admission and, with SUBHALO_INPLACE_CAND_BYTES, the packing. */
 #define SUBHALO_INPLACE_CAND_PROPS_BYTES 6144
+/* Bytes per particle admitted to an in-place receiver in the rounds' list (struct CollAdm,
+ * static assertion in subhalo_collective.c); charged by the admission. */
+#define SUBHALO_INPLACE_ADM_BYTES 16
 
 /* Estimated cost of a serial key of N particles and M member tracks (only ratios matter): N log2 N
  * for the unbinding trees, a term per member candidate and a per-key constant, fitted to measured
@@ -557,8 +560,9 @@ struct SubhaloVoteStats {
     int64_t NServed;           /* of which taken to their receivers' serial sub-tree keys */
     int64_t NHome;             /* of which offered to in-place receivers (they stay home) */
     int64_t NGuests;           /* of which owned outside that key (they travel there) */
-    double Seconds;            /* wall time of the vote in all passes of the plan, the largest over the ranks */
+    double Seconds;            /* wall time of the vote: per pass the largest over the ranks, summed over the passes */
     double WorstShort;         /* the memory check: the largest shortfall over the ranks (> 0: the call fails) */
+    double RecordBytes;        /* the records the plan's admission charged (received, home and the rounds' list), summed over the ranks */
     int WorstRank;
     int Passes;                /* radius passes of the k-nearest walks */
 };

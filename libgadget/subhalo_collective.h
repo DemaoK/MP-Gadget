@@ -76,9 +76,11 @@ struct SubhaloKnnHit {
 };
 /* The k nearest particles of tl[0..nt) with the query's label to each query ql[0..nq) (labels in
  * label[], dense, below 2^24), the query itself excluded: hits[k q ..] sorted by (d2, ID), nhit[q]
- * of them (fewer only when the label has fewer). Exact on any layout: the radius of a query doubles
- * per pass until its k-th neighbour lies strictly inside. Needs a decomposed domain with every
- * particle on its domain rank. Collective over MPI_COMM_WORLD; returns the number of passes. */
+ * of them (fewer only when the label has fewer). Exact whenever it completes: the radius of a query
+ * doubles per pass until its k-th neighbour lies strictly inside. Limits of the builder and walker it
+ * shares: more than eight particles at one position abort the tree build, and a query whose exports
+ * exceed a thread's export buffer aborts the walk. Needs a decomposed domain with every particle on
+ * its domain rank. Collective over MPI_COMM_WORLD; returns the number of passes. */
 int subhalo_collective_knn(DomainDecomp * ddecomp, const int32_t * label, const int * tl, int64_t nt,
                            const int * ql, int64_t nq, int k, struct SubhaloKnnHit * hits, int32_t * nhit);
 /* Export rounds of the last subhalo_collective_knn on this rank, summed over its passes. */

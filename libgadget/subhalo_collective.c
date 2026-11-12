@@ -100,6 +100,7 @@ struct CollAdm {
     int64_t index;
     int32_t owner, recv;
 };
+_Static_assert(sizeof(struct CollAdm) <= SUBHALO_INPLACE_ADM_BYTES, "SUBHALO_INPLACE_ADM_BYTES does not cover struct CollAdm");
 
 struct Coll {
     struct SubhaloPlan * plan;
@@ -119,6 +120,8 @@ struct Coll {
     int64_t c0, c1;          /* the current round */
     struct CollAdm * Adm;    /* this rank's particles admitted to in-place receivers, by index */
     int64_t NAdm, NAdmTaken;
+    int AdmAny;              /* 1: some rank holds admitted particles (the receivers are then counted) */
+    int64_t NAdmRecv;        /* in-place receivers that took at least one admitted particle (global) */
     int nwalks;
     struct SubhaloCallStats st;
 };
@@ -732,7 +735,11 @@ subhalo_collective_knn(DomainDecomp * ddecomp, const int32_t * label, const int 
         if(PartManager->NumPart < need)
             PartManager->NumPart = need;
     }
+    /* a build that runs out of nodes raises the global TreeAllocFactor and retries: restored, so
+     * that the vote leaves the force tree's sizing as it found it */
+    const double taf = force_tree_get_alloc_factor();
     force_tree_active_moments(&tree, ddecomp, &ap, 0, 1, NULL);
+    init_forcetree_params(taf);
     PartManager->NumPart = NumPart;
     label_tree(&tree, ddecomp, label, 0);
     /* the first radius is the side of the query's tree leaf, doubled until the k-th neighbour lies
@@ -2182,7 +2189,8 @@ cmp_homerec_id(const void * a, const void * b)
 }
 
 /* The particles offered to in-place receivers (plan->HomeRecs) leave their owner's source for
- * their receiver's: the receiver's round decides, as a serial key's admission does. */
+ * their receiver's: the receiver's round decides, as a serial key's admission does. Runs with the
+ * rule on only; a rank without home records allocates nothing. Collective. */
 static void
 init_admitted(struct Coll * C)
 {
@@ -2190,8 +2198,8 @@ init_admitted(struct Coll * C)
     int64_t i, n = 0;
     int pass;
     C->Adm = NULL;
-    C->NAdm = C->NAdmTaken = 0;
-    for(pass = 0; pass < 2; pass++) {
+    C->NAdm = C->NAdmTaken = C->NAdmRecv = 0;
+    for(pass = 0; plan->NHomeRecs > 0 && pass < 2; pass++) {
         if(pass == 1)
             C->Adm = (struct CollAdm *) mymalloc2("SubCollAdm", sizeof(struct CollAdm) * (n + 1));
         n = 0;
@@ -2217,6 +2225,7 @@ init_admitted(struct Coll * C)
         }
     }
     C->NAdm = n;
+    C->AdmAny = MPIU_Any(n > 0, C->Comm);
 }
 
 /* The admission of particle i to candidate cc, NULL if i is not admitted to it. */
@@ -2257,7 +2266,7 @@ round_within(struct Coll * C)
     for(i = 0; i < C->NumPart; i++) {
         const int32_t cc = C->Cand[i];
         if(in_round(C, cc) && C->cs[cc].state == SUBHALO_ST_ALIVE && !(C->Flag[i] & CF_BOUND) && part_live(&P[i])
-           && C->cs[cc].keep > C->cs[cc].Nbound && !admitted_to(C, i, cc))
+           && C->cs[cc].keep > C->cs[cc].Nbound && !(C->NAdm > 0 && admitted_to(C, i, cc)))
             n++;
     }
     MPI_Allreduce(&n, &ntot, 1, MPI_INT64, MPI_SUM, C->Comm);
@@ -2268,7 +2277,7 @@ round_within(struct Coll * C)
     for(i = 0; i < C->NumPart; i++) {
         const int32_t cc = C->Cand[i];
         if(!(in_round(C, cc) && C->cs[cc].state == SUBHALO_ST_ALIVE && !(C->Flag[i] & CF_BOUND) && part_live(&P[i])
-             && C->cs[cc].keep > C->cs[cc].Nbound) || admitted_to(C, i, cc))
+             && C->cs[cc].keep > C->cs[cc].Nbound) || (C->NAdm > 0 && admitted_to(C, i, cc)))
             continue;
         u[n].key[0] = P[i].ID;
         u[n].key[1] = double_key(C->En[i]);
@@ -2350,6 +2359,10 @@ round_commit(struct Coll * C, const struct CoreOut * fin)
     const int NR = C->up->MinNumTracerPart;
     int64_t i, c;
     int q;
+    /* the round's receivers that take an admitted particle, counted once as in a serial key */
+    int * took = C->AdmAny ? ta_malloc("SubCollAdmTook", int, nc + 1) : NULL;
+    if(took)
+        memset(took, 0, sizeof(int) * (nc + 1));
     for(c = 0; c < nc; c++) {
         if(C->cs[C->c0 + c].state != SUBHALO_ST_ALIVE)
             continue;
@@ -2372,7 +2385,10 @@ round_commit(struct Coll * C, const struct CoreOut * fin)
             C->Flag[i] &= ~(CF_BOUND | CF_RES | CF_WITHIN);
             continue;
         }
-        C->NAdmTaken += ad != NULL;
+        if(ad) {
+            C->NAdmTaken++;
+            took[cc - C->c0] = 1;
+        }
         if(s->state == SUBHALO_ST_ALIVE) {
             if(((C->Flag[i] & CF_BOUND) || (C->Flag[i] & CF_WITHIN)) && claimable(C, i)) {
                 C->Claim[i] = cc;
@@ -2388,6 +2404,12 @@ round_commit(struct Coll * C, const struct CoreOut * fin)
             C->Flag[i] &= ~(CF_BOUND | CF_RES);
         }
         C->Flag[i] &= ~CF_WITHIN;
+    }
+    if(took) {
+        MPI_Allreduce(MPI_IN_PLACE, took, nc, MPI_INT, MPI_MAX, C->Comm);
+        for(c = 0; c < nc; c++)
+            C->NAdmRecv += took[c];
+        ta_free(took);
     }
 }
 
@@ -3975,7 +3997,8 @@ subhalo_collective_run(struct SubhaloPlan * plan, struct SubhaloCallCtx * ctx, D
 
     /* 2. the sources */
     init_sources(&C);
-    init_admitted(&C);
+    if(C.sp->SubhaloAdmitShare > 0)
+        init_admitted(&C);
     walltime_measure("/Subhalo/Rounds/Setup");
 
     /* 3. the rounds, deepest first */
@@ -3996,7 +4019,8 @@ subhalo_collective_run(struct SubhaloPlan * plan, struct SubhaloCallCtx * ctx, D
     coll_final_tags(&C, slotof);
     walltime_measure("/Subhalo/Rounds/Tags");
 
-    myfree(C.Adm);
+    if(C.Adm)
+        myfree(C.Adm);
     myfree(C.ClaimE);
     myfree(C.En);
     myfree(C.Flag);
@@ -4037,6 +4061,7 @@ subhalo_collective_run(struct SubhaloPlan * plan, struct SubhaloCallCtx * ctx, D
     ctx->Stats.NAdmitTaken += C.NAdmTaken;
     /* the candidate-level diagnostics are identical on every rank: counted once */
     if(C.ThisTask == 0) {
+        ctx->Stats.NAdmitReceivers += C.NAdmRecv;
         ctx->Stats.NCandidates += C.st.NCandidates;
         ctx->Stats.NItercap += C.st.NItercap;
         ctx->Stats.NFinalBound += C.st.NFinalBound;

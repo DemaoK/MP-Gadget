@@ -2565,6 +2565,7 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
 
     message(0, "Subhalo finder: call for snapshot %d at a = %g, %ld tracks, %ld FOF groups.\n",
             SnapNum, atime, tab->NTotal, fof->TotNgroups);
+
     /* Tags must reference existing tracks. */
     int badtag = 0;
     #pragma omp parallel for reduction(+: badtag)
@@ -2639,10 +2640,12 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     subhalo_plan_set_frame(atime, hubble_function(CP, atime));
     if(subhalo_plan_build(&plan, fof, tab, NHostless, ddecomp, Comm)) {
         /* the admission vote, the in-place stage or the plan's reserve does not fit on some rank; P
-         * is unchanged so far, so the domain needs no restore */
+         * is unchanged so far, so the domain needs no restore. The track table keeps what the orphan
+         * lookup wrote (the markers' positions and velocities, SnapTracerLost of lost markers). */
         if(plan.VoteFailed)
             message(0, "Subhalo finder: the admission vote of the oversized keys of snapshot %d does not fit in memory on rank %d "
-                       "(%g MB short); the call is skipped before the exchange. Tags and track table are unchanged; this PIG will be "
+                       "(%g MB short); the call is skipped before the exchange. Particle tags and GrNr are unchanged; the track "
+                       "table keeps this call's orphan lookup (marker positions and velocities, lost markers); this PIG will be "
                        "marked incomplete. Run with more memory per rank or more ranks.\n", SnapNum,
                     subhalo_plan_last_vote()->WorstRank, subhalo_plan_last_vote()->WorstShort / 1048576.);
         else if(plan.Admit.failed)
@@ -2855,8 +2858,8 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     if(sp->SubhaloAdmitShare > 0 && subhalo_plan_last_vote()->NQueries > 0) {
         const struct SubhaloVoteStats * vs = subhalo_plan_last_vote();
         message(0, "Subhalo admission vote of the oversized keys across ranks: %ld tracers queried, %ld offered (%ld by in-place owners), "
-                   "%ld taken to their receivers' sub-tree keys (%ld guests); %d radius pass(es), %.3g s.\n",
-                vs->NQueries, vs->NOffered, vs->NOfferedInplace, vs->NServed, vs->NGuests, vs->Passes, vs->Seconds);
+                   "%ld taken to their receivers' sub-tree keys (%ld guests), %ld kept home for in-place receivers; %d radius pass(es), "
+                   "%.3g s.\n", vs->NQueries, vs->NOffered, vs->NOfferedInplace, vs->NServed, vs->NGuests, vs->NHome, vs->Passes, vs->Seconds);
     }
     log_tagged("after the call", Comm);
 
