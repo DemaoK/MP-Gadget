@@ -383,7 +383,7 @@ check_call_stats(const char * what, int complete)
           && st->PeakIncrementRank < NTask && st->EntryBytes > 0 && st->EntryBytes < st->PeakBytes,
           "%s: own increment %ld bytes (largest stage %g) on rank %d in stage %d; entry %g, high water %ld\n", what,
           st->PeakIncrementBytes, imax, st->PeakIncrementRank, st->PeakIncrementStage, st->EntryBytes, st->PeakBytes);
-    /* the tables count with their allocator charge (audit 5d R2): whole 4096-byte allocator blocks */
+    /* the tables count with their allocator charge: whole 4096-byte allocator blocks */
     if(complete && st->FieldSOPass1Walks > 0)
         CHECK(st->FieldSOElasticBytes > 0 && fmod(st->FieldSOElasticBytes, 4096.) == 0
               && st->StageIncrBytes[SUBHALO_STAGE_FIELDSO] < st->StagePeakBytes[SUBHALO_STAGE_FIELDSO],
@@ -2064,7 +2064,7 @@ check_synthetic_plan(const struct synkey * keys, int64_t nkeys, const struct Sub
     CHECK(bad == 0, "%s: the plan violates its capacities\n", what);
 }
 
-/* The eight-pass input of the audit appendix (four ranks, MaxPart 16871, fraction 0.5, DM only). */
+/* An input that needs eight plan passes (four ranks, MaxPart 16871, fraction 0.5, DM only). */
 static const int64_t appendix_rows[30][4] = {
     {102, 862, 758, 1116}, {1849, 289, 626, 23}, {1711, 159, 48, 748}, {96, 664, 256, 1573},
     {502, 49, 707, 1203}, {43, 54, 1064, 1275}, {1432, 1, 117, 861}, {618, 0, 700, 1028},
@@ -2251,8 +2251,8 @@ test_subhalo_plan_pack(void ** state)
 /* subhalo_local_sort (the record sort with the threaded permutation, and the indirect sort of P
  * it falls back to) leaves the same particle table at 1 to 4 threads: garbage last, then by key
  * (group, encoded travelling key, -1 first), TrackId, BindRank, ID, and the input order for full
- * ties (duplicated records). The reference is built independently of the code under test (audit
- * 5d R4): libc qsort of the input indices on the comparator below, made a total order by the
+ * ties (duplicated records). The reference is built independently of the code under test:
+ * libc qsort of the input indices on the comparator below, made a total order by the
  * input index, then an out-of-place gather; every byte of the table is compared. */
 static const struct particle_data * LocalSortIn;
 
@@ -2366,7 +2366,7 @@ struct sk_ud {
 /* Writes a per-key sequence into the arena (bytes_per_part 8) and records which queue (arena,
  * alone or not) ran key k, in the order of the calls. Then takes the key's extra allowance and
  * the rest of the arena, writing all of it, and checks that the arena refuses anything beyond
- * (audit 5d R1: the key sees exactly its own allowance, not the larger buffer of its queue). */
+ * (the key sees exactly its own allowance, not the larger buffer of its queue). */
 static void
 sk_fn(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloArena * arena, int nthreads, void * userdata)
 {
@@ -2405,7 +2405,7 @@ sk_fn(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloArena * arena, 
     u->result[k] = h;
 }
 
-/* The reduced-team case (Phase 5 audit R2): each key spins for a fixed time and records the
+/* The reduced-team case: each key spins for a fixed time and records the
  * worker that ran it. */
 struct sk_timed {
     int * worker;
@@ -2469,7 +2469,7 @@ test_subhalo_serial_keys(void ** state)
         const struct SubhaloSerialStats * ss = subhalo_serial_last_stats();
         int64_t bad = u.bad, i, j;
         LOCAL_CHECK(bad, u.bad == 0, "serial keys, %d threads: %ld keys could not take their allowance or got more\n", T, u.bad);
-        /* each key saw exactly its own allowance, whichever keys shared its queue (audit 5d R1);
+        /* each key saw exactly its own allowance, whichever keys shared its queue;
          * every key filled its arena, so the high-water fraction is 1 up to the alignment */
         for(k = 0; k < nsegs; k++)
             if(!segs[k].inplace)
@@ -2560,7 +2560,7 @@ test_subhalo_serial_keys(void ** state)
         free(u.done);
         free(u.log);
     }
-    /* a deliberately reduced team (audit R2): 4 queues, but the scheduler called from inside an
+    /* a deliberately reduced team: 4 queues, but the scheduler called from inside an
      * active parallel region with one active level, so its own region runs on 1 worker, which
      * covers every queue. The reported workers, maximum and mean are the worker's: its maximum
      * busy time is the sum of every threaded key (not a quarter of it, as by queue). */
@@ -2686,7 +2686,7 @@ test_subhalo_unhosted_direct(void ** state)
     const double atime = 0.5, vkms = 1e7 / (1e5 * atime);
 
     /* Three partitions of the periodic hostless track 0: particles at x = 0, 400, 700 in a box
-     * of 1000 (the audit's 0, 4, 7 in a box of 10). The common reference is the minimum-ID
+     * of 1000 (0, 4, 7 in a box of 10, scaled). The common reference is the minimum-ID
      * particle (x = 0); the nearest-image displacements 0, 400, -300 give 100/3. */
     int part[3][3] = {{0, 0, 0}, {0, 1, 1}, {3, 1, 2}};
     int p;
@@ -3898,7 +3898,7 @@ test_subhalo_twohalo(void ** state)
         CHECK(bad == 0, "two haloes, call %d: particle tags\n", call);
         CHECK(ntail[0] >= P2_HOT && ntail[1] >= P2_HOT, "two haloes, call %d: tails %ld %ld\n", call, ntail[0], ntail[1]);
         /* J12: BindRank is the energy order of every own-tag particle, so the cold gas particle
-         * ranks among the first ten (formerly reserved to tracers) while MostBoundID stays a tracer */
+         * ranks among the first ten (energy order, not tracers first) while MostBoundID stays a tracer */
         for(i = 0; i < n; i++)
             if(r[i].ID == coldgas)
                 CHECK(r[i].Type == 0 && r[i].TrackId == 0 && r[i].BoundTrackId == 0 && r[i].BindRank < 10 && rec[0].MostBoundID != coldgas,
@@ -4474,9 +4474,9 @@ test_subhalo_sink_orphan(void ** state)
     p2_teardown();
 }
 
-/* ------------------------------------------------------------------ audit regression fixtures (J1-J12) */
+/* ------------------------------------------------------------------ regression fixtures (J1-J12) */
 
-/* Synthetic tracking state (halofinder_phase2a_audit_codex.md, regression items 1-5): particles
+/* Synthetic tracking state (regression items 1-5): particles
  * with chosen positions, velocities and tags, and the records of a previous call injected into
  * the table, so that one call exercises a chosen hierarchy. Every particle is a DM tracer of
  * mass SYN_M (1e6 Msun/h): a 100-particle ball of 1 kpc has v_circ ~ 20 km/s. The ids
@@ -4651,7 +4651,7 @@ tagrec_index(const struct tagrec * r, int64_t n, MyIDType id)
 }
 
 /* ---- regression item 2 and J2: a real nest tree in two groups ----
- * Group 1, the audit's chain C(0) -> X(1) -> A(2) -> D(3) along x, 5 kpc apart: C is the decided
+ * Group 1, a chain C(0) -> X(1) -> A(2) -> D(3) along x, 5 kpc apart: C is the decided
  * central (largest previous Mbound) and moves at 1000 km/s; X (2000 particles) becomes the most
  * massive survivor and is promoted; the 50 particles p, tagged D and unbound to it, sit at rest
  * in C's frame: D, A and X keep them in their tails, C binds them. The deepest claim (D) is on
@@ -4802,7 +4802,7 @@ test_subhalo_nest_tree(void ** state)
 /* ---- J7: deep chains, the arena high-water mark at R = 3 and R = 10, sinking on and off ----
  * A 30-node chain T0 -> T1 -> ... -> T29 (5 kpc apart, 25 bound particles each, 40 for T0) and
  * 300 hot particles in T29's tail that every node rejects: each survivor keeps up to R * 25 of
- * them, the audit's worst case for the persistent lists. */
+ * them, the worst case for the persistent lists. */
 #define DC_L 30
 #define DC_N0 40
 #define DC_N 25
@@ -6099,7 +6099,7 @@ lk_expect(MyIDType id, double pos[3], int64_t * bt)
 }
 
 /* A particle with id but answers that are not lk_expect's (a later duplicate), or a garbage /
- * swallowed one (Phase 5d audit R4). */
+ * swallowed one. */
 static void
 lk_add_other(MyIDType id, int garbage, int swallowed)
 {
@@ -6161,7 +6161,7 @@ test_subhalo_lookup(void ** state)
             add_dm_particle(id, pos);
             P[PartManager->NumPart - 1].BoundTrackId = bt;
         }
-    /* Phase 5d audit R4: duplicated live IDs, answered by the lowest P index in every mode (7 on
+    /* duplicated live IDs, answered by the lowest P index in every mode (7 on
      * rank 0, one id per other rank); ids whose lowest copies are garbage (11) or swallowed (13),
      * answered by their first live copy; ids held only by garbage (5000100) or swallowed
      * (5000101) particles, which are misses */
@@ -6237,7 +6237,7 @@ test_subhalo_lookup(void ** state)
             CHECK(gpeak <= sp.SubhaloLookupBatchBytes + 16384 && (NTask < 4 || gpeak > 0.5 * sp.SubhaloLookupBatchBytes),
                   "lookup: byte cap %ld, high water %g\n", sp.SubhaloLookupBatchBytes, gpeak);
     }
-    /* a call so small that the auto mode differs between the ranks (audit 5d R4): rank 0's
+    /* a call so small that the auto mode differs between the ranks: rank 0's
      * ~20000 live particles answer by the scan (ntot <= nlive / 16), the ~100 of the other ranks
      * by the index; the answers equal those of the forced modes */
     {

@@ -855,7 +855,7 @@ test_thermal(void ** state)
     PartManager->NumPart = 0;
 }
 
-/* ------------------------------------------------------------------ adversarial oracles (audit J5, J6, J10, item 6) */
+/* ------------------------------------------------------------------ adversarial oracles (J5, J6, J10) */
 
 static void
 set_particle(int64_t i, int type, double mass, MyIDType id, double x, double y, double z)
@@ -930,7 +930,7 @@ knn_brute(int64_t q, const int64_t * tr, int64_t nt, int k, double L, int64_t * 
         res[a] = a < nb ? bi[a] : -1;
 }
 
-/* Periodic gravity (J5). The audit's minimal case: box 10, frame origin 0, particles at 4.9 and
+/* Periodic gravity (J5). The minimal case: box 10, frame origin 0, particles at 4.9 and
  * 5.1 (separation 0.2, 9.8 if unwrapped about the origin), by direct sum and by the tree, with
  * velocities that bind the pair only at the periodic separation. Then a tree-sized clump
  * straddling the unwrap cut of the frame in every axis plus a uniform background over the
@@ -1033,7 +1033,7 @@ test_periodic_gravity(void ** state)
     teardown_pman();
 }
 
-/* k nearest tracers (J5, J10): the audit's minimal cut, an exact tie with the larger ID first
+/* k nearest tracers (J5, J10): the minimal cut, an exact tie with the larger ID first
  * in P, and a tree-sized set (origin tracer at 0, half the tracers and queries in a cube around
  * the antipode, half uniform, integer coordinates for exact ties, scrambled IDs) against the
  * periodic brute force with (d2, ID, index) order; a tree built once and queried in batches
@@ -1155,8 +1155,8 @@ test_knn(void ** state)
     teardown_pman();
 }
 
-/* Reassignment scaling (J6, audit item 7): one tree per key queried in 256-query batches, as the
- * driver does, against the former rebuild per batch; the build counter and the times. */
+/* Reassignment scaling (J6): one tree per key queried in 256-query batches, as the
+ * driver does, against a rebuild per batch; the build counter and the times. */
 static void
 test_knn_scaling(void ** state)
 {
@@ -1201,7 +1201,7 @@ test_knn_scaling(void ** state)
         }
         arena.used = 0;
         assert_int_equal(subhalo_knn_build_count(), c0 + 1);
-        /* the former pattern: a full rebuild for every batch */
+        /* the alternative: a full rebuild for every batch */
         int64_t * out2 = (int64_t *) mymalloc("TestOut2", sizeof(int64_t) * nq * k);
         t0 = MPI_Wtime();
         for(i = 0; i < nq; i += B)
@@ -2441,7 +2441,7 @@ struct CandResult {
 
 /* subhalo_unbind (+ subhalo_final_pass when it survives) of P[0, n) with nth OpenMP threads. */
 /* When set, run_threads copies the loop order (Index after subhalo_unbind, before the final pass,
- * all n entries) here (test_final_pass_sampled, audit 5e R6). */
+ * all n entries) here (test_final_pass_sampled). */
 static int64_t * FpLoopCapture;
 
 static void
@@ -2617,7 +2617,7 @@ test_threads_bitwise(void ** state)
     teardown_pman();
 }
 
-/* Phase 5 audit R7: the kernel inside the scheduler's worker region. A key that is not run alone
+/* The kernel inside the scheduler's worker region. A key that is not run alone
  * is processed by one worker of subhalo_run_serial_keys' parallel region, where the kernel must
  * stay serial (omp_in_parallel) and give the same result as alone. The host + satellite candidate
  * of test_threads_bitwise (the satellite a tenth, unbound in the host frame: several iterations,
@@ -2772,7 +2772,7 @@ test_threads_worker_region(void ** state)
  *     NFW-like cusp) with SampleSize 1000, every whole-list step in parallel mode. The sampled
  *     option is bitwise thread-count independent (1, 2 and 8 threads); against the exact pass it
  *     has the same membership, frame, Mbound and unbound tail, its prefix is a permutation of the
- *     exact prefix. Audit 5e R6: the loop order is captured immediately before each final pass
+ *     exact prefix. The loop order is captured immediately before each final pass
  *     (and equals the exact run's); the head length K is derived from it (fp_head_length: the
  *     shortest prefix with 5 x 20 tracers, or all bound tracers plus the non-tracer fill, and at
  *     least 5 x 20 particles); at every thread count the K head particles are exactly the loop's
@@ -2812,7 +2812,7 @@ fp_result_sameset(const struct CandResult * a, const struct CandResult * b)
     assert_int_equal(miss, 0);
 }
 
-/* Audit 5e R6: the head length of subhalo_final_pass from the loop order L[0, n) (n = Nbound) as
+/* The head length of subhalo_final_pass from the loop order L[0, n) (n = Nbound) as
  * subhalo_unbind.h states it: the shortest prefix holding the first T = MARGIN x max(MIN,
  * FinalRefineTracers) tracers (T clamped to n) and, when fewer than T tracers are bound, the
  * first non-tracers that make up T, at least T particles. */
@@ -2845,7 +2845,7 @@ fp_rank_cmp(const void * a, const void * b)
     return (ra > rb) - (ra < rb);
 }
 
-/* Audit 5e R6: the sampled final pass's output r against the loop order L captured immediately
+/* The sampled final pass's output r against the loop order L captured immediately
  * before it (the whole list, N entries) and the exact pass's ranks: the head Index[0, K), K from
  * L, is exactly L[0, K) sorted by exact-pass rank (every one of the K particles at its exact
  * relative position); the bound suffix Index[K, Nbound) is L's (HBT's order); the unbound tail is
@@ -2963,7 +2963,7 @@ test_final_pass_sampled(void ** state)
         struct SubhaloArena arena = arena_alloc(n);
         struct CandResult re, rs[3];
         double tun, tfp;
-        /* the loop order handed to each final pass (audit 5e R6) */
+        /* the loop order handed to each final pass */
         int64_t * le = (int64_t *) malloc(sizeof(int64_t) * n);
         int64_t * ls = (int64_t *) malloc(sizeof(int64_t) * n);
         /* a start frame 100 km/s off: several iterations, the outskirts unbound on the way (the

@@ -1,5 +1,6 @@
-/* Runtime subhalo finder: the HBT-HERONS recipe per serial key, on one rank and one thread
- * (design 7.2 steps 7a-7h and 8, D10 tags), including the sub-tree keys of oversized groups (7.8).
+/* Runtime subhalo finder: the HBT-HERONS recipe per serial key, on one rank, by one worker or by all
+ * threads when the key runs alone (subhalo_unbind.h, intra-key threading) (design 7.2 steps 7a-7h
+ * and 8, D10 tags), including the sub-tree keys of oversized groups (7.8).
  * The oversized candidates themselves are in subhalo_collective.c, unclaimed tracks in subhalo.c. */
 
 #include <mpi.h>

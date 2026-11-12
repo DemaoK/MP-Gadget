@@ -95,7 +95,9 @@ const struct SubhaloParams * subhalo_get_params(void);
 #define SUBHALO_FLAG_PLANCENTRAL  (1 << 2)
 #define SUBHALO_FLAG_SOCUTOFF     (1 << 3)
 #define SUBHALO_FLAG_SONOCROSS    (1 << 4)
-#define SUBHALO_FLAG_RESCUED      (1 << 5)   /* bound set of the rescue's second unbinding (clipped core frame) */
+/* The rescue's second unbinding (clipped core frame) stood for the track in this call; a later unbinding
+ * of the same call, after its children sink, can change the bound set and keeps the flag. */
+#define SUBHALO_FLAG_RESCUED      (1 << 5)
 
 /* Particle block types for the finder's own IOTable entries (PTYPE_FOF_GROUP is 1024). */
 #define PTYPE_SUBHALO 1025
