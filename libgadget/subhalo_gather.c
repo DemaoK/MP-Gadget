@@ -2277,6 +2277,13 @@ vote_owner(const struct particle_data * p, const struct SubhaloMember * mem, int
 
 static struct SubhaloVoteStats LastVote;
 static double VoteExtraBytes = 0;
+static double RecordScale = 1;
+
+void
+subhalo_plan_set_record_scale(double scale)
+{
+    RecordScale = scale;
+}
 
 void
 subhalo_plan_set_vote_extra_bytes(double bytes)
@@ -2929,6 +2936,9 @@ subhalo_plan_build(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubT
         double rb = rec_held + rec_rounds;
         MPI_Allreduce(MPI_IN_PLACE, &rb, 1, MPI_DOUBLE, MPI_SUM, Comm);
         LastVote.RecordBytes = rb;
+        rec_held *= RecordScale;
+        rec_build *= RecordScale;
+        rec_rounds *= RecordScale;
     }
     const int noadmit = plan_admit(plan, dk, ndir, in, fkmap, nfk, ddecomp, rec_held, rec_build, rec_rounds, Comm);
     memset(&LastSummary, 0, sizeof(LastSummary));

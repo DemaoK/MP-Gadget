@@ -580,6 +580,9 @@ struct SubhaloHomeRec {
 const struct SubhaloVoteStats * subhalo_plan_last_vote(void);
 /* Test hook: bytes added to every rank's need in the vote's memory check (0 by default). */
 void subhalo_plan_set_vote_extra_bytes(double bytes);
+/* Test hook: factor on the record bytes the plan's admission charges (1 by default; 0 leaves them
+ * out of the admission, RecordBytes keeps the unscaled sum). */
+void subhalo_plan_set_record_scale(double scale);
 /* Binary search of the member table, NULL if absent. */
 const struct SubhaloMember * subhalo_plan_member(const struct SubhaloPlan * plan, int64_t TrackId);
 /* The in-place key g in plan->Inplace, -1 if g is not in place. */
