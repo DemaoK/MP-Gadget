@@ -1,47 +1,46 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Scripted integration checks for the runtime subhalo finder: Phase 1
-(halofinder_phase1_plan.md section 6), Phase 2a (halofinder_phase2a_plan.md section 6) and Phase 3
-(halofinder_phase3_plan.md section 6).
+"""Scripted integration checks for the runtime subhalo finder: tags, tracking, hierarchy, orphans,
+properties and the track history of its PIG catalogues.
 Every subcommand exits 0 on success and 1 on a failed check, printing each failure; 2 means the
 input could not be read.
 
-  offon OFFDIR ONDIR          check 1: PART_000 byte-identical between the finder-off and -on
+  offon OFFDIR ONDIR          PART_000 byte-identical between the finder-off and -on
                               runs (a warning plus a by-ID roundoff check if not, since MP-Gadget
                               is not bitwise reproducible run to run; --strict-bytes to fail);
                               later PART_nnn matched by ID (max displacement report);
                               PIG_000 FOFGroups identical, finder blocks present and complete.
-  consistency PIGDIR [...]    check 2: the reader rules on one or more PIGs (groups = subhalos,
+  consistency PIGDIR [...]    the reader rules on one or more PIGs (groups = subhalos,
                               slices tile the groups, BindRank dense, bound prefixes, counts);
-                              --no-phase1 for Phase 2a catalogues.
-  tracking PIG_prev PIG_next  check 3: host votes, centrals, newborn numbering, sinks (the target
+                              --no-phase1 for catalogues with several subhalos per group.
+  tracking PIG_prev PIG_next  host votes, centrals, newborn numbering, sinks (the target
                               resolved, or an orphan of the same call: same-call sink chains as in
                               tree, followed to the first resolved target, which must be hosted by
                               the vote; a target absent or dead before the call, or a cycle, fails;
                               a chain ending in a track that died in the call without sinking, as
                               after a failed re-unbinding, is a warning),
                               resurrections, recomputed from the two PIGs (an orphan following
-                              several particles, decision 70: its host from PIG_next's own record,
+                              several particles: its host from PIG_next's own record,
                               which must be the group of one of its markers, or -1 with a marker
                               outside every group). A group with resolved
                               survivors has one Rank 0 member, the most massive (CompareMass) and
                               a previous member; in an orphan-only group the orphan nearest in
                               kinetic distance (H from RSDFactor, float32 roundoff allowed) is
                               resurrected; hostless (pseudo-key) centrals are not checked.
-                              Default: the Phase 2a rules (weighted ten-tracer vote);
-                              --phase1-vote: the Phase 1 rules
+                              Default: the weighted ten-tracer vote;
+                              --phase1-vote: the majority-vote rules
                               (majority vote over every own-bound particle, the most massive
                               candidate wins, the others sink). The vote runs over the current
                               population (PIG_next's saved rows, or --part PART_next) with pre-call
                               tags joined from PIG_prev as the restart join does (exact ID first,
                               else a spawned child inherits its generation-0 base's record);
-                              previously tagged particles absent from it are omitted (Phase 1) or
-                              make a Phase 2a vote inconclusive (a warning) unless --part is given.
-  hierarchy PIGDIR [...]      Phase 2a: Depth(child) = Depth(parent) + 1, parents hosted in the
+                              previously tagged particles absent from it are omitted (--phase1-vote)
+                              or make a weighted vote inconclusive (a warning) unless --part is given.
+  hierarchy PIGDIR [...]      Depth(child) = Depth(parent) + 1, parents hosted in the
                               same group, CentralTrackId the Rank 0 member of its HostGroup, Rank
                               dense per group with Ranks 1.. by Mbound descending; hostless tracks
                               are their own centrals.
-  tags PIGDIR [...]           Phase 2a (D10, J12): BindRank is the energy order of all own-tag
+  tags PIGDIR [...]           BindRank is the energy order of all own-tag
                               particles of a track (dense 0..n-1, every type), the exclusive bound
                               prefix (BoundTrackId == TrackId) first; the first
                               SubhaloMinNumTracerPart (default 10) particles of a tracer type
@@ -51,11 +50,12 @@ input could not be read.
                               of it, or -1; NboundExclusive <= Nbound; the full bound list (every
                               row with BoundTrackId == T, inside T's key) has Nbound members,
                               NboundType per type, NboundTracer tracers, MboundType mass.
-                              --phase1 for Phase 1 PIGs (section 1 holds stale tags there).
+                              --phase1 for PIGs of the one-subhalo-per-group finder (section 1
+                              holds stale tags there).
   orphans PIGDIR [...]        Orphan/*: TracerPos inside the box, SnapTracerLost -1 or <= the
                               snapshot, Snap* ordering, SinkTrackId / DescendantTrackId /
                               NestedParentTrackId / CentralTrackId refer to existing tracks.
-                              The followed set (decision 70; legacy values for schema 1):
+                              The followed set (legacy values for schema 1):
                               NOrphanTracers in [1, 16], OrphanIDs[0] = MostBoundID, the others
                               distinct, -1 exactly after NOrphanTracers; NOrphanFound in [0,
                               NOrphanTracers], 0 exactly when SnapTracerLost >= 0, 1 at the death
@@ -65,7 +65,7 @@ input could not be read.
                               the clipped weighted mean recomputed when every marker is saved
                               (unit penalties; a warning unless --tracer-pos), with HostGroup their
                               weighted plurality group.
-  props PIGDIR [...]          Phase 3: the property columns. Bound SO (MBoundSO, RBoundSO) and field
+  props PIGDIR [...]          The property columns. Bound SO (MBoundSO, RBoundSO) and field
                               SO (MSO, RSO) defined for a looser threshold whenever for a tighter one,
                               non-increasing with the threshold density (Header SOThresholds, else the
                               design 7.10 formulas), R = (3 M / 4 pi rho)^(1/3); MBoundSO <= Mbound,
@@ -76,14 +76,14 @@ input could not be read.
                               set exactly when an MSO definition is -1; group C zero for absent types,
                               MostMassiveBHID (UINT64_MAX the only 'none'; 0 is a real ID) set exactly
                               when a black hole is bound; no NaN. Only defined values (!= -1) are
-                              tested, so a catalogue written before Phase 3 passes. MSO below MBoundSO
-                              is a warning. Phase 5: Vrms, BulkVel, RockstarCoreVel defined only with
+                              tested, so a catalogue without property columns (all -1) passes. MSO
+                              below MBoundSO is a warning. Vrms, BulkVel, RockstarCoreVel defined only with
                               RBoundSO[vir] (Vrms >= 0); Vrms -1 with it where MBoundSO[vir] exceeds
                               1.5 mean particle masses a warning (Rockstar's aperture excludes the
                               crossing particle; the per-type mean is no bound on one particle's mass);
                               Rs -1 below 101 bound particles, else > 0 and below 1.5 RBoundSO[vir]
                               (-1 there is a warning); |RockstarCoreVel - CoreVel| > Vrms a warning;
-                              skipped when all -1. Decision 44 (RsSO, RsKlypinSO, VmaxSO, RmaxSO, the
+                              skipped when all -1. The SO profile (RsSO, RsKlypinSO, VmaxSO, RmaxSO, the
                               field-SO virial sphere's profile): -1 off centrals and without MSO/RSO[vir];
                               VmaxSO, RmaxSO, RsKlypinSO defined together, RsSO only with them;
                               RmaxSO and RsSO in (0, RSO[vir]]; warnings (mass-derived, not counts):
@@ -92,7 +92,7 @@ input could not be read.
                               (the typical bound for a peak between two profile edges; a compact core
                               peaking inside the first bin legitimately gives less); skipped when the
                               columns are absent.
-  tree OUTPUTDIR|PIG...       Phase 4: the track history over a PIG sequence. Tracks present at every
+  tree OUTPUTDIR|PIG...       The track history over a PIG sequence. Tracks present at every
                               output after birth; resolved nodes their own descendant; deaths with
                               SnapDeath = the first orphan output, DescendantTrackId resolved there,
                               SinkTrackId present there (resolved, or an orphan that died in the same
@@ -100,11 +100,11 @@ input could not be read.
                               afterwards; MboundPeak / VmaxPeak running
                               maxima; SnapAcc, SnapFirstAcc, SnapLastIsolation, SnapLastMajorMerger
                               against the Rank history (subhalo_history_update).
-  compare PIG_A PIG_B         check 5: every Subhalo/* and Orphan/* column equal after sorting by
+  compare PIG_A PIG_B         every Subhalo/* and Orphan/* column equal after sorting by
                               TrackId, and the per-particle tags equal when matched by ID
                               (--ignore skips a column or one of the compared Header attributes).
-  markincomplete PIGDIR       check 6 helper: set Header SubhaloStateComplete (default 0).
-  tagcounts PIGDIR            tagged particles per type (to compare with the run log, check 4).
+  markincomplete PIGDIR       restart-test helper: set Header SubhaloStateComplete (default 0).
+  tagcounts PIGDIR            tagged particles per type (to compare with the run log).
 
 Examples (from the directory holding the run outputs):
   python3 tools/subhalo_check.py offon off/output on/output
@@ -113,14 +113,14 @@ Examples (from the directory holding the run outputs):
   python3 tools/subhalo_check.py compare on/output/PIG_001 offline/output/PIG_001
   python3 tools/subhalo_check.py markincomplete restart/output/PIG_001
   python3 tools/subhalo_check.py tagcounts on/output/PIG_001
-  python3 tools/subhalo_check.py consistency --no-phase1 output/PIG_00?      (Phase 2a)
+  python3 tools/subhalo_check.py consistency --no-phase1 output/PIG_00?
   python3 tools/subhalo_check.py hierarchy output/PIG_00?
   python3 tools/subhalo_check.py tags output/PIG_00?
-  python3 tools/subhalo_check.py tags --phase1 on/output/PIG_00?               (Phase 1)
+  python3 tools/subhalo_check.py tags --phase1 on/output/PIG_00?
   python3 tools/subhalo_check.py orphans output/PIG_00?
   python3 tools/subhalo_check.py tracking output/PIG_003 output/PIG_004
-  python3 tools/subhalo_check.py props output/PIG_00?                         (Phase 3)
-  python3 tools/subhalo_check.py tree output                                  (Phase 4)
+  python3 tools/subhalo_check.py props output/PIG_00?
+  python3 tools/subhalo_check.py tree output
 
 The Header attribute file format (BigFile attr-v2), used by the markincomplete fallback when the
 Python bigfile module cannot rewrite attributes: one attribute per line,
@@ -425,7 +425,7 @@ def check_consistency(pigdir, ck, phase1=True, expect_field="auto", allow_incomp
     length = lbt.sum(axis=1) if lbt.shape[0] else np.zeros(0, np.int64)
     ck.check(np.all(np.diff(gid) > 0), "%s: FOFGroups/GroupID not increasing" % tag)
 
-    # per-track accumulations for Phase 1 checks
+    # per-track accumulations for the one-subhalo-per-group checks
     sec0_tracks, sec0_ranks, sec0_ids = [], [], []
     nfield_rows = 0
     field_rows_of_orphans = 0
@@ -522,7 +522,7 @@ def check_consistency(pigdir, ck, phase1=True, expect_field="auto", allow_incomp
         _check_bound_prefix(ck, tag, t, "FieldSlice", S, frow, fs, fl, ft, bt, None)
 
         if phase1:
-            ck.check(np.all(tr[:ng] >= 0), "%s type %d: %d untagged rows inside groups (Phase 1 tags every group member)"
+            ck.check(np.all(tr[:ng] >= 0), "%s type %d: %d untagged rows inside groups (one subhalo per group tags every member)"
                      % (tag, t, np.count_nonzero(tr[:ng] < 0)))
             ck.check(np.array_equal(bt[:ng], tr[:ng]), "%s type %d: %d in-group rows with BoundTrackId != TrackId"
                      % (tag, t, np.count_nonzero(bt[:ng] != tr[:ng])))
@@ -565,7 +565,7 @@ def check_consistency(pigdir, ck, phase1=True, expect_field="auto", allow_incomp
     ck.check(np.array_equal(S["SliceLengthByType"][hrows], lbt[gr].astype(S["SliceLengthByType"].dtype)),
              "%s: in-group slices do not tile the group ranges" % tag)
     ck.check(np.all(S["Rank"][hrows] == 0) and np.all(S["CentralTrackId"][hrows] == st[hrows]),
-             "%s: a hosted Phase 1 subhalo is not a central" % tag)
+             "%s: a hosted subhalo is not a central (one subhalo per group)" % tag)
     # hostless: Nbound = own-tag field particles, no in-group slice
     hl = np.nonzero(~hosted)[0]
     if hl.size:
@@ -594,7 +594,7 @@ def check_consistency(pigdir, ck, phase1=True, expect_field="auto", allow_incomp
 
 
 def _check_bound_prefix(ck, tag, t, prefix, S, trow, starts, lengths, tracks, bt, br):
-    """SliceNbound/FieldSliceNbound (audit H13): nb equals the number of rows of the slice bound to
+    """SliceNbound/FieldSliceNbound: nb equals the number of rows of the slice bound to
     the track (BoundTrackId == TrackId), those rows are exactly the first nb (prefix all bound,
     suffix none), and BindRank (if given) is non-decreasing within the slice."""
     nb = S[prefix + "NboundByType"][trow, t].astype(np.int64)
@@ -652,7 +652,7 @@ def _all_types(cat, names, section=None):
 
 
 def cmd_tracking(args):
-    rule = "Phase 1 majority vote" if args.phase1_vote else "Phase 2a weighted ten-tracer vote"
+    rule = "majority vote" if args.phase1_vote else "weighted ten-tracer vote"
     ck = Checker("tracking %s -> %s (%s)" % (args.prev, args.next, rule))
     try:
         A, B = SubhaloCatalogue(args.prev), SubhaloCatalogue(args.next)
@@ -669,15 +669,15 @@ def cmd_tracking(args):
 
 
 def _tracking_phase1(ck, A, B, args):
-    """The Phase 1 rules (halofinder_phase1_plan.md section 6, check 3)."""
+    """The majority-vote rules: one subhalo per group, the most massive candidate wins."""
     ha, hb = A.header, B.header
     snap_next = int(attr(hb, "SnapshotIndex", snapnum_of(args.next)))
     ntr_a = int(attr(ha, "NumTracksTotal"))
     ntr_b = int(attr(hb, "NumTracksTotal"))
 
-    # host vote (audit H12): over the current population (every saved row of the next PIG, plus
+    # host vote: over the current population (every saved row of the next PIG, plus
     # --part), with pre-call tags joined from the previous PIG; previously tagged particles absent
-    # from the next PIG are omitted (Phase 1 saves every surviving tagged particle, so they were
+    # from the next PIG are omitted (these rules save every surviving tagged particle, so they were
     # removed). Largest count, ties to the smaller GroupID; "no group" only with a strict majority.
     pop = precall_population(A, B, part=args.part, keep_absent=False)
     gid_b = B.groups["GroupID"]
@@ -709,7 +709,7 @@ def _tracking_phase1(ck, A, B, args):
 
     # expected winner per next group. Only tracks alive in the previous PIG are candidates: an
     # orphan (sunk or dead) keeps the tags of its leftover field particles but never wins a group
-    # and never sinks again (Phase 1 never resurrects orphans); a group whose only voters are
+    # and never sinks again (these rules never resurrect orphans); a group whose only voters are
     # orphans is newborn.
     alive_prev = set(int(x) for x in SA["TrackId"].tolist())
     cand = {}
@@ -755,7 +755,7 @@ def _tracking_phase1(ck, A, B, args):
     ck.check(got == expect, "newborn TrackIds %s... are not %s... (GrNr order from NumTracksTotal %d)"
              % (got[:8], expect[:8], ntr_a))
     ck.check(ntr_b == ntr_a + len(newborn), "NumTracksTotal %d, expected %d + %d newborn" % (ntr_b, ntr_a, len(newborn)))
-    # every previous track persists; previous orphans stay orphans (Phase 1)
+    # every previous track persists; previous orphans stay orphans (no resurrection)
     for T in A.subhalos["TrackId"].tolist():
         ck.check(B.subhalo_row(T) >= 0 or B.orphan_row(T) >= 0, "track %d vanished" % T)
     for T in A.orphans["TrackId"].tolist():
@@ -785,7 +785,7 @@ def _tracking_phase1(ck, A, B, args):
           % (len(gid_b), len(gid_b) - len(newborn), len(newborn), nhostless, B.norphans - A.norphans))
 
 
-# ---------------------------------------------------------------------------------- Phase 2a helpers
+# ---------------------------------------------------------------------------------- weighted-vote helpers
 def particles(cat, extra=()):
     """Every saved row of every type with the tag blocks, as one dict of arrays:
     Type, Row (row in <t>/), Section (0 in a group, 1 field), GroupID (the row's FOF GroupID, -1 in
@@ -842,7 +842,7 @@ ID_BASE_MASK = np.uint64((1 << 56) - 1)
 
 
 def precall_population(A, B, part=None, keep_absent=True):
-    """The particles alive at the call that wrote PIG B, with their pre-call tags (audit H12).
+    """The particles alive at the call that wrote PIG B, with their pre-call tags.
 
     Current population: every saved row of B (both sections), or with part = PART_xxx of the same
     snapshot every particle in it (types and IDs; group membership still from B's section 0).
@@ -907,7 +907,7 @@ def precall_population(A, B, part=None, keep_absent=True):
 
 
 def tracer_votes(pop, ntracers, tracer_types):
-    """Phase 2a host vote (plan section 1 steps 0 and 2) over a precall_population: the tracers of
+    """The weighted host vote over a precall_population: the tracers of
     track T are the ntracers lowest-BindRank (ties by ID) particles of a tracer type whose pre-call
     tags have TrackId == BoundTrackId == T; tracer i votes with weight 1/(1 + sqrt(i)) for its
     current GroupID (-1 outside groups); the largest weight wins, ties to the smaller GroupID (-1
@@ -952,7 +952,7 @@ def follow_sink_chain(cat, T, s, snap):
 
     SinkTrackId is the sink edge of the call, not the final owner: in a same-call chain
     L -> P -> C the target P sank (or died) after L sank into it, so P is an orphan of this call
-    too (the tree check's rule, audit P6; subhalo_track.c merge_subtree and the re-unbinding of
+    too (the tree check's rule; subhalo_track.c merge_subtree and the re-unbinding of
     the reference after it; the in-place rounds of subhalo_collective.c). Each orphan on the chain
     must have died in this call (SnapDeath == snap: only a track alive at the call's start takes
     sinkers); the walk is bounded by the number of tracks and stops at a cycle.
@@ -1050,7 +1050,7 @@ def _kinetic_distance(x1, v1, x2, v2, box, a, H):
 
 
 def _tracking_phase2a(ck, A, B, args):
-    """Phase 2a rules (halofinder_phase2a_plan.md section 1 steps 1, 2, 7b, 7d, 10)."""
+    """The weighted ten-tracer vote rules: hosts, orphan hosts, centrals, newborns and new orphans."""
     snap_next = int(attr(B.header, "SnapshotIndex", snapnum_of(args.next)))
     ntr_a = int(attr(A.header, "NumTracksTotal"))
     ntr_b = int(attr(B.header, "NumTracksTotal"))
@@ -1109,8 +1109,8 @@ def _tracking_phase2a(ck, A, B, args):
     if nwrong > 20:
         ck.fail("... %d tracks with a HostGroup other than their vote" % nwrong)
 
-    # 3. orphan hosts from their MostBoundID (step 1); resurrected orphans. An orphan following
-    #    several particles (decision 70) takes the plurality group of its kept markers, whose
+    # 3. orphan hosts from their MostBoundID; resurrected orphans. An orphan following
+    #    several particles takes the plurality group of its kept markers, whose
     #    clip and penalties PIG_next does not hold: its host is read from PIG_next's own record
     #    and must be the group of one of its markers (-1: one outside every group)
     so = np.argsort(mid)
@@ -1154,7 +1154,7 @@ def _tracking_phase2a(ck, A, B, args):
                  "(the group holding its MostBoundID %d, or for a set its markers' plurality)"
                  % (T, SB["HostGroup"][rb], SB["Rank"][rb], orph_host[ra], OA["MostBoundID"][ra]))
 
-    # 4. members per group and the central decision (step 7b); hostless (pseudo-key) centrals are not checked here
+    # 4. members per group and the central decision; hostless (pseudo-key) centrals are not checked here
     cand, ocand = {}, {}
     mb_prev = dict(zip(SA["TrackId"].tolist(), SA["Mbound"].astype(np.float64).tolist()))
     for T, g in host.items():
@@ -1405,7 +1405,7 @@ def cmd_hierarchy(args):
 
 # ---------------------------------------------------------------------------------- tags
 def check_tags(pigdir, ck, ntracers=None, tracer_rank=True, mass_rtol=1e-4, phase1=False):
-    """With phase1, section 1 is ignored: Phase 1 never retags field particles, which keep the
+    """With phase1, section 1 is ignored: the one-subhalo-per-group finder never retags field particles, which keep the
     TrackId, BindRank and BoundTrackId of the last call that processed them, and its Nbound and
     NboundExclusive count the in-group slice only."""
     try:
@@ -1415,7 +1415,7 @@ def check_tags(pigdir, ck, ntracers=None, tracer_rank=True, mass_rtol=1e-4, phas
         ck.fail(str(e))
         return
     if phase1:
-        # Phase 1 ranks by distance over every type, so the tracer rule does not apply either
+        # that finder ranks by distance over every type, so the tracer rule does not apply either
         keep = P["Section"] == 0
         P = {k: v[keep] for k, v in P.items()}
         tracer_rank = False
@@ -1436,7 +1436,7 @@ def check_tags(pigdir, ck, ntracers=None, tracer_rank=True, mass_rtol=1e-4, phas
     brow = lookup(tid, B[bown])
     ck.check(np.all(brow >= 0), "%s: %d rows bound to a track that is not a resolved subhalo (e.g. %s)"
              % (tag, np.count_nonzero(brow < 0), np.unique(B[bown][brow < 0])[:5].tolist()))
-    # tags of orphans: only reported (Phase 1 leaves them on field particles)
+    # tags of orphans: only reported (the one-subhalo-per-group finder leaves them on field particles)
     trow = lookup(tid, T)
     orph_tag = (T >= 0) & (trow < 0)
     if np.any(orph_tag):
@@ -1482,7 +1482,7 @@ def check_tags(pigdir, ck, ntracers=None, tracer_rank=True, mass_rtol=1e-4, phas
         ck.check(np.all(prefix_ok), "%s: in %d tracks the own-bound rows (BoundTrackId == TrackId) are not exactly "
                  "BindRank 0..NboundExclusive-1 (e.g. %s)" % (tag, len(np.unique(T[o][~prefix_ok])), np.unique(T[o][~prefix_ok])[:5].tolist()))
         if tracer_rank:
-            # J12: BindRank is the energy order of every own-tag particle; the reservation only
+            # BindRank is the energy order of every own-tag particle; the reservation only
             # guarantees that the first ntracers tracer-type rows in rank order are bound to T
             to = o[istr[o]]
             if to.size:
@@ -1572,7 +1572,7 @@ NO_ID = np.uint64(0xFFFFFFFFFFFFFFFF)
 
 
 def orphan_markers(O, r):
-    """The IDs orphan row r follows (decision 70): OrphanIDs[:NOrphanTracers], or its MostBoundID
+    """The IDs orphan row r follows: OrphanIDs[:NOrphanTracers], or its MostBoundID
     alone for a row without a set."""
     n = int(O["NOrphanTracers"][r]) if "NOrphanTracers" in O else 0
     if n > 0:
@@ -1659,7 +1659,7 @@ def check_orphans(pigdir, ck, tracer_pos=False):
         ck.check(not np.any(bad), "%s: %d orphans whose %s is not an existing track (e.g. %s -> %s)"
                  % (tag, np.count_nonzero(bad), col, tid[bad][:5].tolist(), v[bad][:5].tolist()))
         ck.check(np.all(v >= -1), "%s: %s values below -1" % (tag, col))
-    # the followed set (decision 70; a schema-1 catalogue holds the legacy set)
+    # the followed set (a schema-1 catalogue holds the legacy set)
     ids = np.asarray(O["OrphanIDs"]).astype(np.uint64)
     if ids.ndim != 2:
         ids = ids.reshape(n, -1) if n else np.zeros((0, 16), np.uint64)
@@ -1699,8 +1699,8 @@ def check_orphans(pigdir, ck, tracer_pos=False):
     bad = (sc > 0) & (sx > 6 * sc * (1 + 1e-5))
     ck.check(not np.any(bad), "%s: %d orphans with OrphanSigmaX above 6 OrphanScale (e.g. %s)" % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
 
-    # TracerPos against the saved markers (only after the step-1 lookup of Phase 2a; Phase 1 never
-    # updates TracerPos): at death the position of OrphanIDs[0] (the MostBoundID); later, when every
+    # TracerPos against the saved markers (only after the weighted vote's orphan lookup; the
+    # one-subhalo-per-group finder never updates TracerPos): at death the position of OrphanIDs[0] (the MostBoundID); later, when every
     # marker is saved, the set's state recomputed with unit penalties, HostGroup included
     P = particles(cat, extra=("Position",))
     so = np.argsort(P["ID"])
@@ -1742,7 +1742,7 @@ def check_orphans(pigdir, ck, tracer_pos=False):
     if tracer_pos:
         ck.check(nmis + nhost == 0, msg)
     elif nmis + nhost:
-        ck.warn(msg + " (fails with --tracer-pos; Phase 1 never updates TracerPos; penalised markers weigh less)")
+        ck.warn(msg + " (fails with --tracer-pos; --phase1 catalogues never update TracerPos; penalised markers weigh less)")
     print("  %s: %d orphans (%d sunk, %d tracer lost, %d following more than one particle), %d checked against their saved markers"
           % (tag, n, np.count_nonzero(sunk), np.count_nonzero(lost >= 0), np.count_nonzero(nt > 1), nchk))
 
@@ -1756,10 +1756,10 @@ def cmd_orphans(args):
     return rc
 
 
-# ---------------------------------------------------------------------------------- props (Phase 3)
+# ---------------------------------------------------------------------------------- props
 GCGS = 6.674e-8
 SO_NAMES = ("vir", "200b", "200c", "500c", "2500c")
-# Phase 3 float columns whose defined values are positive (> 0) or, second set, non-negative
+# property float columns whose defined values are positive (> 0) or, second set, non-negative
 _PROPS_POSITIVE = ("MBoundSO", "RBoundSO", "VmaxVir", "RmaxVir", "Rhalf", "Renclose", "RsKlypin", "MSO", "RSO", "Rs")
 _PROPS_NONNEG = ("SpinPeebles", "SpinBullock", "Xoff", "Voff", "Vrms")
 _PROPS_FINITE = _PROPS_POSITIVE + _PROPS_NONNEG + (
@@ -1831,8 +1831,8 @@ def _check_so_set(ck, tag, tid, M, R, rho, rtol_r, name_m, name_r, rows):
 
 
 def check_props(pigdir, ck, vmax_rtol=1e-3, field_warn=0.02):
-    """Phase 3 (halofinder_phase3_plan.md section 6): internal consistency of the property columns.
-    Every rule applies to defined values only, so a catalogue before Phase 3 (all -1) passes."""
+    """Internal consistency of the property columns.
+    Every rule applies to defined values only, so a catalogue without property values (all -1) passes."""
     try:
         cat = SubhaloCatalogue(pigdir)
     except SubhaloFormatError as e:
@@ -1969,9 +1969,9 @@ NFW_MINPART = 100
 
 
 def deferred_velocity_aperture(vrms):
-    """Rows whose Phase 5 velocities were computed: the virial aperture exists, i.e. Vrms is a finite
+    """Rows whose deferred velocities were computed: the virial aperture exists, i.e. Vrms is a finite
     value >= 0 (-1 otherwise). Velocity components are signed, so -1 km/s is a legitimate value and
-    never marks a missing vector by itself (Phase 5 audit R8)."""
+    never marks a missing vector by itself."""
     vrms = np.asarray(vrms, dtype=np.float64)
     return np.isfinite(vrms) & (vrms >= 0)
 
@@ -1984,12 +1984,12 @@ def deferred_velocity_valid(vrms, vel):
 
 
 def _check_props_deferred(ck, tag, S, tid, corevel_warn=1.0):
-    """Phase 5 (halofinder_phase5_plan.md section 1 item 1, subhalo_props_deferred): Rs, Vrms, BulkVel,
-    RockstarCoreVel. Skipped (a note) when every value is -1, i.e. a catalogue written before Phase 5.
+    """The deferred properties (subhalo_props_deferred): Rs, Vrms, BulkVel,
+    RockstarCoreVel. Skipped (a note) when every value is -1, i.e. a catalogue without them.
      - Vrms defined (>= 0) exactly when RBoundSO[vir] is (the aperture is the bound virial sphere);
      - the velocities are signed, so -1 is a legitimate component value: BulkVel and RockstarCoreVel are
        valid where the aperture exists (Vrms >= 0) and then every component must be finite; where the
-       aperture is absent they must be the all -1 sentinel (Phase 5 audit R8);
+       aperture is absent they must be the all -1 sentinel;
      - Rs is -1 below NFW_MINPART bound particles (the aperture is a subset of the bound set) and
        otherwise > 0, or -1 (a warning: fewer than NFW_MINPART particles inside Rvir, or a failed fit);
        Rs inside the aperture (below 1.5 RBoundSO[vir]: the outer bin edge may lie half a particle
@@ -1998,12 +1998,12 @@ def _check_props_deferred(ck, tag, S, tid, corevel_warn=1.0):
        r < 0.1 Rvir or the innermost 100 against the CoreSize most-bound particles)."""
     names = ("Rs", "Vrms", "BulkVel", "RockstarCoreVel")
     if any(c not in S for c in names):
-        ck.note("%s: no Phase 5 columns (%s); the deferred-property rules are skipped" % (tag, ", ".join(c for c in names if c not in S)))
+        ck.note("%s: no deferred-property columns (%s); the deferred-property rules are skipped" % (tag, ", ".join(c for c in names if c not in S)))
         return
     rs, vrms = S["Rs"].astype(np.float64), S["Vrms"].astype(np.float64)
     bv, rcv = S["BulkVel"].astype(np.float64), S["RockstarCoreVel"].astype(np.float64)
     if not (np.any(_defined(rs)) or np.any(_defined(vrms)) or np.any(_defined(bv)) or np.any(_defined(rcv))):
-        ck.note("%s: Rs, Vrms, BulkVel, RockstarCoreVel all -1 (a catalogue before Phase 5); rules skipped" % tag)
+        ck.note("%s: Rs, Vrms, BulkVel, RockstarCoreVel all -1 (a catalogue without them); rules skipped" % tag)
         return
     rv = S["RBoundSO"][:, 0].astype(np.float64)
     hasr = _defined(rv) & (rv > 0)
@@ -2011,11 +2011,11 @@ def _check_props_deferred(ck, tag, S, tid, corevel_warn=1.0):
     bad = _defined(vrms) & ~hasr
     ck.check(not np.any(bad), "%s: %d subhalos with Vrms defined without RBoundSO[vir] (e.g. TrackId %s)"
              % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
-    # Rockstar's aperture (decision 44) excludes the crossing particle: Vrms is -1 with RBoundSO[vir]
+    # Rockstar's aperture excludes the crossing particle: Vrms is -1 with RBoundSO[vir]
     # only when the crossing is the innermost bound particle, i.e. MBoundSO[vir] is one particle.
     # The catalogue has no particle count inside RBoundSO[vir], only per-type MEAN masses, which do
     # not bound one particle's mass (stars, black holes, any type with one massive particle): a
-    # warning (audit 5e R5)
+    # warning
     mpart = _max_particle_mass(S)
     bad = hasr & ~_defined(vrms) & (S["MBoundSO"][:, 0].astype(np.float64) > 1.5 * mpart)
     if np.any(bad):
@@ -2036,7 +2036,7 @@ def _check_props_deferred(ck, tag, S, tid, corevel_warn=1.0):
              % (tag, np.count_nonzero(bad), tid[bad][:5].tolist()))
     drs = _defined(rs)
     # the fit's aperture holds the bound particles inside the crossing particle, as the velocity
-    # aperture (decision 47.1; nfw.c would also drop the particle before it)
+    # aperture (nfw.c would also drop the particle before it)
     bad = drs & (nb < NFW_MINPART + 1)
     ck.check(not np.any(bad), "%s: %d subhalos with Rs defined below %d bound particles (e.g. TrackId %s)"
              % (tag, np.count_nonzero(bad), NFW_MINPART + 1, tid[bad][:5].tolist()))
@@ -2066,7 +2066,7 @@ def _check_props_deferred(ck, tag, S, tid, corevel_warn=1.0):
         if np.any(far):
             ck.warn("%s: %d subhalos with |RockstarCoreVel - CoreVel| > %g Vrms (different core definitions; e.g. TrackId %s)"
                     % (tag, np.count_nonzero(far), corevel_warn, tid[far][:5].tolist()))
-    print("  %s: Phase 5 defined: Rs %d (of %d with Nbound >= %d), Vrms %d, BulkVel %d, RockstarCoreVel %d"
+    print("  %s: deferred properties defined: Rs %d (of %d with Nbound >= %d), Vrms %d, BulkVel %d, RockstarCoreVel %d"
           % (tag, np.count_nonzero(drs), np.count_nonzero(big), NFW_MINPART, np.count_nonzero(_defined(vrms)),
              np.count_nonzero(deferred_velocity_valid(vrms, bv)), np.count_nonzero(deferred_velocity_valid(vrms, rcv))))
 
@@ -2083,31 +2083,31 @@ def _type_masses(S):
 
 def _max_particle_mass(S):
     """The largest per-subhalo per-type MEAN particle mass: a typical particle mass, not an upper
-    bound on any particle's mass (audit 5e R5), so only warnings may rest on it."""
+    bound on any particle's mass, so only warnings may rest on it."""
     m = _type_masses(S)
     return float(m.max()) if m.size else np.inf
 
 
-# decision 44 (subhalo_so.h pass 3): profile bins over 3 decades inside RSO[vir]
+# the field-SO profile (subhalo_so.h pass 3): profile bins over 3 decades inside RSO[vir]
 SO_NPROF = 120
 SO_PROF_DEX = 3.0 / SO_NPROF
 SO_PROFILE_COLS = ("RsSO", "RsKlypinSO", "VmaxSO", "RmaxSO")
 
 
 def _check_props_so_profile(ck, tag, S, tid, central, rtol=1e-5):
-    """Decision 44: the Rockstar-comparable profile of the field-SO virial sphere (field SO pass 3).
+    """The Rockstar-comparable profile of the field-SO virial sphere (field SO pass 3).
      - all four -1 off centrals and for centrals without MSO[vir] > 0 and RSO[vir] > 0;
      - VmaxSO, RmaxSO and RsKlypinSO defined together (fewer than 100 particles inside RSO[vir] or no
        pass 3 leaves all four -1); RsSO only with them (-1 alone when the fit fails);
      - 0 < RmaxSO <= RSO[vir] and 0 < RsSO <= RSO[vir] (the fit is bounded by the outer bin edge);
      - the particle count inside RSO[vir] is not in the catalogue, and the per-type mean masses do not
-       bound single particles (audit 5e R5), so the missing-value rules are warnings: -1 for a central
+       bound single particles, so the missing-value rules are warnings: -1 for a central
        whose MSO[vir] holds more than 100 of the largest mean particle mass (a variable-mass type, a
        sphere of fewer than 100 massive particles, or a sphere of 100 or more particles without a
        profile edge above rho[vir], subhalo_so.h; MSO[vir] is interpolated, not a count); defined
        with MSO[vir] below 50 of the smallest mean mass;
      - VmaxSO >= 10^(-SO_PROF_DEX / 2) VmaxVir (1 - 1e-3) where both are defined and RmaxVir <= RSO[vir] / 2,
-       a warning (audit 5e R4): the same centre and a superset of the bound particles give
+       a warning: the same centre and a superset of the bound particles give
        M_SO(< e) >= M_bound(< r) for every edge e >= r, so when the peak lies between two edges at
        or above the first, G M / r can exceed the edge maximum by at most one bin's ratio in r
        (VmaxVir^2 <= VmaxSO^2 10^SO_PROF_DEX). That is the typical case, not an invariant: the first
@@ -2116,7 +2116,7 @@ def _check_props_so_profile(ck, tag, S, tid, central, rtol=1e-5):
        a nonmonotone profile the next edge need not satisfy the density cut. The ratio's
        distribution is printed."""
     if any(c not in S for c in SO_PROFILE_COLS):
-        ck.note("%s: no decision-44 SO profile columns (%s); rules skipped"
+        ck.note("%s: no SO profile columns (%s); rules skipped"
                 % (tag, ", ".join(c for c in SO_PROFILE_COLS if c not in S)))
         return
     rs, rk, vm, rm = (S[c].astype(np.float64) for c in SO_PROFILE_COLS)
@@ -2177,7 +2177,7 @@ def _check_props_so_profile(ck, tag, S, tid, central, rtol=1e-5):
             q = vm[both] / vv[both]
             print("  %s: VmaxSO / VmaxVir median %.4f, 10th / 90th percentile %.4f / %.4f, min %.4f over %d centrals"
                   % (tag, np.median(q), np.percentile(q, 10), np.percentile(q, 90), q.min(), q.size))
-    print("  %s: decision 44 defined: VmaxSO %d, RsSO %d of %d centrals with MSO/RSO[vir]"
+    print("  %s: SO profile defined: VmaxSO %d, RsSO %d of %d centrals with MSO/RSO[vir]"
           % (tag, np.count_nonzero(dv), np.count_nonzero(rs != -1), np.count_nonzero(hasso)))
 
 
@@ -2190,9 +2190,9 @@ def cmd_props(args):
     return rc
 
 
-# ---------------------------------------------------------------------------------- tree (Phase 4)
+# ---------------------------------------------------------------------------------- tree
 def check_tree(inputs, ck, show=5):
-    """Phase 4 plan item 4: consistency of the track history over a PIG sequence (design 7.7 and
+    """Consistency of the track history over a PIG sequence (design 7.7 and
     subhalo_history_update). A node is (TrackId, output); `prev` is the same track's node at the
     previous output of the sequence."""
     from subhalo_reader import SubhaloSequence
@@ -2419,7 +2419,7 @@ def cmd_tree(args):
 
 
 def _add_tree_parser(sub):
-    s = sub.add_parser("tree", help="Phase 4: track history consistency over a PIG sequence")
+    s = sub.add_parser("tree", help="track history consistency over a PIG sequence")
     s.add_argument("inputs", nargs="+", help="output directory holding PIG_* (or the PIG directories in order)")
     s.add_argument("--show", type=int, default=5, help="example nodes printed per failed rule (default 5)")
 
@@ -2583,34 +2583,34 @@ def cmd_tagcounts(args):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd")
-    s = sub.add_parser("offon", help="check 1: finder off vs on")
+    s = sub.add_parser("offon", help="finder off vs on")
     s.add_argument("offdir")
     s.add_argument("ondir")
     s.add_argument("--strict-bytes", action="store_true",
                    help="fail when PART_000 is not byte-identical (default: warn and compare by ID)")
     s.add_argument("--tol", type=float, default=None,
                    help="max displacement allowed in later PARTs (default: mean DM separation / 300, a tenth of a 1/30 softening)")
-    s = sub.add_parser("consistency", help="check 2: reader rules on PIGs")
+    s = sub.add_parser("consistency", help="reader rules on PIGs")
     s.add_argument("pigdirs", nargs="+")
     s.add_argument("--expect-field", choices=["auto", "empty", "nonempty", "any"], default="auto",
                    help="section 1 (tagged field particles): auto = must be empty at PIG_000, a warning if "
                         "empty later; nonempty = must be non-empty; empty = must be empty; any = no rule")
     s.add_argument("--allow-incomplete", action="store_true", help="do not fail on SubhaloStateComplete = 0")
-    s.add_argument("--no-phase1", action="store_true", help="skip the Phase 1 rule (one subhalo per group, no tails)")
-    s = sub.add_parser("tracking", help="check 3: tracking between consecutive PIGs")
+    s.add_argument("--no-phase1", action="store_true", help="skip the one-subhalo-per-group rule (no tails)")
+    s = sub.add_parser("tracking", help="tracking between consecutive PIGs")
     s.add_argument("prev")
     s.add_argument("next")
     s.add_argument("--phase1-vote", action="store_true",
-                   help="Phase 1 rules: majority vote over every own-bound particle, the most massive candidate "
-                        "wins and the others sink (default: Phase 2a weighted ten-tracer vote)")
+                   help="majority vote over every own-bound particle, the most massive candidate "
+                        "wins and the others sink (default: weighted ten-tracer vote)")
     s.add_argument("--ntracers", type=int, default=None,
                    help="tracers per track in the vote (default SubhaloNumTracerHostFinding of the previous PIG, else 10)")
     s.add_argument("--part", default=None,
                    help="PART_xxx of the next snapshot: the live population for the vote (default: the next PIG's "
-                        "saved rows; Phase 2a votes that need an unsaved particle are then inconclusive)")
-    s = sub.add_parser("hierarchy", help="Phase 2a: Rank/Depth/parent/central consistency")
+                        "saved rows; weighted votes that need an unsaved particle are then inconclusive)")
+    s = sub.add_parser("hierarchy", help="Rank/Depth/parent/central consistency")
     s.add_argument("pigdirs", nargs="+")
-    s = sub.add_parser("tags", help="Phase 2a: D10 tag rule; BindRank the energy order of all own-tag particles "
+    s = sub.add_parser("tags", help="D10 tag rule; BindRank the energy order of all own-tag particles "
                                     "(bound prefix first), the first tracer-type ones bound with MostBoundID the "
                                     "first of them; BoundTrackId; full bound lists")
     s.add_argument("pigdirs", nargs="+")
@@ -2619,18 +2619,19 @@ def main(argv=None):
                         "(default SubhaloMinNumTracerPart, else 10)")
     s.add_argument("--no-tracer-rank", action="store_true",
                    help="skip the tracer rule (the first tracer-type particles bound, MostBoundID the first of them; "
-                        "Phase 1 hydro PIGs rank by distance)")
+                        "--phase1 hydro PIGs rank by distance)")
     s.add_argument("--phase1", action="store_true",
-                   help="Phase 1 PIGs: ignore section 1, whose rows keep the stale tags of the last call that processed "
-                        "them, and skip the tracer-rank rule (Phase 1 ranks by distance over every type)")
-    s = sub.add_parser("orphans", help="Phase 2a: Orphan/* consistency")
+                   help="PIGs of the one-subhalo-per-group finder: ignore section 1, whose rows keep the stale tags of the "
+                        "last call that processed them, and skip the tracer-rank rule (that finder ranks by distance "
+                        "over every type)")
+    s = sub.add_parser("orphans", help="Orphan/* consistency")
     s.add_argument("pigdirs", nargs="+")
     s.add_argument("--tracer-pos", action="store_true",
-                   help="fail when TracerPos differs from the saved tracer's Position (Phase 2a; a warning otherwise)")
-    s = sub.add_parser("props", help="Phase 3: consistency of the property and field SO columns")
+                   help="fail when TracerPos differs from the saved tracer's Position (a warning otherwise)")
+    s = sub.add_parser("props", help="consistency of the property and field SO columns")
     s.add_argument("pigdirs", nargs="+")
     s.add_argument("--vmax-rtol", type=float, default=1e-3, help="tolerance of VmaxVir <= Vmax (default 1e-3)")
-    s = sub.add_parser("compare", help="check 5: two PIGs of the same snapshot are equal")
+    s = sub.add_parser("compare", help="two PIGs of the same snapshot are equal")
     s.add_argument("pig_a")
     s.add_argument("pig_b")
     s.add_argument("--rtol", type=float, default=1e-6, help="relative tolerance for float columns (default 1e-6)")
@@ -2639,7 +2640,7 @@ def main(argv=None):
     s.add_argument("--ignore", action="append", help="column to skip (repeatable)")
     s.add_argument("--compare-inplace-flag", action="store_true",
                    help="also compare the in-place Flags bit (depends on the rank count)")
-    s = sub.add_parser("markincomplete", help="check 6 helper: set SubhaloStateComplete")
+    s = sub.add_parser("markincomplete", help="restart-test helper: set SubhaloStateComplete")
     s.add_argument("pigdir")
     s.add_argument("--value", type=int, default=0)
     s = sub.add_parser("tagcounts", help="tagged particles per type")
