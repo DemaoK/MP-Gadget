@@ -477,9 +477,8 @@ subhalo_rescue_large_loss(int64_t Nbound, int64_t NPrev)
 {
     return 2 * Nbound < NPrev;
 }
-/* Votes needed among k neighbours for the share s: ceil(s k) in integer arithmetic on s in units of
- * 2^-53; a share up to 2^-52 above a multiple of 1/k counts as that multiple, so the nearest double
- * of m/k needs m votes. */
+/* Votes needed among k neighbours for the share s: ceil(k (Q - 2) / 2^53) in integer arithmetic, Q the
+ * share rounded to units of 2^-53; the two units make the nearest double of m/k need m votes. */
 static inline int
 subhalo_admit_need(double s, int k)
 {

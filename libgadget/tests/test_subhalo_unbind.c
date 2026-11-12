@@ -1155,8 +1155,8 @@ test_knn(void ** state)
     teardown_pman();
 }
 
-/* Reassignment scaling (J6): one tree per key queried in 256-query batches, as the
- * driver does, against a rebuild per batch; the build counter and the times. */
+/* Reassignment scaling (J6): one tree per key queried in batches of 256 (the driver sizes its
+ * batches by the arena), against a rebuild per batch; the build counter and the times. */
 static void
 test_knn_scaling(void ** state)
 {
@@ -2332,6 +2332,9 @@ test_rescue_loss(void ** state)
         assert_int_equal(subhalo_unbind_rescue(&t.c, 0, 3 * n, K, &up1, &arena, &sb), 1);
         message(0, "Second attempt at the cap: ratio %.6f, the first's %.6f\n", sb.ConvergenceRatio, first.ConvergenceRatio);
         assert_true(sb.stood == 1 && t.c.ConvergenceRatio == sa.ConvergenceRatio && sa.ConvergenceRatio != first.ConvergenceRatio);
+        /* a capped second attempt that stands reports its own cap and ratio, and the candidate carries both flags */
+        assert_true(sb.tried == 1 && sb.Itercap == 1 && sb.ConvergenceRatio == sa.ConvergenceRatio);
+        assert_int_equal(t.c.Flags, SUBHALO_FLAG_ITERCAP | SUBHALO_FLAG_RESCUED);
         assert_int_equal(arena.used, mark);
         cand_free(&t);
     }
@@ -2408,6 +2411,11 @@ test_admit_need(void ** state)
     assert_int_equal(subhalo_admit_need(0.25 + ldexp(1, -52), 4), 1);
     assert_int_equal(subhalo_admit_need(0.25 + ldexp(1, -52) + ldexp(1, -53), 4), 2);
     assert_int_equal(subhalo_admit_need(0.30000000000000004, 10), 3);
+    /* the guard is two units exactly: with k = 3 the products 2^53 - 2 and 2^53 + 1 of k (Q - 2) lie on
+     * either side of one vote; a share that rounds to no unit needs one vote */
+    assert_int_equal(subhalo_admit_need(0x1.5555555555558p-2, 3), 1);
+    assert_int_equal(subhalo_admit_need(0x1.555555555555ap-2, 3), 2);
+    assert_int_equal(subhalo_admit_need(0x1p-60, 10), 1);
 }
 
 /* ------------------------------------------------------------------ Phase 5b: intra-key threading */

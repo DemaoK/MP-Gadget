@@ -5745,8 +5745,9 @@ test_subhalo_rescue_loss_call(void ** state)
         message(0, "Loss with admission: S Nbound %d Flags %d, %ld admitted to S, %ld of them bound to S, %ld taken\n",
                 o.rec[1].Nbound, o.rec[1].Flags, nadm, nin, o.st.NAdmitTaken);
         CHECK((o.rec[1].Flags & SUBHALO_FLAG_RESCUED) && o.st.NLossRescued == 1 && nin > 0 && o.st.NAdmitTaken == nin
-              && o.rec[1].Nbound == AD_S20 - AD_S0 + nin, "loss with admission: S Flags %d Nbound %d, %ld bound of %ld admitted, %ld taken\n",
-              o.rec[1].Flags, o.rec[1].Nbound, nin, nadm, o.st.NAdmitTaken);
+              && o.st.NAdmitReceivers == 1 && o.rec[1].Nbound == AD_S20 - AD_S0 + nin,
+              "loss with admission: S Flags %d Nbound %d, %ld bound of %ld admitted, %ld taken by %ld\n", o.rec[1].Flags,
+              o.rec[1].Nbound, nin, nadm, o.st.NAdmitTaken, o.st.NAdmitReceivers);
         free(recv);
         ad_free(&o);
     }
