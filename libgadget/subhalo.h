@@ -40,7 +40,7 @@ struct SubhaloParams {
     double SubhaloBoundMassPrecision;    /* 0.995 */
     double SubhaloSourceRelaxFactor;     /* 3 */
     int    SubhaloPotentialSampleSize;   /* 1000 */
-    int    SubhaloFinalPass;             /* 0 (default) = sampled with an exact head, as HBT (decision 42.4); 1 = exact */
+    int    SubhaloFinalPass;             /* 0 (default) = sampled with an exact head, as HBT; 1 = exact */
     double SubhaloTreeOpenAngle;         /* 0.45 */
     int    SubhaloMergeTrapped;          /* 1 */
     int    SubhaloSinkSymmetric;         /* 0 */
@@ -120,7 +120,7 @@ struct SubTrack {
     int32_t Rank, Depth;
     int32_t SnapBirth, SnapDeath, SnapSink, SnapLastIsolation;
     MyIDType MostBoundID;
-    /* counts (D10) */
+    /* counts (design D10) */
     int32_t Nbound, NboundExclusive, NboundTracer;
     int32_t Flags;
     int32_t NboundType[6], NboundExclusiveType[6], NtailType[6];
@@ -149,7 +149,7 @@ struct SubTrack {
     /* group D: field SO, centrals only */
     float   MSO[SUBHALO_NSO], RSO[SUBHALO_NSO];
     float   MTypeSO200c[6], MTypeSOVir[6];
-    /* Rockstar-comparable profile of the virial sphere (decision 44, subhalo_so.h pass 3) */
+    /* Rockstar-comparable profile of the virial sphere (subhalo_so.h pass 3) */
     float   RsSO, RsKlypinSO, VmaxSO, RmaxSO;
     /* group E: history (design 7.7) */
     float   MboundPeak, VmaxAtMboundPeak, VmaxPeak, MboundAcc, VmaxAcc, MboundFirstAcc, VmaxFirstAcc;

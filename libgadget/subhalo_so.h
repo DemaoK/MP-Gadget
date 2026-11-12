@@ -9,7 +9,7 @@
  * to R = SubhaloSOSearchFactor x the radius of Mbound at the loosest threshold, R doubled while the
  * outer bin is still above it; linear sub-bins across each crossing bin when Nbound >=
  * SubhaloSORefineMinPart; the crossing interpolated in log M - log r. Resolution: one (sub-)bin.
- * Pass 3 (decision 44): the mass profile inside the published f4 RSO[vir] gives VmaxSO, RmaxSO,
+ * Pass 3: the mass profile inside the published f4 RSO[vir] gives VmaxSO, RmaxSO,
  * RsKlypinSO and RsSO; its masses are 128-bit fixed-point, so for the same centre, live particles
  * and published f4 MSO[vir]/RSO[vir] it is bitwise layout independent (passes 1-2 sum doubles).
  *

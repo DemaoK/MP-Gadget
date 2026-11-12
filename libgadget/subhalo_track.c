@@ -998,7 +998,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
         int o = -1;
         if(part_live(p)) {
             const int t = p->TrackId >= 0 ? node_index(nd, nn, p->TrackId) : -1;
-            /* the central's source is its FOF group only, as HBT's FeedCentrals (decision 52): its own
+            /* the central's source is its FOF group only, as HBT's FeedCentrals: its own
              * FOF-less particles would otherwise keep accumulating, call after call, in its bound set.
              * Pseudo-keys and sub-tree keys (whose root is never the central) keep theirs. */
             if(t >= 0 && nd[t].kind == NODE_RESOLVED && (pseudo || subkey || t != ci || p->GrNr == g))
@@ -1360,7 +1360,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
         }
     }
 
-    /* ---- 8: the tags (D10): the most-bound tracers reserved, the deepest source list for the
+    /* ---- 8: the tags (design D10): the most-bound tracers reserved, the deepest source list for the
      *      rest, BindRank in own-tag energy order, BoundTrackId the binder. A tail claim needs the
      *      binder to be the claimant or its ancestor in the FINAL tree (changed by the promotion).
      *      The owner map's memory is reused. ---- */

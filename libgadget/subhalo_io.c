@@ -351,7 +351,7 @@ subhalo_register_table_blocks(struct IOTable * T)
     SUBREG(RockstarCoreVel, "f4", 3, s, T);
     SUBREG(BulkVel, "f4", 3, s, T);
     SUBREG(Vrms, "f4", 1, s, T);
-    /* decision 44: the Rockstar-comparable profile of the field-SO virial sphere (centrals) */
+    /* the Rockstar-comparable profile of the field-SO virial sphere (centrals) */
     SUBREG(RsSO, "f4", 1, s, T);
     SUBREG(RsKlypinSO, "f4", 1, s, T);
     SUBREG(VmaxSO, "f4", 1, s, T);

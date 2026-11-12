@@ -88,7 +88,7 @@ int fof_save_particles(FOFGroups * fof, char * fname, int SaveParticles, Cosmolo
     if(finder) {
         subhalo_set_output_snapshot(fof_pig_snapnum(fname));
         /* The host IO path indexes local particles with int (petaio_build_selection, the
-         * IOTable getters): fail cleanly rather than wrap (H4). */
+         * IOTable getters): fail cleanly rather than wrap. */
         if(MPIU_Any(PartManager->NumPart > INT_MAX, Comm))
             endrun(1, "The PIG writer with the subhalo finder supports at most %d particles per rank (this rank: %ld); run with more ranks.\n",
                    INT_MAX, PartManager->NumPart);
@@ -418,7 +418,7 @@ fof_distribute_particles(struct part_manager_type * halo_pman, struct slots_mana
     message(0, "GrNrMax is %ld\n", GrNrMaxGlobal);
 
     fof_find_target_task(pi, NpigLocal, task_origin_offset, finder ? 2 : 1, Comm);
-    /* MaxPart / NumPart is infinite on a rank without particles (H5): use the global ratio
+    /* MaxPart / NumPart is infinite on a rank without particles: use the global ratio
      * there (or 1.5 if every rank is empty), so that the capacities below stay finite. The
      * distributed sort keeps each rank's number of selected particles, so an empty rank
      * receives nothing and only needs the small minimum. */

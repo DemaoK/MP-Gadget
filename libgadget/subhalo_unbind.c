@@ -1123,7 +1123,7 @@ count_tracers_all(const int64_t * Index, int64_t n, int TracerTypes)
 }
 
 /* Bound (Energy < 0) to the front of (Index, Energy)[0, n), returning their number; the bound
- * keep their order. n <= CHUNK_MIN: the swap loop; above, a stable partition (decision 34: the
+ * keep their order. n <= CHUNK_MIN: the swap loop; above, a stable partition (the
  * swap loop's unbound order cannot be parallelised, and only a dead candidate's list shows it). */
 static int64_t
 partition_bound(int64_t * Index, double * Energy, int64_t n, struct SubhaloArena * arena)

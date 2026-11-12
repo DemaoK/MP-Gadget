@@ -1128,7 +1128,7 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
         list[c] = c;
     }
 
-    /* clocks (decision 47.5): /Subhalo/FieldSO/Setup, then the whole tree build as .../Tree; the
+    /* clocks: /Subhalo/FieldSO/Setup, then the whole tree build as .../Tree; the
      * caller books the walks as .../Walks */
     walltime_measure("/Subhalo/FieldSO/Setup");
     ForceTree tree = {0};

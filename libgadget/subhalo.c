@@ -108,7 +108,7 @@ subhalo_validate_params(const struct SubhaloParams * sp)
         endrun(1, "SubhaloFinalPass = %d must be 1 (exact final pass) or 0 (sampled final pass).\n", sp->SubhaloFinalPass);
     if(!(sp->SubhaloSourceRelaxFactor >= 1 && sp->SubhaloSourceRelaxFactor <= SUBHALO_MAX_RELAX_FACTOR))
         endrun(1, "SubhaloSourceRelaxFactor = %g must be in [1, %g]: the per-thread arena reserves 8 R bytes per particle "
-                  "for the relaxed sources (J7; HBT finds no change above 3).\n", sp->SubhaloSourceRelaxFactor, SUBHALO_MAX_RELAX_FACTOR);
+                  "for the relaxed sources (HBT finds no change above 3).\n", sp->SubhaloSourceRelaxFactor, SUBHALO_MAX_RELAX_FACTOR);
     if(!(sp->SubhaloSourceRelaxFactor >= 1) || !(sp->SubhaloTreeOpenAngle > 0) || !(sp->SubhaloBoundMassPrecision > 0 && sp->SubhaloBoundMassPrecision <= 1)
        || !(sp->SubhaloMajorProgenitorMassRatio >= 0 && sp->SubhaloMajorProgenitorMassRatio <= 1))
         endrun(1, "SubhaloSourceRelaxFactor = %g must be >= 1, SubhaloTreeOpenAngle = %g positive, SubhaloBoundMassPrecision = %g in (0, 1], "
@@ -398,7 +398,7 @@ subhalo_track_make_orphan(struct SubTrack * t, int64_t winner, int SnapNum)
         t->TracerPos[k] = t->MostBoundPos[k];
         t->TracerVel[k] = t->MostBoundVel[k];
     }
-    /* The followed set (decision 70): MostBoundID, then the first distinct step-0 tracers. */
+    /* The followed set: MostBoundID, then the first distinct step-0 tracers. */
     const int K = SubParams.SubhaloOrphanTracers > 1 ? SubParams.SubhaloOrphanTracers : 1;
     subhalo_track_clear_orphan_set(t);
     if(t->MostBoundID != (MyIDType) -1) {
@@ -481,7 +481,7 @@ subhalo_check_mpi_count(int64_t value, const char * what, MPI_Comm Comm)
 {
     if(MPIU_Any(value < 0 || value > INT_MAX, Comm))
         endrun(1, "Subhalo finder: %s exceeds the MPI int limit on some rank (here %ld). "
-                  "Phase 1 does not batch this exchange; run with more ranks.\n", what, value);
+                  "The finder does not batch this exchange; run with more ranks.\n", what, value);
 }
 
 int64_t
@@ -504,7 +504,7 @@ subhalo_alltoallv(const void * sendbuf, const int64_t * sendcounts, size_t elsiz
         bad = 1;
     if(MPIU_Any(bad, Comm))
         endrun(1, "Subhalo exchange of %ld / %ld elements of %lu bytes exceeds the MPI int counts on some rank. "
-                  "Phase 1 does not batch this exchange; run with more ranks.\n", nsend, nrecv, (unsigned long) elsize);
+                  "The finder does not batch this exchange; run with more ranks.\n", nsend, nrecv, (unsigned long) elsize);
 
     int * scounts = ta_malloc("SubSendCounts", int, NTask);
     int * recvcounts = ta_malloc("SubRecvCounts", int, NTask);
@@ -2000,7 +2000,7 @@ subhalo_update_unhosted(struct SubTrackTable * tab, int SnapNum, double atime, i
 
     /* 2. local sums relative to the common reference, in ID order */
     struct FieldSum * sums = (struct FieldSum *) mymalloc("SubFieldSums", sizeof(struct FieldSum) * (ns + 1));
-    /* per track in ID order, as before; the tracks in parallel */
+    /* per track in ID order, independent of the thread count; the tracks in parallel */
     #pragma omp parallel for private(i, k)
     for(s = 0; s < ns; s++) {
       memset(&sums[s], 0, sizeof(struct FieldSum));
@@ -2331,7 +2331,7 @@ const char * const SubhaloStageName[SUBHALO_NSTAGE] = {
     "setup", "vote", "frames", "lookup", "plan", "exchange", "sort", "fetch", "serial", "restore",
     "rounds", "number", "descendants", "history", "store", "unhosted", "orphansync", "fieldso"};
 /* The rounds and field SO stages are subdivided by their callees (tree builds redirected to
- * .../Tree, decision 47.5); the driver books the remainder as Rounds/Cleanup and FieldSO/Walks. */
+ * .../Tree); the driver books the remainder as Rounds/Cleanup and FieldSO/Walks. */
 static const char * const SubhaloStageClock[SUBHALO_NSTAGE] = {
     "/Subhalo/Setup", "/Subhalo/Vote", "/Subhalo/Frames", "/Subhalo/Lookup", "/Subhalo/Plan", "/Subhalo/Exchange",
     "/Subhalo/Sort", "/Subhalo/Fetch", "/Subhalo/Serial", "/Subhalo/Restore", "/Subhalo/Rounds/Cleanup", "/Subhalo/Number",

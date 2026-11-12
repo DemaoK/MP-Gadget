@@ -9,7 +9,7 @@
  * Edge cases: a claim of a candidate or serial member that sinks later is void; an in-place survivor
  * that sinks in a later round keeps its final-pass most-bound tracer, a serial one that of its
  * record; a serial tail whose claimant sank while its serial binder survives goes to the binder, in
- * the binder's final-pass energy order; the final-tree check of a claim (J2) applies to in-place
+ * the binder's final-pass energy order; the final-tree check of a claim applies to in-place
  * binders only (serial ones were checked in their key). */
 
 #include <mpi.h>
@@ -439,7 +439,7 @@ coll_walk(struct Coll * C, double * Sum)
             PartManager->NumPart = need;
     }
     /* the whole build booked to /Subhalo/Rounds/Tree, not forcetree.c's own clocks, so that the
-     * /Subhalo/Rounds children cover the stage (decision 47.5) */
+     * /Subhalo/Rounds children cover the stage */
     walltime_measure("/Subhalo/Rounds/Rounds");
     walltime_redirect_begin("/Subhalo/Rounds/Tree");
     force_tree_active_moments(&tree, C->ddecomp, &act, 0, 0, NULL);
@@ -1500,7 +1500,7 @@ _Static_assert(COLL_PROPS_CAND_BYTES <= SUBHALO_INPLACE_CAND_PROPS_BYTES,
 #define COLL_ALLOC_OVERHEAD (2. * 4096.)
 
 /* subhalo_props_deferred's recipes on the round's radial set (rr by (label, r, ID), pos, Mc = M(<= r)):
- * Rockstar's aperture pos < kc[vir] for the velocities and the NFW fit (decisions 44, 47.1), in four
+ * Rockstar's aperture pos < kc[vir] for the velocities and the NFW fit, in four
  * reductions (1)-(4). Results in rp->dfr (km/s, run length unit), -1 undefined. Collective. */
 static void
 deferred_distributed(const struct Coll * C, const struct CoreOut * core, const struct RadRec * rr, int64_t nr,
@@ -1996,7 +1996,7 @@ round_props(const struct Coll * C, const struct CoreOut * core, struct RoundProp
     }
     myfree(G2);
     myfree(MX);
-    /* inside the virial aperture (crossing particle included, D4): JVir in the CoreVel frame and the
+    /* inside the virial aperture (crossing particle included): JVir in the CoreVel frame and the
      * mean offsets (Rockstar properties.c:417-458) */
     {
         double * jl = (double *) mymalloc("SubCollJvLoc", sizeof(double) * 9 * (nc + 1));
@@ -2914,9 +2914,9 @@ tagrec_radix(const void * a, void * radix, void * arg)
     memcpy(radix, ((const struct TagRec *) a)->key, 24);
 }
 
-/* The final tag of one particle of an oversized key (design 7.2 step 9, D10): a reserved tracer, else a
+/* The final tag of one particle of an oversized key (design 7.2 step 9): a reserved tracer, else a
  * valid serial claim, else the deepest alive in-place claim; a claim across the final tree goes to the
- * binder (J2); a serial tail whose claimant sank goes to its surviving serial binder. */
+ * binder; a serial tail whose claimant sank goes to its surviving serial binder. */
 struct TagDec {
     int64_t tag;             /* the final TrackId, SUBHALO_NOTRACK */
     int64_t bT;              /* the final BoundTrackId */
@@ -3703,7 +3703,7 @@ gather_serial(struct Coll * C)
 
 /* Every particle of an oversized key to one candidate's source (design 7.8): own tags, serial sub-tree
  * remainders to the candidate above the root (serially bound ones excluded), other group particles to
- * the central; field particles tagged by the central (decision 52) or an orphan are released. */
+ * the central; field particles tagged by the central (its source is its FOF group) or an orphan are released. */
 static void
 init_sources(struct Coll * C)
 {
@@ -3724,7 +3724,7 @@ init_sources(struct Coll * C)
             u = p->GrNr;
         else if(p->GrNr < 0 && m) {
             u = m->g;
-            /* a FOF key only, so that its central's field particles are released below (decision 52);
+            /* a FOF key only, so that its central's field particles are released below;
              * a pseudo-key (u > TotNgroups) keeps them (ku stays -1) */
             if(u <= plan->TotNgroups)
                 ku = subhalo_plan_inplace_index(plan, u);
@@ -4077,7 +4077,7 @@ subhalo_collective_run(struct SubhaloPlan * plan, struct SubhaloCallCtx * ctx, D
     message(0, "Subhalo in place: %ld candidates in %d round(s), %ld tree builds and walks, %ld alive, %ld died (%ld resolved from the "
                "previous-bound frame, not rescued in place), %ld descendants sunk; "
                "%ld serial own-tag particles taken by in-place candidates, %ld serial tails given to their binder, %ld claims given to the "
-               "binding owner (J2); final tags %g s (serial repair of %ld tracks, %ld rank queries: %g s); %g s.\n",
+               "binding owner; final tags %g s (serial repair of %ld tracks, %ld rank queries: %g s); %g s.\n",
             ncand, plan->NRounds, iters, CollStats.NAlive, CollStats.NDied, CollStats.NDiedMeanFrame, CollStats.NSunk, CollStats.NStolen, CollStats.NAdded,
             CollStats.NJ2, CollStats.TagSeconds, CollStats.NRepairTracks, CollStats.NRepairQueries, CollStats.RepairSeconds, MPI_Wtime() - t0);
 }

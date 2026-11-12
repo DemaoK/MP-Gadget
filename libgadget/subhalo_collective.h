@@ -6,12 +6,12 @@
  * in-place candidates by round, deepest first. After the domain restore, subhalo_collective_run:
  *  1. gathers the serial sub-tree results into the member table;
  *  2. assigns every particle of an oversized group to one candidate's source (a scratch label, the
- *     tags are not rewritten during the rounds); a central's source is its FOF group only (decision 52);
+ *     tags are not rewritten during the rounds); a central's source is its FOF group only (as HBT);
  *  3. per round: HBT's loop with one global tree and one potential-only walk per iteration, the
  *     sinking, the final pass, the cores and reserved tracers, the relaxed-source claims and the
  *     properties from distributed sorts; the unbound particles pass to the parent candidate;
  *  4. the hierarchy of every oversized group (the serial recipe) and the records;
- *  5. the final tag pass (D10), repairing the serial sub-tree ranks and counts for the particles the
+ *  5. the final tag pass (design D10), repairing the serial sub-tree ranks and counts for the particles the
  *     in-place candidates took over or returned to a surviving serial binder.
  * The plan admits the call's memory (subhalo_coll_estimate) before the exchange.
  *
@@ -43,7 +43,7 @@ struct SubhaloCollectiveStats {
     int64_t NDiedMeanFrame;       /* of which resolved tracks dead at their first unbinding, from the previous-bound frame (no rescue in place) */
     int64_t NAlive;
     int64_t NStolen;              /* serial own-tag particles taken over by an in-place ancestor */
-    int64_t NJ2;                  /* claims across the final tree (J2) given to the binding owner */
+    int64_t NJ2;                  /* claims across the final tree given to the binding owner */
     /* the final tag pass */
     int64_t NAdded;               /* serial tails given to their surviving serial binder */
     int64_t NRepairTracks;        /* serial tracks whose ranks were repaired */

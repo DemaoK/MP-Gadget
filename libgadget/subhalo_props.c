@@ -1,4 +1,4 @@
-/* Subhalo properties of a bound set (design 7.5, D4, section 8; declared in subhalo_unbind.h): the
+/* Subhalo properties of a bound set (design 7.5, section 8; declared in subhalo_unbind.h): the
  * HBT set, Rockstar's recipes, the deferred NFW fit and velocities, and the baryonic sums.
  * Input: a candidate after subhalo_final_pass, Index[0, Nbound) in final-pass binding order (with the
  * sampled final pass: the loop's order, energies unsorted estimates read only by order-free sums). */
@@ -166,7 +166,7 @@ subhalo_props_hbt(struct SubTrack * rec, const struct SubCandidate * c, const st
 }
 
 /* ================================================================== Rockstar recipes
- * Rockstar's properties on the HBT bound set (D4, 4.3, 7.10), after Rockstar-BigFile properties.c,
+ * Rockstar's properties on the HBT bound set (design 4.3, 7.10), after Rockstar-BigFile properties.c,
  * nfw.c and groupies.c: bound SO, VmaxVir, Rhalf, J, spins, Xoff/Voff, Klypin Rs, shapes, inertia. */
 
 void
@@ -493,7 +493,7 @@ subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c, con
     }
 
     /* J and the inertia tensor over the full set (J in the bound-CoM velocity frame); JVir and the
-     * Xoff/Voff means inside the virial aperture, crossing particle included (D4), in the core frame.
+     * Xoff/Voff means inside the virial aperture, crossing particle included, in the core frame.
      * Positions about the core; dx x (Vel - V) = a dx x (v - V / a), the physical specific J. */
     double J[3] = {0, 0, 0}, Jv[3] = {0, 0, 0}, xs[3] = {0, 0, 0}, vs[3] = {0, 0, 0}, I[6] = {0, 0, 0, 0, 0, 0};
     for(k = 0; k < n; k++) {
@@ -772,7 +772,7 @@ subhalo_deferred_velocities(float BulkVel[3], float CoreVel[3], float * Vrms, co
 
 /* subhalo_props_deferred's recipe on a built radial order pr[0, n) and core velocity (shared with
  * subhalo_props_rockstar: one sort per subhalo); the four columns are -1 first. Rockstar's aperture
- * (decisions 44, 47.1): with kc the outermost virial crossing, the velocities and the fit use
+ * (properties.c): with kc the outermost virial crossing, the velocities and the fit use
  * pr[0, kc), the crossing particle excluded, of mass Mfit = M(<= r_(kc-1)). */
 static void
 deferred_on_order(struct SubTrack * rec, const struct RPair * pr, int64_t n, const double cvel[3], const double rho[SUBHALO_NSO],

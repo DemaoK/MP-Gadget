@@ -113,7 +113,7 @@ int subhalo_unbind_rescue(struct SubCandidate * c, int alive, int64_t NPrev, int
 
 /* Final pass over the bound prefix in its recomputed CoM frame: exact-mass energies, prefix sorted
  * by them; returns the count with E >= 0 (NboundPositive). Membership is unchanged. Sampled
- * (SampledFinalPass and Nbound > SampleSize > 0, decision 42.4): needs the unedited post-unbind
+ * (SampledFinalPass and Nbound > SampleSize > 0, as HBT): needs the unedited post-unbind
  * prefix; only its head of MARGIN * Kt tracers is sorted by exact energies, the rest keeps HBT's
  * loop order, and Energy is then the loop's estimator (not sorted; for the property sums only). */
 int64_t subhalo_final_pass(struct SubCandidate * c, const struct SubhaloUnbindParams * up, struct SubhaloArena * arena);
@@ -184,7 +184,7 @@ double subhalo_klypin_f_to_c(double f);
 /* ------------------------------------------------------------------ deferred properties (subhalo_props.c) */
 
 /* Rockstar's NFW fit Rs and RockstarCoreVel, BulkVel, Vrms on the aperture of the kc bound
- * particles inside the outermost virial crossing (design D4, decisions 44, 47.1); -1 when undefined.
+ * particles inside the outermost virial crossing (design D4, Rockstar's aperture); -1 when undefined.
  * Deviations from Rockstar: bin edges interpolated in one length unit (nfw.c mixes Mpc/h and kpc/h),
  * a double fit returning -1 on bad input, softening-floored edge radii, Vrms over the aperture's own
  * mass, only the crossing particle left out of the fit. Outputs final: velocities physical peculiar
@@ -224,7 +224,7 @@ void subhalo_props_baryons(struct SubTrack * rec, const struct SubCandidate * c,
 
 /* A step on more than PAR_MIN elements outside a parallel region (a key run alone) splits over the
  * threads. CHUNK_MIN fixes the chunks of the floating sums and the partition's switch, so it defines
- * results and must not change; PAR_MIN only shares work out (decisions 34, 42.5). set_par_min:
+ * results and must not change; PAR_MIN only shares work out. set_par_min:
  * tests only, outside any parallel region, n <= 0 restores the default. */
 #define SUBHALO_UNBIND_PAR_MIN 512
 #define SUBHALO_UNBIND_CHUNK_MIN 16384

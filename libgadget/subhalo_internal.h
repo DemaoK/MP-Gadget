@@ -41,7 +41,7 @@ size_t subhalo_arena_bytes_per_part(void);
 /* Estimated cost of a serial key of N particles and M member tracks (only ratios matter): N log2 N
  * for the unbinding trees, a term per member candidate and a per-key constant, fitted to measured
  * dm-128 key times (one unit about 1e-7 s; the per-key constant kept low so the many small keys do
- * not dominate the packing; decision 41). The planner uses M = 0, as the directory's Tags counts a
+ * not dominate the packing). The planner uses M = 0, as the directory's Tags counts a
  * track once per holding rank; subhalo_run_serial_keys uses the segment's distinct tags. */
 #define SUBHALO_COST_ITER 10.
 #define SUBHALO_COST_MEMBER 1500.
@@ -441,7 +441,7 @@ struct SubhaloKeySeg {
     int decider;            /* in place: lowest holding rank */
     int64_t ipindex;        /* in place: index into plan->Inplace, else -1 */
     double ref[3];          /* in place: common reference position */
-    int64_t Tracks;         /* serial: the distinct tracks tagging its particles (Phase 5d cost model) */
+    int64_t Tracks;         /* serial: the distinct tracks tagging its particles (for the cost model) */
 };
 
 /* Steps 0 and 2: tracer snapshot and HBT's weighted host vote. Every rank sends, per track T,
@@ -889,7 +889,7 @@ struct SubhaloCallCtx {
 
 /* A tail claim in a serial sub-tree key (bound by member B, tagged by another): its place in B's
  * final-pass energy order (f) and B's exclusive particles before it (g), to return it to B if the
- * claim becomes void in the rounds (decision 19). */
+ * claim becomes void in the rounds. */
 struct SubhaloBindOrd {
     MyIDType ID;
     int64_t g;
