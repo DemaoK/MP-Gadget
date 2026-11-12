@@ -2139,8 +2139,10 @@ first_attempt(struct TestCand * t, int64_t n, const double pos[3], const double 
  * final pass equals that of a candidate never tried. (b) 2 Nbound == NPrev gets no second attempt, NPrev one more
  * does. (c) One clump from a frame 1 km/s off: both attempts bind it all; the tie keeps the first. (d) One clump
  * from a frame that keeps its inner part, MaxIter 1: the first attempt stops at the cap, the second converges; the
- * result that stands carries RESCUED only. (e) No rescue frame: c untouched, nothing tried. NPrev is three times the
- * source unless stated (the rest stripped); the arena returns to the caller's mark throughout. */
+ * result that stands carries RESCUED only. (e) No rescue frame: c untouched, nothing tried. (f) A core of 15, below
+ * MinNumPart, still gives the frame: the second attempt dies, the first result stands alive. (g) The first attempt
+ * converges, the losing second stops at the cap (MaxIter 1 for it alone): the restored result has no ITERCAP. NPrev is
+ * three times the source unless stated (the rest stripped); the arena returns to the caller's mark throughout. */
 static void
 test_rescue_loss(void ** state)
 {
@@ -2306,6 +2308,43 @@ test_rescue_loss(void ** state)
         assert_int_equal(subhalo_unbind_rescue(&t.c, 1, 3 * n, K, &up1, &arena, &sa), 1);
         assert_true(sa.tried == 1 && sa.stood == 0 && sa.Itercap == 1 && sa.ConvergenceRatio < 1.);
         assert_true(memcmp(&first, &t.c, sizeof(first)) == 0 && memcmp(order, t.Index, sizeof(int64_t) * n) == 0);
+        assert_int_equal(arena.used, mark);
+        cand_free(&t);
+    }
+
+    /* (f) and (g): the first attempt keeps the fragment and converges, the second binds less */
+    const int64_t sizes2[2][2] = {{15, 60}, {40, 200}};
+    for(k = 0; k < 2; k++) {
+        const int64_t na = sizes2[k][0], nb = sizes2[k][1], n = na + nb;
+        struct SubhaloUnbindParams up2 = up;
+        up2.MaxIter = k == 0 ? up.MaxIter : 1;
+        double cpos[3], cvel[3];
+        for(d = 0; d < 3; d++) {
+            fpos[d] = wrapb(Centre[d] + (d == 0 ? sep : 0));
+            fvel[d] = Bulk[d] + (d == 0 ? dv : 0);
+        }
+        make_clump(0, na, m, 3., Centre, Bulk, 101 + k, 0, 0);
+        make_clump(na, nb, m, 3., fpos, fvel, 111 + k, na, 10000);
+        assert_int_equal(first_attempt(&t, n, fpos, fvel, &up, &arena), 1);
+        assert_true(t.c.Flags == 0 && subhalo_rescue_large_loss(t.c.Nbound, 3 * n));
+        first = t.c;
+        memcpy(order, t.Index, sizeof(int64_t) * n);
+        /* the second attempt alone, from the core frame and the first result's order */
+        assert_int_equal(subhalo_rescue_frame(&t.c, K, &up, &arena, cpos, cvel), 1);
+        cand_init(&u, 0, n, cpos, cvel, 13);
+        memcpy(u.Index, order, sizeof(int64_t) * n);
+        const int second = subhalo_unbind(&u.c, &up2, &arena);
+        message(0, "Rescue after a loss, second attempt %s: first %ld of %ld, second alive %d with %ld, flags %d\n",
+                k == 0 ? "dead" : "at the cap", (long) t.c.Nbound, (long) n, second, (long) u.c.Nbound, u.c.Flags);
+        if(k == 0)
+            assert_int_equal(second, 0);
+        else
+            assert_true(u.c.Flags == SUBHALO_FLAG_ITERCAP && u.c.Nbound <= t.c.Nbound);
+        cand_free(&u);
+        assert_int_equal(subhalo_unbind_rescue(&t.c, 1, 3 * n, K, &up2, &arena, &sa), 1);
+        assert_true(sa.tried == 1 && sa.stood == 0 && sa.Itercap == k);
+        assert_true(memcmp(&first, &t.c, sizeof(first)) == 0 && memcmp(order, t.Index, sizeof(int64_t) * n) == 0);
+        assert_int_equal(t.c.Flags, 0);
         assert_int_equal(arena.used, mark);
         cand_free(&t);
     }

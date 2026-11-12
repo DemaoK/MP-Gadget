@@ -725,7 +725,7 @@ struct SubhaloCallStats {
     int64_t NFallbackReleased; /* field particles of the oversized keys untagged instead (stale orphan tags, the central's); not in NFallbackField */
     int64_t NRescueTried;    /* serial resolved candidates dead from the mean frame, unbound again from the clipped core frame */
     int64_t NRescued;        /* of which survived */
-    int64_t NLossTried;      /* serial resolved candidates alive from the mean frame below SUBHALO_RESCUE_LOSS NPrev, unbound again from it */
+    int64_t NLossTried;      /* serial resolved candidates alive from the mean frame below SUBHALO_RESCUE_LOSS NPrev, unbound again from the clipped core frame */
     int64_t NLossRescued;    /* of which the second attempt bound more and stands */
     double ArenaPeakFrac;    /* largest arena high-water mark of a key / its arena size */
     /* ---- instrumentation (global, set on every return path; a failed call keeps the wall times

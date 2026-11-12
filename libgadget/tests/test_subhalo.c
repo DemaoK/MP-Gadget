@@ -5087,8 +5087,9 @@ test_subhalo_mixed_call(void ** state)
 #define AD_NM 6
 #define AD_NT 24
 
-/* AD_REST: S at rest in H's frame, so that H would bind what S takes */
-enum { AD_SLOW = 1, AD_FAST = 2, AD_SHELL = 4, AD_NESTED = 8, AD_SIBLING = 16, AD_HOT = 32, AD_REST = 64 };
+/* AD_REST: S at rest in H's frame, so that H would bind what S takes; AD_LOSS: S's previous bound set also
+ * holds a fragment of 60 (the S2 ids) at 20 times the mass, 300 km/s across, in S's ball */
+enum { AD_SLOW = 1, AD_FAST = 2, AD_SHELL = 4, AD_NESTED = 8, AD_SIBLING = 16, AD_HOT = 32, AD_REST = 64, AD_LOSS = 128 };
 
 struct AdUd {
     int mode;
@@ -5118,6 +5119,10 @@ ad_particle(MyIDType id, double atime, struct SynPart * s, void * ud_)
         if(two) {
             syn_ball(id, 43, cS, 0.3, vS, 5, atime, s);
             s->tag = s->bound = 2; s->rank = id - AD_S20;
+        } else if(ud->mode & AD_LOSS) {
+            syn_ball(id, 48, cS, 0.5, vF, 5, atime, s);
+            s->mass = 20 * SYN_M;
+            s->tag = s->bound = 1; s->rank = 100 + id - AD_S20;
         } else park = 1;
     } else if(id < AD_F0) {
         if(ud->mode & AD_SLOW) {
@@ -5512,6 +5517,30 @@ test_subhalo_admit_votes(void ** state)
         ad_free(&on);
         ad_free(&off);
     }
+}
+
+/* The second attempt after a large loss in a call (AD_LOSS): the mean frame of S's 160 previously bound particles
+ * sits on the heavy fragment, whose 60 it keeps; 2 x 60 is below the live NPrev 160 but not below the record's
+ * Nbound 100. The core frame binds the 100 of the core, which stand as RESCUED; the reduced counters see one loss. */
+static void
+test_subhalo_rescue_loss_call(void ** state)
+{
+    struct AdUd lo = {AD_LOSS, 0, 0};
+    struct AdOut o;
+    int64_t i;
+    int bad = 0;
+    ad_run(&lo, 0, 1, &o);
+    message(0, "Loss in a call: S Nbound %d Flags %d; loss tried %ld rescued %ld, death tried %ld rescued %ld\n", o.rec[1].Nbound,
+            o.rec[1].Flags, o.st.NLossTried, o.st.NLossRescued, o.st.NRescueTried, o.st.NRescued);
+    CHECK((o.rec[1].Flags & SUBHALO_FLAG_RESCUED) && o.rec[1].Nbound == AD_S20 - AD_S0, "loss: S Flags %d Nbound %d\n",
+          o.rec[1].Flags, o.rec[1].Nbound);
+    for(i = AD_S0; i < AD_M0; i++)
+        LOCAL_CHECK(bad, (o.r[i].BoundTrackId == 1) == (i < AD_S20), "loss: particle %ld bound to %ld\n", i, o.r[i].BoundTrackId);
+    CHECK(bad == 0, "loss: S's bound set is not its core\n");
+    CHECK(o.st.NLossTried == 1 && o.st.NLossRescued == 1 && o.st.NRescueTried == 0 && o.st.NRescued == 0,
+          "loss: loss tried %ld rescued %ld, death tried %ld rescued %ld\n", o.st.NLossTried, o.st.NLossRescued, o.st.NRescueTried,
+          o.st.NRescued);
+    ad_free(&o);
 }
 
 /* 1 if the bigfile fname has the block (collective). */
@@ -6892,6 +6921,7 @@ int main(void) {
         cmocka_unit_test(test_subhalo_mixed_call),
         cmocka_unit_test(test_subhalo_admit_take),
         cmocka_unit_test(test_subhalo_admit_votes),
+        cmocka_unit_test(test_subhalo_rescue_loss_call),
         cmocka_unit_test(test_subhalo_nocentral),
         cmocka_unit_test(test_subhalo_fallback),
         cmocka_unit_test(test_subhalo_itercap),
