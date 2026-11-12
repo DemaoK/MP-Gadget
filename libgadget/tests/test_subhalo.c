@@ -5731,6 +5731,25 @@ test_subhalo_rescue_loss_call(void ** state)
     /* each unbinding is counted once: H's, and S's first and second attempts */
     CHECK(o.st.NCandidates == 3, "loss: %ld unbindings counted, %ld capped\n", o.st.NCandidates, o.st.NItercap);
     ad_free(&o);
+    /* with H's slow particles in S's core admitted (AD_SLOW): the second attempt stands, and the particles
+     * taken are the admitted ones its bound set holds */
+    {
+        struct AdUd ls = {AD_LOSS | AD_SLOW, 0, 0};
+        ad_run(&ls, 0.5, 1, &o);
+        int * recv = ad_check_count(&ls, &o, 5, "loss with admission");
+        int64_t nin = 0, nadm = 0;
+        for(i = 0; i < AD_END; i++) {
+            nadm += recv[i] == 1;
+            nin += recv[i] == 1 && o.r[i].BoundTrackId == 1;
+        }
+        message(0, "Loss with admission: S Nbound %d Flags %d, %ld admitted to S, %ld of them bound to S, %ld taken\n",
+                o.rec[1].Nbound, o.rec[1].Flags, nadm, nin, o.st.NAdmitTaken);
+        CHECK((o.rec[1].Flags & SUBHALO_FLAG_RESCUED) && o.st.NLossRescued == 1 && nin > 0 && o.st.NAdmitTaken == nin
+              && o.rec[1].Nbound == AD_S20 - AD_S0 + nin, "loss with admission: S Flags %d Nbound %d, %ld bound of %ld admitted, %ld taken\n",
+              o.rec[1].Flags, o.rec[1].Nbound, nin, nadm, o.st.NAdmitTaken);
+        free(recv);
+        ad_free(&o);
+    }
 }
 
 /* 1 if the bigfile fname has the block (collective). */
