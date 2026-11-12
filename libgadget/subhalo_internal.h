@@ -6,7 +6,6 @@
  * the main stack (mymalloc2), since domain_exchange may myrealloc the slots, the last bottom
  * allocation; bottom allocations are scratch freed by the function that made them. */
 
-#include <float.h>
 #include <math.h>
 #include "subhalo.h"
 
@@ -478,12 +477,15 @@ subhalo_rescue_large_loss(int64_t Nbound, int64_t NPrev)
 {
     return 2 * Nbound < NPrev;
 }
-/* Votes needed among k neighbours for the share s: ceil(s k), where a product within a few rounding
- * errors above an integer counts as that integer (0.3 * 10 is 3). */
+/* Votes needed among k neighbours for the share s: ceil(s k) in integer arithmetic on s in units of
+ * 2^-53; a share up to 2^-52 above a multiple of 1/k counts as that multiple, so the nearest double
+ * of m/k needs m votes. */
 static inline int
 subhalo_admit_need(double s, int k)
 {
-    int need = (int) ceil(s * k * (1. - 8 * DBL_EPSILON));
+    const int64_t one = (int64_t) 1 << 53;
+    const int64_t p = llrint(ldexp(s, 53)) * k;
+    int need = (int) ((p - 2 * k + one - 1) >> 53);
     if(need < 1) need = 1;
     if(need > k) need = k;
     return need;

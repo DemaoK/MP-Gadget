@@ -2372,7 +2372,7 @@ test_rescue_loss(void ** state)
 }
 
 /* The admission threshold ceil(s k): the share n / k needs n votes, a share above it by far more than rounding
- * needs n + 1; the literals cover products that round above an integer (0.3 * 10) and just above one. */
+ * needs n + 1; representable shares pin the guard of 2^-52 above a multiple of 1/k from both sides. */
 static void
 test_admit_need(void ** state)
 {
@@ -2395,6 +2395,13 @@ test_admit_need(void ** state)
     assert_int_equal(subhalo_admit_need(5.0 / 7, 7), 5);
     assert_int_equal(subhalo_admit_need(1.0, 64), 64);
     assert_int_equal(subhalo_admit_need(1e-9, 10), 1);
+    /* shares whose exact product lies a few ulp above 1: a floating product's association decides them */
+    assert_int_equal(subhalo_admit_need(0x1.5555555555561p-2, 3), 2);
+    assert_int_equal(subhalo_admit_need(0x1.99999999999a7p-3, 5), 2);
+    /* the guard: 2^-52 above 1/4 counts as 1/4, 2^-53 more does not; 0.30000000000000004 is 3/10 */
+    assert_int_equal(subhalo_admit_need(0.25 + ldexp(1, -52), 4), 1);
+    assert_int_equal(subhalo_admit_need(0.25 + ldexp(1, -52) + ldexp(1, -53), 4), 2);
+    assert_int_equal(subhalo_admit_need(0.30000000000000004, 10), 3);
 }
 
 /* ------------------------------------------------------------------ Phase 5b: intra-key threading */
