@@ -2,7 +2,7 @@
  * Run as: mpirun -np 4 .objs/test_subhalo_collective (green at 1 to 4 threads).
  * Tests (the test_collective_ prefix omitted):
  *  1. serial_vs_inplace   a clump with an embedded satellite, serial against fully in place.
- *  2. subtree_keys        the central in place, its satellites' sub-trees as serial keys; D10.
+ *  2. subtree_keys        the central in place, its satellites' sub-trees as serial keys; tag rule.
  *  3. merger              two oversized groups: the loser's sub-tree in round 0, then the central.
  *  4. kill_passup         a dying in-place satellite passes its particles to its parent.
  *  5. binder              tails returned to a surviving serial binder, in its energy order.
@@ -18,7 +18,7 @@
  * 15. guards              int32 and MPI byte-count guards.
  * 16. walk_theta          the potential-only walk at two opening angles against a direct sum.
  * 17. props_identity      serial and distributed deferred properties agree on four layouts.
- * 18. central_source      decision 52: a central's FOF-less particles untagged, a satellite's kept.
+ * 18. central_source      a central's FOF-less particles untagged, a satellite's kept.
  * SUBHALO_TEST_ONLY=<substring> runs only the matching tests. */
 
 #define _GNU_SOURCE
@@ -119,8 +119,8 @@ default_subhalo_params(void)
     sp.SubhaloReassignGas = 1;
     sp.SubhaloNumNeighboursForReassignment = 10;
     sp.SubhaloUnbindWithThermal = 0;
-    /* off in the Phase 1 fixtures: their sparse particle sets give the full tree fewer nodes
-     * than the top-level grid; the Phase 2a/3 fixtures (p2_setup) switch it on */
+    /* off by default: sparse particle sets give the full tree fewer nodes than the
+     * top-level grid; the fixtures that need it (p2_setup and others) switch it on */
     sp.SubhaloFieldSO = 0;
     sp.SubhaloSOBins = 64;
     sp.SubhaloSOSearchFactor = 2;
@@ -561,13 +561,13 @@ p2_teardown(void)
     teardown_pman();
 }
 
-/* The D10 invariants on the gathered particles against the records: own-tag BindRank dense with
- * the exclusive bound rows first; BindRank is the energy order of all own-tag particles (J12),
+/* The tag invariants on the gathered particles against the records: own-tag BindRank dense with
+ * the exclusive bound rows first; BindRank is the energy order of all own-tag particles,
  * so the reservation shows only as: the first min(10, own-tag tracers) tracer-type (type 1)
  * particles in rank order are bound to the track, and MostBoundID is the first of them;
  * BoundTrackId the tag, an ancestor of it or -1, bound owners resolved; Nbound, NboundTracer,
  * NboundExclusive, NtailType from the particles. Records processed in place
- * (SUBHALO_FLAG_INPLACE, Phase 2b) obey the same rules. Returns the number of violations. */
+ * (SUBHALO_FLAG_INPLACE) obey the same rules. Returns the number of violations. */
 static int
 p2_check_tags(const struct tagrec * r, int64_t n, const struct SubTrack * rec, int64_t nt, const char * what)
 {
@@ -651,7 +651,7 @@ p2_check_tags(const struct tagrec * r, int64_t n, const struct SubTrack * rec, i
 }
 
 /* B at 5 kpc/h (physical) from A's centre on a circular orbit, 60 of its particles pulled to
- * A's centre (the overlap scenario of plan test 6), positions and velocities for atime. */
+ * A's centre (the overlap scenario: a stripped tail re-bound by the parent), positions and velocities for atime. */
 static void
 p2_infall(Cosmology * CP, double atime)
 {
@@ -688,7 +688,7 @@ p2_infall(Cosmology * CP, double atime)
 }
 
 
-/* Synthetic tracking state (halofinder_phase2a_audit_codex.md, regression items 1-5): particles
+/* Synthetic tracking state: particles
  * with chosen positions, velocities and tags, and the records of a previous call injected into
  * the table, so that one call exercises a chosen hierarchy. Every particle is a DM tracer of
  * mass SYN_M (1e6 Msun/h): a 100-particle ball of 1 kpc has v_circ ~ 20 km/s. The ids
@@ -998,7 +998,7 @@ compare_outcomes(const struct Outcome * a, const struct Outcome * b, double nbto
             jy += y->J[d] * y->J[d];
         }
         CHECK(reldiff(sqrt(jx), sqrt(jy)) <= 2 * ptol, "%s: track %ld |J| %g / %g\n", what, t, sqrt(jx), sqrt(jy));
-        /* the Phase 5 columns: Rs fitted in both modes or -1 in both, Vrms within ptol, the two
+        /* the deferred columns: Rs fitted in both modes or -1 in both, Vrms within ptol, the two
          * mean velocities within ptol Vrms (plus 0.01 km/s for a cold ball) */
         message(0, "%s: track %ld Rs %g / %g (RsKlypin %g / %g), Vrms %g / %g, BulkVel (%g %g %g) / (%g %g %g), "
                    "RockstarCoreVel (%g %g %g) / (%g %g %g)\n", what, t, x->Rs, y->Rs, x->RsKlypin, y->RsKlypin, x->Vrms, y->Vrms,
@@ -1356,7 +1356,7 @@ test_collective_kill_passup(void ** state)
     outcome_free(&a);
 }
 
-/* ------------------------------------------------------------------ Phase 2b audit fixes (Q1-Q5) */
+/* ------------------------------------------------------------------ binder, repairs, admission, guards */
 
 /* A point at physical distance rphys from cen (comoving) in a direction drawn from (id, salt). */
 static void
@@ -1374,7 +1374,7 @@ syn_at_radius(MyIDType id, uint64_t salt, const double cen[3], double rphys, dou
         out[d] = cen[d] + rphys * u[d] / sqrt(n2) / atime;
 }
 
-/* ---- test 5: the binder takes the particle (audit Q3) and test 6: many serial repairs (Q2) ----
+/* ---- test 5: the binder takes the particle and test 6: many serial repairs ----
  * Per group g (centre 500 + 125 g): A (3 g, 2000 particles, the in-place central), B (3 g + 1,
  * 300 particles, 5 kpc/h away, a serial satellite) and C (3 g + 2, 100 particles at A's centre,
  * B's satellite: it sinks into A in the rounds while B survives). T: 60 previous tails of C
@@ -1549,7 +1549,7 @@ bd_run(int64_t collective, int ngroups, int withR, int hook, struct Outcome * o)
     syn_teardown();
 }
 
-/* Test 5 (audit Q3): A in place, B a serial survivor, C (B's satellite) sinks into A while B
+/* Test 5: A in place, B a serial survivor, C (B's satellite) sinks into A while B
  * survives: the tails of C that B binds return to B, merged into B's own-tag sequence by B's
  * final-pass energy order. The serial run (every track in one key) ranks B's own-tag particles
  * by one pass over B's energy-ordered list: it is the oracle, rank by rank. */
@@ -1570,7 +1570,7 @@ test_collective_binder(void ** state)
           "binder: C should sink into A in both runs\n");
     CHECK(b.rec[TB].Nbound > 0 && b.rec[TB].NestedParentTrackId == TA, "binder: B Nbound %d parent %ld\n", b.rec[TB].Nbound,
           b.rec[TB].NestedParentTrackId);
-    /* B's own reservation (its ten most-bound tracers, J12) already takes the innermost T in the key */
+    /* B's own reservation (its ten most-bound tracers) already takes the innermost T in the key */
     CHECK(b.st.NAdded >= BD_NT - 12, "binder: %ld tails given to the binder\n", b.st.NAdded);
     CHECK(p2_check_tags(b.r, b.n, b.rec, b.nt, "binder in place") == 0, "binder: tag invariants\n");
     CHECK(p2_check_tags(a.r, a.n, a.rec, a.nt, "binder serial") == 0, "binder: tag invariants (serial)\n");
@@ -1603,7 +1603,7 @@ test_collective_binder(void ** state)
             }
         }
     }
-    /* the ID order of T against its rank order (the old code appended by ID) */
+    /* the ID order of T against its rank order (appending by ID would follow it) */
     for(i = 0; i < b.n; i++) {
         int g, g2;
         int64_t j, j2, k;
@@ -1627,7 +1627,7 @@ test_collective_binder(void ** state)
     outcome_free(&a);
 }
 
-/* Test 6 (audit Q2): three groups, each with tails losing their claimant (C sinks: the tails
+/* Test 6: three groups, each with tails losing their claimant (C sinks: the tails
  * return to the binder B) and B's tails at A's centre that A binds and reserves: the serial ranks
  * are repaired on the tracks' result ranks. The reference is computed here from the gathered
  * pre-pass tags (the serial keys' provisional ranks, captured by the hook) and binder ordinals:
@@ -2083,7 +2083,7 @@ test_collective_sunk_root_field(void ** state)
     outcome_free(&a);
 }
 
-/* ---- test 18: the central's source is its FOF group only (decision 52, HBT FeedCentrals) ----
+/* ---- test 18: the central's source is its FOF group only (HBT FeedCentrals) ----
  * A (0, 3000) the central with FA, 20 of its previous particles at rest in the field far away
  * (bound to A were they in its source); B (1, 200) its satellite 5 kpc/h out with FB, 10 field
  * particles bound to B. Serially, with A in place and B a sub-tree key, and with both in place:
@@ -2270,7 +2270,7 @@ test_collective_failure_after_split(void ** state)
     syn_teardown();
 }
 
-/* ---- test 11: a voided claim across three rounds, the central promotion and J2 ----
+/* ---- test 11: a voided claim across three rounds, the central promotion and the final-tree check ----
  * A (0) the previous central: 1000 cold and 1000 hot particles; B (1, its satellite, 1500 cold
  * particles 4 kpc/h away: too light at the previous call to compete for the centre, the most
  * massive survivor now); C (2, B's satellite, 150 cold particles at A's centre). All three in
@@ -2279,7 +2279,7 @@ test_collective_failure_after_split(void ** state)
  * into A in round 2 and its claim becomes void: the accepted rule gives them to A, not back to B.
  * Q: 40 previous tails of B at A's centre at rest: B claims them in round 1, A binds them in round
  * 2; after the promotion of B to the central, A is B's satellite and no longer an ancestor of B:
- * the claim crosses the final tree and goes to the binding owner A (J2). */
+ * the claim crosses the final tree and goes to the binding owner A. */
 #define VC_AH 1000
 #define VC_B0 2000
 #define VC_C0 3500
@@ -2351,7 +2351,7 @@ test_collective_voided_claim(void ** state)
     outcome_take(&o);
     syn_teardown();
     const struct SubTrack * A = &o.rec[0], * B = &o.rec[1], * C = &o.rec[2];
-    message(0, "voided claim: %d rounds (%ld %ld %ld), %ld sunk, %ld J2; A Nbound %d Rank %d parent %ld; B Nbound %d Rank %d central %ld; "
+    message(0, "voided claim: %d rounds (%ld %ld %ld), %ld sunk, %ld across the final tree; A Nbound %d Rank %d parent %ld; B Nbound %d Rank %d central %ld; "
                "C Nbound %d Sink %ld\n", o.st.NRounds, o.st.NCandsRound[0], o.st.NCandsRound[1], o.st.NCandsRound[2], o.st.NSunk, o.st.NJ2,
             A->Nbound, A->Rank, A->NestedParentTrackId, B->Nbound, B->Rank, B->CentralTrackId, C->Nbound, C->SinkTrackId);
     CHECK(o.st.NRounds == 3 && o.st.NCandsRound[0] == 1 && o.st.NCandsRound[1] == 1 && o.st.NCandsRound[2] == 1,
@@ -2374,10 +2374,10 @@ test_collective_voided_claim(void ** state)
             if(o.r[i].TrackId == 0 && o.r[i].BoundTrackId == 0) nQA++;
         }
     }
-    message(0, "voided claim: C's former claims %ld to A, %ld to B of %ld; B's claims bound by A %ld of %ld given to A (J2)\n", nPA, nPB, nP,
+    message(0, "voided claim: C's former claims %ld to A, %ld to B of %ld; B's claims bound by A %ld of %ld given to A\n", nPA, nPB, nP,
             nQA, nQ);
     CHECK(nPA == nP && nPB == 0, "voided claim: the void claims went %ld to A, %ld to B (no retroactive B claim)\n", nPA, nPB);
-    CHECK(nQA >= nQ - 2 && o.st.NJ2 >= nQ - 2, "voided claim: %ld of %ld J2 claims given to A (%ld counted)\n", nQA, nQ, o.st.NJ2);
+    CHECK(nQA >= nQ - 2 && o.st.NJ2 >= nQ - 2, "voided claim: %ld of %ld final-tree claims given to A (%ld counted)\n", nQA, nQ, o.st.NJ2);
     CHECK(p2_check_tags(o.r, o.n, o.rec, o.nt, "voided claim") == 0, "voided claim: tag invariants\n");
     outcome_free(&o);
 }
@@ -2476,7 +2476,7 @@ test_collective_long_chain(void ** state)
     outcome_free(&a);
 }
 
-/* ---- test 13: the admission of the collective stage (audit Q1) ----
+/* ---- test 13: the admission of the collective stage ----
  * The long-chain fixture without forcing, the free memory squeezed (a top block allocated after
  * the FOF) so that no serial key fits and every key is promoted in place, while the collective
  * stage itself (its walk reserve alone) does not fit either: the call fails before the exchange
@@ -2547,7 +2547,7 @@ test_collective_admission(void ** state)
     syn_teardown();
 }
 
-/* ---- test 14: the int32 and MPI byte-count guards (audit Q4), without allocating ---- */
+/* ---- test 14: the int32 and MPI byte-count guards, without allocating ---- */
 static void
 test_collective_guards(void ** state)
 {
@@ -2556,7 +2556,7 @@ test_collective_guards(void ** state)
     /* a rank r stands for r + 1 particles: INT32_MAX is out */
     CHECK(subhalo_rank_fits_i32(INT32_MAX - 1L) && !subhalo_rank_fits_i32(INT32_MAX) && !subhalo_rank_fits_i32(-1)
           && subhalo_rank_fits_i32(0), "guards: ranks\n");
-    /* 24-byte records: 89478485 fit an MPI int byte count, 89478486 do not (the audit's boundary) */
+    /* 24-byte records: 89478485 fit an MPI int byte count, 89478486 do not (the boundary) */
     CHECK(subhalo_mpi_bytes_fit(89478485, 24) && !subhalo_mpi_bytes_fit(89478486, 24) && subhalo_mpi_bytes_fit(2147483647L, 1)
           && !subhalo_mpi_bytes_fit(2147483648L, 1) && !subhalo_mpi_bytes_fit(-1, 8) && subhalo_mpi_bytes_fit(0, 56),
           "guards: MPI byte counts\n");
@@ -2573,7 +2573,7 @@ test_collective_guards(void ** state)
     const double persist = 25. * 1000001 + 11. * SUBHALO_INPLACE_CAND_BYTES + 3. * (sizeof(struct SubTrack) + 8.);
     CHECK(fabs(a.persist - persist) < 1 && a.need == a.persist + mx
           && a.stage[SUBHALO_COLL_RADIAL] >= 176. * 100000 && a.stage[SUBHALO_COLL_TREE] >= 0.7 * 1000000 * sizeof(struct NODE)
-          /* Phase 5 audit R1: the properties keep 104 bytes per record and every candidate's scratch */
+          /* the properties keep 104 bytes per record and every candidate's scratch */
           && a.stage[SUBHALO_COLL_PROPS] >= 104. * 100000 + 11. * SUBHALO_INPLACE_CAND_PROPS_BYTES,
           "guards: estimate persist %g need %g\n", a.persist, a.need);
 }
@@ -2729,16 +2729,16 @@ test_collective_walk_theta(void ** state)
     syn_teardown();
 }
 
-/* ---- test 16: the deferred recipes of the two modes on identical inputs (Phase 5 audit R4) ----
+/* ---- test 16: the deferred recipes of the two modes on identical inputs ----
  * Seven power-law balls (density ~ r^-2, every particle bound, one across the periodic boundary,
  * one below the NFW fit's 100 particles, one of 137 whose equal-mass virial crossing is at kc =
- * 100, the fit's boundary of decision 47.1: Rs defined with the kc particles inside the crossing,
+ * 100, the fit's boundary: Rs defined with the kc particles inside the crossing,
  * -1 on nfw.c's literal kc - 1), large bulk velocities, prescribed cores (subhalo_core of
  * the ID order) and thresholds with crossings inside every ball. The serial recipes
  * (subhalo_props_rockstar and subhalo_props_deferred on rank 0, which holds every particle) against
  * the distributed ones (round_props through subhalo_collective_test_props) with the particles on
  * rank 0 only, round-robin over the 4 ranks, and unevenly split (1:2:4:6): with equal masses
- * the four Phase 5 columns and the virial mass are bitwise identical in every layout (the
+ * the four deferred columns and the virial mass are bitwise identical in every layout (the
  * compensated cumulative masses are the correctly rounded k m in both modes); with random unequal
  * masses they agree to 1e-6; with masses 1 and 2^-50 (one in 50 heavy, inside the light ones:
  * exact multiples of 2^-50, whose plain sums lose the light masses in an order-dependent way, so
@@ -3023,7 +3023,7 @@ pi_run(int mode)
         /* every ball crosses; the fit runs in the balls of 200 or more particles (aperture about 0.8 N), never below 100 */
         LOCAL_CHECK(bad, mode == PI_WIDE || (x->Vrms > 0 && x->MBoundSO[0] > 0 && (PiN[l] < 100 ? x->Rs == -1 : (PiN[l] < 200 || x->Rs > 0))),
                     "props identity: ball %d Vrms %g MBoundSO %g Rs %g\n", l, x->Vrms, x->MBoundSO[0], x->Rs);
-        /* the fit's aperture (decision 47.1): the kc particles inside the crossing particle, Rs
+        /* the fit's aperture: the kc particles inside the crossing particle, Rs
          * defined iff kc >= 100; with equal masses kc = MBoundSO[vir] / m - 1 */
         if(mode == PI_EQUAL) {
             const int64_t kcv = llround(x->MBoundSO[0] / SYN_M) - 1;
@@ -3078,16 +3078,16 @@ test_collective_props_identity(void ** state)
     pi_run(PI_WIDE);
 }
 
-/* ---- test 17: many in-place candidates in one round: the properties stage (Phase 5 audit R1) ----
+/* ---- test 17: many in-place candidates in one round: the properties stage ----
  * 2304 isolated 12-particle groups, each with one resolved track (SubhaloMinNumPart 10), all
  * forced in place (SubhaloCollectiveMinPart 10): one round of 2304 candidates, whose per-candidate property
  * scratch (the deferred recipes' reductions, the profile vectors: SUBHALO_INPLACE_CAND_PROPS_BYTES
  * each on every rank) is the largest stage. (a) Unsqueezed: admitted with the properties as the
  * largest stage, the call completes and the measured high water stays within the estimate. (b) The
  * same call with the free memory squeezed on every rank to halfway between the need without the
- * properties stage (the admission before the fix) and the need with it: the admission fails at
- * the properties stage, before the exchange, where the old estimate would have admitted it. Also
- * (audit R3, decision 47.5) the walltime children /Subhalo/Rounds/{Setup,Rounds,Tree,Walk,Tags,
+ * properties stage and the need with it: the admission fails at the properties stage, before
+ * the exchange, where an estimate without that stage would admit it. Also
+ * the walltime children /Subhalo/Rounds/{Setup,Rounds,Tree,Walk,Tags,
  * Cleanup} add up to the summary's rounds time. */
 #define ML_NX 16
 #define ML_NYZ 12
@@ -3153,7 +3153,7 @@ ml_post(void * ud)
     c->block = NULL;
 }
 
-/* persist + the largest stage other than the properties: the admission's need before the fix */
+/* persist + the largest stage other than the properties: the need of an estimate without them */
 static double
 ml_need_without_props(const struct SubhaloCollAdmit * ad)
 {
@@ -3185,7 +3185,7 @@ test_collective_admission_props(void ** state)
     struct MlCtx c = {0, 0, NULL};
     /* (a) */
     ml_setup(&CP);
-    /* Phase 5 audit R3: the rounds stage's walltime children (this rank; the clock names carry
+    /* the rounds stage's walltime children (this rank; the clock names carry
      * "@file:line"). walltime_init (in ml_setup) resets the table but not the times of its slots,
      * which new clocks would inherit from the earlier tests: cleared here */
     {
@@ -3245,7 +3245,7 @@ test_collective_admission_props(void ** state)
             ml_need_without_props(ad) / 1048576., ad->avail / 1048576.);
     CHECK(ret == 0 && !subhalo_last_call_complete() && !ps->Admitted && ad->failed && ad->failstage == SUBHALO_COLL_PROPS,
           "many labels (b): ret %d, admitted %d, failed %d at stage %d\n", ret, ps->Admitted, ad->failed, ad->failstage);
-    /* on every rank the need without the properties stage fits: the old estimate admitted the call */
+    /* on every rank the need without the properties stage fits: an estimate without it would admit the call */
     LOCAL_CHECK(bad, ml_need_without_props(ad) < ad->avail && ad->need > ad->avail, "many labels (b): need %g / %g MB without the "
                 "properties, %g MB available\n", ad->need / 1048576., ml_need_without_props(ad) / 1048576., ad->avail / 1048576.);
     struct tagrec * post = gather_tags(&n);

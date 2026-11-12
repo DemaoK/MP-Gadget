@@ -10,7 +10,7 @@
  *  vmax                HBT Vmax/Rmax against a cumulative-mass oracle (multi-peak, flat, ties).
  *  units               the disc in kpc/h and Mpc/h with two velocity units: same physics.
  *  nfw_bin_edges       Rs bin edges in the run's length unit, an overshooting-bin oracle.
- *  aperture_boundaries Rockstar's velocity aperture at its edges (decision 47.1).
+ *  aperture_boundaries Rockstar's velocity aperture at its edges.
  * Internal units kpc/h, 1e10 Msun/h, km/s, a = 1, H = 0; haloes across a periodic boundary.
  * Run as: mpirun -np 1 .objs/test_subhalo_props. */
 
@@ -163,7 +163,7 @@ run_props_up(int64_t n, const double ref[3], const double rho[SUBHALO_NSO], stru
     assert_int_equal(arena.used, 0);
     subhalo_props_rockstar(rec, &c, &up, rho, CORESIZE, Offset, &arena);
     assert_int_equal(arena.used, 0);
-    /* subhalo_props_rockstar fills the Phase 5 columns on its radial order; the standalone
+    /* subhalo_props_rockstar fills Rs and the velocity trio on its radial order; the standalone
      * subhalo_props_deferred must give the same bits */
     struct SubTrack r2 = *rec;
     r2.Rs = r2.Vrms = -7;
@@ -357,7 +357,7 @@ test_nfw(void ** state)
     assert_true(rec.SpinPeebles >= 0 && rec.SpinPeebles < 0.02);
     assert_true(rec.SpinBullock >= 0 && rec.SpinBullock < 0.02);
     assert_true(rec.Xoff < 0.02 * rec.RBoundSO[0]);
-    /* Phase 5: the fitted Rs; BulkVel equal to Bulk within the sampling noise (sigma ~ 150 km/s
+    /* the fitted Rs; BulkVel equal to Bulk within the sampling noise (sigma ~ 150 km/s
      * over ~ 4e4 particles: 0.75 km/s per component), Vrms finite and positive */
     message(0, "NFW Rs (fit) %.3f rs %.3f (%+.2f%%), RsKlypin %.3f; BulkVel (%.2f %.2f %.2f) Bulk (%g %g %g); "
                "RockstarCoreVel (%.2f %.2f %.2f); Vrms %.2f\n", rec.Rs, h.rs, 100 * (rec.Rs / h.rs - 1), rec.RsKlypin,
@@ -429,9 +429,9 @@ test_nfw_fit(void ** state)
     /* too few bins */
     double e3[3] = {0, 1, 2};
     assert_true(subhalo_nfw_fit(1, e3, 2, 0) == -1);
-    /* Phase 5 audit R6: degenerate or nonfinite input is a failed fit, not a radius. Repeated
-     * edges at the fallback start (edge[(6 + 1) / 2] = 1 = the outer edge): the probe step is 0
-     * and the derivatives 0 / 0; before the fix the loop broke and returned 1. */
+    /* Degenerate or nonfinite input is a failed fit, not a radius. Repeated edges at the
+     * fallback start (edge[(6 + 1) / 2] = 1 = the outer edge): the probe step is 0 and the
+     * derivatives 0 / 0; a loop that breaks out there would return 1. */
     {
         double rep[7] = {0, 1, 1, 1, 1, 1, 1};
         const double bad_start[3] = {-1, 5, NAN};
@@ -593,7 +593,7 @@ make_clump(gsl_rng * rng, int64_t first, int64_t n, double M, double dX, double 
     }
 }
 
-/* The Phase 5 velocity trio of the disc tests against oracles over P[0, n) (every particle
+/* Rockstar's velocity trio of the disc tests against oracles over P[0, n) (every particle
  * bound and inside the virial aperture there): the mass-weighted mean and dispersion of all
  * particles, and the mean over r < 0.1 RBoundSO[0] about CorePos (radii floored at EPS). */
 static void
@@ -704,7 +704,7 @@ test_disc(void ** state)
     assert_true(fabs(rec.MBoundSO[0] / rec.Mbound - 1) < 1e-6);
     assert_true(rec.Xoff >= 0 && rec.Xoff < 0.01 * DISC_R);
     assert_true(rec.Voff >= 0 && rec.Voff < 0.01 * DISC_VEDGE);
-    /* Phase 5: the trio against the sample; the rigid rotation of a uniform disc has <v^2> =
+    /* the trio against the sample; the rigid rotation of a uniform disc has <v^2> =
      * VEDGE^2 / 2 about the centre, carried by the fraction frac of the mass, the clump at rest:
      * Vrms = sqrt(frac / 2) VEDGE, BulkVel = Bulk, RockstarCoreVel = Bulk (symmetric core) */
     disc_trio_check(n, &rec, "Disc trio");
@@ -742,7 +742,7 @@ test_disc(void ** state)
     teardown_pman();
 }
 
-/* ------------------------------------------------------------------ 7. units (Phase 3 audit P4) */
+/* ------------------------------------------------------------------ 7. units */
 
 /* The disc with its central clump at a = 0.5 in the length unit UL and velocity unit UV (the
  * mass unit 1e10 Msun/h): positions, softening and box in UL, Vel = a v_pec in UV, G and H(a)
@@ -821,7 +821,7 @@ test_units(void ** state)
     assert_true(fabs(a.VmaxVir / b.VmaxVir - 1) < 1e-4);
     assert_true(fabs(a.MBoundSO[0] / b.MBoundSO[0] - 1) < 1e-4);
     assert_true(fabs(a.RBoundSO[0] / (1000 * b.RBoundSO[0]) - 1) < 1e-4);
-    /* Phase 5: physical km/s and the run's length unit */
+    /* the trio and Rs: physical km/s and the run's length unit */
     message(0, "Units: Vrms %g / %g km/s, BulkVel.x %g / %g, RockstarCoreVel.x %g / %g, Rs %g kpc/h / %g Mpc/h\n",
             a.Vrms, b.Vrms, a.BulkVel[0], b.BulkVel[0], a.RockstarCoreVel[0], b.RockstarCoreVel[0], a.Rs, b.Rs);
     assert_true(a.Vrms > 0 && fabs(a.Vrms / b.Vrms - 1) < 1e-4);
@@ -1005,7 +1005,7 @@ test_absent(void ** state)
         assert_true(rec.MBoundSO[s] == -1 && rec.RBoundSO[s] == -1);
     assert_true(rec.VmaxVir == -1 && rec.RmaxVir == -1 && rec.JVir[0] == -1 && rec.SpinBullock == -1);
     assert_true(rec.Xoff == -1 && rec.Voff == -1 && rec.RsKlypin == -1 && rec.BtoA == -1 && rec.AxisA500[2] == -1);
-    /* the Phase 5 columns need the crossing too */
+    /* Rs and the velocity trio need the crossing too */
     assert_true(rec.Rs == -1 && rec.Vrms == -1);
     for(d = 0; d < 3; d++)
         assert_true(rec.RockstarCoreVel[d] == -1 && rec.BulkVel[d] == -1);
@@ -1113,7 +1113,7 @@ test_vmax(void ** state)
     int64_t i, b;
     setup_pman(600);
 
-    /* (a) the audit's multi-peak profile: rlo(b) = exp((b + 0.2) / 64), rhi(b) = exp((b + 0.8)
+    /* (a) a multi-peak profile: rlo(b) = exp((b + 0.2) / 64), rhi(b) = exp((b + 0.8)
      * / 64), M(rhi) = rhi, M(rlo) = 1.00001 rlo except 1.005 rlo at b = 220, endpoints at 1 and
      * exp(4) with 1e-9 each; a central core particle of mass 1e-12 */
     {
@@ -1139,7 +1139,7 @@ test_vmax(void ** state)
             assert_true(P[i].Mass > 0);
         hbt_props(n, 1, &rec);
         best = vmax_brute(n, rec.CorePos, rfloor, &rb);
-        message(0, "Vmax multi-peak profile (%ld particles): Rmax %.8g (oracle %.8g, audit 31.20645611), Vmax^2 / G %.8g (oracle %.8g, audit 1.005)\n",
+        message(0, "Vmax multi-peak profile (%ld particles): Rmax %.8g (oracle %.8g, expected 31.20645611), Vmax^2 / G %.8g (oracle %.8g, expected 1.005)\n",
                 (long) n, rec.Rmax, rb, rec.Vmax * rec.Vmax / TEST_G, best);
         assert_true(fabs(rb / 31.20645611 - 1) < 1e-8);
         assert_true(fabs(best / 1.005 - 1) < 1e-8);
@@ -1184,7 +1184,7 @@ test_vmax(void ** state)
     teardown_pman();
 }
 
-/* ------------------------------------------------------------------ 9. NFW bin edges (Phase 5 audit R5) */
+/* ------------------------------------------------------------------ 9. NFW bin edges */
 
 /* The oracle's equal-mass bin edges of nfw.c:101-144 for the innermost nfit of n equal masses m at
  * the sorted radii r (rnext the next radius, the particle after the aperture included, r[k] at the
@@ -1251,19 +1251,19 @@ nfw_line_props(int64_t n)
 
 /* Rockstar's bin edge (nfw.c:126-132) converts the midpoint to kpc/h and subtracts the
  * interpolation in Mpc/h (an upstream unit bug that effectively drops the correction); the recipe
- * applies the correction in the run's length unit. (a) The audit's example, radii 0.01, 0.02, 0.03
+ * applies the correction in the run's length unit. (a) A worked example, radii 0.01, 0.02, 0.03
  * Mpc/h and an excess of half the closing mass: 0.020 Mpc/h = 20 kpc/h (Rockstar literally 24.995
  * kpc/h), the same edge in kpc/h units. (b) An overshooting-bin oracle: 132 equal masses at
  * distinct radii 0.5 + 0.1 k from a one-particle core, every particle above the threshold (the
- * crossing is the outermost particle), the fit's aperture (decision 47.1: the crossing particle
- * excluded, as the velocity aperture) the 131 inside it, 8 bins of 16.375 masses (seven close
+ * crossing is the outermost particle), the fit's aperture (the crossing particle excluded, as
+ * in the velocity aperture) the 131 inside it, 8 bins of 16.375 masses (seven close
  * with an excess, the last exactly at the aperture's last particle, its outer neighbour the
  * crossing particle); Rs of subhalo_props_deferred against the fit on the edges computed here
  * with the intended interpolation, and different from the fit on nfw.c's literal aperture (the
- * 130 inside the particle before the crossing, decision 44's rule) and on the former aperture
- * (D4: all 132, crossing included). The crossing particle carries a large velocity: BulkVel and
+ * 130 inside the particle before the crossing) and on the aperture with the crossing included
+ * (all 132). The crossing particle carries a large velocity: BulkVel and
  * Vrms of the aperture (the 131 inside it, at rest) are 0, with it they would not be. (c) The -1
- * rule at the boundary (decision 47.1): with the crossing outermost, kc = 100 (101 bound
+ * rule at the boundary: with the crossing outermost, kc = 100 (101 bound
  * particles) fits, kc = 99 gives -1 (nfw.c's literal aperture would need kc = 101); kc = 1 (two
  * particles) gives the innermost particle's velocities and Rs -1; kc = 0 (one particle) all -1. */
 static void
@@ -1339,7 +1339,7 @@ test_nfw_bin_edges(void ** state)
     double e44[SUBHALO_NFW_MAXBINS + 1], eold[SUBHALO_NFW_MAXBINS + 1];
     double mpbin, mp44, mpold;
     int novershoot, nov44, novold;
-    /* the aperture: the n - 1 inside the crossing particle (decision 47.1) */
+    /* the aperture: the n - 1 inside the crossing particle */
     const int64_t nfit = n - 1;
     const int nb = subhalo_nfw_bin_plan(nfit, nfit * m, m, &mpbin);
     assert_int_equal(nb, 8);                       /* ppbin 131 / (131 / 15) = 16 */
@@ -1351,16 +1351,16 @@ test_nfw_bin_edges(void ** state)
     assert_true(fabs(edge[nb] - 0.5 * (r[n - 2] + r[n - 1])) < 1e-12 * r[n - 1]);
     const double rs = subhalo_nfw_fit(rs0, edge, nb, 3 * rfloor);
     const double rs_lit = subhalo_nfw_fit(rs0, lit, nb, 3 * rfloor);
-    /* nfw.c's literal aperture (decision 44: the crossing and the particle before it excluded) */
+    /* nfw.c's literal aperture (the crossing and the particle before it excluded) */
     const int nb44 = nfw_oracle_edges(r, n, m, n - 2, 0, e44, &mp44, &nov44);
     assert_int_equal(nb44, 8);
     assert_true(fabs(mp44 / m - 16.25) < 1e-12);
     const double rs_44 = subhalo_nfw_fit(rs0, e44, nb44, 3 * rfloor);
-    /* the former aperture (D4: every particle up to and including the crossing) */
+    /* the aperture with every particle up to and including the crossing */
     const int nbold = nfw_oracle_edges(r, n, m, n, 0, eold, &mpold, &novold);
     const double rs_old = subhalo_nfw_fit(rs0, eold, nbold, 3 * rfloor);
-    message(0, "NFW bin oracle: the aperture inside the crossing Rs %.8g, nfw.c's literal aperture (two excluded) %.8g, the former "
-               "aperture (crossing included) %.8g (%d bins of %.4g masses); BulkVel (%g %g %g) Vrms %g RockstarCoreVel.x %g with "
+    message(0, "NFW bin oracle: the aperture inside the crossing Rs %.8g, nfw.c's literal aperture (two excluded) %.8g, the "
+               "aperture with the crossing included %.8g (%d bins of %.4g masses); BulkVel (%g %g %g) Vrms %g RockstarCoreVel.x %g with "
                "the crossing particle at 5000\n", rs, rs_44, rs_old, nbold, mpold / m,
             rec.BulkVel[0], rec.BulkVel[1], rec.BulkVel[2], rec.Vrms, rec.RockstarCoreVel[0]);
     assert_true(rs_44 > 0 && fabs(rs_44 / rs - 1) > 1e-4);
@@ -1443,7 +1443,7 @@ aper_oracle_edges(const double * r, const double * m, int64_t n, int64_t nfit, i
     return b - 1;
 }
 
-/* Aperture boundaries (decision 47.1): (a) kc = 2, velocities of the two inner particles; (b) the
+/* Aperture boundaries: (a) kc = 2, velocities of the two inner particles; (b) the
  * largest included mass at kc - 1, a larger crossing mass at kc; plan and edges worked out here. */
 static void
 test_aperture_boundaries(void ** state)

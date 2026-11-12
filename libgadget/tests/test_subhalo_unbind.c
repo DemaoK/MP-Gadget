@@ -1,8 +1,8 @@
 /* Serial tests of the unbinding kernel (subhalo_unbind.c; design 7.4) and the k-nearest tracer
  * search: Hernquist haloes, unbound shells, subsampling, satellites, scale factor, thermal energy,
  * periodic gravity, ties, tree order, core fill, sinking, death, rescue and its clipped core frame, the
- * second attempt after a large loss; bitwise results at 1 to 8 threads and inside a worker region (decisions 37, 42.5); the sampled
- * final pass (42.4).
+ * second attempt after a large loss; bitwise results at 1 to 8 threads and inside a worker region; the sampled
+ * final pass.
  * test_timing takes sizes, thresholds, threads and the final-pass mode from SUBHALO_UNBIND_TIMING*.
  * Haloes sample the exact Hernquist distribution function (truncated at 100 scale radii) across a
  * periodic boundary; a = 1, H = 0, units kpc/h, 1e10 Msun/h, km/s. Run as: mpirun -np 1. */
@@ -855,7 +855,7 @@ test_thermal(void ** state)
     PartManager->NumPart = 0;
 }
 
-/* ------------------------------------------------------------------ adversarial oracles (J5, J6, J10) */
+/* ------------------------------------------------------------------ adversarial oracles */
 
 static void
 set_particle(int64_t i, int type, double mass, MyIDType id, double x, double y, double z)
@@ -930,7 +930,7 @@ knn_brute(int64_t q, const int64_t * tr, int64_t nt, int k, double L, int64_t * 
         res[a] = a < nb ? bi[a] : -1;
 }
 
-/* Periodic gravity (J5). The minimal case: box 10, frame origin 0, particles at 4.9 and
+/* Periodic gravity. The minimal case: box 10, frame origin 0, particles at 4.9 and
  * 5.1 (separation 0.2, 9.8 if unwrapped about the origin), by direct sum and by the tree, with
  * velocities that bind the pair only at the periodic separation. Then a tree-sized clump
  * straddling the unwrap cut of the frame in every axis plus a uniform background over the
@@ -1033,7 +1033,7 @@ test_periodic_gravity(void ** state)
     teardown_pman();
 }
 
-/* k nearest tracers (J5, J10): the minimal cut, an exact tie with the larger ID first
+/* k nearest tracers: the minimal cut, an exact tie with the larger ID first
  * in P, and a tree-sized set (origin tracer at 0, half the tracers and queries in a cube around
  * the antipode, half uniform, integer coordinates for exact ties, scrambled IDs) against the
  * periodic brute force with (d2, ID, index) order; a tree built once and queried in batches
@@ -1155,7 +1155,7 @@ test_knn(void ** state)
     teardown_pman();
 }
 
-/* Reassignment scaling (J6): one tree per key queried in batches of 256 (the driver sizes its
+/* Reassignment scaling: one tree per key queried in batches of 256 (the driver sizes its
  * batches by the arena), against a rebuild per batch; the build counter and the times. */
 static void
 test_knn_scaling(void ** state)
@@ -1222,7 +1222,7 @@ test_knn_scaling(void ** state)
     }
 }
 
-/* Exact energy ties (J10): NTIE particles at one point (every potential is the same sum of
+/* Exact energy ties: NTIE particles at one point (every potential is the same sum of
  * identical terms, direct or tree) with velocities +-(k + 1) s along axis k % 3 for pair k, so
  * each pair ties exactly; IDs scrambled against P order. The bound and unbound parts must be in
  * (E, ID) order and the result, IDs and energies, identical bit for bit for a second copy laid
@@ -1321,7 +1321,7 @@ test_ties(void ** state)
     teardown_pman();
 }
 
-/* Tree energies do not depend on the order of P (J10, equal Morton keys ordered by ID): a
+/* Tree energies do not depend on the order of P (equal Morton keys ordered by ID): a
  * Hernquist cloud with every fifth particle on top of the previous one and mixed masses, laid
  * out twice in different P orders with scrambled IDs, gives bitwise identical energies. */
 static void
@@ -2418,7 +2418,7 @@ test_admit_need(void ** state)
     assert_int_equal(subhalo_admit_need(0x1p-60, 10), 1);
 }
 
-/* ------------------------------------------------------------------ Phase 5b: intra-key threading */
+/* ------------------------------------------------------------------ intra-key threading */
 
 /* A host Hernquist sphere of nhost particles (IDs 0..) at Centre and a satellite of nsat (a
  * tenth of the mass, a quarter of the scale radius; IDs from nhost) at 2 a on a circular orbit,
@@ -2524,7 +2524,7 @@ assert_same_result(const struct CandResult * a, const struct CandResult * b)
 #define NBIG_HOST 200000
 #define NBIG_SAT 20000
 
-/* The parallel mode (subhalo_unbind.h, Phase 5b) gives bit-identical results at 1, 3 and 8
+/* The parallel mode (subhalo_unbind.h) gives bit-identical results at 1, 3 and 8
  * threads on a 2.2e5-particle host + satellite candidate: the subsampled loop (SampleSize 1000:
  * subsample, gather, partition, frame, refinement on 2e4) and the exact final pass (tree over
  * 2e5), a candidate that dies after a parallel iteration (the stable partition's whole order),
@@ -2769,7 +2769,7 @@ test_threads_worker_region(void ** state)
     omp_set_num_threads(nmax0);
 }
 
-/* The sampled final pass (SubhaloFinalPass = 0, decision 42.4; subhalo_final_pass in
+/* The sampled final pass (SubhaloFinalPass = 0; subhalo_final_pass in
  * subhalo_unbind.h).
  *  1. Below the sample size it is the exact pass: a 900-particle Hernquist sphere alone
  *     (N <= SampleSize, no subsampling at all) and with 400 fast particles added (N = 1300 >
@@ -3051,11 +3051,11 @@ test_final_pass_sampled(void ** state)
     omp_set_num_threads(nmax0);
 }
 
-/* Decision 42.5 (second round): the threading threshold PAR_MIN only shares work out. Keys below
+/* The threading threshold PAR_MIN only shares work out. Keys below
  * SUBHALO_UNBIND_CHUNK_MIN (1500, 3000 and 10000 particles, the host + satellite candidate of
  * test_threads_worker_region from a frame 150 km/s off, with and without subsampling, plus a
  * candidate that dies after its first iteration and the neighbour search over 3000 tracers) give
- * bit-identical results with PAR_MIN at 16384 (the Phase 5b value), its default and 1 (every
+ * bit-identical results with PAR_MIN at 16384, its default and 1 (every
  * step of more than one element in parallel mode; at 1 also with the fixed 256 loop chunks of
  * subhalo_unbind_set_loop_chunk(0)), at 1, 2 and 8 threads, all compared with the 1-thread run
  * at the default (the serial path). */
@@ -3188,16 +3188,16 @@ env_int_list(const char * name, int64_t * v, int nmax)
     return n;
 }
 
-/* Timing table of the parallel mode (Phase 5 plan section 4 item 6), run only when
+/* Timing table of the parallel mode, run only when
  * SUBHALO_UNBIND_TIMING is set to a repeat count (it takes minutes): unbind + final pass of a
  * Hernquist sphere of 2e4, 2e5 and 1e6 particles with the production SampleSize 1000, at 1, 2,
  * 4 and 8 threads, the minimum time over the repeats, each result checked bitwise against the
  * 1-thread one. Run with `mpirun --bind-to none`: by default
  * Open MPI binds a single rank to one core, and every thread then shares it.
- * Decision 42.5 (second round) knobs: SUBHALO_UNBIND_TIMING_SIZES (e.g. 2000,4000,8000),
+ * Further knobs: SUBHALO_UNBIND_TIMING_SIZES (e.g. 2000,4000,8000),
  * SUBHALO_UNBIND_TIMING_THREADS (e.g. 1,2,4,8) and SUBHALO_UNBIND_TIMING_PARMIN (thresholds set
  * with subhalo_unbind_set_par_min, e.g. 16384,8192,4096), SUBHALO_UNBIND_TIMING_LOOPCHUNK=0
- * (subhalo_unbind_set_loop_chunk(0): the fixed 256 energy-loop chunks of Phase 5b; default
+ * (subhalo_unbind_set_loop_chunk(0): the fixed 256 energy-loop chunks; default
  * adaptive); SUBHALO_UNBIND_TIMING_FIXTURE=sat
  * times the host + satellite candidate of test_threads_worker_region (start frame 150 km/s off,
  * several iterations) instead of the sphere. The repeats of one size and thread count
@@ -3205,7 +3205,7 @@ env_int_list(const char * name, int64_t * v, int nmax)
  * only between blocks of repeats, because libgomp's team resizing made a run right after a
  * change of team size up to 100 ms slower on r30 (an artifact; production keeps one team). The
  * 1-thread run does not depend on the threshold and is taken once. SUBHALO_UNBIND_TIMING_SAMPLED=1
- * times the sampled final pass instead of the exact one (TIMING SAMPLED rows, decision 42.4). */
+ * times the sampled final pass instead of the exact one (TIMING SAMPLED rows). */
 static void
 test_timing(void ** state)
 {

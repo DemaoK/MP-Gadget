@@ -103,7 +103,7 @@ static void test_openmpsort(void ** state) {
 }
 
 
-/* Phase 5d: the parallel merge is stable and its result does not depend on the thread count. */
+/* The parallel merge is stable and its result does not depend on the thread count. */
 struct rec16 { int key; int orig; int64_t pad; };
 struct rec48 { int key; int orig; char pad[40]; };
 static int cmp_key16(const void * a, const void * b) {
@@ -203,7 +203,7 @@ static void test_permute_openmp(void ** state) {
     free(src);
 }
 
-/* Explicit permute_openmp layouts (audit 5d R4). The units are S = max(1024, nmemb / (16
+/* Explicit permute_openmp layouts. The units are S = max(1024, nmemb / (16
  * threads) + 1) consecutive positions of the cycle listing (the non-fixed positions, cycles in
  * the order of their smallest element): a first cycle of exactly S (or 2 S) non-fixed positions,
  * plain or with fixed points between them, so that the next cycle starts exactly at a unit

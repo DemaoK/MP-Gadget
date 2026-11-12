@@ -7,7 +7,7 @@
  *                   layouts and batch sizes ("SO test checksum"); the doubling cap; the memory
  *                   fallbacks (fewer bins, pass 2 skipped, SO off); an emptied rank routed.
  *  field_so_mixed   non-dyadic, mixed-type refined shells: one-ulp sums, partition agreement.
- *  field_so_profile pass 3 (decision 44) on an NFW sphere: RsSO, RsKlypinSO, VmaxSO, RmaxSO, the
+ *  field_so_profile pass 3 on an NFW sphere: RsSO, RsKlypinSO, VmaxSO, RmaxSO, the
  *                   -1 cases, bitwise across layouts ("SO profile checksum"), the memory rule.
  *  so_prof_unit     pass 3's 128-bit fixed-point unit: overflow bound and exact quantisation.
  *  field_so_shell   thin shells at 0.99 RSO[vir]: the 100-particle rule and its diagnostics. */
@@ -609,7 +609,7 @@ test_subhalo_field_so(void ** state)
             subhalo_so_walk_bytes(1, 64, 1), subhalo_so_walk_bytes(2, 64, 1), subhalo_so_walk_bytes(1, 64, 6),
             subhalo_so_walk_bytes(2, 64, 6));
     subhalo_so_set_import_buffer_boost(0);
-    /* Phase 5d audit R2: the export tables leave the stage increment with their allocator charge;
+    /* the export tables leave the stage increment with their allocator charge;
      * the charge is exactly what an allocation takes from the free space */
     if(!A_MAIN->use_malloc) {
         const size_t req[6] = {1, 4095, 4096, 4097, 12 * 1000, 12 * 4096 + 5};
@@ -847,7 +847,7 @@ test_subhalo_field_so(void ** state)
 
 /* ------------------------------------------------------------------ non-dyadic refined shells */
 
-/* Test 7 (audit P3). One central with non-dyadic, mixed masses of types 1, 2 and 3:
+/* Test 7. One central with non-dyadic, mixed masses of types 1, 2 and 3:
  *   core    NM_CORE particles uniform in r inside 0.8 of the inner edge of the 200c crossing bin;
  *   shell1  NM_SH1 particles (half type 1, half type 3) in one pass-2 sub-bin (3) of that bin;
  *   shell2a NM_SH2A particles in the middle of the pass-1 bin before the vir crossing bin;
@@ -856,7 +856,7 @@ test_subhalo_field_so(void ** state)
  * The masses are scaled so that the 200c crossing lies in sub-bin 40 of its bin (core + shell1
  * = K200c r200c^3) and the vir crossing in sub-bin 40 of its bin, with the cumulative density at
  * each crossing bin's inner edge above the threshold. The sub-bins after the shell are empty, so
- * the interpolation returns the accumulated mass (the audit's trigger): MSO200c = M(core +
+ * the interpolation returns the accumulated mass (its summation error shows): MSO200c = M(core +
  * shell1), MSOvir = MSO200b = the whole clump, per type alike. 200b crosses in an empty bin.
  *
  * Accuracy bound (documented in subhalo_so.c): the sub-bins accumulate in double, so a refined
@@ -868,7 +868,7 @@ test_subhalo_field_so(void ** state)
  *   - the per-type masses sum to MSO within 2^-22 relative (the f4 roundings);
  *   - every MSO (also 500c, 2500c, interpolated in the core) within 1e-6 relative of the
  *     default-domain result.
- * The float accumulation of the previous pass 2 misses these by orders of magnitude (100000
+ * A float accumulation in pass 2 would miss these by orders of magnitude (100000
  * additions of ~1e-5 of the total each). */
 
 #define NM_CORE 40000
@@ -1061,7 +1061,7 @@ mixed_setup_particles(const struct mixed_geom * gm)
 
 struct mixed_result {
     double MSO[SUBHALO_NSO], MTVir[6], MT200c[6], Rsearch;
-    double RSOvir, P3[4];             /* f4 RSO[vir]; RsSO, RsKlypinSO, VmaxSO, RmaxSO (R2) */
+    double RSOvir, P3[4];             /* f4 RSO[vir]; RsSO, RsKlypinSO, VmaxSO, RmaxSO */
 };
 
 /* One call with the central on rank `owner`; results gathered on every rank. */
@@ -1102,7 +1102,7 @@ mixed_run(DomainDecomp * dd, int owner, const Cosmology * CP, const struct Subha
     MPI_Allreduce(&mine, res, sizeof(mine) / sizeof(double), MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
 }
 
-/* R2: the pass-3 columns rebuilt from the gathered particles: a brute-force histogram of the
+/* The pass-3 columns rebuilt from the gathered particles: a brute-force histogram of the
  * published f4 sphere (fixed-point unit from the global count and largest mass), then
  * so_profile_finish's recipe. Returns the failures; *nin the particles inside. */
 static int
@@ -1206,7 +1206,7 @@ mixed_p3_reference(const struct gpart * g, int64_t ng, const struct mixed_result
     return bad;
 }
 
-/* R2: one run's pass-3 columns bitwise equal to the reference of its own f4 sphere. */
+/* One run's pass-3 columns bitwise equal to the reference of its own f4 sphere. */
 static int
 mixed_p3_check(const struct mixed_result * r, const struct gpart * g, int64_t ng, const Cosmology * CP, double rhovir,
                const char * what)
@@ -1341,7 +1341,7 @@ test_subhalo_field_so_mixed(void ** state)
           st.Pass3, st.Nprofile);
     int bad = mixed_check(&r0, NULL, &gm, Mref, MTref, "mixed default");
     CHECK(bad == 0, "mixed default domain: %d failures\n", bad);
-    /* R2: pass 3 against the brute-force reference; the f4 sphere spans several ranks (imports) */
+    /* pass 3 against the brute-force reference; the f4 sphere spans several ranks (imports) */
     {
         const double R = (float) r0.RSOvir;
         int has = 0, nr = 0;
@@ -1396,7 +1396,7 @@ test_subhalo_field_so_mixed(void ** state)
     PartManager->NumPart = 0;
 }
 
-/* ------------------------------------------------------------------ 8. pass 3 (decision 44) */
+/* ------------------------------------------------------------------ 8. pass 3 */
 
 #define NN_N 40000
 #define NN_CL 60                  /* the small clump */
@@ -1673,14 +1673,14 @@ test_subhalo_field_so_profile(void ** state)
     PartManager->NumPart = 0;
 }
 
-/* ------------------------------------------------------------------ audit 5e R1: the unit */
+/* ------------------------------------------------------------------ the fixed-point unit */
 
 /* Pass 3's fixed-point unit (subhalo_so_prof_unit) for a synthetic global count of 2^31 live
  * particles, no particle allocated: for largest masses 1, 0.75, 3.1e-3 and 1e3 the unit is the
  * largest power of two with N m_max unit <= 2^126 (2^31 quantised largest masses do not overflow,
  * twice the unit would exceed the bound); masses 1e-6, 1e-6 (1 + 2^-20), 0.3 and 2^-70 of the
- * largest (as float, the particles' type) are quantised exactly, where the former 64-bit unit
- * (2^(62 - emax - 31)) rounded 1e-6 by 2.4e-4 relative; the sum of 2^31 copies of each, as one
+ * largest (as float, the particles' type) are quantised exactly, where a 64-bit unit
+ * (2^(62 - emax - 31)) rounds 1e-6 by 2.4e-4 relative; the sum of 2^31 copies of each, as one
  * 128-bit product, converts back to 2^31 m to 1e-15. Also the unit at 2^31 + 1 particles (one more
  * bit), without mass, and the warning bound 0.5 / (unit m) <= 1e-9 for a 2^-60 mass ratio. */
 static void
@@ -1713,7 +1713,7 @@ test_subhalo_so_prof_unit(void ** state)
             CHECK(back == m, "m_max %g: mass %.9g quantised to %.17g\n", mmax, m, back);
             CHECK(fabs(sum / ((double) N * m) - 1) < 1e-15, "m_max %g: 2^31 masses %.9g sum to %.17g\n", mmax, m, sum);
             if(a == 0 && k == 1)
-                CHECK(eold > 1e-4, "the former unit's error at 1e-6 is %g, not the audit's 2.4e-4\n", eold);
+                CHECK(eold > 1e-4, "the 64-bit unit's error at 1e-6 is %g, not the expected 2.4e-4\n", eold);
         }
     }
     CHECK(subhalo_so_prof_unit(N + 1, 1.) == 0.5 * subhalo_so_prof_unit(N, 1.) && subhalo_so_prof_unit(N - 1, 1.) == subhalo_so_prof_unit(N, 1.)
@@ -1723,13 +1723,13 @@ test_subhalo_so_prof_unit(void ** state)
     CHECK(0.5 / (u * 0x1p-60) <= 1e-9, "unit: a 2^-60 mass ratio is quantised to %g\n", 0.5 / (u * 0x1p-60));
 }
 
-/* ------------------------------------------------------------------ audit 5e R2: a thin shell */
+/* ------------------------------------------------------------------ a thin shell */
 
 #define SH_N 16                    /* shells */
 #define SH_P 100                   /* particles per shell: SUBHALO_NFW_MINPART */
 #define SH_NB 64                   /* pass-1 bins */
 
-/* Thin shells (audit 5e R2): 16 centrals, each the only matter within 200 kpc/h, 100 particles of
+/* Thin shells: 16 centrals, each the only matter within 200 kpc/h, 100 particles of
  * mass (64 + k) / 65536 (float exact) on a sphere of radius 0.99 RSO_k, RSO_k = (3 M_k /
  * (4 pi rho_vir))^(1/3), so the shell is in the last profile bin (0.944 RSO, RSO]. Each record's
  * Mbound sets its search radius so that a pass-1 edge lies at 0.995 RSO_k: the crossing bin
