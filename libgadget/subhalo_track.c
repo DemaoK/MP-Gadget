@@ -646,10 +646,7 @@ admit_particles(int32_t * owner, struct SubNode * nd, int nn, int ci, int64_t st
                 int32_t ** admlist)
 {
     const int kk = sp->SubhaloNumNeighboursForReassignment;
-    /* the threshold is the share itself: the fewest votes n with n / k >= s */
-    int need = 1;
-    while(need < kk && (double) need / kk < sp->SubhaloAdmitShare)
-        need++;
+    const int need = subhalo_admit_need(sp->SubhaloAdmitShare, kk);
     int64_t i, nt = 0, nc = 0, nadm = 0;
     int v, u, nrecv = 0;
     for(v = 0; v < nn; v++)

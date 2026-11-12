@@ -6,6 +6,7 @@
  * the main stack (mymalloc2), since domain_exchange may myrealloc the slots, the last bottom
  * allocation; bottom allocations are scratch freed by the function that made them. */
 
+#include <float.h>
 #include <math.h>
 #include "subhalo.h"
 
@@ -476,6 +477,16 @@ static inline int
 subhalo_rescue_large_loss(int64_t Nbound, int64_t NPrev)
 {
     return 2 * Nbound < NPrev;
+}
+/* Votes needed among k neighbours for the share s: ceil(s k), where a product within a few rounding
+ * errors above an integer counts as that integer (0.3 * 10 is 3). */
+static inline int
+subhalo_admit_need(double s, int k)
+{
+    int need = (int) ceil(s * k * (1. - 8 * DBL_EPSILON));
+    if(need < 1) need = 1;
+    if(need > k) need = k;
+    return need;
 }
 /* Resurrection order of the orphans of a key without a resolved progenitor: the larger membership
  * weight M (MarkerWeight), then the smaller kinetic distance d, then the smaller TrackId. */

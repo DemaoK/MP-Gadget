@@ -908,8 +908,8 @@ nb_better(double d2, int64_t p, double d2w, int64_t pw)
 static void
 knn_brute(int64_t q, const int64_t * tr, int64_t nt, int k, double L, int64_t * res)
 {
-    double bd[SUBHALO_KNN_MAXK];
-    int64_t bi[SUBHALO_KNN_MAXK];
+    double bd[SUBHALO_KNN_MAXK + 1];
+    int64_t bi[SUBHALO_KNN_MAXK + 1];
     int nb = 0, a;
     int64_t j;
     for(j = 0; j < nt; j++) {
@@ -1037,7 +1037,7 @@ test_periodic_gravity(void ** state)
  * in P, and a tree-sized set (origin tracer at 0, half the tracers and queries in a cube around
  * the antipode, half uniform, integer coordinates for exact ties, scrambled IDs) against the
  * periodic brute force with (d2, ID, index) order; a tree built once and queried in batches
- * gives the same rows with one build. */
+ * gives the same rows with one build; the largest k, SUBHALO_KNN_MAXK + 1, agrees with the brute force. */
 static void
 test_knn(void ** state)
 {
@@ -1103,7 +1103,7 @@ test_knn(void ** state)
     assert_int_equal(arena.used, 0);
     int64_t bad = 0, ties = 0, idties = 0;
     for(i = 0; i < nq; i++) {
-        int64_t bi[SUBHALO_KNN_MAXK];
+        int64_t bi[SUBHALO_KNN_MAXK + 1];
         knn_brute(q[i], tr, nt, k, L, bi);
         for(a = 0; a < k; a++) {
             if(out[i * k + a] != bi[a])
@@ -1128,6 +1128,24 @@ test_knn(void ** state)
     arena.used = 0;
     assert_int_equal(subhalo_knn_build_count(), nb0 + 1);
     assert_memory_equal(out, out_b, sizeof(int64_t) * nq * k);
+
+    /* the largest k of a query, one above a parameter's */
+    {
+        const int kx = SUBHALO_KNN_MAXK + 1;
+        int64_t * outx = (int64_t *) mymalloc("TestOutX", sizeof(int64_t) * nq * kx);
+        subhalo_knn_tracers(q, nq, tr, nt, kx, outx, L, &arena);
+        assert_int_equal(arena.used, 0);
+        int64_t badx = 0;
+        for(i = 0; i < nq; i++) {
+            int64_t bi[SUBHALO_KNN_MAXK + 1];
+            knn_brute(q[i], tr, nt, kx, L, bi);
+            for(a = 0; a < kx; a++)
+                badx += outx[i * kx + a] != bi[a];
+        }
+        message(0, "kNN at k = %d: %ld mismatches against the brute force over %ld queries\n", kx, (long) badx, (long) nq);
+        assert_int_equal(badx, 0);
+        myfree(outx);
+    }
 
     myfree(out_b);
     myfree(out);
@@ -2353,6 +2371,32 @@ test_rescue_loss(void ** state)
     teardown_pman();
 }
 
+/* The admission threshold ceil(s k): the share n / k needs n votes, a share above it by far more than rounding
+ * needs n + 1; the literals cover products that round above an integer (0.3 * 10) and just above one. */
+static void
+test_admit_need(void ** state)
+{
+    int k, n;
+    /* a share read as a parameter: the compiler may not cancel its division against s k */
+    volatile double s;
+    for(k = 1; k <= SUBHALO_KNN_MAXK; k++)
+        for(n = 1; n <= k; n++) {
+            s = (double) n / k;
+            assert_int_equal(subhalo_admit_need(s, k), n);
+            if(n < k) {
+                s = ((double) n / k) * (1 + 1e-12);
+                assert_int_equal(subhalo_admit_need(s, k), n + 1);
+            }
+        }
+    assert_int_equal(subhalo_admit_need(0.3, 10), 3);
+    assert_int_equal(subhalo_admit_need(0.5, 10), 5);
+    assert_int_equal(subhalo_admit_need(0.7, 10), 7);
+    assert_int_equal(subhalo_admit_need(0.50000000005, 10), 6);
+    assert_int_equal(subhalo_admit_need(5.0 / 7, 7), 5);
+    assert_int_equal(subhalo_admit_need(1.0, 64), 64);
+    assert_int_equal(subhalo_admit_need(1e-9, 10), 1);
+}
+
 /* ------------------------------------------------------------------ Phase 5b: intra-key threading */
 
 /* A host Hernquist sphere of nhost particles (IDs 0..) at Centre and a satellite of nsat (a
@@ -3255,6 +3299,7 @@ int main(void) {
         cmocka_unit_test(test_rescue_frame),
         cmocka_unit_test(test_rescue_frame_cases),
         cmocka_unit_test(test_rescue_loss),
+        cmocka_unit_test(test_admit_need),
         cmocka_unit_test(test_threads_bitwise),
         cmocka_unit_test(test_threads_worker_region),
         cmocka_unit_test(test_final_pass_sampled),
