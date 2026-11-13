@@ -48,6 +48,14 @@
 #define CF_RELEASE 32    /* a field particle tagged by an orphan or the central: untagged by the final pass */
 
 static struct SubhaloCollectiveStats CollStats;
+
+/* The particle count a tree build of the in-place walks is told on a nearly empty rank, to hold the
+ * top-level grid and the per-thread node caches (the builds and the admission estimate). */
+static inline int64_t
+coll_tree_min_part(int64_t nleaf, int nthr)
+{
+    return 2048 + 512 * (int64_t) nthr + 4 * nleaf * nthr;
+}
 static subhalo_collective_hook PretagHook = NULL;
 
 void
@@ -151,23 +159,12 @@ mass_before_v(float Ma, float Va, MyIDType Ia, int64_t Ta, float Mb, float Vb, M
     return Ta > Tb;
 }
 
-static double CollImportBufferBoost = 2;
-
-void
-subhalo_collective_set_import_buffer_boost(double boost)
-{
-    CollImportBufferBoost = boost;
-}
-
 size_t
 subhalo_collective_walk_bytes(void)
 {
     /* query: TreeWalkQueryBase + label + index; result: TreeWalkResultBase + one double */
     const size_t q = sizeof(TreeWalkQueryBase) + 8, r = sizeof(TreeWalkResultBase) + 8;
-    const size_t bpb = sizeof(struct data_index) + q + r + (size_t) ceil(CollImportBufferBoost * (q + r));
-    const int64_t nthr = omp_get_max_threads();
-    const int64_t nbuf = 4096 * 10 + (4096 + 1 > 100 * nthr ? 4096 + 1 : 100 * nthr);
-    return (size_t) nbuf * bpb;
+    return subhalo_walk_reserve_bytes(q, r, subhalo_import_buffer_boost());
 }
 
 /* ------------------------------------------------------------------ the potential-only walk */
@@ -419,7 +416,7 @@ coll_walk(struct Coll * C, double * Sum)
     {
         const int nthr = omp_get_max_threads();
         const int64_t nleaf = C->ddecomp->Tasks[C->ThisTask].EndLeaf - C->ddecomp->Tasks[C->ThisTask].StartLeaf;
-        int64_t need = 2048 + 512 * (int64_t) nthr + 4 * nleaf * nthr;
+        int64_t need = coll_tree_min_part(nleaf, nthr);
         if(need > PartManager->MaxPart)
             need = PartManager->MaxPart;
         if(PartManager->NumPart < need)
@@ -675,10 +672,7 @@ size_t
 subhalo_collective_knn_walk_bytes(int k)
 {
     const size_t q = sizeof(TreeWalkQueryKnn), r = sizeof(TreeWalkResultKnn) + sizeof(struct SubhaloKnnHit) * (size_t) k;
-    const size_t bpb = sizeof(struct data_index) + q + r + (size_t) ceil(CollImportBufferBoost * (q + r));
-    const int64_t nthr = omp_get_max_threads();
-    const int64_t nbuf = 4096 * 10 + (4096 + 1 > 100 * nthr ? 4096 + 1 : 100 * nthr);
-    return (size_t) nbuf * bpb;
+    return subhalo_walk_reserve_bytes(q, r, subhalo_import_buffer_boost());
 }
 
 static int64_t KnnExportRounds = 0;
@@ -716,7 +710,7 @@ subhalo_collective_knn(DomainDecomp * ddecomp, const int32_t * label, const int 
         int ThisTask;
         MPI_Comm_rank(MPI_COMM_WORLD, &ThisTask);
         const int64_t nleaf = ddecomp->Tasks[ThisTask].EndLeaf - ddecomp->Tasks[ThisTask].StartLeaf;
-        int64_t need = 2048 + 512 * (int64_t) nthr + 4 * nleaf * nthr;
+        int64_t need = coll_tree_min_part(nleaf, nthr);
         if(need > PartManager->MaxPart)
             need = PartManager->MaxPart;
         if(PartManager->NumPart < need)
@@ -3546,7 +3540,7 @@ subhalo_coll_estimate(struct SubhaloCollAdmit * a, int64_t NumPart, int64_t MaxP
      * no Father array; the query and tree lists, the top-leaf labels, the walk's export reserve */
     {
         double np = (double) NumPart;
-        double need = 2048. + 512. * nthreads + 4. * (double) NLocalLeaves * nthreads;
+        double need = (double) coll_tree_min_part(NLocalLeaves, nthreads);
         if(need > (double) MaxPart)
             need = (double) MaxPart;
         if(np < need)

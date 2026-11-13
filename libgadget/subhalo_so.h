@@ -85,9 +85,6 @@ void subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * dde
  * batched path that is otherwise taken only when a rank holds more centrals than particles. */
 void subhalo_so_set_max_batch(int64_t maxbatch);
 
-/* The ImportBufferBoost the memory check assumes (default 2, the parameter's default). */
-void subhalo_so_set_import_buffer_boost(double boost);
-
 /* Free bytes treewalk.c's ev_begin needs on this rank for a walk of the given pass (1, 2 or 3)
  * with NB pass-1 bins and NT particle types (not counting this module's own buffers; pass 3
  * depends on neither). */

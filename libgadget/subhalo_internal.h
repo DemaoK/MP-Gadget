@@ -129,6 +129,14 @@ void subhalo_deferred_velocities(float BulkVel[3], float CoreVel[3], float * Vrm
  * Vel * UnitVelocity_in_cm_per_s / (1e5 * atime). The units come from subhalo_set_units. */
 double subhalo_vel_to_kms(double atime);
 
+/* The run's ImportBufferBoost (2, the parameter's default, until set_subhalo_params reads it), which
+ * treewalk.c's reserve applies; the memory checks of the field SO and of the in-place walks read it. */
+double subhalo_import_buffer_boost(void);
+void subhalo_set_import_buffer_boost(double boost);
+/* Bytes treewalk.c's ev_begin reserves for a walk of q-byte queries and r-byte results: 40960 +
+ * max(4097, 100 x threads) buffers of index, query, result and boost x (query + result). */
+size_t subhalo_walk_reserve_bytes(size_t q, size_t r, double boost);
+
 /* Collective range check before narrowing a 64-bit count to an MPI int: endrun(1) on every rank,
  * naming what, if value < 0 or > INT_MAX on any rank (exchanges are not batched past the limit). */
 void subhalo_check_mpi_count(int64_t value, const char * what, MPI_Comm Comm);

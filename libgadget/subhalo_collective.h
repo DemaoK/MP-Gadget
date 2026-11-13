@@ -28,8 +28,6 @@
 /* Bytes treewalk.c's ev_begin reserves for the potential-only walk: 40960 + max(4097, 100 x threads)
  * buffers of index, query and result plus ImportBufferBoost x (query + result). */
 size_t subhalo_collective_walk_bytes(void);
-/* The ImportBufferBoost the estimate uses (the run's parameter, set by set_subhalo_params). */
-void subhalo_collective_set_import_buffer_boost(double boost);
 
 /* Diagnostics of the last call (global). */
 struct SubhaloCollectiveStats {

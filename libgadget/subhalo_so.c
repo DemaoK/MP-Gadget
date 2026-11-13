@@ -43,9 +43,6 @@
 #define SO_SLACK (1L << 20)
 
 static int64_t SOMaxBatch = 0;
-/* treewalk.c keeps ImportBufferBoost private: the parameter's default (gadget/params.c) unless
- * subhalo_so_set_import_buffer_boost says otherwise */
-static double SOImportBufferBoost = 2.;
 
 static inline int64_t so_imin(int64_t a, int64_t b) { return a < b ? a : b; }
 static inline int64_t so_imax(int64_t a, int64_t b) { return a > b ? a : b; }
@@ -54,12 +51,6 @@ void
 subhalo_so_set_max_batch(int64_t maxbatch)
 {
     SOMaxBatch = maxbatch;
-}
-
-void
-subhalo_so_set_import_buffer_boost(double boost)
-{
-    SOImportBufferBoost = boost > 0 ? boost : 0;
 }
 
 /* Per-type slot of a definition: 0 for vir, 1 for 200c, -1 otherwise. */
@@ -193,11 +184,9 @@ subhalo_so_walk_bytes(int pass, int NB, int NT)
     /* pass 3's result has no flexible part: its accumulator is inside the struct */
     const size_t r = pass == 3 ? sizeof(TreeWalkResultSO3)
                    : (pass == 1 ? sizeof(TreeWalkResultSO1) : sizeof(TreeWalkResultSO2)) + so_acc_bytes(pass, NB, NT);
-    /* as ev_begin: bytes per buffer, the 40960-buffer reserve, then more than 4096 buffers and
-     * at least 100 per thread */
-    const size_t bpb = sizeof(struct data_index) + q + r + (size_t) ceil(SOImportBufferBoost * (q + r));
-    const int64_t nbuf = 4096 * 10 + so_imax(4096 + 1, 100 * (int64_t) omp_get_max_threads());
-    return (size_t) nbuf * bpb;
+    /* a negative boost counts as 0 here */
+    const double boost = subhalo_import_buffer_boost();
+    return subhalo_walk_reserve_bytes(q, r, boost > 0 ? boost : 0);
 }
 
 /* The pass-1 bin of radius r. Not inlined, so that pass 1 and pass 2 evaluate it with the same

@@ -604,11 +604,11 @@ test_subhalo_field_so(void ** state)
     /* the treewalk reserve with the parameter's default boost (logged for subhalo_so.c's
      * comment), then the boost of these tests: ImportBufferBoost is never set here, so
      * treewalk.c uses 0, and the 650 MB test allocator would not hold pass 2's reserve at 2 */
-    subhalo_so_set_import_buffer_boost(2);
+    subhalo_set_import_buffer_boost(2);
     message(0, "treewalk reserve with boost 2, 64 bins: NT = 1 pass 1 %zu pass 2 %zu; NT = 6 pass 1 %zu pass 2 %zu bytes\n",
             subhalo_so_walk_bytes(1, 64, 1), subhalo_so_walk_bytes(2, 64, 1), subhalo_so_walk_bytes(1, 64, 6),
             subhalo_so_walk_bytes(2, 64, 6));
-    subhalo_so_set_import_buffer_boost(0);
+    subhalo_set_import_buffer_boost(0);
     /* the export tables leave the stage increment with their allocator charge;
      * the charge is exactly what an allocation takes from the free space */
     if(!A_MAIN->use_malloc) {
@@ -1297,7 +1297,7 @@ test_subhalo_field_so_mixed(void ** state)
     tp.FractionalGravitySoftening = 1. / 50;
     set_gravshort_treepar(tp);
     gravshort_set_softenings(50.);
-    subhalo_so_set_import_buffer_boost(0);     /* as in test_subhalo_field_so */
+    subhalo_set_import_buffer_boost(0);     /* as in test_subhalo_field_so */
 
     Cosmology CP = test_cosmology();
     double rho[SUBHALO_NSO];
@@ -1560,10 +1560,10 @@ test_subhalo_field_so_profile(void ** state)
     tp.FractionalGravitySoftening = 1. / 50;
     set_gravshort_treepar(tp);
     gravshort_set_softenings(50.);       /* GravitySoftening = 1 kpc/h */
-    subhalo_so_set_import_buffer_boost(2);
+    subhalo_set_import_buffer_boost(2);
     message(0, "treewalk reserve with boost 2: pass 3 %zu bytes (any NB, NT); 64 bins NT = 1: pass 1 %zu, pass 2 %zu\n",
             subhalo_so_walk_bytes(3, 64, 1), subhalo_so_walk_bytes(1, 64, 1), subhalo_so_walk_bytes(2, 64, 1));
-    subhalo_so_set_import_buffer_boost(0);
+    subhalo_set_import_buffer_boost(0);
 
     Cosmology CP = test_cosmology();
     /* the virial threshold: the sphere's mean density inside NN_XV rs; the others any positive */
@@ -1754,7 +1754,7 @@ test_subhalo_field_so_shell(void ** state)
     tp.FractionalGravitySoftening = 1. / 50;
     set_gravshort_treepar(tp);
     gravshort_set_softenings(50.);       /* GravitySoftening = 1 kpc/h */
-    subhalo_so_set_import_buffer_boost(0);
+    subhalo_set_import_buffer_boost(0);
     Cosmology CP = test_cosmology();
     const double soft = FORCE_SOFTENING() / 2.8;
     const double M0 = SH_P * (64. / 65536);

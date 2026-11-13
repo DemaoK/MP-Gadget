@@ -19,6 +19,7 @@
 #include "utils/string.h"
 
 #include "walltime.h"
+#include "treewalk.h"
 #include "gravity.h"
 #include "subhalo.h"
 #include "subhalo_internal.h"
@@ -163,6 +164,30 @@ subhalo_int_param(double v, const char * name)
     return (int64_t) v;
 }
 
+/* The run's ImportBufferBoost: the default of gadget/params.c until set_subhalo_params reads it. */
+static double SubhaloImportBufferBoost = 2;
+
+double
+subhalo_import_buffer_boost(void)
+{
+    return SubhaloImportBufferBoost;
+}
+
+void
+subhalo_set_import_buffer_boost(double boost)
+{
+    SubhaloImportBufferBoost = boost;
+}
+
+size_t
+subhalo_walk_reserve_bytes(size_t q, size_t r, double boost)
+{
+    const size_t bpb = sizeof(struct data_index) + q + r + (size_t) ceil(boost * (q + r));
+    const int64_t nthr = omp_get_max_threads();
+    const int64_t nbuf = 4096 * 10 + (4096 + 1 > 100 * nthr ? 4096 + 1 : 100 * nthr);
+    return (size_t) nbuf * bpb;
+}
+
 void
 set_subhalo_params(ParameterSet * ps)
 {
@@ -217,8 +242,7 @@ set_subhalo_params(ParameterSet * ps)
     MPI_Bcast(checks, 2, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(raw, 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Bcast(&boost, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-    subhalo_so_set_import_buffer_boost(boost);
-    subhalo_collective_set_import_buffer_boost(boost);
+    subhalo_set_import_buffer_boost(boost);
     MPI_Bcast(SubhaloFOFFileBase, sizeof(SubhaloFOFFileBase), MPI_CHAR, 0, MPI_COMM_WORLD);
 
     if(!SubParams.SubhaloFinderOn) {
