@@ -1,7 +1,5 @@
-/* Runtime subhalo finder, pipeline steps 0, 2 and 3 (design 7.1-7.3, the plan side of 7.8): host
- * vote, previous-bound frames, track keys and the plan (budgets, packing, oversized keys, sub-tree
- * keys, memory check). The exchange, the local sort, the member fetch, the domain restore and the
- * serial-key scheduler are in subhalo_serial.c. */
+/* Pipeline steps 0, 2 and 3 (design 7.1-7.3, 7.8): host vote, previous-bound frames, track keys
+ * and the plan; the exchange and the serial-key scheduler are in subhalo_serial.c. */
 
 #include <mpi.h>
 #include <stdio.h>

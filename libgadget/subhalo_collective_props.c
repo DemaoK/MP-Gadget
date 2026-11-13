@@ -1,6 +1,5 @@
-/* The properties of the in-place candidates as a distributed ordered set: the holder-side sums,
- * the radial profile by rank-ordered compensated sums, shapes and the deferred Rockstar recipes
- * (formulas of subhalo_props.c). */
+/* Properties of the in-place candidates as a distributed ordered set: holder sums, the radial
+ * profile by rank-ordered compensated sums, shapes and the deferred Rockstar recipes. */
 
 #include <mpi.h>
 #include <math.h>

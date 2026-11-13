@@ -1,7 +1,5 @@
-/* Subhalo finder core: parameters and units (design 10, 7.10), status, per-stage clocks and the
- * driver subhalo_find (7.2; steps numbered as there). Restart entry: subhalo_init (11). Its services:
- * records and the track table (subhalo_table.c), batched ID lookups (subhalo_lookup.c), newborn
- * numbering (subhalo_newborn.c), hostless and dead tracks and orphan links (subhalo_orphan.c). */
+/* Finder core: parameters, units, status, stage clocks, the driver subhalo_find (design 7.2, 10)
+ * and the restart entry subhalo_init (11); services in subhalo_{table,lookup,newborn,orphan}.c. */
 
 #include <mpi.h>
 #include <stdio.h>

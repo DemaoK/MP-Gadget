@@ -1,7 +1,5 @@
-/* Runtime subhalo finder, the serial keys' steps 4, 5, 7a and 9 (design 7.1, 7.3): the whole-key
- * exchange, local sort and segments, member fetch, domain restore and the serial-key scheduler with
- * its per-thread arenas. The exchange follows fof_distribute_particles: target rank in P[i].TopLeaf,
- * domain_exchange, local sort; domain_maintain restores the domain. */
+/* The serial keys' steps 4, 5, 7a and 9 (design 7.1, 7.3): whole-key exchange as in
+ * fof_distribute_particles, local sort, member fetch, domain restore and the per-thread scheduler. */
 
 #include <mpi.h>
 #include <stdio.h>

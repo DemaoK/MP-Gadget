@@ -1,6 +1,5 @@
-/* The labelled walks of the in-place path over the global tree: the potential-only walk of the
- * unbinding (contract in subhalo_collective.h) and the k-nearest search of the admission vote,
- * called from the plan (subhalo_gather.c). */
+/* The in-place path's labelled walks over the global tree: the unbinding's potential walk
+ * (contract in subhalo_collective.h) and the k-nearest search of the plan's admission vote. */
 
 #include <mpi.h>
 #include <math.h>

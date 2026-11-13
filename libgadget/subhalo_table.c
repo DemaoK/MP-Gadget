@@ -1,6 +1,5 @@
-/* The finder's records and the distributed track table (design 7.1): record reset, orphan state and
- * history columns, the keyed all-to-all of the finder, and the table's storage, redistribution,
- * batched fetch and store by TrackId. */
+/* The finder's records and the distributed track table (design 7.1): record reset, orphan and
+ * history columns, the keyed all-to-all, and the table's storage, fetch and store by TrackId. */
 
 #include <mpi.h>
 #include <stdio.h>

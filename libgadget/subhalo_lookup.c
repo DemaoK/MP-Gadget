@@ -1,6 +1,5 @@
-/* Batched lookups of particle IDs on every rank (design 7.2 steps 1 and 11): the orphans' followed
- * sets and the dead or sunk tracks' tracers outside their keys, with the weighted plurality of
- * their descendants. */
+/* Batched lookups of particle IDs on every rank (design 7.2 steps 1 and 11): orphans' followed sets
+ * and the tracers of dead or sunk tracks outside their keys, with their descendants' plurality. */
 
 #include <mpi.h>
 #include <stdio.h>
