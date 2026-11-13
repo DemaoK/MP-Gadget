@@ -7,7 +7,8 @@
  *  disc                rotating disc with a core: J, spins, Xoff/Voff, the velocity trio.
  *  baryons, absent     baryonic sums; crossing-dependent columns -1 without a crossing, all
  *                      Rockstar columns -1 for an empty bound set.
- *  vmax                HBT Vmax/Rmax against a cumulative-mass oracle (multi-peak, flat, ties).
+ *  vmax                HBT Vmax/Rmax against a cumulative-mass oracle (multi-peak, flat, ties),
+ *                      M(<= r) as a compensated sum.
  *  units               the disc in kpc/h and Mpc/h with two velocity units: same physics.
  *  nfw_bin_edges       Rs bin edges in the run's length unit, an overshooting-bin oracle.
  *  aperture_boundaries Rockstar's velocity aperture at its edges.
@@ -19,6 +20,7 @@
 #include <setjmp.h>
 #include <cmocka.h>
 #include <math.h>
+#include <float.h>
 #include <mpi.h>
 #include <stdio.h>
 #include <string.h>
@@ -1060,12 +1062,13 @@ vmax_brute(int64_t n, const double cen[3], double rfloor, double * rbest)
     return best;
 }
 
-/* subhalo_props_hbt on P[0, n) in Index order with CoreSize core particles, an arena of exactly
- * the documented budget. */
+/* subhalo_props_hbt on P[0, n) in Index order with CoreSize core particles and gravitational
+ * constant G, an arena of exactly the documented budget. */
 static void
-hbt_props(int64_t n, int coresize, struct SubTrack * rec)
+hbt_props_g(int64_t n, int coresize, double G, struct SubTrack * rec)
 {
     struct SubhaloUnbindParams up = default_params();
+    up.G = G;
     struct SubCandidate c;
     memset(&c, 0, sizeof(c));
     int64_t * Index = (int64_t *) mymalloc("TestIndex", sizeof(int64_t) * n);
@@ -1089,6 +1092,12 @@ hbt_props(int64_t n, int coresize, struct SubTrack * rec)
     myfree(arena.base);
     myfree(Energy);
     myfree(Index);
+}
+
+static void
+hbt_props(int64_t n, int coresize, struct SubTrack * rec)
+{
+    hbt_props_g(n, coresize, TEST_G, rec);
 }
 
 /* P[i] at Centre + r along axis (k / 2) % 3, sign by k % 2 */
@@ -1180,6 +1189,37 @@ test_vmax(void ** state)
         assert_true(rb > 1);   /* the maximum lies on a shared radius, not at the floor */
         assert_true(fabs(rec.Rmax / rb - 1) < 1e-6);
         assert_true(fabs(rec.Vmax / sqrt(TEST_G * best) - 1) < 1e-6);
+    }
+    /* (d) M(<= r) compensated: mass 1 and nine of 1e-16 at one point must store the Vmax of {1, 2^-50},
+     * at a G bisected so that mass 1 alone stores the float below a rounding midpoint, the pair above */
+    {
+        const double rfl = default_params().h / 2.8;
+        const float f = 200.f;
+        const double mid = 0.5 * ((double) f + (double) nextafterf(f, 1e30f));
+        double lo = mid * mid * rfl * (1 - 1e-12), hi = mid * mid * rfl * (1 + 1e-12);
+        int k;
+        place(0, 0, 0, 1.0, 1);
+        for(k = 0; k < 200; k++) {
+            const double G = 0.5 * (lo + hi);
+            if(G == lo || G == hi)
+                break;
+            hbt_props_g(1, 1, G, &rec);
+            if(rec.Vmax == f)
+                lo = G;
+            else
+                hi = G;
+        }
+        hbt_props_g(1, 1, lo, &rec);
+        const float v0 = rec.Vmax;
+        place(1, 0, 0, ldexp(1., -50), 2);
+        hbt_props_g(2, 1, lo, &rec);
+        const float v1 = rec.Vmax;
+        for(i = 1; i < 10; i++)
+            place(i, 0, 0, 1e-16, 1 + i);
+        hbt_props_g(10, 1, lo, &rec);
+        message(0, "Vmax compensated sum: G %.17g, Vmax %.9g, of mass 1 %.9g, of mass 1 + 2^-50 %.9g\n", lo, rec.Vmax, v0, v1);
+        assert_true(v0 == f && v1 != v0);
+        assert_true(rec.Vmax == v1);
     }
     teardown_pman();
 }

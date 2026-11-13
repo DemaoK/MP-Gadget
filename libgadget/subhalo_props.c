@@ -125,13 +125,14 @@ subhalo_props_hbt(struct SubTrack * rec, const struct SubCandidate * c, const st
      * CalculateProfileProperties): M(<= r) / r at the last of equal radii, Rmax the first maximum. */
     {
         const size_t mark = arena ? arena->used : 0;
-        double Mtot, Mc = 0, best = -1, Rmax = 0;
+        /* M(<= r) compensated as in the in-place profile: equal masses agree exactly, others to about a rounding */
+        double Mtot, Mk[2] = {0, 0}, best = -1, Rmax = 0;
         const struct RPair * pr = radial_order(c, CorePos, up->h / 2.8, BoxSize, arena, &Mtot);
         for(i = 0; i < n; i++) {
-            Mc += P[pr[i].p].Mass;
+            subhalo_ksum_add(Mk, P[pr[i].p].Mass);
             if(i + 1 < n && pr[i + 1].r == pr[i].r)
                 continue;
-            const double v = Mc / pr[i].r;
+            const double v = subhalo_ksum_value(Mk) / pr[i].r;
             if(v > best) {
                 best = v;
                 Rmax = pr[i].r;
