@@ -810,20 +810,27 @@ subhalo_finish_call(int SnapNum, int complete, const struct SubhaloCallStats * l
 
 /* ------------------------------------------------------------------ the driver */
 
-int
-subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime, Cosmology * CP, int MetalReturnOn, MPI_Comm Comm)
+/* A call that stops before its results: the stage s it stopped in is booked, the summary marks it
+ * FAILED and the PIG incomplete. Returns 0, the driver's value for it. Collective. */
+static int
+call_failed(int SnapNum, int s, MPI_Comm Comm)
+{
+    SubStatus.LastCallComplete = 0;
+    stage_end(s);
+    subhalo_finish_call(SnapNum, 0, NULL, NULL, NULL, Comm);
+    return 0;
+}
+
+/* The call's set-up: the table at its home ranks (the static home rule must hold at the start of
+ * every call), the tags checked against it, the per-call transient fields of the home records. */
+static void
+call_setup(struct SubTrackTable * tab, const FOFGroups * fof, int SnapNum, double atime, MPI_Comm Comm)
 {
     int64_t i;
-    int ThisTask;
-    MPI_Comm_rank(Comm, &ThisTask);
-    struct SubTrackTable * tab = &SubTable;
-    const struct SubhaloParams * sp = &SubParams;
-
     walltime_measure("/Misc");
     stage_begin_call();
     if(!tab->initialised)
         subhalo_table_init(tab, SUBHALO_TABLE_INITIAL_BYTES, Comm);
-    /* The static home rule must hold at the start of every call. */
     subhalo_table_redistribute(tab, Comm);
 
     message(0, "Subhalo finder: call for snapshot %d at a = %g, %ld tracks, %ld FOF groups.\n",
@@ -841,7 +848,6 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
         endrun(5, "Particle tags reference tracks outside [0, %ld).\n", tab->NTotal);
     log_tagged("before the call", Comm);
 
-    /* per-call transient fields of the home records */
     for(i = 0; i < tab->NLocal; i++) {
         struct SubTrack * t = &tab->Track[i];
         t->Host = -1;
@@ -856,7 +862,220 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
         for(d = 0; d < 3; d++)
             t->RefPos[d] = t->RefVel[d] = 0;
     }
+}
 
+/* Step 1's memory: the orphan lookup runs before the plan budgets memory, so its peak is checked
+ * first; returns 0 (and says so) if a rank is short of it. Collective. */
+static int
+lookup_fits(const struct SubTrackTable * tab, int SnapNum, MPI_Comm Comm)
+{
+    int64_t i, norph = 0, nids = 0;
+    for(i = 0; i < tab->NLocal; i++)
+        if(tab->Track[i].NboundPrev <= 0) {
+            const MyIDType * mk;
+            const int nm = orphan_markers(&tab->Track[i], &mk);
+            norph++;
+            nids += nm > 1 ? nm : 1;
+        }
+    /* the ids and hits of every marker, the record index of every orphan */
+    const double need = subhalo_lookup_index_bytes(PartManager->NumPart) + subhalo_lookup_batch_peak_bytes(tab->NTask)
+        + (double) (nids + 1) * (sizeof(MyIDType) + sizeof(struct SubhaloIdHit)) + (double) (norph + 1) * sizeof(int64_t) + 4. * 4096;
+    const double avail = (double) mymalloc_freebytes();
+    if(!MPIU_Any(need > avail, Comm))
+        return 1;
+    message(1, "Subhalo finder: the orphan lookup needs %g bytes, %g free on this rank.\n", need, avail);
+    message(0, "Subhalo finder: not enough memory for the orphan lookup of snapshot %d; the call is skipped. "
+               "Tags and track table are unchanged; this PIG will be marked incomplete. "
+               "Lower SubhaloLookupBatchBytes or run with more memory per rank.\n", SnapNum);
+    return 0;
+}
+
+/* Why a plan was refused: the admission vote, the in-place stage or the plan's reserve does not fit
+ * on some rank. P is unchanged so far, so the domain needs no restore. The track table keeps what
+ * the orphan lookup wrote (the markers' positions and velocities, SnapTracerLost of lost markers). */
+static void
+plan_failed_message(const struct SubhaloPlan * plan, int SnapNum)
+{
+    if(plan->VoteFailed)
+        message(0, "Subhalo finder: the admission vote of the oversized keys of snapshot %d does not fit in memory on rank %d "
+                   "(%g MB short); the call is skipped before the exchange. Particle tags and GrNr are unchanged; the track "
+                   "table keeps this call's orphan lookup (marker positions and velocities, lost markers); this PIG will be "
+                   "marked incomplete. Run with more memory per rank or more ranks.\n", SnapNum,
+                subhalo_plan_last_vote()->WorstRank, subhalo_plan_last_vote()->WorstShort / 1048576.);
+    else if(plan->MemCheck.failed)
+        message(0, "Subhalo finder: the in-place stage of snapshot %d does not fit in memory on rank %d (stage: %s)%s; the call is "
+                   "skipped before the exchange. Particle tags and GrNr are unchanged; the track table keeps this call's "
+                   "orphan lookup; this PIG will be marked incomplete. Run with more memory per rank or more ranks.\n",
+                SnapNum, plan->MemCheck.failrank,
+                plan->MemCheck.failstage >= 0 ? SubhaloCollStageName[plan->MemCheck.failstage] : "?",
+                plan->MemCheck.reserve_failed ? " and the reserve admission failed too" : "");
+    else
+        message(0, "Subhalo finder: the reserve admission of snapshot %d failed: rank %d is %g MB short of the plan's reserve; the "
+                   "call is skipped before the exchange. Particle tags and GrNr are unchanged; the track table keeps this "
+                   "call's orphan lookup; this PIG will be marked incomplete. Run with more memory per rank or more ranks.\n",
+                SnapNum, plan->MemCheck.reserve_rank,
+                plan->MemCheck.reserve_short / 1048576.);
+}
+
+/* The unbinding parameters of this call. */
+static void
+call_unbind_params(struct SubhaloUnbindParams * up, const struct SubhaloParams * sp, const Cosmology * CP, double atime)
+{
+    memset(up, 0, sizeof(*up));
+    up->atime = atime;
+    up->Hubble = hubble_function(CP, atime);
+    up->G = CP->GravInternal;
+    up->h = FORCE_SOFTENING();
+    up->BoxSize = PartManager->BoxSize;
+    up->PotentialTypes = sp->SubhaloPotentialTypes;
+    up->TracerTypes = sp->SubhaloTracerTypes;
+    up->MinNumPart = sp->SubhaloMinNumPart;
+    up->MinNumTracerPart = sp->SubhaloMinNumTracerPart;
+    up->SampleSize = sp->SubhaloPotentialSampleSize;
+    up->SampledFinalPass = !sp->SubhaloFinalPass;
+    /* the core and the reserved tracers (SubhaloMinNumTracerPart >= SubhaloNumTracerHostFinding) */
+    up->FinalRefineTracers = sp->SubhaloCoreSize > sp->SubhaloMinNumTracerPart ? sp->SubhaloCoreSize : sp->SubhaloMinNumTracerPart;
+    up->MaxIter = sp->SubhaloMaxUnbindIterations;
+    up->OpenAngle = sp->SubhaloTreeOpenAngle;
+    up->BoundMassPrecision = sp->SubhaloBoundMassPrecision;
+    up->WithThermal = sp->SubhaloUnbindWithThermal;
+}
+
+/* The context of the keys of this call: frame, plan, members, SO thresholds and diagnostics. */
+static void
+call_ctx(struct SubhaloCallCtx * ctx, const struct SubhaloParams * sp, const FOFGroups * fof, int SnapNum, double atime,
+         const Cosmology * CP, int MetalReturnOn, int ThisTask)
+{
+    int d;
+    ctx->SnapNum = SnapNum;
+    ctx->atime = atime;
+    ctx->BoxSize = PartManager->BoxSize;
+    for(d = 0; d < 3; d++)
+        ctx->Offset[d] = PartManager->CurrentParticleOffset[d];
+    ctx->TracerTypes = sp->SubhaloTracerTypes;
+    ctx->ThisTask = ThisTask;
+    ctx->TotNgroups = fof->TotNgroups;
+    /* the SO thresholds of this call and the metal switch of the baryonic sums */
+    subhalo_so_thresholds(CP, atime, ctx->rho);
+    ctx->MetalReturnOn = MetalReturnOn;
+    ctx->Stats.WorstConvRatio = 1;
+    ctx->Stats.WorstTrackId = -1;
+    /* the plan's vote is global: its withheld count enters the reduction once */
+    ctx->Stats.NAdmitWithheld = ThisTask == 0 ? subhalo_plan_last_vote()->NWithheld : 0;
+}
+
+/* Result slots (serial keys' members and newborns, in-place candidates owned here), on the top so
+ * that they survive the domain restore. */
+static struct SubhaloResult *
+call_results(const struct SubhaloKeySeg * segs, int64_t nsegs, struct SubhaloCallCtx * ctx)
+{
+    int64_t i;
+    const int64_t nres = subhalo_result_slots(segs, nsegs, ctx);
+    struct SubhaloResult * res = (struct SubhaloResult *) mymalloc2("SubResults", sizeof(struct SubhaloResult) * (nres + 1));
+    memset(res, 0, sizeof(struct SubhaloResult) * (nres + 1));
+    for(i = 0; i <= nres; i++) {
+        res[i].ipk = -1;
+        res[i].subkey = -1;
+    }
+    ctx->Res = res;
+    ctx->NRes = nres;
+    return res;
+}
+
+/* Step 13 for the records resolved this call, then everything back to the home ranks. Collective. */
+static void
+call_store(struct SubhaloResult * res, int64_t nres, struct SubTrackTable * tab, int SnapNum, MPI_Comm Comm)
+{
+    int64_t i, nout = 0;
+    for(i = 0; i < nres; i++)
+        if(res[i].valid)
+            nout++;
+    struct SubTrack * out = (struct SubTrack *) mymalloc("SubOutRecs", sizeof(struct SubTrack) * (nout + 1));
+    nout = 0;
+    for(i = 0; i < nres; i++) {
+        if(!res[i].valid)
+            continue;
+        if(res[i].history)
+            subhalo_history_update(&res[i].rec, SnapNum, res[i].MaxMergerMbound);
+        out[nout++] = res[i].rec;
+    }
+    stage_end(SUBHALO_STAGE_HISTORY);
+    subhalo_table_store(tab, out, nout, Comm);
+    myfree(out);
+}
+
+/* The counts of this call on the home ranks and the closing lines of the log. Collective. */
+static void
+call_log(const struct SubTrackTable * tab, int SnapNum, int64_t nnew, int64_t ndead, int64_t nhostless, MPI_Comm Comm)
+{
+    int64_t i, loc[4] = {0, 0, 0, 0}, tot[4];
+    for(i = 0; i < tab->NLocal; i++) {
+        const struct SubTrack * t = &tab->Track[i];
+        if(t->SnapSink == SnapNum) loc[0]++;
+        if(t->SnapDeath == SnapNum && t->SnapSink != SnapNum) loc[1]++;
+        if(t->Nbound > 0) loc[2]++;
+        if(t->Nbound > 0 && t->HostGroup < 0) loc[3]++;
+    }
+    MPI_Allreduce(loc, tot, 4, MPI_INT64, MPI_SUM, Comm);
+    message(0, "Subhalo finder: snapshot %d done: %ld newborn, %ld sunk, %ld died (%ld without particles), %ld resolved (%ld hostless, %ld by the unprocessed-pseudo-key rule); %ld tracks in total.\n",
+            SnapNum, nnew, tot[0], tot[1], ndead, tot[2], tot[3], nhostless, tab->NTotal);
+}
+
+/* The diagnostics and admission lines of the reduced statistics (SubLastStats). */
+static void
+call_diagnostics_log(const struct SubhaloParams * sp, int64_t norphsync_tot)
+{
+    message(0, "Subhalo diagnostics: %ld unbindings, %ld at the iteration cap (worst Nbound/Nlast %g, track %ld); "
+               "%ld of %ld tracks dead from the mean frame rescued from the clipped core frame; "
+               "%ld of %ld tracks alive below half their previous bound number from the mean frame bound more from the clipped core frame; "
+               "%ld of %ld final-pass bound particles with E >= 0; %ld tail claims across the final branch dropped; "
+               "in-place tags written %ld, field tags released %ld; %ld orphan hosts updated; arena high water %.3f.\n",
+            SubLastStats.NCandidates, SubLastStats.NItercap, SubLastStats.WorstConvRatio, SubLastStats.WorstTrackId,
+            SubLastStats.NRescued, SubLastStats.NRescueTried, SubLastStats.NLossRescued, SubLastStats.NLossTried,
+            SubLastStats.NFinalPositive, SubLastStats.NFinalBound, SubLastStats.NTailRejected,
+            SubLastStats.NFallbackField, SubLastStats.NFallbackReleased, norphsync_tot, SubLastStats.ArenaPeakFrac);
+    /* the withheld counts appear only with the withholding on */
+    char wh[64] = "", vwh[64] = "";
+    if(sp->SubhaloAdmitMinCoreDistance > 0) {
+        snprintf(wh, sizeof(wh), ", %ld withheld near their owner's core", SubLastStats.NAdmitWithheld);
+        snprintf(vwh, sizeof(vwh), ", %ld withheld near their owner's core", subhalo_plan_last_vote()->NWithheld);
+    }
+    if(sp->SubhaloAdmitShare > 0)
+        message(0, "Subhalo admission: %ld particles of ancestors admitted to satellites by neighbour majority, %ld taken, by %ld satellites%s.\n",
+                SubLastStats.NAdmitted, SubLastStats.NAdmitTaken, SubLastStats.NAdmitReceivers, wh);
+    if(sp->SubhaloAdmitShare > 0 && subhalo_plan_last_vote()->NQueries > 0) {
+        const struct SubhaloVoteStats * vs = subhalo_plan_last_vote();
+        message(0, "Subhalo admission vote of the oversized keys across ranks: %ld tracers queried, %ld offered (%ld by in-place owners)%s, "
+                   "%ld taken to their receivers' sub-tree keys (%ld guests), %ld kept home for in-place receivers; %d radius pass(es), "
+                   "%.3g s.\n", vs->NQueries, vs->NOffered, vs->NOfferedInplace, vwh, vs->NServed, vs->NGuests, vs->NHome, vs->Passes, vs->Seconds);
+    }
+}
+
+/* A complete call: the finder's state is that of this snapshot. */
+static void
+call_complete(int SnapNum, double atime, const double rho[])
+{
+    if(SubStatus.StateSnapshot >= 0 && SubStatus.StateTime > 0)
+        SubStatus.TimeSincePrevious = atime - SubStatus.StateTime;
+    else
+        SubStatus.TimeSincePrevious = -1;
+    SubStatus.LastCallComplete = 1;
+    SubStatus.LastCallSnapshot = SnapNum;
+    SubStatus.StateSnapshot = SnapNum;
+    SubStatus.StateTime = atime;
+    subhalo_set_state_so_thresholds(rho);
+    message(0, "Subhalo finder: time since the previous call (scale factor) %g.\n", SubStatus.TimeSincePrevious);
+}
+
+int
+subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime, Cosmology * CP, int MetalReturnOn, MPI_Comm Comm)
+{
+    int ThisTask;
+    MPI_Comm_rank(Comm, &ThisTask);
+    struct SubTrackTable * tab = &SubTable;
+    const struct SubhaloParams * sp = &SubParams;
+
+    call_setup(tab, fof, SnapNum, atime, Comm);
     stage_end(SUBHALO_STAGE_SETUP);
 
     /* Steps 0 and 2: tracer snapshot and weighted host vote, on the home ranks. */
@@ -866,32 +1085,10 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     subhalo_previous_frames(tab, Comm);
     stage_end(SUBHALO_STAGE_FRAMES);
 
-    /* Step 1: orphan tracer lookup. It runs before the plan budgets memory, so its peak is checked
-     * first; a rank short of it fails the call before anything is modified. */
-    {
-        int64_t norph = 0, nids = 0;
-        for(i = 0; i < tab->NLocal; i++)
-            if(tab->Track[i].NboundPrev <= 0) {
-                const MyIDType * mk;
-                const int nm = orphan_markers(&tab->Track[i], &mk);
-                norph++;
-                nids += nm > 1 ? nm : 1;
-            }
-        /* the ids and hits of every marker, the record index of every orphan */
-        const double need = subhalo_lookup_index_bytes(PartManager->NumPart) + subhalo_lookup_batch_peak_bytes(tab->NTask)
-            + (double) (nids + 1) * (sizeof(MyIDType) + sizeof(struct SubhaloIdHit)) + (double) (norph + 1) * sizeof(int64_t) + 4. * 4096;
-        const double avail = (double) mymalloc_freebytes();
-        if(MPIU_Any(need > avail, Comm)) {
-            message(1, "Subhalo finder: the orphan lookup needs %g bytes, %g free on this rank.\n", need, avail);
-            message(0, "Subhalo finder: not enough memory for the orphan lookup of snapshot %d; the call is skipped. "
-                       "Tags and track table are unchanged; this PIG will be marked incomplete. "
-                       "Lower SubhaloLookupBatchBytes or run with more memory per rank.\n", SnapNum);
-            SubStatus.LastCallComplete = 0;
-            stage_end(SUBHALO_STAGE_LOOKUP);
-            subhalo_finish_call(SnapNum, 0, NULL, NULL, NULL, Comm);
-            return 0;
-        }
-    }
+    /* Step 1: orphan tracer lookup; a rank short of its memory fails the call before anything is
+     * modified. */
+    if(!lookup_fits(tab, SnapNum, Comm))
+        return call_failed(SnapNum, SUBHALO_STAGE_LOOKUP, Comm);
     int64_t nlook = 0, nfound = 0;
     subhalo_orphan_lookup(tab, SnapNum, atime, &nlook, &nfound, Comm);
     message(0, "Subhalo orphans: %ld tracers looked up, %ld found.\n", nlook, nfound);
@@ -902,34 +1099,10 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     struct SubhaloPlan plan = {0};
     subhalo_plan_set_frame(atime, hubble_function(CP, atime));
     if(subhalo_plan_build(&plan, fof, tab, NHostless, ddecomp, Comm)) {
-        /* the admission vote, the in-place stage or the plan's reserve does not fit on some rank; P
-         * is unchanged so far, so the domain needs no restore. The track table keeps what the orphan
-         * lookup wrote (the markers' positions and velocities, SnapTracerLost of lost markers). */
-        if(plan.VoteFailed)
-            message(0, "Subhalo finder: the admission vote of the oversized keys of snapshot %d does not fit in memory on rank %d "
-                       "(%g MB short); the call is skipped before the exchange. Particle tags and GrNr are unchanged; the track "
-                       "table keeps this call's orphan lookup (marker positions and velocities, lost markers); this PIG will be "
-                       "marked incomplete. Run with more memory per rank or more ranks.\n", SnapNum,
-                    subhalo_plan_last_vote()->WorstRank, subhalo_plan_last_vote()->WorstShort / 1048576.);
-        else if(plan.MemCheck.failed)
-            message(0, "Subhalo finder: the in-place stage of snapshot %d does not fit in memory on rank %d (stage: %s)%s; the call is "
-                       "skipped before the exchange. Particle tags and GrNr are unchanged; the track table keeps this call's "
-                       "orphan lookup; this PIG will be marked incomplete. Run with more memory per rank or more ranks.\n",
-                    SnapNum, plan.MemCheck.failrank,
-                    plan.MemCheck.failstage >= 0 ? SubhaloCollStageName[plan.MemCheck.failstage] : "?",
-                    plan.MemCheck.reserve_failed ? " and the reserve admission failed too" : "");
-        else
-            message(0, "Subhalo finder: the reserve admission of snapshot %d failed: rank %d is %g MB short of the plan's reserve; the "
-                       "call is skipped before the exchange. Particle tags and GrNr are unchanged; the track table keeps this "
-                       "call's orphan lookup; this PIG will be marked incomplete. Run with more memory per rank or more ranks.\n",
-                    SnapNum, plan.MemCheck.reserve_rank,
-                    plan.MemCheck.reserve_short / 1048576.);
+        plan_failed_message(&plan, SnapNum);
         subhalo_restore_field_grnr(&plan);
         subhalo_plan_free(&plan);
-        SubStatus.LastCallComplete = 0;
-        stage_end(SUBHALO_STAGE_PLAN);
-        subhalo_finish_call(SnapNum, 0, NULL, NULL, NULL, Comm);
-        return 0;
+        return call_failed(SnapNum, SUBHALO_STAGE_PLAN, Comm);
     }
     stage_end(SUBHALO_STAGE_PLAN);
 
@@ -947,10 +1120,7 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
         subhalo_restore_field_grnr(&plan);
         subhalo_plan_free(&plan);
         subhalo_restore_domain(ddecomp);
-        SubStatus.LastCallComplete = 0;
-        stage_end(SUBHALO_STAGE_RESTORE);
-        subhalo_finish_call(SnapNum, 0, NULL, NULL, NULL, Comm);
-        return 0;
+        return call_failed(SnapNum, SUBHALO_STAGE_RESTORE, Comm);
     }
 
     subhalo_local_sort();
@@ -964,57 +1134,15 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     stage_end(SUBHALO_STAGE_FETCH);
 
     struct SubhaloUnbindParams up;
-    memset(&up, 0, sizeof(up));
-    up.atime = atime;
-    up.Hubble = hubble_function(CP, atime);
-    up.G = CP->GravInternal;
-    up.h = FORCE_SOFTENING();
-    up.BoxSize = PartManager->BoxSize;
-    up.PotentialTypes = sp->SubhaloPotentialTypes;
-    up.TracerTypes = sp->SubhaloTracerTypes;
-    up.MinNumPart = sp->SubhaloMinNumPart;
-    up.MinNumTracerPart = sp->SubhaloMinNumTracerPart;
-    up.SampleSize = sp->SubhaloPotentialSampleSize;
-    up.SampledFinalPass = !sp->SubhaloFinalPass;
-    /* the core and the reserved tracers (SubhaloMinNumTracerPart >= SubhaloNumTracerHostFinding) */
-    up.FinalRefineTracers = sp->SubhaloCoreSize > sp->SubhaloMinNumTracerPart ? sp->SubhaloCoreSize : sp->SubhaloMinNumTracerPart;
-    up.MaxIter = sp->SubhaloMaxUnbindIterations;
-    up.OpenAngle = sp->SubhaloTreeOpenAngle;
-    up.BoundMassPrecision = sp->SubhaloBoundMassPrecision;
-    up.WithThermal = sp->SubhaloUnbindWithThermal;
-
+    call_unbind_params(&up, sp, CP, atime);
     struct SubhaloCallCtx ctx = {0};
-    ctx.SnapNum = SnapNum;
-    ctx.atime = atime;
-    ctx.BoxSize = PartManager->BoxSize;
-    for(i = 0; i < 3; i++)
-        ctx.Offset[i] = PartManager->CurrentParticleOffset[i];
-    ctx.TracerTypes = sp->SubhaloTracerTypes;
-    ctx.ThisTask = ThisTask;
-    ctx.TotNgroups = fof->TotNgroups;
     ctx.plan = &plan;
     ctx.up = &up;
     ctx.Members = members;
     ctx.NMembers = nmembers;
-    /* the SO thresholds of this call and the metal switch of the baryonic sums */
-    subhalo_so_thresholds(CP, atime, ctx.rho);
-    ctx.MetalReturnOn = MetalReturnOn;
-    ctx.Stats.WorstConvRatio = 1;
-    ctx.Stats.WorstTrackId = -1;
-    /* the plan's vote is global: its withheld count enters the reduction once */
-    ctx.Stats.NAdmitWithheld = ThisTask == 0 ? subhalo_plan_last_vote()->NWithheld : 0;
-
-    /* Result slots (serial keys' members and newborns, in-place candidates owned here), on the
-     * top so that they survive the domain restore. */
-    const int64_t nres = subhalo_result_slots(segs, nsegs, &ctx);
-    struct SubhaloResult * res = (struct SubhaloResult *) mymalloc2("SubResults", sizeof(struct SubhaloResult) * (nres + 1));
-    memset(res, 0, sizeof(struct SubhaloResult) * (nres + 1));
-    for(i = 0; i <= nres; i++) {
-        res[i].ipk = -1;
-        res[i].subkey = -1;
-    }
-    ctx.Res = res;
-    ctx.NRes = nres;
+    call_ctx(&ctx, sp, fof, SnapNum, atime, CP, MetalReturnOn, ThisTask);
+    struct SubhaloResult * res = call_results(segs, nsegs, &ctx);
+    const int64_t nres = ctx.NRes;
 
     /* Steps 7-8: serial keys, tags written straight into P. */
     subhalo_serial_reset_stats();
@@ -1050,35 +1178,18 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     subhalo_finish_descendants(res, nres, Comm);
     stage_end(SUBHALO_STAGE_DESCENDANTS);
 
-    /* Step 13 for the records resolved this call, then everything back to the home ranks. */
-    int64_t nout = 0;
-    for(i = 0; i < nres; i++)
-        if(res[i].valid)
-            nout++;
-    struct SubTrack * out = (struct SubTrack *) mymalloc("SubOutRecs", sizeof(struct SubTrack) * (nout + 1));
-    nout = 0;
-    for(i = 0; i < nres; i++) {
-        if(!res[i].valid)
-            continue;
-        if(res[i].history)
-            subhalo_history_update(&res[i].rec, SnapNum, res[i].MaxMergerMbound);
-        out[nout++] = res[i].rec;
-    }
-    stage_end(SUBHALO_STAGE_HISTORY);
-    subhalo_table_store(tab, out, nout, Comm);
-    myfree(out);
+    call_store(res, nres, tab, SnapNum, Comm);
     /* Free the per-key buffers before the unclaimed-track update; ipl is copied out first since
      * it was allocated after them. */
     struct SubhaloCallStats locstats = ctx.Stats;
-    const int64_t nipl = K;
-    struct InplaceWinnerEntry * iplcopy = (struct InplaceWinnerEntry *) mymalloc("SubIplCopy", sizeof(struct InplaceWinnerEntry) * (nipl + 1));
-    memcpy(iplcopy, ipl, sizeof(struct InplaceWinnerEntry) * nipl);
+    struct InplaceWinnerEntry * iplcopy = (struct InplaceWinnerEntry *) mymalloc("SubIplCopy", sizeof(struct InplaceWinnerEntry) * (K + 1));
+    memcpy(iplcopy, ipl, sizeof(struct InplaceWinnerEntry) * K);
     myfree(ipl);
     myfree(res);
     myfree(members);
     myfree(segs);
     subhalo_plan_free(&plan);
-    qsort(iplcopy, nipl, sizeof(struct InplaceWinnerEntry), cmp_iplwinner);
+    qsort(iplcopy, K, sizeof(struct InplaceWinnerEntry), cmp_iplwinner);
     stage_end(SUBHALO_STAGE_STORE);
 
     /* Unclaimed tracks on the home ranks: resolved tracks without a key die. */
@@ -1086,7 +1197,7 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     subhalo_update_unhosted(tab, SnapNum, atime, &nhostless, &ndead, Comm);
     stage_end(SUBHALO_STAGE_UNHOSTED);
     /* The orphans' current host and central. */
-    int64_t norphsync = subhalo_sync_orphan_links(tab, iplcopy, nipl), norphsync_tot = 0;
+    int64_t norphsync = subhalo_sync_orphan_links(tab, iplcopy, K), norphsync_tot = 0;
     MPI_Allreduce(&norphsync, &norphsync_tot, 1, MPI_INT64, MPI_SUM, Comm);
     myfree(iplcopy);
     stage_end(SUBHALO_STAGE_ORPHANSYNC);
@@ -1099,54 +1210,10 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
         stage_end(SUBHALO_STAGE_FIELDSO);
     }
 
-    /* Counts of this call on the home ranks. */
-    int64_t loc[4] = {0, 0, 0, 0}, tot[4];
-    for(i = 0; i < tab->NLocal; i++) {
-        const struct SubTrack * t = &tab->Track[i];
-        if(t->SnapSink == SnapNum) loc[0]++;
-        if(t->SnapDeath == SnapNum && t->SnapSink != SnapNum) loc[1]++;
-        if(t->Nbound > 0) loc[2]++;
-        if(t->Nbound > 0 && t->HostGroup < 0) loc[3]++;
-    }
-    MPI_Allreduce(loc, tot, 4, MPI_INT64, MPI_SUM, Comm);
-    message(0, "Subhalo finder: snapshot %d done: %ld newborn, %ld sunk, %ld died (%ld without particles), %ld resolved (%ld hostless, %ld by the unprocessed-pseudo-key rule); %ld tracks in total.\n",
-            SnapNum, nnew, tot[0], tot[1], ndead, tot[2], tot[3], nhostless, tab->NTotal);
+    call_log(tab, SnapNum, nnew, ndead, nhostless, Comm);
     subhalo_finish_call(SnapNum, 1, &locstats, &plan, sp->SubhaloFieldSO ? &sostats : NULL, Comm);
-    message(0, "Subhalo diagnostics: %ld unbindings, %ld at the iteration cap (worst Nbound/Nlast %g, track %ld); "
-               "%ld of %ld tracks dead from the mean frame rescued from the clipped core frame; "
-               "%ld of %ld tracks alive below half their previous bound number from the mean frame bound more from the clipped core frame; "
-               "%ld of %ld final-pass bound particles with E >= 0; %ld tail claims across the final branch dropped; "
-               "in-place tags written %ld, field tags released %ld; %ld orphan hosts updated; arena high water %.3f.\n",
-            SubLastStats.NCandidates, SubLastStats.NItercap, SubLastStats.WorstConvRatio, SubLastStats.WorstTrackId,
-            SubLastStats.NRescued, SubLastStats.NRescueTried, SubLastStats.NLossRescued, SubLastStats.NLossTried,
-            SubLastStats.NFinalPositive, SubLastStats.NFinalBound, SubLastStats.NTailRejected,
-            SubLastStats.NFallbackField, SubLastStats.NFallbackReleased, norphsync_tot, SubLastStats.ArenaPeakFrac);
-    /* the withheld counts appear only with the withholding on */
-    char wh[64] = "", vwh[64] = "";
-    if(sp->SubhaloAdmitMinCoreDistance > 0) {
-        snprintf(wh, sizeof(wh), ", %ld withheld near their owner's core", SubLastStats.NAdmitWithheld);
-        snprintf(vwh, sizeof(vwh), ", %ld withheld near their owner's core", subhalo_plan_last_vote()->NWithheld);
-    }
-    if(sp->SubhaloAdmitShare > 0)
-        message(0, "Subhalo admission: %ld particles of ancestors admitted to satellites by neighbour majority, %ld taken, by %ld satellites%s.\n",
-                SubLastStats.NAdmitted, SubLastStats.NAdmitTaken, SubLastStats.NAdmitReceivers, wh);
-    if(sp->SubhaloAdmitShare > 0 && subhalo_plan_last_vote()->NQueries > 0) {
-        const struct SubhaloVoteStats * vs = subhalo_plan_last_vote();
-        message(0, "Subhalo admission vote of the oversized keys across ranks: %ld tracers queried, %ld offered (%ld by in-place owners)%s, "
-                   "%ld taken to their receivers' sub-tree keys (%ld guests), %ld kept home for in-place receivers; %d radius pass(es), "
-                   "%.3g s.\n", vs->NQueries, vs->NOffered, vs->NOfferedInplace, vwh, vs->NServed, vs->NGuests, vs->NHome, vs->Passes, vs->Seconds);
-    }
+    call_diagnostics_log(sp, norphsync_tot);
     log_tagged("after the call", Comm);
-
-    if(SubStatus.StateSnapshot >= 0 && SubStatus.StateTime > 0)
-        SubStatus.TimeSincePrevious = atime - SubStatus.StateTime;
-    else
-        SubStatus.TimeSincePrevious = -1;
-    SubStatus.LastCallComplete = 1;
-    SubStatus.LastCallSnapshot = SnapNum;
-    SubStatus.StateSnapshot = SnapNum;
-    SubStatus.StateTime = atime;
-    subhalo_set_state_so_thresholds(ctx.rho);
-    message(0, "Subhalo finder: time since the previous call (scale factor) %g.\n", SubStatus.TimeSincePrevious);
+    call_complete(SnapNum, atime, ctx.rho);
     return 1;
 }
