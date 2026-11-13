@@ -123,10 +123,6 @@ subhalo_ksum_value(const double s[2])
  * Vel * UnitVelocity_in_cm_per_s / (1e5 * atime). The units come from subhalo_set_units. */
 double subhalo_vel_to_kms(double atime);
 
-/* Weighted plurality of n ballots: the candidate >= 0 with the largest summed weight (sums in
- * ballot order), ties to the smaller; SUBHALO_NOTRACK if there is none. top and second (NULL
- * allowed) get the winning and the runner-up sums (0 if absent). n <= SUBHALO_MAXTRACERS. */
-int64_t subhalo_weighted_plurality(const int64_t * cand, const double * w, int n, double * top, double * second);
 /* 1 if SubhaloAdmitMinCoreDistance = MinD is inside its range (finite, not negative). */
 int subhalo_admit_distance_valid(double MinD);
 
@@ -137,6 +133,22 @@ void subhalo_set_import_buffer_boost(double boost);
 /* Bytes treewalk.c's ev_begin reserves for a walk of q-byte queries and r-byte results: 40960 +
  * max(4097, 100 x threads) buffers of index, query, result and boost x (query + result). */
 size_t subhalo_walk_reserve_bytes(size_t q, size_t r, double boost);
+
+/* The FOF keys g = GrNr live in [1, TotNgroups] (fof_assign_grnr numbers them from 1).
+ * Their directory (the plan, the newborn numbering) is a static partition: key g on rank
+ * (g - 1) / KChunk, KChunk = max(1, ceil(TotNgroups / NTask)). */
+static inline int64_t subhalo_key_chunk(int64_t TotNgroups, int NTask) {
+    int64_t c = (TotNgroups + NTask - 1) / NTask;
+    return c > 0 ? c : 1;
+}
+static inline int subhalo_key_dir_rank(int64_t g, int64_t KChunk) {
+    return (int) ((g - 1) / KChunk);
+}
+
+/* The run's parameters (set_subhalo_params, subhalo_set_testpar), read by the driver's files. */
+extern struct SubhaloParams SubParams;
+
+/* ------------------------------------------------------------------ records, table transport (subhalo_table.c) */
 
 /* Collective range check before narrowing a 64-bit count to an MPI int: endrun(1) on every rank,
  * naming what, if value < 0 or > INT_MAX on any rank (exchanges are not batched past the limit). */
@@ -152,17 +164,6 @@ int64_t subhalo_alltoallv(const void * sendbuf, const int64_t * sendcounts, size
  * request and reply buffers), whatever the request pattern. */
 double subhalo_table_batch_peak_bytes(int NTask);
 
-/* The FOF keys g = GrNr live in [1, TotNgroups] (fof_assign_grnr numbers them from 1).
- * Their directory (the plan, the newborn numbering) is a static partition: key g on rank
- * (g - 1) / KChunk, KChunk = max(1, ceil(TotNgroups / NTask)). */
-static inline int64_t subhalo_key_chunk(int64_t TotNgroups, int NTask) {
-    int64_t c = (TotNgroups + NTask - 1) / NTask;
-    return c > 0 ? c : 1;
-}
-static inline int subhalo_key_dir_rank(int64_t g, int64_t KChunk) {
-    return (int) ((g - 1) / KChunk);
-}
-
 /* Step 13: history columns of a record resolved this call (design 7.7). MaxMergerMbound is, for
  * a central, the largest previous Mbound among the tracks that sank into it or became its
  * satellites this call (0 if none). Rank > 0 marks a satellite, Rank 0 a central, a hostless
@@ -176,11 +177,42 @@ void subhalo_track_make_orphan(struct SubTrack * t, int64_t winner, int SnapNum)
 /* The followed-set columns of a record reset to "absent" (resolved: no set, -1 scales). */
 void subhalo_track_clear_orphan_set(struct SubTrack * t);
 
+/* ------------------------------------------------------------------ step 10: new TrackIds (subhalo_newborn.c) */
+
+struct SubhaloResult;
+struct SubhaloPlan;
+
+/* Numbers the newborn keys in host (GrNr) order and rewrites every provisional tag and record
+ * reference. Returns the global number of newborns. Collective. */
+int64_t subhalo_number_newborns(struct SubhaloResult * res, int64_t nres, int64_t TotNgroups, int64_t NTotalBefore, MPI_Comm Comm);
+
+/* ------------------------------------------------------------------ unprocessed tracks, orphans (subhalo_orphan.c) */
+
 /* The tracks no key processed this call, on their home ranks: one without live particles dies (not
  * sunk); one with own-tag field particles gets the hostless rule (all bound, SUBHALO_FLAG_INPLACE,
  * properties cleared), which only the unit test reaches: every pseudo-key is processed.
  * Returns the global counts. Collective. */
 void subhalo_update_unhosted(struct SubTrackTable * tab, int SnapNum, double atime, int64_t * nhostless, int64_t * ndead, MPI_Comm Comm);
+
+/* The central of in-place key g (its winner). */
+struct InplaceWinnerEntry {
+    int64_t g;
+    int64_t winner;
+};
+static inline int
+cmp_iplwinner(const void * a, const void * b)
+{
+    const int64_t x = ((const struct InplaceWinnerEntry *) a)->g, y = ((const struct InplaceWinnerEntry *) b)->g;
+    return (x > y) - (x < y);
+}
+/* ipl[k] = (g, final TrackId of the winner) of in-place key k, on every rank. Collective. */
+void gather_inplace_winners(const struct SubhaloPlan * plan, const struct SubhaloResult * res, int64_t nres,
+                            struct InplaceWinnerEntry * ipl, MPI_Comm Comm);
+/* An orphan's HostGroup and CentralTrackId from its tracer's group this call (ipl sorted by g);
+ * returns the number of changed links. Not collective. */
+int64_t subhalo_sync_orphan_links(struct SubTrackTable * tab, const struct InplaceWinnerEntry * ipl, int64_t nipl);
+
+/* ------------------------------------------------------------------ restart state (subhalo_io.c) */
 
 /* subhalo_read_state without the abort on a validation failure (duplicate or missing TrackIds,
  * out-of-range ids, inconsistent Subhalo/Orphan classification): returns 1 (collectively) and
@@ -611,7 +643,7 @@ struct SubhaloSerialStats {
 const struct SubhaloSerialStats * subhalo_serial_last_stats(void);
 void subhalo_serial_reset_stats(void);
 
-/* ------------------------------------------------------------------ batched ID lookup (subhalo.c) */
+/* ------------------------------------------------------------------ batched ID lookup (subhalo_lookup.c) */
 
 /* What the rank holding a live particle reports about it (steps 1 and 11). */
 struct SubhaloIdHit {
@@ -648,6 +680,25 @@ void subhalo_orphan_lookup(struct SubTrackTable * tab, int SnapNum, double atime
  * markers within 3 OrphanScale of their median give TracerPos/Vel (weighted mean) and Host (weighted
  * plurality), one kept marker copied exactly. Returns 1 if a marker was found. */
 int subhalo_orphan_update(struct SubTrack * t, const struct SubhaloIdHit * hit, int n, const double Offset[3], double BoxSize, double vfac, int SnapNum);
+/* The IDs an orphan looks up: its followed set, or the MostBoundID alone for a record without
+ * one (written before schema 2). Returns their count, 0 if there is nothing to follow. */
+static inline int
+orphan_markers(const struct SubTrack * t, const MyIDType ** ids)
+{
+    if(t->NOrphanTracers > 0) {
+        *ids = t->OrphanIDs;
+        return t->NOrphanTracers < SUBHALO_MAXTRACERS ? t->NOrphanTracers : SUBHALO_MAXTRACERS;
+    }
+    *ids = &t->MostBoundID;
+    return t->MostBoundID != (MyIDType) -1;
+}
+/* Weighted plurality of n ballots: the candidate >= 0 with the largest summed weight (sums in
+ * ballot order), ties to the smaller; SUBHALO_NOTRACK if there is none. top and second (NULL
+ * allowed) get the winning and the runner-up sums (0 if absent). n <= SUBHALO_MAXTRACERS. */
+int64_t subhalo_weighted_plurality(const int64_t * cand, const double * w, int n, double * top, double * second);
+/* Step 11: the descendant of every dead or sunk track, the weighted plurality of its tracers'
+ * BoundTrackId, looked up outside the key. Collective. */
+void subhalo_finish_descendants(struct SubhaloResult * res, int64_t nres, MPI_Comm Comm);
 
 /* ------------------------------------------------------------------ per-key processing (subhalo_track.c) */
 
