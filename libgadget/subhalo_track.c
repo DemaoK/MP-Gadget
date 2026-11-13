@@ -383,15 +383,39 @@ stats_merge(struct SubhaloCallStats * to, const struct SubhaloCallStats * ks)
     }
 }
 
+/* The tracer a sinking survivor hands on (MergeTo): the first tracer of a final pass of its bound set, the
+ * rule of a record's MostBoundID; the pass runs on a copy, so the set joins its sink in the unbinding's order. */
+static void
+sunk_mb(struct SubNode * u, const struct SubhaloUnbindParams * up, struct SubhaloArena * arena, int64_t g, int TracerTypes)
+{
+    const size_t mark = arena->used;
+    const int64_t n = u->c.Nbound;
+    struct SubCandidate f = u->c;
+    int64_t j;
+    f.Index = (int64_t *) arena_need(arena, sizeof(int64_t) * (n + 1), g, "sunk survivor's list");
+    f.Energy = (double *) arena_need(arena, sizeof(double) * (n + 1), g, "sunk survivor's final pass");
+    memcpy(f.Index, u->c.Index, sizeof(int64_t) * n);
+    subhalo_final_pass(&f, up, arena);
+    for(j = 0; j < n; j++)
+        if(is_tracer(f.Index[j], TracerTypes)) {
+            set_mb_from(u, f.Index[j]);
+            break;
+        }
+    if(!u->has_mb && n > 0)
+        set_mb_from(u, f.Index[0]);
+    arena->used = mark;
+}
+
 /* HBT MergeRecursively (subhalo_merge.cpp:41-91): sink the subtree below x into ref, children
  * first. Only tracks resolved at the call's start take part (an older orphan sunk here would get
  * SnapSink != SnapDeath). Returns 1 if a survivor sank (its bound set appended to ref's list). */
 static int
-merge_subtree(struct SubNode * nd, int x, int ref, const struct SubhaloUnbindParams * up, int symmetric, int TracerTypes)
+merge_subtree(struct SubNode * nd, int x, int ref, const struct SubhaloUnbindParams * up, int symmetric, int TracerTypes,
+              struct SubhaloArena * arena, int64_t g)
 {
     int merged = 0, y;
     for(y = nd[x].child; y >= 0; y = nd[y].sib)
-        merged |= merge_subtree(nd, y, ref, up, symmetric, TracerTypes);
+        merged |= merge_subtree(nd, y, ref, up, symmetric, TracerTypes, arena, g);
     if(x == ref)
         return merged;
     struct SubNode * u = &nd[x];
@@ -401,16 +425,9 @@ merge_subtree(struct SubNode * nd, int x, int ref, const struct SubhaloUnbindPar
     if(!subhalo_sink_test(&u->core, &r->core, symmetric, up->BoxSize))
         return merged;
     if(u->state == SUBHALO_ST_ALIVE) {
-        /* the most-bound tracer of the bound set becomes the orphan's tracer (MergeTo,
-         * subhalo_merge.cpp:213-221), then the bound set joins the reference */
+        /* the orphan's tracer, then the bound set joins the reference */
         int64_t j;
-        for(j = 0; j < u->c.Nbound; j++)
-            if(is_tracer(u->c.Index[j], TracerTypes)) {
-                set_mb_from(u, u->c.Index[j]);
-                break;
-            }
-        if(!u->has_mb && u->c.Nbound > 0)
-            set_mb_from(u, u->c.Index[0]);
+        sunk_mb(u, up, arena, g, TracerTypes);
         struct SubNode * rr = &nd[ref];
         for(j = 0; j < u->c.Nbound; j++)
             rr->c.Index[rr->c.N++] = u->c.Index[j];
@@ -1247,7 +1264,7 @@ node_unbind(struct KeyRun * K, struct SubNode * x, int u, int64_t cap)
     node_unbound(x, alive, K->TracerTypes);
     node_core(x, K->up, sp->SubhaloCoreSize);
     if(x->state == SUBHALO_ST_ALIVE && sp->SubhaloMergeTrapped
-       && merge_subtree(K->nd, u, u, K->up, sp->SubhaloSinkSymmetric, K->TracerTypes)) {
+       && merge_subtree(K->nd, u, u, K->up, sp->SubhaloSinkSymmetric, K->TracerTypes, arena, K->g)) {
         x->c.Energy = (double *) arena_need(arena, sizeof(double) * (cap + 1), K->g, "candidate energies");
         alive = unbind_counted(&x->c, NULL, K->up, arena, &K->ks);
         arena->used = mark;

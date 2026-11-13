@@ -4649,12 +4649,13 @@ sh_particle(MyIDType id, double atime, struct SynPart * s, void * ud)
 }
 
 static void
-sh_run(int64_t collective, struct Outcome * o)
+sh_run(int64_t collective, int finalpass, int samplesize, struct Outcome * o)
 {
     Cosmology CP;
     struct SubhaloParams sp = default_subhalo_params();
     sp.SubhaloFieldSO = 0;
-    sp.SubhaloPotentialSampleSize = 0;
+    sp.SubhaloPotentialSampleSize = samplesize;
+    sp.SubhaloFinalPass = finalpass;
     sp.SubhaloTreeOpenAngle = COLL_TEST_THETA;
     sp.SubhaloCollectiveMinPart = collective;
     syn_setup(&CP, SH_END + SYN_NFIELD, sp);
@@ -4670,9 +4671,6 @@ sh_run(int64_t collective, struct Outcome * o)
     syn_teardown();
 }
 
-/* Y's tracer equal on the paths. Disabled: serially t1 (loop order), in place and in the sub-tree key t2 (final pass). */
-static const int ShComparePaths = 0;
-
 static void
 test_collective_sunk_tracer(void ** state)
 {
@@ -4681,7 +4679,7 @@ test_collective_sunk_tracer(void ** state)
     struct Outcome o[3];
     int k;
     for(k = 0; k < 3; k++) {
-        sh_run(knob[k], &o[k]);
+        sh_run(knob[k], 1, 0, &o[k]);
         const struct SubTrack * A = &o[k].rec[0], * Y = &o[k].rec[1];
         message(0, "sunk tracer (%s): %ld candidates; Y Nbound %d SinkTrackId %ld SnapSink %d MostBoundID %ld; A Nbound %d Rank %d; "
                    "f tagged %ld\n", TwoPathName[k], o[k].st.NCands, Y->Nbound, Y->SinkTrackId, Y->SnapSink, (long) Y->MostBoundID,
@@ -4689,15 +4687,33 @@ test_collective_sunk_tracer(void ** state)
         CHECK(o[k].st.NCands == k, "sunk tracer (%s): %ld candidates\n", TwoPathName[k], o[k].st.NCands);
         CHECK(Y->Nbound == 0 && Y->SinkTrackId == 0 && Y->SnapSink == 1 && A->Rank == 0,
               "sunk tracer (%s): Y not sunk into A\n", TwoPathName[k]);
-        CHECK(Y->MostBoundID == SH_Y0 || Y->MostBoundID == SH_Y0 + 1, "sunk tracer (%s): Y's tracer %ld, neither t1 nor t2\n",
-              TwoPathName[k], (long) Y->MostBoundID);
+        /* the final pass ranks t2 first on every path */
+        CHECK(Y->MostBoundID == SH_Y0 + 1, "sunk tracer (%s): Y's tracer %ld, not t2\n", TwoPathName[k], (long) Y->MostBoundID);
         CHECK(p2_check_tags(o[k].r, o[k].n, o[k].rec, o[k].nt, "sunk tracer") == 0, "sunk tracer: tag invariants\n");
     }
-    for(k = 1; k < 3 && ShComparePaths; k++)
+    for(k = 1; k < 3; k++)
         CHECK(o[k].rec[1].MostBoundID == o[0].rec[1].MostBoundID, "sunk tracer: Y's tracer %ld serially, %ld %s\n",
               (long) o[0].rec[1].MostBoundID, (long) o[k].rec[1].MostBoundID, TwoPathName[k]);
     for(k = 2; k >= 0; k--)
         outcome_free(&o[k]);
+    /* a sampled loop (Y above the sample size) with the sampled and the exact final pass: the whole
+     * serial key hands on what the sub-tree key's record stores (the in-place path never subsamples) */
+    int fp;
+    for(fp = 0; fp < 2; fp++) {
+        for(k = 0; k < 2; k++) {
+            sh_run(knob[k], fp, 100, &o[k]);
+            const struct SubTrack * Y = &o[k].rec[1];
+            message(0, "sunk tracer, sampled loop, SubhaloFinalPass %d (%s): Y Nbound %d SinkTrackId %ld MostBoundID %ld\n", fp,
+                    TwoPathName[k], Y->Nbound, Y->SinkTrackId, (long) Y->MostBoundID);
+            CHECK(Y->Nbound == 0 && Y->SinkTrackId == 0 && Y->SnapSink == 1,
+                  "sunk tracer, sampled loop, SubhaloFinalPass %d (%s): Y not sunk into A\n", fp, TwoPathName[k]);
+        }
+        CHECK(o[1].rec[1].MostBoundID == o[0].rec[1].MostBoundID,
+              "sunk tracer, sampled loop, SubhaloFinalPass %d: Y's tracer %ld serially, %ld in the sub-tree key\n", fp,
+              (long) o[0].rec[1].MostBoundID, (long) o[1].rec[1].MostBoundID);
+        outcome_free(&o[1]);
+        outcome_free(&o[0]);
+    }
 }
 
 /* The election centre across the box edge: A, B and an untagged chain span over half the box, so the
