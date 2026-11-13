@@ -2522,14 +2522,14 @@ test_collective_admission(void ** state)
     int64_t ng;
     int ret = run_finder_call_ex(1, &CP, &ng, lm_pre, lm_post, &c);
     const struct SubhaloPlanSummary * ps = subhalo_plan_last_summary();
-    const struct SubhaloCollAdmit * ad = subhalo_plan_last_admission();
+    const struct SubhaloMemCheck * ad = subhalo_plan_last_memcheck();
     message(0, "admission: ret %d; plan %ld serial, %ld in place, %ld candidates; admitted %d, failed %d on rank %d at the %s, "
                "this rank needs %g MB (%g held + stages %g %g %g %g %g %g %g %g), %g MB available\n", ret, ps->NSerial, ps->NOversized, ps->NCands,
-            ps->Admitted, ad->failed, ad->failrank, ad->failstage >= 0 ? SubhaloCollStageName[ad->failstage] : "-", ad->need / 1048576.,
+            ps->Fits, ad->failed, ad->failrank, ad->failstage >= 0 ? SubhaloCollStageName[ad->failstage] : "-", ad->need / 1048576.,
             ad->persist / 1048576., ad->stage[0] / 1048576., ad->stage[1] / 1048576., ad->stage[2] / 1048576., ad->stage[3] / 1048576.,
             ad->stage[4] / 1048576., ad->stage[5] / 1048576., ad->stage[6] / 1048576., ad->stage[7] / 1048576., ad->avail / 1048576.);
     CHECK(ret == 0 && !subhalo_last_call_complete(), "admission: the squeezed call returned %d\n", ret);
-    CHECK(ps->NSerial == 0 && ps->NOversized >= 2 && ps->NCands == 6 && !ps->Admitted && ad->failed
+    CHECK(ps->NSerial == 0 && ps->NOversized >= 2 && ps->NCands == 6 && !ps->Fits && ad->failed
           && ps->NEncFof == 0 && ps->NEncField == 0, "admission: every key promoted and the admission failed\n");
     CHECK(ad->failstage == SUBHALO_COLL_TREE, "admission: the largest stage is the %s\n", SubhaloCollStageName[ad->failstage]);
     int64_t n, i, bad = 0;
@@ -2564,7 +2564,7 @@ test_collective_guards(void ** state)
           "guards: MPI byte counts\n");
     /* the admission estimate: the persistent scratch is 25 bytes per particle, every stage at least
      * its records, the largest stage chosen */
-    struct SubhaloCollAdmit a;
+    struct SubhaloMemCheck a;
     memset(&a, 0, sizeof(a));
     subhalo_coll_estimate(&a, 1000000, 2000000, 100000, 50000, 2, 2 * 20 * 4, 10, 100, 100, 4097, 3585, 1000, 0.7, 1);
     double mx = 0;
@@ -3157,7 +3157,7 @@ ml_post(void * ud)
 
 /* persist + the largest stage other than the properties: the need of an estimate without them */
 static double
-ml_need_without_props(const struct SubhaloCollAdmit * ad)
+ml_need_without_props(const struct SubhaloMemCheck * ad)
 {
     double mx = 0;
     int s;
@@ -3217,7 +3217,7 @@ test_collective_admission_props(void ** state)
               "many labels (a): walltime rounds %g s (mean %g s, cleanup %g s), summary mean %g s\n", wt1 - wt0, wmean, wcl, smean);
     }
     const struct SubhaloPlanSummary * ps = subhalo_plan_last_summary();
-    const struct SubhaloCollAdmit * ad = subhalo_plan_last_admission();
+    const struct SubhaloMemCheck * ad = subhalo_plan_last_memcheck();
     const struct SubhaloCollectiveStats * cs = subhalo_collective_last_stats();
     const double need = ad->need, noprops = ml_need_without_props(ad), delta = c.freepre - ad->avail;
     message(0, "many labels (a): ret %d in %.2f s, %ld groups, %ld candidates in %d round(s), %ld alive; this rank needs %g MB (%g held, "
@@ -3225,7 +3225,7 @@ test_collective_admission_props(void ** state)
                "(largest measured/estimated %.3f)\n", ret, MPI_Wtime() - t0, ng, ps->NCands, ps->NRounds, cs->NAlive, need / 1048576.,
             ad->persist / 1048576., ad->stage[SUBHALO_COLL_PROPS] / 1048576., ad->stage[SUBHALO_COLL_TREE] / 1048576.,
             noprops / 1048576., cs->MeasPeakBytes / 1048576., cs->EstPeakBytes / 1048576., cs->MaxMeasOverEst);
-    CHECK(ret == 1 && ng == ML_NG && subhalo_last_call_complete() && ps->Admitted && ps->NCands == ML_NG && ps->NRounds == 1
+    CHECK(ret == 1 && ng == ML_NG && subhalo_last_call_complete() && ps->Fits && ps->NCands == ML_NG && ps->NRounds == 1
           && cs->NAlive == ML_NG, "many labels (a): ret %d, %ld groups, %ld candidates, %ld alive\n", ret, ng, ps->NCands, cs->NAlive);
     CHECK(ad->checked && !ad->failed && ad->failstage == SUBHALO_COLL_PROPS, "many labels (a): the largest stage is the %s\n",
           ad->failstage >= 0 ? SubhaloCollStageName[ad->failstage] : "-");
@@ -3240,13 +3240,13 @@ test_collective_admission_props(void ** state)
     pre = gather_tags(&npre);
     ret = run_finder_call_ex(1, &CP, &ng, ml_pre, ml_post, &c);
     ps = subhalo_plan_last_summary();
-    ad = subhalo_plan_last_admission();
+    ad = subhalo_plan_last_memcheck();
     message(0, "many labels (b): free %g MB at the call squeezed to %g MB; ret %d, admitted %d, failed %d on rank %d at the %s; this rank needs "
-               "%g MB (%g MB without the properties stage), %g MB available\n", c.freepre / 1048576., c.target / 1048576., ret, ps->Admitted,
+               "%g MB (%g MB without the properties stage), %g MB available\n", c.freepre / 1048576., c.target / 1048576., ret, ps->Fits,
             ad->failed, ad->failrank, ad->failstage >= 0 ? SubhaloCollStageName[ad->failstage] : "-", ad->need / 1048576.,
             ml_need_without_props(ad) / 1048576., ad->avail / 1048576.);
-    CHECK(ret == 0 && !subhalo_last_call_complete() && !ps->Admitted && ad->failed && ad->failstage == SUBHALO_COLL_PROPS,
-          "many labels (b): ret %d, admitted %d, failed %d at stage %d\n", ret, ps->Admitted, ad->failed, ad->failstage);
+    CHECK(ret == 0 && !subhalo_last_call_complete() && !ps->Fits && ad->failed && ad->failstage == SUBHALO_COLL_PROPS,
+          "many labels (b): ret %d, admitted %d, failed %d at stage %d\n", ret, ps->Fits, ad->failed, ad->failstage);
     /* on every rank the need without the properties stage fits: an estimate without it would admit the call */
     LOCAL_CHECK(bad, ml_need_without_props(ad) < ad->avail && ad->need > ad->avail, "many labels (b): need %g / %g MB without the "
                 "properties, %g MB available\n", ad->need / 1048576., ml_need_without_props(ad) / 1048576., ad->avail / 1048576.);
@@ -4280,7 +4280,7 @@ struct TpCall {
     int recv_rank;           /* the rank that received the records (-1: none or no rounds) */
     int64_t nrecv;           /* records it received */
     int64_t nsend_at_recv;   /* offered particles it held before the call (the records it sent) */
-    struct SubhaloCollAdmit adm;  /* the plan's admission */
+    struct SubhaloMemCheck adm;  /* the plan's admission */
 };
 
 static void
@@ -4319,7 +4319,7 @@ tp_call(int64_t collective, double share, int fail, struct TpCall * out)
     out->keylen = TkKeyLen;
     out->admallocs = AdmAllocs;
     out->ncands = subhalo_plan_last_summary()->NCands;
-    out->adm = *subhalo_plan_last_admission();
+    out->adm = *subhalo_plan_last_memcheck();
     out->recv_rank = TpRecvRank;
     out->nrecv = TpNRecv;
     out->vs = *subhalo_plan_last_vote();

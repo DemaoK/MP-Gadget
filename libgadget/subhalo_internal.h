@@ -32,10 +32,10 @@ size_t subhalo_arena_bytes_per_part(void);
 #define SUBHALO_INPLACE_CAND_BYTES 4096
 #define SUBHALO_INPLACE_MEMBER_BYTES 768
 /* Transient per-candidate scratch of a round's properties on every rank (static assertions in
- * subhalo_collective.c); charged by the admission and, with SUBHALO_INPLACE_CAND_BYTES, the packing. */
+ * subhalo_collective.c); charged by the memory check and, with SUBHALO_INPLACE_CAND_BYTES, the packing. */
 #define SUBHALO_INPLACE_CAND_PROPS_BYTES 6144
 /* Bytes per particle admitted to an in-place receiver in the rounds' list (struct CollAdm,
- * static assertion in subhalo_collective.c); charged by the admission. */
+ * static assertion in subhalo_collective.c); charged by the memory check. */
 #define SUBHALO_INPLACE_ADM_BYTES 16
 
 /* Estimated cost of a serial key of N particles and M member tracks (only ratios matter): N log2 N
@@ -305,7 +305,7 @@ struct SubhaloPlanStats {
 enum { SUBHALO_COLL_SETUP = 0, SUBHALO_COLL_TREE, SUBHALO_COLL_CORE, SUBHALO_COLL_RADIAL, SUBHALO_COLL_PROPS,
        SUBHALO_COLL_SOURCE, SUBHALO_COLL_TAGS, SUBHALO_COLL_REPAIR, SUBHALO_COLL_NSTAGE };
 extern const char * const SubhaloCollStageName[SUBHALO_COLL_NSTAGE];
-struct SubhaloCollAdmit {
+struct SubhaloMemCheck {
     int checked;             /* 1: the plan has in-place candidates and was checked */
     int failed;              /* 1: some rank cannot fit the collective stage */
     int failrank, failstage; /* the rank with the largest shortfall and its largest stage */
@@ -313,7 +313,7 @@ struct SubhaloCollAdmit {
     double stage[SUBHALO_COLL_NSTAGE];   /* this rank: the transient peak of each stage */
     double need;             /* this rank: persist + max(stage) */
     double avail;            /* this rank: free bytes left for the collective call */
-    /* the reserve admission of every plan: the free bytes at pack time against cfg.ReserveBytes +
+    /* the reserve check of every plan: the free bytes at pack time against cfg.ReserveBytes +
      * cfg.SortBytesPerPart * MaxPart */
     int reserve_failed;      /* 1: some rank is short of the reserve */
     int reserve_rank;        /* the rank with the largest shortfall */
@@ -346,7 +346,7 @@ struct SubhaloPlan {
     int64_t * OrphanIds;                    /* orphans hosted by a serial key processed here, sorted */
     int64_t NOrphanIds;
     struct SubhaloPlanStats Stats;
-    struct SubhaloCollAdmit Admit;          /* the admission of the collective stage */
+    struct SubhaloMemCheck MemCheck;       /* the memory check of the plan and of the collective stage */
     double PackFreeBytes;                   /* this rank: mymalloc_freebytes() at the last packing */
     int64_t ExchOut, ExchIn;                /* this rank: live particles sent and received by subhalo_plan_exchange */
     /* the admission records of the serial sub-tree keys processed here, sorted by ID (top of the
@@ -528,30 +528,30 @@ int64_t subhalo_assign_keys(struct SubTrackTable * tab, int64_t TotNgroups, MPI_
 /* Step 3, the plan: census, budgets and packing of the FOF, pseudo- and sub-tree keys; hosted orphans
  * routed to their serial key's rank (OrphanIds). Allocates the tables on the top, sets P[i].TopLeaf
  * to each particle's target and encodes a travelling particle's key in GrNr (undone by
- * subhalo_restore_field_grnr). ddecomp (NULL in tests) sizes the admission's tree. Returns 0, or 1 on
- * every rank if the admission fails (P untouched; the caller frees the plan). Collective. */
+ * subhalo_restore_field_grnr). ddecomp (NULL in tests) sizes the memory check's tree. Returns 0, or 1
+ * on every rank if the memory check fails (P untouched; the caller frees the plan). Collective. */
 int subhalo_plan_build(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubTrackTable * tab, int64_t NHostless,
                        const DomainDecomp * ddecomp, MPI_Comm Comm);
 /* The kinematic constants of the plan-step central decision (the serial key's kinetic distance):
  * set by the driver before subhalo_plan_build (a, H(a) in internal units). */
 void subhalo_plan_set_frame(double atime, double Hubble);
 
-/* Admission estimate of subhalo_collective_run (particle-free; subhalo_collective.c), made before the
+/* Memory estimate of subhalo_collective_run (particle-free; subhalo_collective.c), made before the
  * exchange: this rank's persistent bytes and per-stage peaks from its particle counts (NUniv in
  * oversized groups, NSubPart in its sub-tree keys), owned candidates and their core records
  * (OwnedRecv), the global counts and the top tree; fills a->persist, stage[] and need. */
-void subhalo_coll_estimate(struct SubhaloCollAdmit * a, int64_t NumPart, int64_t MaxPart, int64_t NUniv, int64_t NSubPart,
+void subhalo_coll_estimate(struct SubhaloMemCheck * a, int64_t NumPart, int64_t MaxPart, int64_t NUniv, int64_t NSubPart,
                            int64_t NOwned, int64_t OwnedRecv, int64_t NCands, int64_t NMembers, int64_t NSubResults,
                            int64_t NTopNodes, int64_t NTopLeaves, int64_t NLocalLeaves, double TreeAllocFactor, int nthreads);
-/* The admission of the last subhalo_plan_build (this rank; the failure fields are global). */
-const struct SubhaloCollAdmit * subhalo_plan_last_admission(void);
+/* The memory check of the last subhalo_plan_build (this rank; the failure fields are global). */
+const struct SubhaloMemCheck * subhalo_plan_last_memcheck(void);
 /* What the last subhalo_plan_build made (global; tests and logs). */
 struct SubhaloPlanSummary {
     int64_t NSerial, NOversized;     /* keys packed serially, in place */
     int64_t NSubKeys, NCands;        /* serial sub-tree keys, in-place candidates */
     int64_t NEncFof, NEncField;      /* group particles of sub-tree keys and field particles that travel encoded */
     int NRounds;
-    int Admitted;                    /* 0: the collective admission failed (nothing encoded) */
+    int Fits;                        /* 0: the memory check failed (nothing encoded) */
 };
 const struct SubhaloPlanSummary * subhalo_plan_last_summary(void);
 /* A particle offered by the admission vote of an oversized key: its index in P, its receiver's and
@@ -572,7 +572,7 @@ struct SubhaloVoteStats {
     int64_t NGuests;           /* of which owned outside that key (they travel there) */
     double Seconds;            /* wall time of the vote: per pass the largest over the ranks, summed over the passes */
     double WorstShort;         /* the memory check: the largest shortfall over the ranks (> 0: the call fails) */
-    double RecordBytes;        /* the records the plan's admission charged (received, home and the rounds' list), summed over the ranks */
+    double RecordBytes;        /* the records the plan's memory check charged (received, home and the rounds' list), summed over the ranks */
     int WorstRank;
     int Passes;                /* radius passes of the k-nearest walks */
 };
@@ -590,8 +590,8 @@ struct SubhaloHomeRec {
 const struct SubhaloVoteStats * subhalo_plan_last_vote(void);
 /* Test hook: bytes added to every rank's need in the vote's memory check (0 by default). */
 void subhalo_plan_set_vote_extra_bytes(double bytes);
-/* Test hook: factor on the record bytes the plan's admission charges (1 by default; 0 leaves them
- * out of the admission, RecordBytes keeps the unscaled sum). */
+/* Test hook: factor on the record bytes the plan's memory check charges (1 by default; 0 leaves them
+ * out of the check, RecordBytes keeps the unscaled sum). */
 void subhalo_plan_set_record_scale(double scale);
 /* Binary search of the member table, NULL if absent. */
 const struct SubhaloMember * subhalo_plan_member(const struct SubhaloPlan * plan, int64_t TrackId);
@@ -863,7 +863,7 @@ struct SubhaloCallStats {
     double KeyFitA, KeyFitB;                /* t = A N log2 N + B fitted to the single-threaded key times of every rank */
     int64_t NCands;                         /* in-place candidates */
     int NRounds;                            /* their rounds */
-    double TreeBytes;                       /* the admission's tree-stage estimate of the rounds, max over the ranks */
+    double TreeBytes;                       /* the memory check's tree-stage estimate of the rounds, max over the ranks */
     int FieldSOPass1Walks, FieldSOPass2Walks, FieldSOBins;
     int64_t FieldSOCentrals;
     /* admission by neighbour majority (SubhaloAdmitShare): serial keys, serial sub-tree keys and

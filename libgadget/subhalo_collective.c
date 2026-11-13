@@ -1,7 +1,7 @@
 /* Oversized candidates unbound in place with the global tree (design 7.8); the outline and the
  * walk contract are in subhalo_collective.h.
  *
- * Memory per rank (admitted by the plan through subhalo_coll_estimate): for the whole call 25 bytes
+ * Memory per rank (checked by the plan through subhalo_coll_estimate): for the whole call 25 bytes
  * of scratch per local particle (source candidate, claim, flags, two energies) and the per-candidate
  * vectors; then the stages, each freed before the next: tree and walk, cores, radial set,
  * properties, relaxed sources, final tags, serial repair.
@@ -50,7 +50,7 @@
 static struct SubhaloCollectiveStats CollStats;
 
 /* The particle count a tree build of the in-place walks is told on a nearly empty rank, to hold the
- * top-level grid and the per-thread node caches (the builds and the admission estimate). */
+ * top-level grid and the per-thread node caches (the builds and the memory estimate). */
 static inline int64_t
 coll_tree_min_part(int64_t nleaf, int nthr)
 {
@@ -453,7 +453,7 @@ coll_walk(struct Coll * C, double * Sum)
     tw->priv = &pv;
     tw->tree = &tree;
     /* the treewalk sizes its export tables from the free memory: that elastic part is measured
-     * apart, and the high water charges the walk with the reserve the admission guarantees */
+     * apart, and the high water charges the walk with the reserve the memory check guarantees */
     const size_t lowbefore = allocator_get_min_free(A_MAIN), freebefore = mymalloc_freebytes();
     treewalk_run(tw, ql, nq);
     walltime_measure("/Subhalo/Rounds/Walk");
@@ -3492,7 +3492,7 @@ struct SerialInfo {
 };
 
 /* The per-key, per-candidate and per-member vectors every rank holds, as charged by the plan's
- * budget (subhalo_plan_default_cfg) and the admission (subhalo_coll_estimate). */
+ * budget (subhalo_plan_default_cfg) and the memory check (subhalo_coll_estimate). */
 _Static_assert(sizeof(struct SubhaloInplaceKey) + 8 + 4 * 16 <= SUBHALO_INPLACE_KEY_BYTES,
                "SUBHALO_INPLACE_KEY_BYTES does not cover the per-key vectors");
 _Static_assert(sizeof(struct SubhaloInplaceCand) + sizeof(struct CandState)
@@ -3510,7 +3510,7 @@ const char * const SubhaloCollStageName[SUBHALO_COLL_NSTAGE] = {
 #define COLL_STAGE_SLACK (256. * 1024.)
 
 void
-subhalo_coll_estimate(struct SubhaloCollAdmit * a, int64_t NumPart, int64_t MaxPart, int64_t NUniv, int64_t NSubPart,
+subhalo_coll_estimate(struct SubhaloMemCheck * a, int64_t NumPart, int64_t MaxPart, int64_t NUniv, int64_t NSubPart,
                       int64_t NOwned, int64_t OwnedRecv, int64_t NCands, int64_t NMembers, int64_t NSubResults,
                       int64_t NTopNodes, int64_t NTopLeaves, int64_t NLocalLeaves, double TreeAllocFactor, int nthreads)
 {
@@ -3889,7 +3889,7 @@ subhalo_collective_run(struct SubhaloPlan * plan, struct SubhaloCallCtx * ctx, D
     memset(&CollStats, 0, sizeof(CollStats));
     if(plan->NCands == 0)
         return;
-    /* the measured high water of the call against the plan's admission */
+    /* the measured high water of the call against the plan's memory check */
     const double Free0 = (double) mymalloc_freebytes();
     allocator_reset_min_free(A_MAIN);
     struct Coll C;
@@ -3999,7 +3999,7 @@ subhalo_collective_run(struct SubhaloPlan * plan, struct SubhaloCallCtx * ctx, D
     myfree(slotof);
     {
         const double meas = Free0 - (double) allocator_get_min_free(A_MAIN);
-        const double est = plan->Admit.checked ? plan->Admit.need : 0;
+        const double est = plan->MemCheck.checked ? plan->MemCheck.need : 0;
         struct { double v; int r; } in[3], out[3];
         in[0].v = meas;
         in[1].v = est;
@@ -4011,7 +4011,7 @@ subhalo_collective_run(struct SubhaloPlan * plan, struct SubhaloCallCtx * ctx, D
         CollStats.EstPeakBytes = out[1].v;
         CollStats.EstPeakRank = out[1].r;
         CollStats.MaxMeasOverEst = out[2].v;
-        double av[2] = {plan->Admit.checked ? -plan->Admit.avail : 0, -Free0}, avg[2];
+        double av[2] = {plan->MemCheck.checked ? -plan->MemCheck.avail : 0, -Free0}, avg[2];
         MPI_Allreduce(av, avg, 2, MPI_DOUBLE, MPI_MAX, Comm);
         CollStats.EstAvailBytes = -avg[0];
         CollStats.FreeAtStartBytes = -avg[1];

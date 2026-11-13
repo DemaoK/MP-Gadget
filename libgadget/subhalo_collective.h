@@ -13,7 +13,7 @@
  *  4. the hierarchy of every oversized group (the serial recipe) and the records;
  *  5. the final tag pass (design D10), repairing the serial sub-tree ranks and counts for the particles the
  *     in-place candidates took over or returned to a surviving serial binder.
- * The plan admits the call's memory (subhalo_coll_estimate) before the exchange.
+ * The plan checks the call's memory (subhalo_coll_estimate) before the exchange.
  *
  * Walk contract: result = sum_j m_j W(r_ij, h) over the query's own candidate (W =
  * grav_spline_potential, h = FORCE_SOFTENING()), geometric opening len^2 > r^2 theta^2 (theta^2 capped
@@ -48,8 +48,8 @@ struct SubhaloCollectiveStats {
     int64_t NRepairQueries;       /* own-tag particles of those tracks that asked their new rank */
     double RepairSeconds;         /* the distributed serial repair */
     double TagSeconds;            /* the whole final tag pass */
-    /* memory: the admission estimate and the measured high water, the largest over the ranks (bytes) */
-    double EstPeakBytes;          /* persistent + largest stage, as admitted by the plan */
+    /* memory: the plan's estimate and the measured high water, the largest over the ranks (bytes) */
+    double EstPeakBytes;          /* persistent + largest stage, as checked by the plan */
     double MeasPeakBytes;         /* free bytes at the start of the call minus the least free bytes during it */
     double EstAvailBytes;         /* free bytes the plan expected at the start of the call */
     double FreeAtStartBytes;      /* measured free bytes at the start of the call */

@@ -2503,7 +2503,7 @@ subhalo_finish_call(int SnapNum, int complete, const struct SubhaloCallStats * l
             st->LargestSerial = plan->Stats.LargestSerial;
             st->NCands = plan->NCands;
             st->NRounds = plan->NRounds;
-            double tb = plan->Admit.checked ? plan->Admit.stage[SUBHALO_COLL_TREE] : 0;
+            double tb = plan->MemCheck.checked ? plan->MemCheck.stage[SUBHALO_COLL_TREE] : 0;
             MPI_Allreduce(&tb, &st->TreeBytes, 1, MPI_DOUBLE, MPI_MAX, Comm);
         }
         /* the serial keys: counts, the longest key, the thread and rank balance, the cost fit */
@@ -2674,19 +2674,19 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
                        "table keeps this call's orphan lookup (marker positions and velocities, lost markers); this PIG will be "
                        "marked incomplete. Run with more memory per rank or more ranks.\n", SnapNum,
                     subhalo_plan_last_vote()->WorstRank, subhalo_plan_last_vote()->WorstShort / 1048576.);
-        else if(plan.Admit.failed)
+        else if(plan.MemCheck.failed)
             message(0, "Subhalo finder: the in-place stage of snapshot %d does not fit in memory on rank %d (stage: %s)%s; the call is "
                        "skipped before the exchange. Particle tags and GrNr are unchanged; the track table keeps this call's "
                        "orphan lookup; this PIG will be marked incomplete. Run with more memory per rank or more ranks.\n",
-                    SnapNum, plan.Admit.failrank,
-                    plan.Admit.failstage >= 0 ? SubhaloCollStageName[plan.Admit.failstage] : "?",
-                    plan.Admit.reserve_failed ? " and the reserve admission failed too" : "");
+                    SnapNum, plan.MemCheck.failrank,
+                    plan.MemCheck.failstage >= 0 ? SubhaloCollStageName[plan.MemCheck.failstage] : "?",
+                    plan.MemCheck.reserve_failed ? " and the reserve admission failed too" : "");
         else
             message(0, "Subhalo finder: the reserve admission of snapshot %d failed: rank %d is %g MB short of the plan's reserve; the "
                        "call is skipped before the exchange. Particle tags and GrNr are unchanged; the track table keeps this "
                        "call's orphan lookup; this PIG will be marked incomplete. Run with more memory per rank or more ranks.\n",
-                    SnapNum, plan.Admit.reserve_rank,
-                    plan.Admit.reserve_short / 1048576.);
+                    SnapNum, plan.MemCheck.reserve_rank,
+                    plan.MemCheck.reserve_short / 1048576.);
         subhalo_restore_field_grnr(&plan);
         subhalo_plan_free(&plan);
         SubStatus.LastCallComplete = 0;

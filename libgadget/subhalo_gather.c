@@ -1,6 +1,6 @@
 /* Runtime subhalo finder, pipeline steps 0-5, 7a and 9 (design 7.1-7.3, the plan side of 7.8):
  * host vote, previous-bound frames, track keys, the plan (budgets, packing, oversized keys,
- * sub-tree keys, admission), the whole-key exchange, local sort, member fetch, domain restore and
+ * sub-tree keys, memory check), the whole-key exchange, local sort, member fetch, domain restore and
  * the serial-key scheduler with its per-thread arenas. The exchange follows fof_distribute_particles:
  * target rank in P[i].TopLeaf, domain_exchange, local sort; domain_maintain restores the domain. */
 
@@ -2022,13 +2022,13 @@ plan_census_pass(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubTra
     return ndir;
 }
 
-static struct SubhaloCollAdmit LastAdmit;
+static struct SubhaloMemCheck LastMemCheck;
 static struct SubhaloPlanSummary LastSummary;
 
-const struct SubhaloCollAdmit *
-subhalo_plan_last_admission(void)
+const struct SubhaloMemCheck *
+subhalo_plan_last_memcheck(void)
 {
-    return &LastAdmit;
+    return &LastMemCheck;
 }
 
 const struct SubhaloPlanSummary *
@@ -2037,19 +2037,19 @@ subhalo_plan_last_summary(void)
     return &LastSummary;
 }
 
-/* Admission of the final plan. Every plan: the free bytes at pack time must cover the reserve and
+/* Memory check of the final plan. Every plan: the free bytes at pack time must cover the reserve and
  * the per-MaxPart sort bytes (a->reserve_failed). With in-place candidates: the collective stage's
  * peak (subhalo_coll_estimate) must fit the free bytes less what the serial stage keeps until the
  * collective call and the slot growth. The admission vote's records count in both: rec_held bytes
  * from the encoding to the end of the call (rec_build at their exchange), rec_rounds through the
  * rounds. Returns 1 on every rank if some rank fails. Collective. */
 static int
-plan_admit(struct SubhaloPlan * plan, const struct SubhaloDirKey * dk, int64_t ndir, const struct SubhaloDirMsg * in,
+plan_memory_check(struct SubhaloPlan * plan, const struct SubhaloDirKey * dk, int64_t ndir, const struct SubhaloDirMsg * in,
            const struct SubhaloTrackKey * fkmap, int64_t nfk, const DomainDecomp * ddecomp, double rec_held, double rec_build,
            double rec_rounds, MPI_Comm Comm)
 {
     const int NTask = plan->NTask, ThisTask = plan->ThisTask;
-    struct SubhaloCollAdmit * a = &plan->Admit;
+    struct SubhaloMemCheck * a = &plan->MemCheck;
     memset(a, 0, sizeof(*a));
     a->failrank = a->failstage = -1;
     struct SubhaloPlanCfg cfg;
@@ -2070,7 +2070,7 @@ plan_admit(struct SubhaloPlan * plan, const struct SubhaloDirKey * dk, int64_t n
                     wrs.r, wrs.v / 1048576., rinfo[0] / 1048576., rinfo[1] / 1048576.);
     }
     if(plan->NCands == 0) {
-        LastAdmit = *a;
+        LastMemCheck = *a;
         return a->reserve_failed;
     }
     a->checked = 1;
@@ -2190,7 +2190,7 @@ plan_admit(struct SubhaloPlan * plan, const struct SubhaloDirKey * dk, int64_t n
     else
         message(0, "Subhalo plan: in-place stage admitted; tightest rank %d needs %g MB of %g MB (largest stage: %s).\n",
                 wsh.r, info[1] / 1048576., info[2] / 1048576., SubhaloCollStageName[a->failstage]);
-    LastAdmit = *a;
+    LastMemCheck = *a;
     return a->failed || a->reserve_failed;
 }
 
@@ -2300,7 +2300,7 @@ subhalo_plan_last_vote(void)
  * *offers on the bottom of the stack: the local particles offered, in P order, with their
  * receivers' TrackIds (*noff of them). The memory is checked first: returns 1 on every rank if
  * some rank cannot hold the vote (nothing is allocated then); the records of the offers are charged
- * by plan_admit once their keys' ranks are known. Collective. */
+ * by plan_memory_check once their keys' ranks are known. Collective. */
 static int
 plan_vote(const struct SubhaloMember * mem, int64_t nmem, const int64_t * centralT, const int64_t * O, int64_t nO,
           int64_t TotNgroups, const struct SubhaloTrackKey * fkmap, int64_t nfk, const DomainDecomp * ddecomp,
@@ -2917,7 +2917,7 @@ subhalo_plan_build(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubT
                    "%ld serial sub-tree keys.\n", plan->NInplace, plan->NMembers, plan->NCands, plan->NRounds, nmax, plan->NSubKeys);
     }
 
-    /* ---- the admission, before anything in P changes ---- */
+    /* ---- the memory check, before anything in P changes ---- */
     double rec_held = 0, rec_build = 0, rec_rounds = 0;
     if(sp->SubhaloAdmitShare > 0 && nO > 0 && ddecomp) {
         vote_record_bytes(plan, offers, noff, &rec_held, &rec_build, &rec_rounds, Comm);
@@ -2928,16 +2928,16 @@ subhalo_plan_build(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubT
         rec_build *= RecordScale;
         rec_rounds *= RecordScale;
     }
-    const int noadmit = plan_admit(plan, dk, ndir, in, fkmap, nfk, ddecomp, rec_held, rec_build, rec_rounds, Comm);
+    const int nofit = plan_memory_check(plan, dk, ndir, in, fkmap, nfk, ddecomp, rec_held, rec_build, rec_rounds, Comm);
     memset(&LastSummary, 0, sizeof(LastSummary));
     LastSummary.NSerial = plan->Stats.NSerial;
     LastSummary.NOversized = plan->Stats.NOversized;
     LastSummary.NSubKeys = plan->NSubKeys;
     LastSummary.NCands = plan->NCands;
     LastSummary.NRounds = plan->NRounds;
-    LastSummary.Admitted = !noadmit;
+    LastSummary.Fits = !nofit;
 
-    if(noadmit) {
+    if(nofit) {
         myfree(dk);
         myfree(in);
         myfree(msg);

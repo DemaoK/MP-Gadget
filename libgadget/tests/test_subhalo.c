@@ -4108,7 +4108,7 @@ test_subhalo_reserve_admission(void ** state)
     p2_place(0.5, CP.GravInternal, cen, bulk);
     int64_t ng, n, i;
     int ret = run_finder_call(0, &CP, &ng);
-    const struct SubhaloCollAdmit * ad = subhalo_plan_last_admission();
+    const struct SubhaloMemCheck * ad = subhalo_plan_last_memcheck();
     CHECK(ret == 1 && ad->checked && !ad->failed && !ad->reserve_failed && ad->reserve_short < 0,
           "reserve: the first call returned %d (checked %d failed %d reserve failed %d short %g)\n", ret, ad->checked, ad->failed,
           ad->reserve_failed, ad->reserve_short);
@@ -4133,13 +4133,13 @@ test_subhalo_reserve_admission(void ** state)
         myfree(block);
     fof_finish(&fof);
     domain_free(&ddecomp);
-    ad = subhalo_plan_last_admission();
+    ad = subhalo_plan_last_memcheck();
     const struct SubhaloPlanSummary * ps = subhalo_plan_last_summary();
     message(0, "reserve: ret %d; reserve failed %d on rank %d, short %g MB (this rank needs %g MB, had %g MB); collective checked %d "
                "failed %d (needs %g MB of %g MB); plan %ld serial, %ld in place, %ld candidates\n", ret, ad->reserve_failed,
             ad->reserve_rank, ad->reserve_short / 1048576., ad->reserve_need / 1048576., ad->pack_free / 1048576., ad->checked,
             ad->failed, ad->need / 1048576., ad->avail / 1048576., ps->NSerial, ps->NOversized, ps->NCands);
-    CHECK(ret == 0 && !subhalo_last_call_complete() && !ps->Admitted, "reserve: the squeezed call returned %d\n", ret);
+    CHECK(ret == 0 && !subhalo_last_call_complete() && !ps->Fits, "reserve: the squeezed call returned %d\n", ret);
     CHECK(ad->reserve_failed && ad->reserve_short >= 2. * 1024 * 1024 && ad->reserve_short < need,
           "reserve: reserve failed %d, short %g bytes\n", ad->reserve_failed, ad->reserve_short);
     CHECK(ad->checked && !ad->failed && ad->need <= ad->avail, "reserve: the collective admission (checked %d) failed %d: %g of %g bytes\n",
@@ -4159,7 +4159,7 @@ test_subhalo_reserve_admission(void ** state)
 
     /* the memory back: the call completes */
     ret = run_finder_call(1, &CP, &ng);
-    ad = subhalo_plan_last_admission();
+    ad = subhalo_plan_last_memcheck();
     CHECK(ret == 1 && subhalo_last_call_complete() && !ad->reserve_failed, "reserve: the next call returned %d\n", ret);
     check_call_stats("reserve, next call", 1);
     p2_teardown();
