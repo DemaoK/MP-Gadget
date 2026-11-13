@@ -1986,10 +1986,15 @@ const char * const SubhaloCollStageName[SUBHALO_COLL_NSTAGE] = {
 #define COLL_STAGE_SLACK (256. * 1024.)
 
 void
-subhalo_coll_estimate(struct SubhaloMemCheck * a, int64_t NumPart, int64_t MaxPart, int64_t NUniv, int64_t NSubPart,
-                      int64_t NOwned, int64_t OwnedRecv, int64_t NCands, int64_t NMembers, int64_t NSubResults,
-                      int64_t NTopNodes, int64_t NTopLeaves, int64_t NLocalLeaves, double TreeAllocFactor, int nthreads)
+subhalo_coll_estimate(struct SubhaloMemCheck * a, const struct SubhaloCollSizes * z)
 {
+    /* the sizes as locals: a store into *a could alias a field of *z and force its reload */
+    const int64_t NumPart = z->NumPart, MaxPart = z->MaxPart, NUniv = z->NUniv, NSubPart = z->NSubPart;
+    const int64_t NOwned = z->NOwned, OwnedRecv = z->OwnedRecv, NCands = z->NCands, NMembers = z->NMembers;
+    const int64_t NSubResults = z->NSubResults, NTopNodes = z->NTopNodes, NTopLeaves = z->NTopLeaves;
+    const int64_t NLocalLeaves = z->NLocalLeaves;
+    const double TreeAllocFactor = z->TreeAllocFactor;
+    const int nthreads = z->nthreads;
     const struct SubhaloParams * sp = subhalo_get_params();
     const int CoreSize = sp->SubhaloCoreSize > 0 ? sp->SubhaloCoreSize : 1;
     const double K = CoreSize > sp->SubhaloMinNumTracerPart ? CoreSize : sp->SubhaloMinNumTracerPart;

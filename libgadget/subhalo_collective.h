@@ -20,13 +20,19 @@
 /* Bytes treewalk.c's ev_begin reserves for the potential-only walk: 40960 + max(4097, 100 x threads)
  * buffers of index, query and result plus ImportBufferBoost x (query + result). */
 size_t subhalo_collective_walk_bytes(void);
+/* The inputs of subhalo_coll_estimate: this rank's particle counts (NUniv in oversized groups,
+ * NSubPart in its sub-tree keys), owned candidates and their core records (OwnedRecv); the global
+ * counts; the domain's top tree, this rank's top leaves and the tree's sizing. */
+struct SubhaloCollSizes {
+    int64_t NumPart, MaxPart, NUniv, NSubPart, NOwned, OwnedRecv;
+    int64_t NCands, NMembers, NSubResults;
+    int64_t NTopNodes, NTopLeaves, NLocalLeaves;
+    double TreeAllocFactor;
+    int nthreads;
+};
 /* Memory estimate of subhalo_collective_run (particle-free; subhalo_collective.c), made before the
- * exchange: this rank's persistent bytes and per-stage peaks from its particle counts (NUniv in
- * oversized groups, NSubPart in its sub-tree keys), owned candidates and their core records
- * (OwnedRecv), the global counts and the top tree; fills a->persist, stage[] and need. */
-void subhalo_coll_estimate(struct SubhaloMemCheck * a, int64_t NumPart, int64_t MaxPart, int64_t NUniv, int64_t NSubPart,
-                           int64_t NOwned, int64_t OwnedRecv, int64_t NCands, int64_t NMembers, int64_t NSubResults,
-                           int64_t NTopNodes, int64_t NTopLeaves, int64_t NLocalLeaves, double TreeAllocFactor, int nthreads);
+ * exchange: this rank's persistent bytes and per-stage peaks; fills a->persist, stage[] and need. */
+void subhalo_coll_estimate(struct SubhaloMemCheck * a, const struct SubhaloCollSizes * z);
 
 /* Diagnostics of the last call (global). */
 struct SubhaloCollectiveStats {

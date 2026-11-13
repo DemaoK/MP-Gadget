@@ -2205,15 +2205,16 @@ plan_memory_check(struct SubhaloPlan * plan, const struct PlanPass * ps, const D
         const int64_t h = hg[plan->Cands[i].gidx] < NTask ? hg[plan->Cands[i].gidx] : NTask;
         recv += 2 * K * (h > 0 ? h : 1);
     }
-    int64_t NTopNodes = 0, NTopLeaves = 0, NLocalLeaves = 0;
+    struct SubhaloCollSizes z = {
+        .NumPart = PartManager->NumPart, .MaxPart = PartManager->MaxPart, .NUniv = nuniv, .NSubPart = (int64_t) mine[7],
+        .NOwned = nowned, .OwnedRecv = recv, .NCands = plan->NCands, .NMembers = plan->NMembers, .NSubResults = plan->NMembers,
+        .TreeAllocFactor = force_tree_get_alloc_factor(), .nthreads = omp_get_max_threads()};
     if(ddecomp) {
-        NTopNodes = ddecomp->NTopNodes;
-        NTopLeaves = ddecomp->NTopLeaves;
-        NLocalLeaves = ddecomp->Tasks[ThisTask].EndLeaf - ddecomp->Tasks[ThisTask].StartLeaf;
+        z.NTopNodes = ddecomp->NTopNodes;
+        z.NTopLeaves = ddecomp->NTopLeaves;
+        z.NLocalLeaves = ddecomp->Tasks[ThisTask].EndLeaf - ddecomp->Tasks[ThisTask].StartLeaf;
     }
-    subhalo_coll_estimate(a, PartManager->NumPart, PartManager->MaxPart, nuniv, (int64_t) mine[7], nowned, recv, plan->NCands,
-                          plan->NMembers, plan->NMembers, NTopNodes, NTopLeaves, NLocalLeaves, force_tree_get_alloc_factor(),
-                          omp_get_max_threads());
+    subhalo_coll_estimate(a, &z);
     a->persist += rb->rounds;
     a->need += rb->rounds;
     /* what the serial stage keeps, read before its table is freed; the free bytes after */

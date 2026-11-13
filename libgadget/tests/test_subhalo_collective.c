@@ -1896,7 +1896,8 @@ test_collective_guards(void ** state)
      * its records, the largest stage chosen */
     struct SubhaloMemCheck a;
     memset(&a, 0, sizeof(a));
-    subhalo_coll_estimate(&a, 1000000, 2000000, 100000, 50000, 2, 2 * 20 * 4, 10, 100, 100, 4097, 3585, 1000, 0.7, 1);
+    const struct SubhaloCollSizes z = {1000000, 2000000, 100000, 50000, 2, 2 * 20 * 4, 10, 100, 100, 4097, 3585, 1000, 0.7, 1};
+    subhalo_coll_estimate(&a, &z);
     double mx = 0;
     int s;
     for(s = 0; s < SUBHALO_COLL_NSTAGE; s++)
