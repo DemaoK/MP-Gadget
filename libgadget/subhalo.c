@@ -9,6 +9,7 @@
 #include <math.h>
 #include <limits.h>
 #include <stddef.h>
+#include <float.h>
 #include <omp.h>
 
 #include "utils/endrun.h"
@@ -71,69 +72,145 @@ subhalo_isfinite(double x)
 /* Largest double below 2^62, the range in which the integer-valued parameters are converted. */
 #define SUBHALO_INT_PARAM_MAX 4.6e18
 
+/* How a parameter is declared, stored and printed: SUBPAR_COUNT is an int64_t declared as a double
+ * so that a parameter file can write it in exponent form; it must hold a non-negative integer. */
+enum { SUBPAR_INT, SUBPAR_DOUBLE, SUBPAR_COUNT };
+/* Flags: lower bound excluded; range checked only with the field SO on (its only reader); written last
+ * and only while it and SubhaloAdmitShare are positive, so a run without admission keeps its header. */
+#define SUBPAR_LO_OPEN 1
+#define SUBPAR_FIELDSO 2
+#define SUBPAR_ADMIT 4
+
+/* One Subhalo* parameter: declaration (name, kind, default, help), its member of struct
+ * SubhaloParams and the range [lo, hi] the start-up check enforces while the finder is on. */
+struct SubhaloParamDesc {
+    const char * name;
+    int kind;
+    size_t offset;
+    double def;
+    double lo, hi;
+    int flags;
+    const char * help;
+};
+
+#define SUBPAR(name, kind, def, lo, hi, flags, help) {#name, SUBPAR_##kind, offsetof(struct SubhaloParams, name), def, lo, hi, flags, help}
+
+/* Every Subhalo* parameter, in the order of the parameter dump and the header string (design 10).
+ * Doubles must be finite; rules between parameters are in subhalo_validate_params. */
+static const struct SubhaloParamDesc SubhaloParamTable[] = {
+    SUBPAR(SubhaloFinderOn, INT, 0, -DBL_MAX, DBL_MAX, 0, "Run the subhalo finder at every PART/PIG output. Requires SnapshotWithFOF = 1 and FOFSaveParticles = 1."),
+    SUBPAR(SubhaloMaxGatherFraction, DOUBLE, 0.5, 0, DBL_MAX, SUBPAR_LO_OPEN, "Fraction of the particle slots left free on a rank after its own group particles have left that may be filled by whole groups."),
+    SUBPAR(SubhaloCollectiveMinPart, COUNT, 0, 0, DBL_MAX, 0, "Testing knob: candidate keys above this particle count are processed in place even if they would fit a rank. 0 = off."),
+    SUBPAR(SubhaloMaxUnbindIterations, INT, 50, 1, DBL_MAX, 0, "Iteration cap of the unbinding loop."),
+    SUBPAR(SubhaloRestartFresh, INT, 0, -DBL_MAX, DBL_MAX, 0, "If 1, start with an empty track table when no complete finder state is found at restart; otherwise abort."),
+    SUBPAR(SubhaloTracerTypes, INT, 2+16, 0, 63, 0, "Bitmask of tracer particle types."),
+    SUBPAR(SubhaloPotentialTypes, INT, 1+2+16+32, 0, 63, 0, "Bitmask of particle types that source the potential and are unbound."),
+    SUBPAR(SubhaloMinNumPart, INT, 20, 1, DBL_MAX, 0, "Minimum number of bound particles of a resolved subhalo."),
+    SUBPAR(SubhaloMinNumTracerPart, INT, 10, 1, DBL_MAX, 0, "Minimum number of bound tracer particles of a resolved subhalo."),
+    /* at most SUBHALO_MAXTRACERS: the tracer IDs live in the track record */
+    SUBPAR(SubhaloNumTracerHostFinding, INT, 10, 1, SUBHALO_MAXTRACERS, 0, "Tracers used in the host vote and for descendants. Must not exceed SubhaloMinNumTracerPart."),
+    SUBPAR(SubhaloOrphanTracers, INT, 10, 1, SUBHALO_MAXTRACERS, 0, "Particles an orphan follows: its MostBoundID and the first host-vote tracers at death; position and host from their clipped, penalty-weighted set. 1 = the MostBoundID alone (HBT). At most 16."),
+    SUBPAR(SubhaloLookupBatchBytes, COUNT, 64.*1024*1024, 1024.*1024, DBL_MAX, 0, "Per-rank bound in bytes on one batch of the tracer ID lookups: the gathered IDs plus the outgoing and returning replies (at least one ID per rank and batch)."),
+    SUBPAR(SubhaloMajorProgenitorMassRatio, DOUBLE, 0.8, 0, 1, 0, "Central candidacy mass ratio."),
+    SUBPAR(SubhaloBoundMassPrecision, DOUBLE, 0.995, 0, 1, SUBPAR_LO_OPEN, "Unbinding convergence criterion."),
+    SUBPAR(SubhaloSourceRelaxFactor, DOUBLE, 3, 1, SUBHALO_MAX_RELAX_FACTOR, 0, "Source size as a multiple of Nbound, in [1, 10]; the per-thread arena reserves 8 bytes per particle per unit."),
+    SUBPAR(SubhaloPotentialSampleSize, INT, 1000, 0, DBL_MAX, 0, "Potential subsampling size; 0 disables subsampling."),
+    SUBPAR(SubhaloFinalPass, INT, 0, 0, 1, 0, "0 = sampled final pass (default; HBT-HERONS's rule: the last unbinding iteration's subsampled order, the head of the most bound re-ranked by exact energies over all bound particles; subhalos above SubhaloPotentialSampleSize only); 1 = exact final pass (energies of the bound set over all its particles set the whole binding order)."),
+    SUBPAR(SubhaloTreeOpenAngle, DOUBLE, 0.45, 0, DBL_MAX, SUBPAR_LO_OPEN, "Geometric opening angle of the serial octree and of the in-place walk."),
+    SUBPAR(SubhaloMergeTrapped, INT, 1, -DBL_MAX, DBL_MAX, 0, "Enable sinking of trapped satellites."),
+    SUBPAR(SubhaloSinkSymmetric, INT, 0, -DBL_MAX, DBL_MAX, 0, "0 = HBT code behaviour, 1 = documented symmetric sinking test."),
+    SUBPAR(SubhaloCoreSize, INT, 20, 1, DBL_MAX, 0, "Core particles for the centre and sinking."),
+    SUBPAR(SubhaloReassignGas, INT, 1, -DBL_MAX, DBL_MAX, 0, "HBT ReassignParticles for non-tracers (serial groups only)."),
+    SUBPAR(SubhaloNumNeighboursForReassignment, INT, 10, 1, SUBHALO_KNN_MAXK, 0, "Nearest tracers searched by SubhaloReassignGas (HBT NumNeighboursForReassignment)."),
+    SUBPAR(SubhaloAdmitShare, DOUBLE, 0, 0, 1, SUBPAR_ADMIT, "In [0, 1], 0 = off. A tracer owned by an ancestor of a satellite joins the satellite's source when at least this share of its SubhaloNumNeighboursForReassignment nearest tracers were bound to the satellite at the previous call; it stays only if the unbinding binds it."),
+    SUBPAR(SubhaloAdmitMinCoreDistance, DOUBLE, 12, 0, DBL_MAX, SUBPAR_ADMIT, "Not negative, 0 = off. With SubhaloAdmitShare > 0, a particle is not admitted to a satellite whose previous core lies nearer its owner's previous core than this phase-space distance of the sinking test (in the owner's dispersions; a satellite sinks below 2)."),
+    SUBPAR(SubhaloUnbindWithThermal, INT, 0, -DBL_MAX, DBL_MAX, 0, "Add the gas internal energy to the kinetic term when unbinding."),
+    SUBPAR(SubhaloFieldSO, INT, 1, -DBL_MAX, DBL_MAX, 0, "Run the field spherical overdensity tree walk for centrals."),
+    SUBPAR(SubhaloSOBins, INT, 64, 8, 256, SUBPAR_FIELDSO, "Logarithmic radial bins of the field SO pass 1."),
+    SUBPAR(SubhaloSOSearchFactor, DOUBLE, 2, 0, DBL_MAX, SUBPAR_LO_OPEN | SUBPAR_FIELDSO, "Field SO search radius in units of the radius implied by the inclusive bound mass."),
+    SUBPAR(SubhaloSOMaxDoublings, INT, 3, 0, 60, SUBPAR_FIELDSO, "Maximum number of field SO search-radius doublings per central."),
+    SUBPAR(SubhaloSORefineMinPart, INT, 1000, -DBL_MAX, DBL_MAX, 0, "Centrals at least this large get the field SO pass-2 refinement."),
+    SUBPAR(SubhaloMajorMergerRatio, DOUBLE, 0.3, 0, DBL_MAX, 0, "Mass ratio for SnapLastMajorMerger."),
+    SUBPAR(SubhaloGeometricParents, INT, 0, -DBL_MAX, DBL_MAX, 0, "Also compute consistent-trees-style geometric pid/upid."),
+    SUBPAR(SubhaloDebugForceExchangeFailure, INT, 0, -DBL_MAX, DBL_MAX, 0, "Debug: send every serial key to rank 0 and take the exchange failure path."),
+};
+#define SUBHALO_NPARAMS ((int) (sizeof(SubhaloParamTable) / sizeof(SubhaloParamTable[0])))
+
+void
+subhalo_declare_params(ParameterSet * ps)
+{
+    int k;
+    for(k = 0; k < SUBHALO_NPARAMS; k++) {
+        const struct SubhaloParamDesc * d = &SubhaloParamTable[k];
+        if(d->kind == SUBPAR_INT)
+            param_declare_int(ps, d->name, OPTIONAL, (int) d->def, d->help);
+        else
+            param_declare_double(ps, d->name, OPTIONAL, d->def, d->help);
+    }
+}
+
+/* The value of a parameter as a double (exact for every int and for counts below 2^53). */
+static double
+subhalo_param_value(const struct SubhaloParamDesc * d, const struct SubhaloParams * sp)
+{
+    const char * m = (const char *) sp + d->offset;
+    if(d->kind == SUBPAR_INT)
+        return *(const int *) m;
+    if(d->kind == SUBPAR_COUNT)
+        return (double) *(const int64_t *) m;
+    return *(const double *) m;
+}
+
+/* 1 if v is finite and inside the range of d; the range of a SUBPAR_FIELDSO parameter applies only
+ * with fieldso set. Finiteness first: under -ffast-math a NaN comparison proves nothing. */
+static int
+subhalo_param_ok(const struct SubhaloParamDesc * d, double v, int fieldso)
+{
+    if(!subhalo_isfinite(v))
+        return 0;
+    if((d->flags & SUBPAR_FIELDSO) && !fieldso)
+        return 1;
+    const int lo_ok = (d->flags & SUBPAR_LO_OPEN) ? v > d->lo : v >= d->lo;
+    return lo_ok && v <= d->hi;
+}
+
+static const struct SubhaloParamDesc *
+subhalo_param_desc(const char * name)
+{
+    int k;
+    for(k = 0; k < SUBHALO_NPARAMS; k++)
+        if(0 == strcmp(SubhaloParamTable[k].name, name))
+            return &SubhaloParamTable[k];
+    endrun(5, "%s is not a subhalo parameter\n", name);
+}
+
 int
 subhalo_admit_distance_valid(double MinD)
 {
-    return subhalo_isfinite(MinD) && MinD >= 0;
+    return subhalo_param_ok(subhalo_param_desc("SubhaloAdmitMinCoreDistance"), MinD, 0);
 }
 
 /* Validation of the parameters: endrun(1) on every rank, which all hold the broadcast values. */
 static void
 subhalo_validate_params(const struct SubhaloParams * sp)
 {
-    if(!subhalo_isfinite(sp->SubhaloMaxGatherFraction) || sp->SubhaloMaxGatherFraction <= 0)
-        endrun(1, "SubhaloMaxGatherFraction = %g must be finite and positive (values above 1 are allowed for testing).\n", sp->SubhaloMaxGatherFraction);
-    if(sp->SubhaloCollectiveMinPart < 0)
-        endrun(1, "SubhaloCollectiveMinPart = %ld must not be negative.\n", sp->SubhaloCollectiveMinPart);
-    if(sp->SubhaloLookupBatchBytes < 1024L * 1024L)
-        endrun(1, "SubhaloLookupBatchBytes = %ld must be at least 1 MB.\n", sp->SubhaloLookupBatchBytes);
-    if(sp->SubhaloTracerTypes < 0 || sp->SubhaloTracerTypes > 63)
-        endrun(1, "SubhaloTracerTypes = %d must be a bitmask of the six particle types (0-63).\n", sp->SubhaloTracerTypes);
-    if(sp->SubhaloPotentialTypes < 0 || sp->SubhaloPotentialTypes > 63)
-        endrun(1, "SubhaloPotentialTypes = %d must be a bitmask of the six particle types (0-63).\n", sp->SubhaloPotentialTypes);
-    if(sp->SubhaloMinNumTracerPart < 1 || sp->SubhaloNumTracerHostFinding < 1)
-        endrun(1, "SubhaloMinNumTracerPart = %d and SubhaloNumTracerHostFinding = %d must be at least 1.\n",
-               sp->SubhaloMinNumTracerPart, sp->SubhaloNumTracerHostFinding);
+    int k;
+    for(k = 0; k < SUBHALO_NPARAMS; k++) {
+        const struct SubhaloParamDesc * d = &SubhaloParamTable[k];
+        const double v = subhalo_param_value(d, sp);
+        if(!subhalo_param_ok(d, v, sp->SubhaloFieldSO)) {
+            char lo[32] = "-inf", hi[32] = "inf";
+            if(d->lo > -DBL_MAX)
+                snprintf(lo, sizeof(lo), "%g", d->lo);
+            if(d->hi < DBL_MAX)
+                snprintf(hi, sizeof(hi), "%g", d->hi);
+            endrun(1, "%s = %.17g must be finite and in %c%s, %s]. %s\n", d->name, v,
+                   (d->flags & SUBPAR_LO_OPEN) ? '(' : '[', lo, hi, d->help);
+        }
+    }
     if(sp->SubhaloNumTracerHostFinding > sp->SubhaloMinNumTracerPart)
         endrun(1, "SubhaloNumTracerHostFinding = %d must not exceed SubhaloMinNumTracerPart = %d.\n",
                sp->SubhaloNumTracerHostFinding, sp->SubhaloMinNumTracerPart);
-    if(sp->SubhaloNumTracerHostFinding > SUBHALO_MAXTRACERS)
-        endrun(1, "SubhaloNumTracerHostFinding = %d must not exceed %d (the tracer IDs live in the track record).\n",
-               sp->SubhaloNumTracerHostFinding, SUBHALO_MAXTRACERS);
-    if(sp->SubhaloOrphanTracers < 1 || sp->SubhaloOrphanTracers > SUBHALO_MAXTRACERS)
-        endrun(1, "SubhaloOrphanTracers = %d must be in [1, %d] (the followed IDs live in the track record).\n",
-               sp->SubhaloOrphanTracers, SUBHALO_MAXTRACERS);
-    if(sp->SubhaloNumNeighboursForReassignment < 1 || sp->SubhaloNumNeighboursForReassignment > SUBHALO_KNN_MAXK)
-        endrun(1, "SubhaloNumNeighboursForReassignment = %d must be in [1, %d].\n",
-               sp->SubhaloNumNeighboursForReassignment, SUBHALO_KNN_MAXK);
-    if(!subhalo_isfinite(sp->SubhaloAdmitShare) || !(sp->SubhaloAdmitShare >= 0 && sp->SubhaloAdmitShare <= 1))
-        endrun(1, "SubhaloAdmitShare = %g must be in [0, 1].\n", sp->SubhaloAdmitShare);
-    if(!subhalo_admit_distance_valid(sp->SubhaloAdmitMinCoreDistance))
-        endrun(1, "SubhaloAdmitMinCoreDistance = %g must be finite and not negative.\n", sp->SubhaloAdmitMinCoreDistance);
-    if(sp->SubhaloCoreSize < 1 || sp->SubhaloPotentialSampleSize < 0 || sp->SubhaloMaxUnbindIterations < 1)
-        endrun(1, "SubhaloCoreSize = %d and SubhaloMaxUnbindIterations = %d must be at least 1, SubhaloPotentialSampleSize = %d not negative.\n",
-               sp->SubhaloCoreSize, sp->SubhaloMaxUnbindIterations, sp->SubhaloPotentialSampleSize);
-    if(sp->SubhaloFinalPass != 0 && sp->SubhaloFinalPass != 1)
-        endrun(1, "SubhaloFinalPass = %d must be 1 (exact final pass) or 0 (sampled final pass).\n", sp->SubhaloFinalPass);
-    if(!(sp->SubhaloSourceRelaxFactor >= 1 && sp->SubhaloSourceRelaxFactor <= SUBHALO_MAX_RELAX_FACTOR))
-        endrun(1, "SubhaloSourceRelaxFactor = %g must be in [1, %g]: the per-thread arena reserves 8 R bytes per particle "
-                  "for the relaxed sources (HBT finds no change above 3).\n", sp->SubhaloSourceRelaxFactor, SUBHALO_MAX_RELAX_FACTOR);
-    if(!(sp->SubhaloSourceRelaxFactor >= 1) || !(sp->SubhaloTreeOpenAngle > 0) || !(sp->SubhaloBoundMassPrecision > 0 && sp->SubhaloBoundMassPrecision <= 1)
-       || !(sp->SubhaloMajorProgenitorMassRatio >= 0 && sp->SubhaloMajorProgenitorMassRatio <= 1))
-        endrun(1, "SubhaloSourceRelaxFactor = %g must be >= 1, SubhaloTreeOpenAngle = %g positive, SubhaloBoundMassPrecision = %g in (0, 1], "
-                  "SubhaloMajorProgenitorMassRatio = %g in [0, 1].\n", sp->SubhaloSourceRelaxFactor, sp->SubhaloTreeOpenAngle,
-               sp->SubhaloBoundMassPrecision, sp->SubhaloMajorProgenitorMassRatio);
-    if(sp->SubhaloMinNumPart < 1)
-        endrun(1, "SubhaloMinNumPart = %d must be at least 1.\n", sp->SubhaloMinNumPart);
-    if(!subhalo_isfinite(sp->SubhaloMajorMergerRatio) || sp->SubhaloMajorMergerRatio < 0)
-        endrun(1, "SubhaloMajorMergerRatio = %g must be finite and non-negative.\n", sp->SubhaloMajorMergerRatio);
-    /* Finiteness of the remaining floating-point knobs, so that a typo cannot reach any arithmetic. */
-    const double fknobs[5] = {sp->SubhaloMajorProgenitorMassRatio, sp->SubhaloBoundMassPrecision,
-                              sp->SubhaloSourceRelaxFactor, sp->SubhaloTreeOpenAngle, sp->SubhaloSOSearchFactor};
-    int k;
-    for(k = 0; k < 5; k++)
-        if(!subhalo_isfinite(fknobs[k]))
-            endrun(1, "A floating-point Subhalo* parameter is not finite (%g).\n", fknobs[k]);
 }
 
 /* Arena bytes per particle of a serial key (subhalo_internal.h), set from SubhaloSourceRelaxFactor. */
@@ -194,69 +271,49 @@ set_subhalo_params(ParameterSet * ps)
     int ThisTask;
     MPI_Comm_rank(MPI_COMM_WORLD, &ThisTask);
     int checks[2] = {0, 0};
-    /* the two integer-valued doubles, converted on every rank after validation */
-    double raw[2] = {0, 0};
+    /* the SUBPAR_COUNT parameters as read, converted on every rank after validation */
+    double raw[SUBHALO_NPARAMS] = {0};
     /* the treewalk's import buffer factor (the memory checks of the field SO and the in-place walk) */
     double boost = 2;
+    int k;
     if(ThisTask == 0) {
         boost = param_get_double(ps, "ImportBufferBoost");
-        SubParams.SubhaloFinderOn = param_get_int(ps, "SubhaloFinderOn");
-        SubParams.SubhaloMaxGatherFraction = param_get_double(ps, "SubhaloMaxGatherFraction");
-        raw[0] = param_get_double(ps, "SubhaloCollectiveMinPart");
-        SubParams.SubhaloMaxUnbindIterations = param_get_int(ps, "SubhaloMaxUnbindIterations");
-        SubParams.SubhaloRestartFresh = param_get_int(ps, "SubhaloRestartFresh");
-        SubParams.SubhaloTracerTypes = param_get_int(ps, "SubhaloTracerTypes");
-        SubParams.SubhaloPotentialTypes = param_get_int(ps, "SubhaloPotentialTypes");
-        SubParams.SubhaloMinNumPart = param_get_int(ps, "SubhaloMinNumPart");
-        SubParams.SubhaloMinNumTracerPart = param_get_int(ps, "SubhaloMinNumTracerPart");
-        SubParams.SubhaloNumTracerHostFinding = param_get_int(ps, "SubhaloNumTracerHostFinding");
-        SubParams.SubhaloOrphanTracers = param_get_int(ps, "SubhaloOrphanTracers");
-        raw[1] = param_get_double(ps, "SubhaloLookupBatchBytes");
-        SubParams.SubhaloMajorProgenitorMassRatio = param_get_double(ps, "SubhaloMajorProgenitorMassRatio");
-        SubParams.SubhaloBoundMassPrecision = param_get_double(ps, "SubhaloBoundMassPrecision");
-        SubParams.SubhaloSourceRelaxFactor = param_get_double(ps, "SubhaloSourceRelaxFactor");
-        SubParams.SubhaloPotentialSampleSize = param_get_int(ps, "SubhaloPotentialSampleSize");
-        SubParams.SubhaloFinalPass = param_get_int(ps, "SubhaloFinalPass");
-        SubParams.SubhaloTreeOpenAngle = param_get_double(ps, "SubhaloTreeOpenAngle");
-        SubParams.SubhaloMergeTrapped = param_get_int(ps, "SubhaloMergeTrapped");
-        SubParams.SubhaloSinkSymmetric = param_get_int(ps, "SubhaloSinkSymmetric");
-        SubParams.SubhaloCoreSize = param_get_int(ps, "SubhaloCoreSize");
-        SubParams.SubhaloReassignGas = param_get_int(ps, "SubhaloReassignGas");
-        SubParams.SubhaloNumNeighboursForReassignment = param_get_int(ps, "SubhaloNumNeighboursForReassignment");
-        SubParams.SubhaloAdmitShare = param_get_double(ps, "SubhaloAdmitShare");
-        SubParams.SubhaloAdmitMinCoreDistance = param_get_double(ps, "SubhaloAdmitMinCoreDistance");
-        SubParams.SubhaloUnbindWithThermal = param_get_int(ps, "SubhaloUnbindWithThermal");
-        SubParams.SubhaloFieldSO = param_get_int(ps, "SubhaloFieldSO");
-        SubParams.SubhaloSOBins = param_get_int(ps, "SubhaloSOBins");
-        SubParams.SubhaloSOSearchFactor = param_get_double(ps, "SubhaloSOSearchFactor");
-        SubParams.SubhaloSOMaxDoublings = param_get_int(ps, "SubhaloSOMaxDoublings");
-        SubParams.SubhaloSORefineMinPart = param_get_int(ps, "SubhaloSORefineMinPart");
-        SubParams.SubhaloMajorMergerRatio = param_get_double(ps, "SubhaloMajorMergerRatio");
-        SubParams.SubhaloGeometricParents = param_get_int(ps, "SubhaloGeometricParents");
-        SubParams.SubhaloDebugForceExchangeFailure = param_get_int(ps, "SubhaloDebugForceExchangeFailure");
+        for(k = 0; k < SUBHALO_NPARAMS; k++) {
+            const struct SubhaloParamDesc * d = &SubhaloParamTable[k];
+            char * m = (char *) &SubParams + d->offset;
+            if(d->kind == SUBPAR_INT)
+                *(int *) m = param_get_int(ps, d->name);
+            else if(d->kind == SUBPAR_DOUBLE)
+                *(double *) m = param_get_double(ps, d->name);
+            else
+                raw[k] = param_get_double(ps, d->name);
+        }
         checks[0] = param_get_int(ps, "SnapshotWithFOF");
         checks[1] = param_get_int(ps, "FOFSaveParticles");
         param_get_string2(ps, "FOFFileBase", SubhaloFOFFileBase, sizeof(SubhaloFOFFileBase));
     }
     MPI_Bcast(&SubParams, sizeof(struct SubhaloParams), MPI_BYTE, 0, MPI_COMM_WORLD);
     MPI_Bcast(checks, 2, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(raw, 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Bcast(raw, SUBHALO_NPARAMS, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Bcast(&boost, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     subhalo_set_import_buffer_boost(boost);
     MPI_Bcast(SubhaloFOFFileBase, sizeof(SubhaloFOFFileBase), MPI_CHAR, 0, MPI_COMM_WORLD);
 
-    if(!SubParams.SubhaloFinderOn) {
-        /* unused while off; keep the conversion defined */
-        SubParams.SubhaloCollectiveMinPart = 0;
-        SubParams.SubhaloLookupBatchBytes = 64L * 1024L * 1024L;
-        return;
+    const int on = SubParams.SubhaloFinderOn;
+    if(on) {
+        if(checks[0] != 1)
+            endrun(1, "SubhaloFinderOn = 1 requires SnapshotWithFOF = 1 (the finder runs at every PART/PIG output).\n");
+        if(checks[1] != 1)
+            endrun(1, "SubhaloFinderOn = 1 requires FOFSaveParticles = 1 (the PIG particle blocks are the finder's restart state).\n");
     }
-    if(checks[0] != 1)
-        endrun(1, "SubhaloFinderOn = 1 requires SnapshotWithFOF = 1 (the finder runs at every PART/PIG output).\n");
-    if(checks[1] != 1)
-        endrun(1, "SubhaloFinderOn = 1 requires FOFSaveParticles = 1 (the PIG particle blocks are the finder's restart state).\n");
-    SubParams.SubhaloCollectiveMinPart = subhalo_int_param(raw[0], "SubhaloCollectiveMinPart");
-    SubParams.SubhaloLookupBatchBytes = subhalo_int_param(raw[1], "SubhaloLookupBatchBytes");
+    /* unused while off: the defaults keep the conversion defined */
+    for(k = 0; k < SUBHALO_NPARAMS; k++) {
+        const struct SubhaloParamDesc * d = &SubhaloParamTable[k];
+        if(d->kind == SUBPAR_COUNT)
+            *(int64_t *) ((char *) &SubParams + d->offset) = on ? subhalo_int_param(raw[k], d->name) : (int64_t) d->def;
+    }
+    if(!on)
+        return;
     subhalo_validate_params(&SubParams);
     subhalo_set_arena_bytes(&SubParams);
 }
@@ -268,6 +325,31 @@ subhalo_set_testpar(struct SubhaloParams params)
         subhalo_validate_params(&params);
     SubParams = params;
     subhalo_set_arena_bytes(&SubParams);
+}
+
+/* Provenance only (a restart uses the supplied parameter file): every parameter in table order,
+ * doubles %.17g, the SUBPAR_ADMIT ones last. */
+void
+subhalo_format_params(char * buf, size_t size)
+{
+    const struct SubhaloParams * sp = subhalo_get_params();
+    int last, k;
+    buf[0] = '\0';
+    for(last = 0; last < 2; last++)
+        for(k = 0; k < SUBHALO_NPARAMS; k++) {
+            const struct SubhaloParamDesc * d = &SubhaloParamTable[k];
+            const int admit = (d->flags & SUBPAR_ADMIT) != 0;
+            if(admit != last || (admit && !(sp->SubhaloAdmitShare > 0 && subhalo_param_value(d, sp) > 0)))
+                continue;
+            const size_t len = strlen(buf);
+            const char * m = (const char *) sp + d->offset;
+            if(d->kind == SUBPAR_INT)
+                snprintf(buf + len, size - len, "%s = %d\n", d->name, *(const int *) m);
+            else if(d->kind == SUBPAR_COUNT)
+                snprintf(buf + len, size - len, "%s = %ld\n", d->name, *(const int64_t *) m);
+            else
+                snprintf(buf + len, size - len, "%s = %.17g\n", d->name, *(const double *) m);
+        }
 }
 
 void

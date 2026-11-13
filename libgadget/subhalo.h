@@ -23,46 +23,50 @@
 
 /* ------------------------------------------------------------------ parameters (design 10) */
 
+/* One member per Subhalo* parameter; name, default, range and help are in the table
+ * SubhaloParamTable of subhalo.c, which declares, reads, checks and prints them. */
 struct SubhaloParams {
     int    SubhaloFinderOn;              /* master switch; requires SnapshotWithFOF=1 and FOFSaveParticles=1 */
-    double SubhaloMaxGatherFraction;     /* 0.5: fraction of (MaxPart - staying) a rank may receive */
+    double SubhaloMaxGatherFraction;     /* fraction of (MaxPart - staying) a rank may receive */
     int64_t SubhaloCollectiveMinPart;    /* 0 = off; testing: keys above this are processed in place */
-    int    SubhaloMaxUnbindIterations;   /* 50 */
+    int    SubhaloMaxUnbindIterations;
     int    SubhaloRestartFresh;          /* 1 allows an empty table when no complete state is found */
-    int    SubhaloTracerTypes;           /* bitmask, default 2+16 */
-    int    SubhaloPotentialTypes;        /* bitmask, default 1+2+16+32 */
-    int    SubhaloMinNumPart;            /* 20 */
-    int    SubhaloMinNumTracerPart;      /* 10 */
-    int    SubhaloNumTracerHostFinding;  /* 10 */
-    int    SubhaloOrphanTracers;         /* 10: particles an orphan follows (1 = its MostBoundID alone, as HBT) */
-    int64_t SubhaloLookupBatchBytes;     /* 64 MB */
-    double SubhaloMajorProgenitorMassRatio; /* 0.8 */
-    double SubhaloBoundMassPrecision;    /* 0.995 */
-    double SubhaloSourceRelaxFactor;     /* 3 */
-    int    SubhaloPotentialSampleSize;   /* 1000 */
-    int    SubhaloFinalPass;             /* 0 (default) = sampled with an exact head, as HBT; 1 = exact */
-    double SubhaloTreeOpenAngle;         /* 0.45 */
-    int    SubhaloMergeTrapped;          /* 1 */
-    int    SubhaloSinkSymmetric;         /* 0 */
-    int    SubhaloCoreSize;              /* 20 */
-    int    SubhaloReassignGas;           /* 1 */
-    int    SubhaloNumNeighboursForReassignment; /* 10 (HBT NumNeighboursForReassignment) */
+    int    SubhaloTracerTypes;           /* bitmask */
+    int    SubhaloPotentialTypes;        /* bitmask */
+    int    SubhaloMinNumPart;
+    int    SubhaloMinNumTracerPart;
+    int    SubhaloNumTracerHostFinding;
+    int    SubhaloOrphanTracers;         /* particles an orphan follows (1 = its MostBoundID alone, as HBT) */
+    int64_t SubhaloLookupBatchBytes;
+    double SubhaloMajorProgenitorMassRatio;
+    double SubhaloBoundMassPrecision;
+    double SubhaloSourceRelaxFactor;
+    int    SubhaloPotentialSampleSize;
+    int    SubhaloFinalPass;             /* 0 = sampled with an exact head, as HBT; 1 = exact */
+    double SubhaloTreeOpenAngle;
+    int    SubhaloMergeTrapped;
+    int    SubhaloSinkSymmetric;
+    int    SubhaloCoreSize;
+    int    SubhaloReassignGas;
+    int    SubhaloNumNeighboursForReassignment; /* HBT NumNeighboursForReassignment */
     double SubhaloAdmitShare;            /* 0 = off: share of the k nearest tracers bound to a satellite that admits an ancestor's particle to its source */
     double SubhaloAdmitMinCoreDistance;  /* 0 = off: no admission to a satellite whose previous core is nearer its owner's than this sinking-test distance */
-    int    SubhaloUnbindWithThermal;     /* 0 */
-    int    SubhaloFieldSO;               /* 1 */
-    int    SubhaloSOBins;                /* 64 */
-    double SubhaloSOSearchFactor;        /* 2 */
-    int    SubhaloSOMaxDoublings;        /* 3 */
-    int    SubhaloSORefineMinPart;       /* 1000 */
-    double SubhaloMajorMergerRatio;      /* 0.3 */
-    int    SubhaloGeometricParents;      /* 0 */
+    int    SubhaloUnbindWithThermal;
+    int    SubhaloFieldSO;
+    int    SubhaloSOBins;
+    double SubhaloSOSearchFactor;
+    int    SubhaloSOMaxDoublings;
+    int    SubhaloSORefineMinPart;
+    double SubhaloMajorMergerRatio;
+    int    SubhaloGeometricParents;
     /* Debug: 1 sends every serial key to rank 0, to exercise the exchange failure path (design 7.3). */
     int    SubhaloDebugForceExchangeFailure;
 };
 
-/* Read the parameters on rank 0 and broadcast; endrun if SubhaloFinderOn lacks SnapshotWithFOF
- * or FOFSaveParticles. */
+/* Declare every Subhalo* parameter (name, default, help) in the run's parameter set. */
+void subhalo_declare_params(ParameterSet * ps);
+/* Read the parameters on rank 0 and broadcast; with the finder on, endrun if it lacks
+ * SnapshotWithFOF or FOFSaveParticles or a value is outside its range. */
 void set_subhalo_params(ParameterSet * ps);
 /* Test helper: set the parameters without a ParameterSet, validated like the parameter file. */
 void subhalo_set_testpar(struct SubhaloParams params);

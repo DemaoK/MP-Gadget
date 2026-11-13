@@ -110,10 +110,8 @@ subhalo_register_particle_blocks(struct IOTable * IOTable)
 
 /* ------------------------------------------------------------------ table columns (Appendix B) */
 
-/* The track columns, one line each: X(name, dtype, items, tables, schema). The name is both the
- * struct SubTrack member and the block name; tables says which of Subhalo/ and Orphan/ hold it;
- * schema is the version that introduced it. Each table registers its columns in this order.
- * tools/subhalo_reader.py keeps its own list of these columns and must follow this one. */
+/* The track columns X(name, dtype, items, tables, schema) in registration order: name is the SubTrack
+ * member and the block, schema the version that added it. tools/subhalo_reader.py lists the same. */
 #define SUBTRACK_COLUMNS(X) \
     /* group A links and snapshots, and group E: both tables */ \
     X(TrackId,                i8, 1,                  SUBCOL_BOTH, 1) \
@@ -583,64 +581,6 @@ subhalo_write_tables(BigFile * bf, MPI_Comm Comm)
 }
 
 /* ------------------------------------------------------------------ header and marker */
-
-/* Provenance only (a restart uses the supplied parameter file): every parameter, doubles %.17g. */
-void
-subhalo_format_params(char * buf, size_t size)
-{
-    const struct SubhaloParams * sp = subhalo_get_params();
-    snprintf(buf, size,
-        "SubhaloFinderOn = %d\n"
-        "SubhaloMaxGatherFraction = %.17g\n"
-        "SubhaloCollectiveMinPart = %ld\n"
-        "SubhaloMaxUnbindIterations = %d\n"
-        "SubhaloRestartFresh = %d\n"
-        "SubhaloTracerTypes = %d\n"
-        "SubhaloPotentialTypes = %d\n"
-        "SubhaloMinNumPart = %d\n"
-        "SubhaloMinNumTracerPart = %d\n"
-        "SubhaloNumTracerHostFinding = %d\n"
-        "SubhaloOrphanTracers = %d\n"
-        "SubhaloLookupBatchBytes = %ld\n"
-        "SubhaloMajorProgenitorMassRatio = %.17g\n"
-        "SubhaloBoundMassPrecision = %.17g\n"
-        "SubhaloSourceRelaxFactor = %.17g\n"
-        "SubhaloPotentialSampleSize = %d\n"
-        "SubhaloFinalPass = %d\n"
-        "SubhaloTreeOpenAngle = %.17g\n"
-        "SubhaloMergeTrapped = %d\n"
-        "SubhaloSinkSymmetric = %d\n"
-        "SubhaloCoreSize = %d\n"
-        "SubhaloReassignGas = %d\n"
-        "SubhaloNumNeighboursForReassignment = %d\n"
-        "SubhaloUnbindWithThermal = %d\n"
-        "SubhaloFieldSO = %d\n"
-        "SubhaloSOBins = %d\n"
-        "SubhaloSOSearchFactor = %.17g\n"
-        "SubhaloSOMaxDoublings = %d\n"
-        "SubhaloSORefineMinPart = %d\n"
-        "SubhaloMajorMergerRatio = %.17g\n"
-        "SubhaloGeometricParents = %d\n"
-        "SubhaloDebugForceExchangeFailure = %d\n",
-        sp->SubhaloFinderOn, sp->SubhaloMaxGatherFraction, sp->SubhaloCollectiveMinPart,
-        sp->SubhaloMaxUnbindIterations, sp->SubhaloRestartFresh, sp->SubhaloTracerTypes,
-        sp->SubhaloPotentialTypes, sp->SubhaloMinNumPart, sp->SubhaloMinNumTracerPart,
-        sp->SubhaloNumTracerHostFinding, sp->SubhaloOrphanTracers, sp->SubhaloLookupBatchBytes,
-        sp->SubhaloMajorProgenitorMassRatio, sp->SubhaloBoundMassPrecision,
-        sp->SubhaloSourceRelaxFactor, sp->SubhaloPotentialSampleSize, sp->SubhaloFinalPass, sp->SubhaloTreeOpenAngle,
-        sp->SubhaloMergeTrapped, sp->SubhaloSinkSymmetric, sp->SubhaloCoreSize,
-        sp->SubhaloReassignGas, sp->SubhaloNumNeighboursForReassignment, sp->SubhaloUnbindWithThermal, sp->SubhaloFieldSO,
-        sp->SubhaloSOBins, sp->SubhaloSOSearchFactor, sp->SubhaloSOMaxDoublings,
-        sp->SubhaloSORefineMinPart, sp->SubhaloMajorMergerRatio, sp->SubhaloGeometricParents,
-        sp->SubhaloDebugForceExchangeFailure);
-    /* written only when the admission is on, so the header of a run without it is unchanged */
-    const size_t len = strlen(buf);
-    if(sp->SubhaloAdmitShare > 0 && len < size)
-        snprintf(buf + len, size - len, "SubhaloAdmitShare = %.17g\n", sp->SubhaloAdmitShare);
-    const size_t len2 = strlen(buf);
-    if(sp->SubhaloAdmitShare > 0 && sp->SubhaloAdmitMinCoreDistance > 0 && len2 < size)
-        snprintf(buf + len2, size - len2, "SubhaloAdmitMinCoreDistance = %.17g\n", sp->SubhaloAdmitMinCoreDistance);
-}
 
 void
 subhalo_write_header_attrs(BigBlock * bh, const struct part_manager_type * pman, double atime, MPI_Comm Comm)

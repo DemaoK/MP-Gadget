@@ -127,7 +127,7 @@ double subhalo_vel_to_kms(double atime);
  * ballot order), ties to the smaller; SUBHALO_NOTRACK if there is none. top and second (NULL
  * allowed) get the winning and the runner-up sums (0 if absent). n <= SUBHALO_MAXTRACERS. */
 int64_t subhalo_weighted_plurality(const int64_t * cand, const double * w, int n, double * top, double * second);
-/* 1 if SubhaloAdmitMinCoreDistance = MinD is finite and not negative. */
+/* 1 if SubhaloAdmitMinCoreDistance = MinD is inside its range (finite, not negative). */
 int subhalo_admit_distance_valid(double MinD);
 
 /* The run's ImportBufferBoost (2, the parameter's default, until set_subhalo_params reads it), which

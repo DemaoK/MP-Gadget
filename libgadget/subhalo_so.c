@@ -35,8 +35,6 @@
 /* definitions with per-type masses: vir (SO slot 0) and 200c (SO slot 2) */
 #define SO_DEF_VIR 0
 #define SO_DEF_200C 2
-#define SO_MINBINS 8
-#define SO_MAXBINS 256
 /* pass 1 halves its bins down to this many when the treewalk reserve does not fit */
 #define SO_SHRINKBINS 16
 /* allocator slack on top of the computed requirements */
@@ -993,12 +991,8 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
                       double * Rsearch, struct SubhaloSOStats * stats, MPI_Comm Comm)
 {
     const double tstart = MPI_Wtime();
+    /* the SO parameters' ranges are checked at start-up (subhalo_validate_params) */
     const int NBpar = par->SubhaloSOBins;
-    if(NBpar < SO_MINBINS || NBpar > SO_MAXBINS)
-        endrun(1, "SubhaloSOBins = %d must be in [%d, %d].\n", NBpar, SO_MINBINS, SO_MAXBINS);
-    if(!(par->SubhaloSOSearchFactor > 0) || par->SubhaloSOMaxDoublings < 0 || par->SubhaloSOMaxDoublings > 60)
-        endrun(1, "SubhaloSOSearchFactor = %g must be positive and SubhaloSOMaxDoublings = %d in [0, 60].\n",
-               par->SubhaloSOSearchFactor, par->SubhaloSOMaxDoublings);
     double rho[SUBHALO_NSO];
     int d, t;
     if(rho_in)
