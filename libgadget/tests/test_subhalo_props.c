@@ -1557,6 +1557,66 @@ test_aperture_boundaries(void ** state)
     }
 }
 
+/* RsKlypin of the serial Rockstar properties for two particles of mass 0.75 at 0.5 from the centre
+ * (Mvir 1.5, best 3, rbest 0.5, all exact) and the virial threshold rho0. */
+static float
+klypin_serial(double rho0)
+{
+    double rho[SUBHALO_NSO];
+    int s;
+    for(s = 0; s < SUBHALO_NSO; s++)
+        rho[s] = rho0;
+    place(0, 0.5, 0, 0.75, 1);
+    place(1, 0.5, 1, 0.75, 2);
+    int64_t Index[2];
+    double Energy[2];
+    struct SubTrack rec;
+    run_props(2, Centre, rho, &rec, Index, Energy);
+    assert_true(rec.MBoundSO[0] == 1.5f && rec.RmaxVir == 0.5f);
+    return rec.RsKlypin;
+}
+
+/* The in-place path's evaluation: subhalo_klypin_rs on the serial inputs, Rvir as the serial path
+ * writes it. */
+static float
+klypin_inplace(double rho0)
+{
+    const double Mvir = 1.5;
+    return (float) subhalo_klypin_rs(cbrt(3 * Mvir / (4 * M_PI * rho0)), Mvir, 3, 0.5);
+}
+
+/* One compiled Klypin Rs on both paths: about a flip of the serial float (bisected in rho0, where
+ * the operand order of f decides the rounding) the serial and the in-place values agree. */
+static void
+test_klypin_paths(void ** state)
+{
+    setup_pman(2);
+    double lo = 0.358, hi = 0.358 * (1 + 1e-6);
+    const float flo = klypin_serial(lo);
+    assert_true(klypin_serial(hi) != flo);
+    while(nextafter(lo, hi) < hi) {
+        double mid = 0.5 * (lo + hi);
+        if(!(mid > lo && mid < hi))
+            mid = nextafter(lo, hi);
+        if(klypin_serial(mid) == flo)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    int64_t k, bad = 0;
+    double x = lo;
+    for(k = 0; k < 256; k++)
+        x = nextafter(x, 0);
+    for(k = 0; k < 513; k++, x = nextafter(x, 1)) {
+        const float s = klypin_serial(x), p = klypin_inplace(x);
+        if(s != p && bad++ < 3)
+            message(1, "Klypin Rs at rho0 %.17g: serial %.9g, in place %.9g\n", x, s, p);
+    }
+    message(0, "Klypin Rs: serial flip at rho0 %.17g (%.9g), %ld of 513 values about it differ by path\n", lo, flo, bad);
+    assert_int_equal(bad, 0);
+    teardown_pman();
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_thresholds),
@@ -1570,6 +1630,7 @@ int main(void) {
         cmocka_unit_test(test_units),
         cmocka_unit_test(test_nfw_bin_edges),
         cmocka_unit_test(test_aperture_boundaries),
+        cmocka_unit_test(test_klypin_paths),
     };
     return cmocka_run_group_tests_mpi(tests, NULL, NULL);
 }

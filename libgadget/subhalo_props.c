@@ -504,7 +504,9 @@ subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c, con
  * Rockstar's NFW fit (nfw.c:51-144), core/bulk velocities and Vrms (properties.c) on the bound virial
  * aperture; the bin and fit helpers are shared with the distributed version in subhalo_collective.c. */
 
-double
+/* Out of line and unspecialised: every caller runs this one compiled evaluation, so -ffast-math cannot
+ * reorder f differently at an inlined call site and give the paths different RsKlypin. */
+double __attribute__((noinline, noclone))
 subhalo_klypin_rs(double Rvir, double Mvir, double best, double rbest)
 {
     if(!(best > 0) || !(Mvir > 0) || !(Rvir > 0))
