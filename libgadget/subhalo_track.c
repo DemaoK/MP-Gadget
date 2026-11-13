@@ -20,6 +20,7 @@
 #include "subhalo.h"
 #include "subhalo_internal.h"
 #include "subhalo_unbind.h"
+#include "subhalo_props.h"
 
 static int
 cmp_member_trackid(const void * a, const void * b)
@@ -1384,7 +1385,7 @@ key_final_pass(struct KeyRun * K)
     struct SubhaloArena * arena = K->arena;
     const int CoreSize = K->sp->SubhaloCoreSize;
     const double vu = subhalo_vel_to_kms(1.0);   /* the unit factor: subhalo_props_hbt divides by a only */
-    int v, d, nalive = 0;
+    int v, nalive = 0;
     for(v = 0; v < K->nn; v++) {
         struct SubNode * x = &K->nd[v];
         if(x->state != SUBHALO_ST_ALIVE)
@@ -1404,15 +1405,7 @@ key_final_pass(struct KeyRun * K)
         subhalo_props_baryons(rec, &x->c, ctx->MetalReturnOn);
         x->c.Energy = NULL;
         arena->used = mark;
-        for(d = 0; d < 3; d++) {
-            rec->CoreVel[d] *= vu;
-            rec->MostBoundVel[d] *= vu;
-            rec->CoMVel[d] *= vu;
-        }
-        rec->CoreSigmaV *= vu;
-        rec->Vmax *= vu;
-        rec->Ekin *= vu * vu;
-        rec->Epot *= vu * vu;
+        subhalo_finish_kms(rec, vu);
     }
     K->nalive = nalive;
 }
