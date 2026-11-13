@@ -734,11 +734,27 @@ admit_choice(const int64_t * row, int64_t self, int kk, int A, const struct Subh
     return (int) subhalo_admit_choice(btid, kk, A, need, at);
 }
 
-/* The admitted particles (owner map entries -2 - receiver) grouped by receiver in key order
- * (adm_off, adm_n); the owner map becomes the admission map (receiver, -1 otherwise). */
-static int32_t *
-admit_lists(int32_t * owner, struct SubNode * nd, int nn, int64_t n, int64_t nadm, struct SubhaloArena * arena, int64_t g)
+/* A serial key as its admission sees it: the owner map of its particles P[start, start + n), its
+ * nodes and its central's node; filled by the admission: the admitted particles grouped by receiver
+ * (admlist, at the receivers' adm_off, adm_n) and the votes withheld near their owner's core. */
+struct AdmitKey {
+    int32_t * owner;
+    struct SubNode * nd;
+    int nn, ci;
+    int64_t g, start, n;
+    int32_t * admlist;
+    int64_t nwithheld;
+};
+
+/* The admitted particles (owner map entries -2 - receiver) grouped by receiver in key order into
+ * ak->admlist (adm_off, adm_n); the owner map becomes the admission map (receiver, -1 otherwise). */
+static void
+admit_lists(struct AdmitKey * ak, int64_t nadm, struct SubhaloArena * arena)
 {
+    int32_t * owner = ak->owner;
+    struct SubNode * nd = ak->nd;
+    const int nn = ak->nn;
+    const int64_t n = ak->n;
     int64_t i, o = 0;
     int v;
     for(i = 0; i < n; i++)
@@ -749,7 +765,7 @@ admit_lists(int32_t * owner, struct SubNode * nd, int nn, int64_t n, int64_t nad
         o += nd[v].adm_n;
         nd[v].adm_n = 0;
     }
-    int32_t * al = (int32_t *) arena_need(arena, sizeof(int32_t) * (nadm + 1), g, "admission lists");
+    int32_t * al = (int32_t *) arena_need(arena, sizeof(int32_t) * (nadm + 1), ak->g, "admission lists");
     for(i = 0; i < n; i++) {
         if(owner[i] <= -2) {
             struct SubNode * r = &nd[-2 - owner[i]];
@@ -759,7 +775,7 @@ admit_lists(int32_t * owner, struct SubNode * nd, int nn, int64_t n, int64_t nad
         else
             owner[i] = -1;
     }
-    return al;
+    ak->admlist = al;
 }
 
 static int
@@ -774,13 +790,15 @@ cmp_admitrec_id(const void * a, const void * b)
  * previous call (BoundTrackId, not yet rewritten). Receivers are the resolved members with a previous
  * bound set below the key's root. The vote of a whole key (a group or pseudo-key processed serially);
  * an oversized group's is taken by the plan across ranks (plan_vote). Returns the count; the owner map
- * becomes the admission map and *admlist holds the admitted particles grouped by receiver (adm_off,
- * adm_n), in key order. */
+ * becomes the admission map and ak->admlist holds the admitted particles grouped by receiver
+ * (adm_off, adm_n), in key order. */
 static int64_t
-admit_particles(int32_t * owner, struct SubNode * nd, int nn, int ci, int64_t start, int64_t n, int TracerTypes,
-                const struct SubhaloParams * sp, const struct SubhaloCallCtx * ctx, struct SubhaloArena * arena, int64_t g,
-                int32_t ** admlist, int64_t * nwithheld)
+admit_particles(struct AdmitKey * ak, const struct SubhaloParams * sp, const struct SubhaloCallCtx * ctx, struct SubhaloArena * arena)
 {
+    int32_t * owner = ak->owner;
+    struct SubNode * nd = ak->nd;
+    const int nn = ak->nn, ci = ak->ci, TracerTypes = ctx->TracerTypes;
+    const int64_t g = ak->g, start = ak->start, n = ak->n;
     const int kk = sp->SubhaloNumNeighboursForReassignment;
     const int need = subhalo_admit_need(sp->SubhaloAdmitShare, kk);
     const struct SerialAdmitTree st = {nd, nn, sp->SubhaloAdmitMinCoreDistance, ctx->BoxSize};
@@ -844,14 +862,14 @@ admit_particles(int32_t * owner, struct SubNode * nd, int nn, int ci, int64_t st
                     nadm++;
                 }
                 else if(got[a] == SUBHALO_ADMIT_WITHHELD)
-                    (*nwithheld)++;
+                    ak->nwithheld++;
             nb = 0;
         }
     }
     arena->used = mark;
     if(nadm == 0)
         return 0;
-    *admlist = admit_lists(owner, nd, nn, n, nadm, arena, g);
+    admit_lists(ak, nadm, arena);
     return nadm;
 }
 
@@ -859,9 +877,9 @@ admit_particles(int32_t * owner, struct SubNode * nd, int nn, int ci, int64_t st
  * mark in GrNr and the record of the particle's ID (the key's root receives too, from above it).
  * Marks the owner map as admit_particles does and returns the count. */
 static int64_t
-admit_records(int32_t * owner, struct SubNode * nd, int nn, int64_t start, int64_t n, const struct SubhaloPlan * plan,
-              struct SubhaloArena * arena, int64_t g, int32_t ** admlist)
+admit_records(struct AdmitKey * ak, const struct SubhaloPlan * plan, struct SubhaloArena * arena)
 {
+    const int64_t g = ak->g, start = ak->start, n = ak->n;
     int64_t i, nadm = 0;
     for(i = 0; i < n; i++) {
         const struct particle_data * p = &P[start + i];
@@ -871,16 +889,16 @@ admit_records(int32_t * owner, struct SubNode * nd, int nn, int64_t start, int64
         key.ID = p->ID;
         const struct SubhaloAdmitRec * rec = (const struct SubhaloAdmitRec *)
             bsearch(&key, plan->AdmitRecs, plan->NAdmitRecs, sizeof(struct SubhaloAdmitRec), cmp_admitrec_id);
-        const int r = rec ? node_index(nd, nn, rec->Receiver) : -1;
+        const int r = rec ? node_index(ak->nd, ak->nn, rec->Receiver) : -1;
         if(r < 0)
             endrun(5, "Sub-tree key %ld: offered particle %ld has no record or a receiver %ld outside the key.\n",
                    g, (long) p->ID, rec ? rec->Receiver : -1L);
-        owner[i] = -2 - r;
+        ak->owner[i] = -2 - r;
         nadm++;
     }
     if(nadm == 0)
         return 0;
-    *admlist = admit_lists(owner, nd, nn, n, nadm, arena, g);
+    admit_lists(ak, nadm, arena);
     return nadm;
 }
 
@@ -1072,16 +1090,19 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
     }
     /* admission by neighbour majority; adm then marks the admitted and taken particles (the owner
      * map is not read again) */
-    int32_t * adm = NULL, * admlist = NULL;
+    struct AdmitKey ak = {owner, nd, nn, ci, g, start, n, NULL, 0};
+    int32_t * adm = NULL;
     if(sp->SubhaloAdmitShare > 0) {
         /* a sub-tree key takes its group's vote, taken across ranks by the plan */
         if(subkey)
-            ks.NAdmitted = admit_records(owner, nd, nn, start, n, ctx->plan, arena, g, &admlist);
+            ks.NAdmitted = admit_records(&ak, ctx->plan, arena);
         else
-            ks.NAdmitted = admit_particles(owner, nd, nn, ci, start, n, TracerTypes, sp, ctx, arena, g, &admlist, &ks.NAdmitWithheld);
+            ks.NAdmitted = admit_particles(&ak, sp, ctx, arena);
+        ks.NAdmitWithheld += ak.nwithheld;
         if(ks.NAdmitted > 0)
             adm = owner;
     }
+    const int32_t * admlist = ak.admlist;
 
     /* ---- d: post-order unbinding with the remainder passed up, sinking, re-unbinding
      *      (RecursiveUnbind, subhalo_unbind.cpp:810-842) ---- */
