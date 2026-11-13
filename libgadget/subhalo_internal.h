@@ -510,10 +510,13 @@ static inline int64_t subhalo_particle_key(const struct particle_data * p) {
 /* GrNr = -1 again for every field particle and the group number again for the group particles
  * of the serial sub-tree keys (after the serial keys, and on the failure path). */
 void subhalo_restore_field_grnr(const struct SubhaloPlan * plan);
-/* Step 4: the exchange. Returns this rank's failure flag (not reduced). Collective. */
-int subhalo_plan_exchange(struct SubhaloPlan * plan, MPI_Comm Comm);
 /* Frees what subhalo_plan_build allocated (reverse order). */
 void subhalo_plan_free(struct SubhaloPlan * plan);
+
+/* ------------------------------------------------------------------ serial keys (subhalo_serial.c) */
+
+/* Step 4: the exchange. Returns this rank's failure flag (not reduced). Collective. */
+int subhalo_plan_exchange(struct SubhaloPlan * plan, MPI_Comm Comm);
 /* Local sort of P by (garbage last, processing key, TrackId, BindRank, ID). */
 void subhalo_local_sort(void);
 /* An order-preserving threaded selection over P[0 .. N): COUNT_CHUNKS fills off[c + 1]

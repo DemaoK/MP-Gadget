@@ -82,4 +82,25 @@ void subhalo_plan_pack(struct SubhaloDirKey * dk, int64_t ndir, const struct Sub
                        const struct SubhaloPlanRes * res, const struct SubhaloPlanCfg * cfg,
                        struct SubhaloPlanStats * stats, MPI_Comm Comm);
 
+/* Orders of int64 lists and of the plan's key tables by g (qsort, bsearch), shared by the plan
+ * (subhalo_gather.c) and the serial side (subhalo_serial.c). */
+static inline int
+cmp_int64(const void * a, const void * b)
+{
+    const int64_t x = *(const int64_t *) a, y = *(const int64_t *) b;
+    return (x > y) - (x < y);
+}
+static inline int
+cmp_assigned_g(const void * a, const void * b)
+{
+    const int64_t x = ((const struct SubhaloAssignedKey *) a)->g, y = ((const struct SubhaloAssignedKey *) b)->g;
+    return (x > y) - (x < y);
+}
+static inline int
+cmp_inplace_g(const void * a, const void * b)
+{
+    const int64_t x = ((const struct SubhaloInplaceKey *) a)->g, y = ((const struct SubhaloInplaceKey *) b)->g;
+    return (x > y) - (x < y);
+}
+
 #endif
