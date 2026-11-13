@@ -1612,11 +1612,11 @@ scaled_offset(double dist, double sigma)
     return dist > 0 ? 1e300 : 0;
 }
 
-int
-subhalo_sink_test(const double sPos[3], const double sVel[3], const double aPos[3], const double aVel[3],
-                  double aSigmaX, double aSigmaV, double sSigmaX, double sSigmaV, int symmetric, double BoxSize)
+double __attribute__((noinline))
+subhalo_core_distance(const double sPos[3], const double sVel[3], const double aPos[3], const double aVel[3],
+                      double aSigmaX, double aSigmaV, double BoxSize)
 {
-    /* PhaseSpaceDistance / AreOverlappingInPhaseSpace, subhalo_merge.cpp:13-26 */
+    /* PhaseSpaceDistance, subhalo_merge.cpp:13-20 */
     double dx2 = 0, dv2 = 0;
     int d;
     for(d = 0; d < 3; d++) {
@@ -1625,10 +1625,17 @@ subhalo_sink_test(const double sPos[3], const double sVel[3], const double aPos[
         dx2 += dx * dx;
         dv2 += dv * dv;
     }
-    const double dx = sqrt(dx2), dv = sqrt(dv2);
-    double D = scaled_offset(dx, aSigmaX) + scaled_offset(dv, aSigmaV);
+    return scaled_offset(sqrt(dx2), aSigmaX) + scaled_offset(sqrt(dv2), aSigmaV);
+}
+
+int
+subhalo_sink_test(const double sPos[3], const double sVel[3], const double aPos[3], const double aVel[3],
+                  double aSigmaX, double aSigmaV, double sSigmaX, double sSigmaV, int symmetric, double BoxSize)
+{
+    /* AreOverlappingInPhaseSpace, subhalo_merge.cpp:21-26 */
+    double D = subhalo_core_distance(sPos, sVel, aPos, aVel, aSigmaX, aSigmaV, BoxSize);
     if(symmetric) {
-        const double Ds = scaled_offset(dx, sSigmaX) + scaled_offset(dv, sSigmaV);
+        const double Ds = subhalo_core_distance(sPos, sVel, aPos, aVel, sSigmaX, sSigmaV, BoxSize);
         if(Ds < D)
             D = Ds;
     }

@@ -124,6 +124,11 @@ int64_t subhalo_final_pass(struct SubCandidate * c, const struct SubhaloUnbindPa
 void subhalo_core(const struct SubCandidate * c, const struct SubhaloUnbindParams * up, int CoreSize,
                   double CorePos[3], double CoreVel[3], double * SigmaX, double * SigmaV);
 
+/* The sinking test's phase-space distance of core s from core a in a's dispersions,
+ * |dx| / aSigmaX + |dv| / aSigmaV (periodic minimum image); one compiled copy for every caller. */
+double subhalo_core_distance(const double sPos[3], const double sVel[3], const double aPos[3], const double aVel[3],
+                             double aSigmaX, double aSigmaV, double BoxSize);
+
 /* HBT sinking test of satellite s against ancestor a using the cores above
  * (|dx| / SigmaX_a + |dv| / SigmaV_a < 2, or the symmetric form when symmetric != 0). */
 int subhalo_sink_test(const double sPos[3], const double sVel[3], const double aPos[3], const double aVel[3],
