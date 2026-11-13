@@ -3656,10 +3656,20 @@ av_gather(int source, int64_t * n)
 static struct FailSnap AvPre = {NULL, 0};
 static struct SubhaloCallStats AvStats;
 static struct SubhaloVoteStats AvVote;
-/* SubhaloAdmitMinCoreDistance of av_run, and AvNear: the stored cores of A, B, C, D far apart
- * (dispersions 1/16 and 1/2) but B's at 0.25 and 3.99 from A's, D(B, A) = 11.98 (else syn_rec's) */
+/* SubhaloAdmitMinCoreDistance of av_run; AvNear 1 (3): B's (D's) stored core at 11.98 from A's (B's),
+ * all others far apart; 0: syn_rec's cores */
 static double AvMinD = 0;
 static int AvNear = 0;
+
+/* st_particle, with A's ten least bound particles inside D's ball (A-owned offers to D) */
+static void
+av_particle(MyIDType id, double atime, struct SynPart * s, void * ud)
+{
+    const double cD[3] = {500 + 6.2 / atime, 500, 500}, vD[3] = {0, 44, 0};
+    st_particle(id, atime, s, ud);
+    if(id >= ST_B0 - 10 && id < ST_B0)
+        syn_ball(id, 56, cD, 0.3, vD, 3, atime, s);
+}
 
 static void
 av_run(int64_t collective, double share, int k, struct Outcome * o)
@@ -3681,19 +3691,19 @@ av_run(int64_t collective, double share, int k, struct Outcome * o)
     recs[2] = syn_rec(2, 200, 0.02, 0, 0, 2, 1);
     recs[3] = syn_rec(3, 100, 0.01, 1, 0, 3, 2);
     if(AvNear) {
-        const double x[4] = {100, 100.25, 200, 300};
+        const double x1[4] = {100, 100.25, 200, 300}, x3[4] = {100, 200, 300, 200.25};
         int t;
         for(t = 0; t < 4; t++) {
-            recs[t].CorePos[0] = x[t];
+            recs[t].CorePos[0] = AvNear == 1 ? x1[t] : x3[t];
             recs[t].CorePos[1] = recs[t].CorePos[2] = 100;
             recs[t].CoreVel[0] = recs[t].CoreVel[2] = 0;
-            recs[t].CoreVel[1] = t == 1 ? 3.99f : 0;
-            recs[t].CoreSigmaX = t == 1 ? 1.0f : 0.0625f;
-            recs[t].CoreSigmaV = t == 1 ? 8.0f : 0.5f;
+            recs[t].CoreVel[1] = t == AvNear ? 3.99f : 0;
+            recs[t].CoreSigmaX = t == AvNear ? 1.0f : 0.0625f;
+            recs[t].CoreSigmaV = t == AvNear ? 8.0f : 0.5f;
         }
     }
     syn_records(recs, 4);
-    syn_place(st_particle, NULL, 0.55, 1);
+    syn_place(AvNear == 3 ? av_particle : st_particle, NULL, 0.55, 1);
     AvN = 0;
     subhalo_set_admit_hook(av_hook);
     int64_t ng;
@@ -3827,17 +3837,37 @@ av_case(double share, int k, int need)
     free(ser);
 }
 
-/* B's stored core at 11.98 from A's (B's only ancestor) with SubhaloAdmitMinCoreDistance = 12: every
- * offer to B of the vote at distance 0 is withheld and the others stand, alike in the serial key's
- * vote and the plan's, with equal withheld counters. */
-static void
-av_withheld_case(void)
+/* The owner of particle ID before the last av_run call: its member's track, else A. */
+static int64_t
+av_owner(MyIDType ID)
 {
-    int64_t n0, ns, np, i, bad = 0, toB = 0;
-    AvNear = 1;
+    int64_t i;
+    for(i = 0; i < AvPre.n; i++)
+        if(AvPre.r[i].ID == ID)
+            return AvPre.r[i].TrackId >= 1 && AvPre.r[i].TrackId <= 3 ? AvPre.r[i].TrackId : 0;
+    return -1;
+}
+
+/* At SubhaloAdmitMinCoreDistance = 12 the offers of the distance 0 to the near receiver from the
+ * owner it is near are withheld and the others stand, alike in the serial and the plan's vote. */
+static void
+av_withheld_case(int near)
+{
+    /* near 1: B below A; near 3: D below B below A, D(D, B) < 12 < D(D, A), D(B, A) > 12 */
+    const int64_t wr = near, wo = near == 1 ? 0 : 1;
+    int64_t n0, ns, np, i, bad = 0, toB = 0, fromA = 0;
+    AvNear = near;
     AvMinD = 0;
     av_run(0, 0.5, 0, NULL);
     struct AdmPair * all = av_gather(SUBHALO_ADMIT_KEY, &n0);
+    char * wh = calloc(n0 + 1, 1);
+    for(i = 0; i < n0; i++)
+        if(all[i].Receiver == wr) {
+            const int64_t o = av_owner(all[i].ID);
+            wh[i] = o == wo;
+            toB += o == wo;
+            fromA += o == 0 && near == 3;
+        }
     AvMinD = 12;
     av_run(0, 0.5, 0, NULL);
     struct AdmPair * ser = av_gather(SUBHALO_ADMIT_KEY, &ns);
@@ -3845,11 +3875,9 @@ av_withheld_case(void)
     av_run(1000, 0.5, 0, NULL);
     struct AdmPair * pl = av_gather(SUBHALO_ADMIT_PLAN, &np);
     const int64_t wp = AvStats.NAdmitWithheld, wv = AvVote.NWithheld;
-    for(i = 0; i < n0; i++)
-        toB += all[i].Receiver == 1;
     int64_t j = 0;
     for(i = 0; i < n0; i++)
-        if(all[i].Receiver != 1) {
+        if(!wh[i]) {
             LOCAL_CHECK(bad, j < ns && ser[j].ID == all[i].ID && ser[j].Receiver == all[i].Receiver,
                         "admission withheld: pair (%ld, %ld) of the distance 0 missing from the serial vote\n", (long) all[i].ID, all[i].Receiver);
             j++;
@@ -3858,11 +3886,13 @@ av_withheld_case(void)
         LOCAL_CHECK(bad, ser[i].ID == pl[i].ID && ser[i].Receiver == pl[i].Receiver,
                     "admission withheld: pair %ld: serial (%ld, %ld) plan (%ld, %ld)\n", i, (long) ser[i].ID, ser[i].Receiver,
                     (long) pl[i].ID, pl[i].Receiver);
-    message(0, "admission withheld: %ld pairs at distance 0 (%ld to B); at 12 %ld from the serial key, %ld from the plan's vote; withheld "
-               "%ld serial, %ld plan (%ld by the vote); %ld mismatches\n", n0, toB, ns, np, ws, wp, wv, bad);
-    CHECK(toB > 0 && n0 > toB && ns == n0 - toB && np == ns && bad == 0 && ws == toB && wp == ws && wv == ws,
-          "admission withheld: %ld pairs (%ld to B), %ld serial, %ld plan, withheld %ld / %ld / %ld, %ld mismatches\n", n0, toB, ns, np, ws, wp,
-          wv, bad);
+    message(0, "admission withheld, near %d: %ld pairs at distance 0 (%ld to withhold, %ld of A to D); at 12 %ld from the serial key, %ld "
+               "from the plan's vote; withheld %ld serial, %ld plan (%ld by the vote); %ld mismatches\n", near, n0, toB, fromA, ns, np, ws, wp,
+            wv, bad);
+    CHECK(toB > 0 && n0 > toB && ns == n0 - toB && np == ns && bad == 0 && ws == toB && wp == ws && wv == ws && (near == 1 || fromA > 0),
+          "admission withheld, near %d: %ld pairs (%ld to withhold, %ld of A to D), %ld serial, %ld plan, withheld %ld / %ld / %ld, "
+          "%ld mismatches\n", near, n0, toB, fromA, ns, np, ws, wp, wv, bad);
+    free(wh);
     AvNear = 0;
     AvMinD = 0;
     free(pl);
@@ -3875,7 +3905,8 @@ test_collective_vote_identity(void ** state)
 {
     av_case(0.5, 0, 5);
     av_case(0.3, 7, 3);
-    av_withheld_case();
+    av_withheld_case(1);
+    av_withheld_case(3);
     free(AvPre.r);
     AvPre.r = NULL;
     free(AvPairs);

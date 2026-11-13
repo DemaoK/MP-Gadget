@@ -5114,6 +5114,7 @@ struct AdUd {
     int nh;             /* AD_SMALL: H's tracers */
     double minD;        /* SubhaloAdmitMinCoreDistance */
     const struct AdCore * core;   /* the stored cores of the records H, S, S2; NULL: syn_rec's */
+    int sym;            /* SubhaloSinkSymmetric */
 };
 
 /* A previous record's sinking core (CorePos, CoreVel, CoreSigmaX, CoreSigmaV). */
@@ -5373,6 +5374,7 @@ ad_run(const struct AdUd * ud, double share, int T, struct AdOut * out)
     struct SubhaloParams sp = default_subhalo_params();
     sp.SubhaloAdmitShare = share;
     sp.SubhaloAdmitMinCoreDistance = ud->minD;
+    sp.SubhaloSinkSymmetric = ud->sym;
     sp.SubhaloNumNeighboursForReassignment = ad_k(ud);
     /* concentric satellites, and S at rest in H, stay apart */
     if((ud->mode & (AD_NESTED | AD_SIBLING | AD_REST)) && !(ud->mode & AD_SINK))
@@ -5637,9 +5639,7 @@ test_subhalo_admit_votes(void ** state)
 }
 
 /* ---- the admission withheld near the owner's core (SubhaloAdmitMinCoreDistance) ----
- * The stored cores of the previous records are placed far from the particles (whose frames would give
- * D > 40), so that only the records decide: H at AD_Q with dispersions 1/16 and 1/2, S 0.25 off (4 in
- * H's dispersions) and dv off in velocity, S's own dispersions 1 and 8 (D below 1 in them). */
+ * Stored cores far from the particles' frames (D > 40 there), so that only the records decide. */
 #define AD_Q 100.
 struct AdPair {
     MyIDType ID;
@@ -5695,15 +5695,14 @@ ad_run_hooked(const struct AdUd * ud, double share, struct AdOut * out)
     free(counts);
 }
 
-/* One placement of S's stored core against H's (pos x0 + dx, velocity dv, H's dispersions sx, sv):
- * below 12 S takes nothing and the call equals the rule off, every admitted particle counted withheld;
- * at 12 or above the call equals SubhaloAdmitMinCoreDistance = 0. */
+/* S's stored core at x0 + dx, dv from H's (H's dispersions sx and 1/2, S's 1 and 8): withheld, S takes
+ * nothing and the call equals the rule off; else the call equals the distance 0. */
 static void
-ad_distance_case(double x0, double dx, float dv, float sx, int withhold, const char * what)
+ad_distance_case(double x0, double dx, float dv, float sx, double minD, int sym, int withhold, const char * what)
 {
     const struct AdCore core[2] = {{{x0, AD_Q, AD_Q}, {0, 0, 0}, sx, 0.5f},
                                    {{x0 + dx, AD_Q, AD_Q}, {0, dv, 0}, 1.0f, 8.0f}};
-    struct AdUd ud0 = {.mode = AD_SLOW, .core = core}, ud = {.mode = AD_SLOW, .minD = 12, .core = core};
+    struct AdUd ud0 = {.mode = AD_SLOW, .core = core, .sym = sym}, ud = {.mode = AD_SLOW, .minD = minD, .core = core, .sym = sym};
     struct AdOut off, base, on;
     ad_run(&ud0, 0, 1, &off);
     ad_run(&ud0, 0.5, 1, &base);
@@ -5727,22 +5726,54 @@ ad_distance_case(double x0, double dx, float dv, float sx, int withhold, const c
     ad_free(&on);
 }
 
+/* A tie of A's receivers 1 and 2 (5 votes each, need 5): receiver 1's core near A's, receiver 2's far. */
+static int64_t ad_tie_receiver(const void * t, int64_t T) { (void) t; return T == 1 || T == 2 ? T : -1; }
+static int64_t ad_tie_parent(const void * t, int64_t v) { (void) t; return v > 0 ? 0 : -1; }
+static int ad_tie_depth(const void * t, int64_t v) { (void) t; return v > 0; }
+static int64_t ad_tie_trackid(const void * t, int64_t v) { (void) t; return v; }
+static int AdTieCalls = 0;
+static int
+ad_tie_withheld(const void * t, int64_t r, int64_t A)
+{
+    const double pos[3][3] = {{AD_Q, AD_Q, AD_Q}, {AD_Q + 0.25, AD_Q, AD_Q}, {AD_Q + 50, AD_Q, AD_Q}};
+    const float vel[3][3] = {{0, 0, 0}, {0, 3.99f, 0}, {0, 0, 0}};
+    AdTieCalls++;
+    return subhalo_admit_withheld(pos[r], vel[r], pos[A], vel[A], 0.0625f, 0.5f, *(const double *) t, BOXSIZE);
+}
+
 /* The withholding: strictly below the distance, in the owner's dispersions of the stored records,
- * across the box edge, not with a zero dispersion of the owner, and against each particle's owner
- * in a nest; a negative distance is not a valid parameter. */
+ * across the box edge, not with a zero dispersion, against each particle's owner in a nest. */
 static void
 test_subhalo_admit_distance(void ** state)
 {
+    /* the tie's winner (the smaller TrackId) withheld: no other receiver is tried */
+    const int64_t btid[10] = {1, 2, 1, 2, 1, 2, 1, 2, 1, 2};
+    const int need = subhalo_admit_need(0.5, 10);
+    const double d12 = 12, d0 = 0;
+    struct SubhaloAdmitTree tie = {ad_tie_receiver, ad_tie_parent, ad_tie_depth, ad_tie_trackid, &d12, ad_tie_withheld};
+    const int64_t w12 = subhalo_admit_choice(btid, 10, 0, need, &tie);
+    const int calls12 = AdTieCalls;
+    tie.t = &d0;
+    const int64_t w0 = subhalo_admit_choice(btid, 10, 0, need, &tie);
+    tie.withheld = NULL;
+    const int64_t wnull = subhalo_admit_choice(btid, 10, 0, need, &tie);
+    CHECK(need == 5 && w12 == SUBHALO_ADMIT_WITHHELD && calls12 == 1 && w0 == 1 && wnull == 1,
+          "tie: need %d, choice %ld at 12 (%d tests), %ld at 0, %ld without the test\n", need, w12, calls12, w0, wnull);
+
     CHECK(!subhalo_admit_distance_valid(-1e-3) && subhalo_admit_distance_valid(0) && subhalo_admit_distance_valid(12),
           "SubhaloAdmitMinCoreDistance: -0.001, 0 and 12 judged %d %d %d\n", subhalo_admit_distance_valid(-1e-3), subhalo_admit_distance_valid(0),
           subhalo_admit_distance_valid(12));
     /* D(S, H) = 4 + dv / 0.5 */
-    ad_distance_case(AD_Q, 0.25, 3.99f, 0.0625f, 1, "D 11.98");
-    ad_distance_case(AD_Q, 0.25, 4.0f, 0.0625f, 0, "D 12 exactly");
-    ad_distance_case(AD_Q, 0.25, 4.01f, 0.0625f, 0, "D 12.02");
-    ad_distance_case(0.1, BOXSIZE - 0.25, 3.99f, 0.0625f, 1, "D 11.98 across the box edge");
+    ad_distance_case(AD_Q, 0.25, 3.99f, 0.0625f, 12, 0, 1, "D 11.98");
+    ad_distance_case(AD_Q, 0.25, 4.0f, 0.0625f, 12, 0, 0, "D 12 exactly");
+    ad_distance_case(AD_Q, 0.25, 4.01f, 0.0625f, 12, 0, 0, "D 12.02");
+    ad_distance_case(0.1, BOXSIZE - 0.25, 3.99f, 0.0625f, 12, 0, 1, "D 11.98 across the box edge");
     /* H's position dispersion 0 with S at H's position: the velocity term alone is 7.98 */
-    ad_distance_case(AD_Q, 0, 3.99f, 0, 0, "H's dispersion 0");
+    ad_distance_case(AD_Q, 0, 3.99f, 0, 12, 0, 0, "H's dispersion 0");
+    ad_distance_case(AD_Q, 0.25, 3.0f, 0.0625f, 5, 0, 0, "D 10 at the distance 5");
+    ad_distance_case(AD_Q, 0.25, 3.0f, 0.0625f, 12, 0, 1, "D 10 at the distance 12");
+    /* 0.75 in S's own dispersions: the symmetric sinking form does not enter */
+    ad_distance_case(AD_Q, 0.25, 4.01f, 0.0625f, 12, 1, 0, "D 12.02 with SubhaloSinkSymmetric = 1");
     /* the nest H > S > S2 with D(S2, S) = 11.98 and D(S2, H), D(S, H) above 800: X (H's) still goes
      * to S2, S's particles offered to S2 are withheld */
     const struct AdCore core[3] = {{{AD_Q, AD_Q, AD_Q}, {0, 0, 0}, 0.0625f, 0.5f},
