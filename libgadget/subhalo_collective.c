@@ -877,15 +877,6 @@ round_commit(struct Coll * C, const struct CoreOut * fin)
 
 /* ------------------------------------------------------------------ records */
 
-/* Vmax as the serial key stores it: sqrt(G M/r / a) in Vel units, then the unit factor. */
-static inline float
-rec_vmax(double best, const struct SubhaloUnbindParams * up)
-{
-    float v = (float) sqrt(up->G * best / up->atime);
-    v *= subhalo_vel_to_kms(1.0);
-    return v;
-}
-
 /* The record of an alive candidate of the current round (owner only) from the round's reduced sums;
  * the hierarchy columns and the exclusive/tail counts come later. */
 static void
@@ -1945,7 +1936,7 @@ _Static_assert(sizeof(struct SubhaloInplaceKey) + 8 + 4 * 16 <= SUBHALO_INPLACE_
                "SUBHALO_INPLACE_KEY_BYTES does not cover the per-key vectors");
 _Static_assert(sizeof(struct SubhaloInplaceCand) + sizeof(struct CandState)
                + 8 * (NHS + 2 + CORE_ND + 1 + 2 * SUBHALO_MAXTRACERS + 2 * SUBHALO_NSO + 8 + 9 + 8 + 2 * NSUM + 12 + 4 + 4 + 3 * 12 + 2 + 1)
-               + 4 * 11 <= SUBHALO_INPLACE_CAND_BYTES, "SUBHALO_INPLACE_CAND_BYTES does not cover the per-candidate vectors");
+               + 4 * 12 <= SUBHALO_INPLACE_CAND_BYTES, "SUBHALO_INPLACE_CAND_BYTES does not cover the per-candidate vectors");
 _Static_assert(sizeof(struct SubhaloMember) + sizeof(struct SerialInfo) + 32 <= SUBHALO_INPLACE_MEMBER_BYTES,
                "SUBHALO_INPLACE_MEMBER_BYTES does not cover the member table");
 
@@ -2199,7 +2190,6 @@ static void
 run_round(struct Coll * C, int r, const int64_t * slotof, const struct SubTrack * oldrec)
 {
     const struct SubhaloPlan * plan = C->plan;
-    const struct SubhaloUnbindParams * up = C->up;
     C->c0 = plan->RoundStart[r];
     C->c1 = plan->RoundStart[r + 1];
     const double t0 = MPI_Wtime();
@@ -2277,11 +2267,14 @@ run_round(struct Coll * C, int r, const int64_t * slotof, const struct SubTrack 
             endrun(1, "Subhalo in place: candidate %ld has %.0f bound particles, beyond the catalogue's int32 counts.\n",
                    plan->Cands[c].TrackId, h[HS_N]);
     }
+    /* the Vmax of the owner's record, for the hierarchy's tie-break (-1 where there is none here) */
+    float * vrec = (float *) mymalloc("SubCollVmaxRec", sizeof(float) * (C->c1 - C->c0 + 1));
     for(c = C->c0; c < C->c1; c++) {
         struct CandState * s = &C->cs[c];
+        const int64_t q = c - C->c0;
+        vrec[q] = -1;
         if(s->state != SUBHALO_ST_ALIVE)
             continue;
-        const int64_t q = c - C->c0;
         const struct CoreRow * o = &fin.d[q];
         s->mbID = fin.mbID[q];
         for(d = 0; d < 3; d++) {
@@ -2290,14 +2283,20 @@ run_round(struct Coll * C, int r, const int64_t * slotof, const struct SubTrack 
         }
         s->has_mb = 1;
         s->Mbound_rec = (float) rp.hs[NHS * q + HS_M];
-        s->Vmax_rec = rec_vmax(rp.prof[8 * q], up);
         s->MostBoundID_rec = fin.mbID[q];
         if(slotof[c] >= 0) {
             const struct SubhaloMember * m = &plan->Members[plan->Cands[c].member];
             const struct SubTrack * old = m->kind == SUBHALO_MEM_NEWBORN ? NULL : &oldrec[slotof[c] - C->ctx->IpResStart];
             fill_alive_record(C, c, &fin, &rp, &C->ctx->Res[slotof[c]].rec, old);
+            vrec[q] = C->ctx->Res[slotof[c]].rec.Vmax;
         }
     }
+    if(C->c1 > C->c0)
+        MPI_Allreduce(MPI_IN_PLACE, vrec, C->c1 - C->c0, MPI_FLOAT, MPI_MAX, C->Comm);
+    for(c = C->c0; c < C->c1; c++)
+        if(C->cs[c].state == SUBHALO_ST_ALIVE)
+            C->cs[c].Vmax_rec = vrec[c - C->c0];
+    myfree(vrec);
     free_round_props(&rp);
     /* the relaxed sources (claims) and the remainders to the parents */
     round_within(C);

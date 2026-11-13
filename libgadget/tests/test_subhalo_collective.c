@@ -4430,6 +4430,27 @@ tp_particle(MyIDType id, double atime, struct SynPart * s, void * ud)
     }
 }
 
+/* In-place survivors whose hierarchy Vmax (the tie-break of CompareMass) is not their record's
+ * stored Vmax, and those checked; all ranks. */
+static int64_t TpVmaxDiff, TpVmaxChecked;
+
+static void
+tp_vmax_hook(const struct SubhaloCallCtx * ctx, const struct SubhaloPlan * plan)
+{
+    int64_t j, n[2] = {0, 0};
+    for(j = 0; j < ctx->NIpRes; j++) {
+        const struct SubhaloResult * rs = &ctx->Res[ctx->IpResStart + j];
+        if(!rs->valid || rs->state != SUBHALO_ST_ALIVE)
+            continue;
+        const struct SubhaloMember * m = subhalo_plan_member(plan, rs->rec.TrackId);
+        n[0] += !m || m->Vmax != rs->rec.Vmax;
+        n[1]++;
+    }
+    MPI_Allreduce(MPI_IN_PLACE, n, 2, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
+    TpVmaxDiff = n[0];
+    TpVmaxChecked = n[1];
+}
+
 static void
 tp_run(int64_t collective, struct Outcome * o)
 {
@@ -4446,8 +4467,11 @@ tp_run(int64_t collective, struct Outcome * o)
     recs[1] = syn_rec(1, TP_XT - TP_X0, (TP_XT - TP_X0) * SYN_M, 0, 0, 1, 1);
     syn_records(recs, 2);
     syn_place(tp_particle, NULL, 0.55, 1);
+    TpVmaxDiff = TpVmaxChecked = 0;
+    subhalo_collective_set_pretag_hook(tp_vmax_hook);
     int64_t ng;
     const int ret = run_finder_call(1, &CP, &ng);
+    subhalo_collective_set_pretag_hook(NULL);
     CHECK(ret == 1 && ng == 1, "tail priority: %ld groups\n", ng);
     outcome_take(o);
     syn_teardown();
@@ -4467,6 +4491,8 @@ tp_outcomes(struct Outcome o[3])
                 A->Nbound, A->Rank, A->NestedParentTrackId, count_tags(&o[k], TP_U0, TP_W0, 0, -1), count_tags(&o[k], TP_U0, TP_W0, 1, -1),
                 count_tags(&o[k], TP_U0, TP_W0, -1, -1), count_tags(&o[k], TP_W0, TP_END, 0, 0));
         CHECK(o[k].st.NCands == k, "tail priority (%s): %ld candidates\n", TwoPathName[k], o[k].st.NCands);
+        CHECK(TpVmaxChecked == k && TpVmaxDiff == 0, "tail priority (%s): %ld of %ld in-place survivors ranked by a Vmax not their record's\n",
+              TwoPathName[k], TpVmaxDiff, TpVmaxChecked);
         CHECK(X->Rank == 0 && X->NestedParentTrackId == -1 && A->Rank == 1 && A->NestedParentTrackId == 1 && A->Depth == 1,
               "tail priority (%s): X not promoted above A\n", TwoPathName[k]);
         CHECK(count_tags(&o[k], TP_W0, TP_END, 0, 0) == TP_END - TP_W0, "tail priority (%s): W not A's\n", TwoPathName[k]);
