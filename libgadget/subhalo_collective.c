@@ -2523,17 +2523,9 @@ fill_alive_record(const struct Coll * C, int64_t c, const struct CoreOut * fin, 
         rec->SpinBullock = (float) (sqrt(jj) / sqrt(2 * G * Mvir * a * Rvir));
         rec->Xoff = (float) sqrt(xo);
         rec->Voff = (float) (sqrt(vo) * vkms);
-        /* subhalo_klypin_rs written out: the call evaluates f in another order under -ffast-math */
-        if(best > 0) {
-            const double f = Rvir * best / (Mvir * KLYPIN_RS_CONSTANT);
-            double rs = rbest / KLYPIN_RMAX_TO_RS;
-            if(f >= 4.625) {
-                const double conc = subhalo_klypin_f_to_c(f);
-                if(conc > 0)
-                    rs = Rvir / conc;
-            }
-            rec->RsKlypin = (float) rs;
-        }
+        /* Klypin Rs by the serial path's helper, so both paths evaluate it alike */
+        if(best > 0)
+            rec->RsKlypin = (float) subhalo_klypin_rs(Rvir, Mvir, best, rbest);
     }
     /* the deferred columns (subhalo_props_deferred) */
     {
