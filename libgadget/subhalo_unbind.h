@@ -1,20 +1,15 @@
 #ifndef SUBHALO_UNBIND_H
 #define SUBHALO_UNBIND_H
 
-/* Unbinding kernel and property interface of the subhalo finder (design 7.4, 7.5, D3 items 3-6):
- * a port of HBT-HERONS's tree, unbinding loop, core, sinking test and k-nearest tracer search.
- *
- * Thread-safe (one key per thread); scratch comes only from the caller's arena and is rewound on
- * return (except the tree of subhalo_knn_build). A key run alone splits its larger steps over the threads (see the threading block at
- * the end); results never depend on the thread count.
- *
- * Conventions (design 7.10): Pos in the translated comoving frame, Vel = a v_pec, energies per
- * unit mass in physical (km/s)^2:
- *   E_i   = 1/2 |Vel_i / a - RefVel / a + H a dx_i|^2 + phi_i (+ u_i for type 0 with WithThermal)
- *   dx_i  = NEAREST(Pos_i - RefPos)
- *   phi_i = -(G / a) sum_{j != i, Type_j in PotentialTypes} m_j W(|dx_ij|, h)
- * with W = grav_spline_potential. Every pair displacement is a nearest image taken at each
- * interaction, as HBT does, so sources of any extent are handled. Every ordering breaks ties by particle ID, then by P index. */
+/* Unbinding kernel and property interface of the subhalo finder (design 7.4, 7.5, D3 items 3-6): a port
+ * of HBT-HERONS's tree, unbinding loop, core, sinking test and k-nearest tracer search. Thread-safe (one
+ * key per thread); scratch only from the caller's arena, rewound on return (except the tree of
+ * subhalo_knn_build); a key run alone splits its larger steps over the threads, results never depend
+ * on the thread count. Conventions (design 7.10): Pos translated comoving, Vel = a v_pec, energies per
+ * unit mass in physical (km/s)^2, E_i = 1/2 |Vel_i / a - RefVel / a + H a dx_i|^2 + phi_i (+ u_i for
+ * type 0 with WithThermal), dx_i = NEAREST(Pos_i - RefPos), phi_i = -(G / a) sum_{j != i, Type_j in
+ * PotentialTypes} m_j W(|dx_ij|, h), W = grav_spline_potential: every pair displacement is a nearest
+ * image taken at each interaction, as HBT does. Ties break by particle ID, then by P index. */
 
 #include <stdint.h>
 #include "subhalo.h"
@@ -204,6 +199,12 @@ void subhalo_props_deferred(struct SubTrack * rec, const struct SubCandidate * c
                             const struct SubhaloUnbindParams * up, const double rho[SUBHALO_NSO],
                             int CoreSize, struct SubhaloArena * arena);
 
+/* The velocity trio (subhalo_props.c) from the compensated aperture sums
+ * about the core velocity cvel (Vel units): Mb the aperture mass, Sb and S2 its first and second
+ * moments, Mc and Sc those of the Rockstar core; vkms converts Vel to km/s. One function for the
+ * serial and the distributed recipe, so that equal sums give equal columns. */
+void subhalo_deferred_velocities(float BulkVel[3], float CoreVel[3], float * Vrms, const double cvel[3], double Mb, double Mc,
+                                 double Sb[3][2], double S2[3][2], double Sc[3][2], double vkms);
 /* Pieces both modes share, so the serial and the in-place Rs come from the same arithmetic. */
 #define SUBHALO_NFW_MAXBINS 50        /* MAX_SCALE_BINS */
 #define SUBHALO_NFW_MINPERBIN 15      /* MIN_PART_PER_BIN (also Rockstar's iteration cap) */

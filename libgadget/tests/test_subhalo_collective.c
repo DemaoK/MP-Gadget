@@ -1,25 +1,7 @@
-/* Tests of the oversized candidates unbound in place (subhalo_collective.c, design 7.8), MPI.
- * Run as: mpirun -np 4 .objs/test_subhalo_collective (green at 1 to 4 threads).
- * Tests (the test_collective_ prefix omitted):
- *  1. serial_vs_inplace   a clump with an embedded satellite, serial against fully in place.
- *  2. subtree_keys        the central in place, its satellites' sub-trees as serial keys; tag rule.
- *  3. merger              two oversized groups: the loser's sub-tree in round 0, then the central.
- *  4. kill_passup         a dying in-place satellite passes its particles to its parent.
- *  5. binder              tails returned to a surviving serial binder, in its energy order.
- *  6. serial_repairs      returned tails and reserved tracers against a reference from the old tags.
- *  7. relaxed_boundary    sub-tree remainder tags on both sides of the relaxed-source boundary.
- *  8. dead_field          a dead in-place candidate with field particles on other ranks.
- *  9. sunk_root_field     a serial root sinks into the in-place central, its descendant survives.
- * 10. failure_after_split exchange failure after a real split: tags and records restored.
- * 11. voided_claim        the voided-claim rule over three rounds and the central promotion.
- * 12. long_chain          four in-place rounds, two groups of unequal depth.
- * 13. admission           a memory squeeze refuses the collective stage before the exchange.
- * 14. admission_props     the deferred-properties stage as the largest admission need.
- * 15. guards              int32 and MPI byte-count guards.
- * 16. walk_theta          the potential-only walk at two opening angles against a direct sum.
- * 17. props_identity      serial and distributed deferred properties agree on four layouts.
- * 18. central_source      a central's FOF-less particles untagged, a satellite's kept.
- * SUBHALO_TEST_ONLY=<substring> runs only the matching tests. */
+/* Tests of the oversized candidates unbound in place (subhalo_collective.c, design 7.8), MPI; the
+ * comment above each test says what it checks and main() registers them in order (the
+ * test_collective_ prefix omitted). Run as: mpirun -np 4 .objs/test_subhalo_collective (green at
+ * 1 to 4 threads). SUBHALO_TEST_ONLY=<substring> runs only the matching tests. */
 
 #define _GNU_SOURCE
 #include <stdarg.h>
@@ -381,7 +363,7 @@ compare_outcomes(const struct Outcome * a, const struct Outcome * b, double nbto
     return worst;
 }
 
-/* ------------------------------------------------------------------ test 1 */
+/* ------------------------------------------------------------------ serial against in place */
 
 /* The overlap scenario of test_subhalo.c: call 0 two clumps, call 1 B on a circular orbit at 5
  * kpc/h in A with 60 particles pulled to A's centre. Subsampling off; the field SO on. */
@@ -724,7 +706,7 @@ syn_at_radius(MyIDType id, uint64_t salt, const double cen[3], double rphys, dou
         out[d] = cen[d] + rphys * u[d] / sqrt(n2) / atime;
 }
 
-/* ---- test 5: the binder takes the particle and test 6: many serial repairs ----
+/* ---- the binder takes the particle; many serial repairs ----
  * Per group g (centre 500 + 125 g): A (3 g, 2000 particles, the in-place central), B (3 g + 1,
  * 300 particles, 5 kpc/h away, a serial satellite) and C (3 g + 2, 100 particles at A's centre,
  * B's satellite: it sinks into A in the rounds while B survives). T: 60 previous tails of C
@@ -825,7 +807,7 @@ bd_particle(MyIDType id, double atime, struct SynPart * s, void * ud)
     }
 }
 
-/* the pre-final-pass state, captured by the hook (test 6) */
+/* the pre-final-pass state, captured by the hook (serial_repairs) */
 static struct tagrec * BdPre = NULL;
 static int64_t BdNPre = 0;
 static struct SubhaloBindOrd * BdBo = NULL;
@@ -1070,7 +1052,7 @@ test_collective_serial_repairs(void ** state)
     outcome_free(&b);
 }
 
-/* ---- test 7: the sub-tree remainder on both sides of the relaxed-source boundary ----
+/* ---- the sub-tree remainder on both sides of the relaxed-source boundary ----
  * A (0, 2000) the central in place; B (1, 100 particles, 5 kpc/h away) a serial satellite whose
  * 350 previous tails S sit at A's centre moving against B: B's relaxed source keeps R Nbound =
  * 300 list entries, so about 200 of S stay B's tails (bound by A) and the rest, beyond the
@@ -1170,7 +1152,7 @@ test_collective_relaxed_boundary(void ** state)
     outcome_free(&a);
 }
 
-/* ---- test 8: a dead in-place candidate with field particles ----
+/* ---- a dead in-place candidate with field particles ----
  * A (0, 3000 cold particles in 1 kpc/h) and its satellite B (1) at A's centre: 100 cold gas
  * particles (non-tracers), 10 tracers of which one is hot, and 20 tracers in the field far away
  * (outside every FOF group, on other ranks) that move fast. B, in place (depth 1), keeps 9 bound
@@ -1278,7 +1260,7 @@ test_collective_dead_field(void ** state)
     outcome_free(&o);
 }
 
-/* ---- test 9: a serial root with field particles sinks into the in-place central ----
+/* ---- a serial root with field particles sinks into the in-place central ----
  * A (0, 3000) in place; R (1, 150 particles at A's centre, A's satellite) and D (2, 200 particles
  * 5 kpc/h away, R's satellite) form a serial sub-tree key. FR: 10 field particles of R 30 kpc/h
  * (comoving) out, bound to R; FD: 10 field particles of D, bound to D; DT: 20 tails of D at A's
@@ -1433,7 +1415,7 @@ test_collective_sunk_root_field(void ** state)
     outcome_free(&a);
 }
 
-/* ---- test 18: the central's source is its FOF group only (HBT FeedCentrals) ----
+/* ---- the central's source is its FOF group only (HBT FeedCentrals) ----
  * A (0, 3000) the central with FA, 20 of its previous particles at rest in the field far away
  * (bound to A were they in its source); B (1, 200) its satellite 5 kpc/h out with FB, 10 field
  * particles bound to B. Serially, with A in place and B a sub-tree key, and with both in place:
@@ -1559,7 +1541,7 @@ test_collective_central_source(void ** state)
     outcome_free(&a);
 }
 
-/* ---- test 10: a failed exchange after a real split ----
+/* ---- a failed exchange after a real split ----
  * The sunk-root fixture with A in place (sub-tree key R + D, its group particles and the field
  * particles FR, FD travel encoded) and SubhaloDebugForceExchangeFailure: GrNr, the tags and the
  * records are those before the call and the call is incomplete. */
@@ -1620,7 +1602,7 @@ test_collective_failure_after_split(void ** state)
     syn_teardown();
 }
 
-/* ---- test 11: a voided claim across three rounds, the central promotion and the final-tree check ----
+/* ---- a voided claim across three rounds, the central promotion and the final-tree check ----
  * A (0) the previous central: 1000 cold and 1000 hot particles; B (1, its satellite, 1500 cold
  * particles 4 kpc/h away: too light at the previous call to compete for the centre, the most
  * massive survivor now); C (2, B's satellite, 150 cold particles at A's centre). All three in
@@ -1732,7 +1714,7 @@ test_collective_voided_claim(void ** state)
     outcome_free(&o);
 }
 
-/* ---- test 12: a long in-place chain and groups at unequal depths in one call ----
+/* ---- a long in-place chain and groups at unequal depths in one call ----
  * Group 1: A0 > A1 > A2 > A3 (tracks 0-3, depths 0-3); group 2: B0 > B1 (4, 5). Everything in
  * place: four rounds (A3; A2; A1 and B1; A0 and B0), against the serial run. */
 #define LC_N0 2000
@@ -1826,7 +1808,7 @@ test_collective_long_chain(void ** state)
     outcome_free(&a);
 }
 
-/* ---- test 13: the admission of the collective stage ----
+/* ---- the memory check of the collective stage ----
  * The long-chain fixture without forcing, the free memory squeezed (a top block allocated after
  * the FOF) so that no serial key fits and every key is promoted in place, while the collective
  * stage itself (its walk reserve alone) does not fit either: the call fails before the exchange
@@ -1897,7 +1879,7 @@ test_collective_admission(void ** state)
     syn_teardown();
 }
 
-/* ---- test 14: the int32 and MPI byte-count guards, without allocating ---- */
+/* ---- the int32 and MPI byte-count guards, without allocating ---- */
 static void
 test_collective_guards(void ** state)
 {
@@ -1928,7 +1910,7 @@ test_collective_guards(void ** state)
           "guards: estimate persist %g need %g\n", a.persist, a.need);
 }
 
-/* ---- test 15: the potential-only walk at the default opening angle against a direct sum ----
+/* ---- the potential-only walk at the default opening angle against a direct sum ----
  * Two interpenetrating clumps (labels 0 and 1) straddling the periodic boundary at x = 0, a knot
  * of label-0 particles closer than the softening across the boundary, a field outside every
  * label: on 4 ranks the clumps span several domains (remote monopoles, mixed-label top nodes).
@@ -2079,7 +2061,7 @@ test_collective_walk_theta(void ** state)
     syn_teardown();
 }
 
-/* ---- test 16: the deferred recipes of the two modes on identical inputs ----
+/* ---- the deferred recipes of the two modes on identical inputs ----
  * Seven power-law balls (density ~ r^-2, every particle bound, one across the periodic boundary,
  * one below the NFW fit's 100 particles, one of 137 whose equal-mass virial crossing is at kc =
  * 100, the fit's boundary: Rs defined with the kc particles inside the crossing,
@@ -2428,7 +2410,7 @@ test_collective_props_identity(void ** state)
     pi_run(PI_WIDE);
 }
 
-/* ---- test 17: many in-place candidates in one round: the properties stage ----
+/* ---- many in-place candidates in one round: the properties stage ----
  * 2304 isolated 12-particle groups, each with one resolved track (SubhaloMinNumPart 10), all
  * forced in place (SubhaloCollectiveMinPart 10): one round of 2304 candidates, whose per-candidate property
  * scratch (the deferred recipes' reductions, the profile vectors: SUBHALO_INPLACE_CAND_PROPS_BYTES
@@ -2931,7 +2913,7 @@ test_collective_knn_identity(void ** state)
 }
 
 /* ---- the admission vote of an oversized group against the vote of its serial key ----
- * The hierarchy of test 2 (A central; B, C its satellites; D B's satellite; S, B's particles at A's
+ * The hierarchy of subtree_keys (A central; B, C its satellites; D B's satellite; S, B's particles at A's
  * centre) with SubhaloAdmitShare = 0.5: A's tracers among S vote for B. The group as one serial key
  * (SubhaloCollectiveMinPart 0) and in place with serial sub-tree keys (1000) must offer the same
  * pairs (particle, receiver): the per-key vote of the first, the plan's vote across ranks of the

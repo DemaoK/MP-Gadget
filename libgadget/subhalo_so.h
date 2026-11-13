@@ -1,22 +1,15 @@
 #ifndef SUBHALO_SO_H
 #define SUBHALO_SO_H
 
-/* Field spherical overdensity of the centrals (design 7.6): MSO, RSO, MTypeSO200c, MTypeSOVir,
- * Flags bits 3-4 and the pass-3 columns, from all live particles in a sphere about CorePos
- * (satellites', unbound and FOF-less ones included), by tree walks over a full tree.
- *
- * Passes 1-2 (vir, 200b, 200c, 500c, 2500c at the thresholds of subhalo_so_thresholds): log bins out
- * to R = SubhaloSOSearchFactor x the radius of Mbound at the loosest threshold, R doubled while the
- * outer bin is still above it; linear sub-bins across each crossing bin when Nbound >=
- * SubhaloSORefineMinPart; the crossing interpolated in log M - log r. Resolution: one (sub-)bin.
- * Pass 3: the mass profile inside the published f4 RSO[vir] gives VmaxSO, RmaxSO,
- * RsKlypinSO and RsSO; its masses are 128-bit fixed-point, so for the same centre, live particles
- * and published f4 MSO[vir]/RSO[vir] it is bitwise layout independent (passes 1-2 sum doubles).
- *
- * Contracts: queries are anchored on local live particles, so a rank with centrals but no live
- * particle routes them to the lowest rank that has one. The treewalk reserve is checked after the
- * tree build: short memory halves the pass-1 bins (down to 16), then skips pass 2, pass 3 or the
- * whole call (columns -1) with a warning; it never aborts for this. */
+/* Field spherical overdensity of the centrals (design 7.6) from all live particles in a sphere about
+ * CorePos, by walks over a full tree. Passes 1-2 (the thresholds of subhalo_so_thresholds): log bins
+ * out to SubhaloSOSearchFactor x the radius of Mbound at the loosest threshold, doubled while the outer
+ * bin is above it, linear sub-bins across a crossing bin when Nbound >= SubhaloSORefineMinPart, the
+ * crossing interpolated in log M - log r (resolution one sub-bin). Pass 3: the profile inside the
+ * published f4 RSO[vir] in 128-bit fixed point, so layout independent (passes 1-2 sum doubles). A rank
+ * with centrals but no live particle routes them to the lowest rank that has one. Short memory for the
+ * treewalk reserve, checked after the tree build, halves the pass-1 bins (down to 16), then skips pass
+ * 2, pass 3 or the whole call (columns -1) with a warning; it never aborts for this. */
 
 #include <mpi.h>
 #include <stddef.h>
@@ -76,7 +69,8 @@ struct SubhaloSOStats {
 
 /* The same with the thresholds given (rho == NULL: subhalo_so_thresholds), the final search
  * radius of every record returned in Rsearch (n entries, -1 for records not queried; may be
- * NULL) and the diagnostics in stats (may be NULL). Used by the tests. Collective. */
+ * NULL) and the diagnostics in stats (may be NULL). The driver's entry; subhalo_field_so is its
+ * shorthand for the tests. Collective. */
 void subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp, double atime,
                            const Cosmology * CP, const struct SubhaloParams * par, const double * rho,
                            double * Rsearch, struct SubhaloSOStats * stats, MPI_Comm Comm);

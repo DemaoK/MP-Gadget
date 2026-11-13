@@ -1,29 +1,7 @@
-/* Driver and plumbing tests of the runtime subhalo finder (MPI).
+/* Driver and plumbing tests of the runtime subhalo finder (MPI); the comment above each test says
+ * what it checks and main() registers them in order (the test_subhalo_ prefix omitted).
  * Run as: mpirun -np 4 .objs/test_subhalo with OMP_NUM_THREADS 1 or 2; above 2 threads the
  * MP-Gadget tree build itself fails on these 125-particle-per-rank fixtures (NODECACHE_SIZE).
- * Tests (the test_subhalo_ prefix omitted):
- *  1. table            track table: growth, home rank and local index, redistribution, round trips.
- *  2. sort_key         the 16-byte PIG sort key and the local comparator.
- *  3. exchange_tags    TrackId/BindRank/BoundTrackId survive domain_exchange.
- *  4. join             restart tag join from a synthetic PIG.
- *  5. fof_as_subhalo   the driver over five calls on two clumps.
- *  6. forced_failure   in-place (oversized) keys and the exchange failure path.
- *  7. plan_pack        the head/tail packing as a particle-free function, incl. cost balance.
- *  8. unhosted_direct  hostless centre across a periodic wrap, swallowed BHs, dead tracks, units.
- *  9. lifecycle_pig    driver, PIG writer and restart over four calls with an empty rank;
- *                      corrupted states rejected; header wall time and peak memory.
- * 10. many_keys        200 keys (> 32 per rank): tail packing on real particles.
- * Then, in registration order: twohalo, overlap, central_source, sink_orphan (persistent tracks,
- * a satellite with a tail, a central's FOF-less particles untagged, a satellite's
- * kept; sinking, orphan tracer, resurrection; all but central_source log a tag/record checksum),
- * nest_tree, deep_chain, mixed_call, admit_take, admit_votes and admit_distance (SubhaloAdmitShare, SubhaloAdmitMinCoreDistance), nocentral, fallback (serial/in-place transitions), itercap,
- * lookup (three modes), serial_keys (scheduler at 1-4 threads), reserve_admission,
- * local_sort (thread-count independent), header_params, sampled_default (SubhaloFinalPass = 0),
- * weighted_plurality and penalty_descendant (collision-penalty weights of the tracer votes),
- * orphan_set_death, _update, _lookup, _sink (orphans following several particles;
- * life cycle also reads its PIG_003 as a version-1 state), penalty_column (the TracerPenalty snapshot
- * column, the Checkpoint header attribute, the Snapshots.txt index rule), snapshot_only (I/O table marks).
- *
  * SUBHALO_TEST_ONLY=<substring> runs only the matching tests. The sort-key range checks abort
  * through endrun, so they run alone: SUBHALO_TEST_SORTKEY_OVERFLOW=grnr|trackid|bindrank
  * mpirun -np 1 .objs/test_subhalo must exit non-zero. */
@@ -51,6 +29,7 @@
 
 #include <libgadget/subhalo.h>
 #include <libgadget/subhalo_internal.h>
+#include <libgadget/subhalo_plan.h>
 #include <libgadget/subhalo_unbind.h>
 #include <libgadget/petaio.h>
 #include <libgadget/checkpoint.h>

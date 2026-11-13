@@ -1835,7 +1835,7 @@ subhalo_number_newborns(struct SubhaloResult * res, int64_t nres, int64_t TotNgr
     return ntot;
 }
 
-/* ------------------------------------------------------------------ step 7f: hostless and dead tracks */
+/* ------------------------------------------------------------------ hostless and dead tracks */
 
 /* The common periodic reference of a hostless track: its global minimum-ID live field particle. */
 struct FieldRef {
@@ -2240,9 +2240,7 @@ subhalo_finish_descendants(struct SubhaloResult * res, int64_t nres, MPI_Comm Co
 
 /* ------------------------------------------------------------------ orphan links */
 
-/* On the home records after the store: an orphan's HostGroup is its tracer's group this call and
- * CentralTrackId that group's central (in-place winner from ipl, else as the serial key set, -1
- * in the field); links fixed at death are kept. Not collective. */
+/* The central of in-place key g (its winner). */
 struct InplaceWinnerEntry {
     int64_t g;
     int64_t winner;
@@ -2255,6 +2253,9 @@ cmp_iplwinner(const void * a, const void * b)
     return (x > y) - (x < y);
 }
 
+/* On the home records after the store: an orphan's HostGroup is its tracer's group this call and
+ * CentralTrackId that group's central (in-place winner from ipl, else as the serial key set, -1
+ * in the field); links fixed at death are kept. Not collective. */
 static int64_t
 subhalo_sync_orphan_links(struct SubTrackTable * tab, const struct InplaceWinnerEntry * ipl, int64_t nipl)
 {

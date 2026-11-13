@@ -201,7 +201,8 @@ struct SubTrackTable {
     int initialised;
 };
 
-/* Create the allocator and an empty table. bytes is the initial allocator size; it grows. */
+/* Create the allocator and an empty table with room for bytes / sizeof(struct SubTrack) records
+ * (at least one); the table grows. */
 void subhalo_table_init(struct SubTrackTable * tab, size_t bytes, MPI_Comm Comm);
 void subhalo_table_free(struct SubTrackTable * tab);
 static inline int subhalo_table_home_rank(const struct SubTrackTable * tab, int64_t TrackId) {
@@ -235,9 +236,10 @@ struct SubTrackTable * subhalo_get_table(void);
 void subhalo_init(int RestartSnapNum, int MaxStateSnapNum, const char * OutputDir, MPI_Comm Comm);
 
 /* One finder call (design 7.2), between write_checkpoint and fof_save_groups, on the groups of
- * fof_fof. On return the domain is restored and the tags and table describe this call. Returns 0,
- * tags and table untouched (orphan tracer state excepted), if the exchange or orphan lookup did
- * not fit. Collective over MPI_COMM_WORLD (the field SO's treewalk). */
+ * fof_fof. On return the domain is restored and the tags and table describe this call. Returns 1
+ * when the call completed; 0, tags and table untouched (orphan tracer state excepted), if the
+ * orphan lookup, the plan's memory check or the exchange did not fit. Collective over
+ * MPI_COMM_WORLD (the field SO's treewalk). */
 int subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime, Cosmology * CP, int MetalReturnOn, MPI_Comm Comm);
 
 /* Status accessors used by the writer. */

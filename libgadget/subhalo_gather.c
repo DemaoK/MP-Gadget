@@ -23,13 +23,35 @@
 #include "walltime.h"
 #include "subhalo.h"
 #include "subhalo_internal.h"
+#include "subhalo_plan.h"
 #include "subhalo_collective.h"
 #include "subhalo_so.h"
 #include "subhalo_unbind.h"
 #include "forcetree.h"
 
-/* The largest serial keys (the head) are packed exactly by a greedy on rank 0; the tail is spread
- * over the remaining budgets in proportion (longest-first packing for small keys), subhalo_plan_pack. */
+/* A particle offered by the admission vote of an oversized key: its index in P, its receiver's and
+ * its owner's TrackIds. */
+struct SubhaloOffer {
+    int64_t index;
+    int64_t receiver;
+    int64_t owner;
+};
+
+/* The processing key of a track (its record's Key) for the tracks tagging this rank's live
+ * field particles: (TrackId, Key) pairs sorted by TrackId. */
+struct SubhaloTrackKey {
+    int64_t TrackId;
+    int64_t Key;
+};
+
+/* The bytes a serial key costs its processing rank (arena, member records, per-key buffers). */
+static inline double subhalo_plan_key_bytes(const struct SubhaloPlanCfg * cfg, int64_t Length, int64_t Tags) {
+    return cfg->PartBytes * (double) Length + cfg->MemberBytes * (double) Tags + cfg->KeyBytes;
+}
+
+/* The keys of the largest FOF groups (the head, g <= H) are packed exactly by a greedy on rank 0; the
+ * tail is spread over the remaining budgets in proportion (longest-first packing for small keys),
+ * subhalo_plan_pack. */
 #define SUBHALO_HEAD_PER_TASK 32
 #define SUBHALO_HEAD_MAX 4096
 /* Cap on the classification and packing passes; the census rounds settle the plan either way. */
@@ -642,8 +664,8 @@ pack_head(const struct HeadKey * hk, int64_t nh, const struct RankBudget * rb, i
     int r, d;
     struct HeadOrder * ord = (struct HeadOrder *) mymalloc("SubHeadOrder", sizeof(struct HeadOrder) * (nh + 1));
     for(k = 0; k < nh; k++) {
-        /* no member term: the directory's Tags counts a track once per holding rank, which
-         * misled the packing (subhalo_key_cost) */
+        /* no member term: the directory's Tags counts a track once per holding rank
+         * (subhalo_key_cost) */
         ord[k].cost = subhalo_key_cost((int64_t) hk[k].dims[0], 0);
         ord[k].g = hk[k].g;
         ord[k].i = k;
