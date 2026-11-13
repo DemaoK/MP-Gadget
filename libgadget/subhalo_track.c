@@ -761,10 +761,9 @@ cmp_admitrec_id(const void * a, const void * b)
  * the receiver below A to which at least the share s of its k nearest owned tracers were bound at the
  * previous call (BoundTrackId, not yet rewritten). Receivers are the resolved members with a previous
  * bound set below the key's root. The vote of a whole key (a group or pseudo-key processed serially);
- * an oversized group's is taken by the plan across ranks (plan_vote). A choice withheld near the
- * owner's core (SubhaloAdmitMinCoreDistance) leaves the particle with its owner and counts in
- * *nwithheld. Returns the count; the owner map becomes the admission map and *admlist holds the
- * admitted particles grouped by receiver (adm_off, adm_n), in key order. */
+ * an oversized group's is taken by the plan across ranks (plan_vote). Returns the count; the owner map
+ * becomes the admission map and *admlist holds the admitted particles grouped by receiver (adm_off,
+ * adm_n), in key order. */
 static int64_t
 admit_particles(int32_t * owner, struct SubNode * nd, int nn, int ci, int64_t start, int64_t n, int TracerTypes,
                 const struct SubhaloParams * sp, const struct SubhaloCallCtx * ctx, struct SubhaloArena * arena, int64_t g,

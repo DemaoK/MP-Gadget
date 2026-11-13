@@ -762,11 +762,11 @@ struct SubhaloAdmitTree {
     /* 1 if receiver r's core is too close to owner A's for the admission (NULL: never) */
     int (*withheld)(const void * t, int64_t r, int64_t A);
 };
-/* The receiver below owner A that the most of the k neighbours' previous tags btid[0..k) name, if
- * at least need of them; ties to the deeper receiver, then the smaller TrackId; -1 if none,
- * SUBHALO_ADMIT_WITHHELD if the tree's withheld test refuses the choice (no other receiver is tried).
- * The one choice of every admission vote, so that all of them decide alike. */
+/* the choice when the tree's withheld test refuses the vote's winner: no other receiver is tried */
 enum { SUBHALO_ADMIT_WITHHELD = -2 };
+/* The receiver below owner A that the most of the k neighbours' previous tags btid[0..k) name, if
+ * at least need of them; ties to the deeper receiver, then the smaller TrackId; -1 if none. The one
+ * choice of every admission vote, so that all of them decide alike. */
 int64_t subhalo_admit_choice(const int64_t * btid, int kk, int64_t A, int need, const struct SubhaloAdmitTree * at);
 /* Every offered pair (particle ID, receiver TrackId) of a vote, reported to an optional hook with its
  * source: a serial key's vote or the plan's vote across ranks (unit tests; NULL: none). */
@@ -776,9 +776,8 @@ void subhalo_set_admit_hook(subhalo_admit_hook fn);
 void subhalo_admit_report(MyIDType ID, int64_t Receiver, int source);
 /* 1 if SubhaloAdmitMinCoreDistance = MinD is finite and not negative. */
 int subhalo_admit_distance_valid(double MinD);
-/* 1 if a particle owned by A is withheld from receiver S: both cores and A's dispersions from the
- * previous records (types of struct SubTrack), D(S, A) of subhalo_core_distance below MinD and both
- * of A's dispersions positive. One compiled copy for every vote. */
+/* 1 if a particle owned by A is withheld from receiver S: D(S, A) of subhalo_core_distance from the
+ * previous records below MinD, both of A's dispersions positive; one compiled copy for every vote. */
 int subhalo_admit_withheld(const double sPos[3], const float sVel[3], const double aPos[3], const float aVel[3],
                            float aSigmaX, float aSigmaV, double MinD, double BoxSize);
 
