@@ -237,14 +237,14 @@ deferred_distributed(const struct Coll * C, const struct CoreOut * core, const s
         c = (int64_t) rr[k].key[2];
         if(pos[k] >= kc[3 * c])
             continue;
-        const double * cp = core->d + CORE_ND * c;
+        const struct SubhaloCore * cp = &core->d[c].core;
         const double m = rr[k].m;
         double * a = A + NA * c;
         if(rr[k].r < 0.1 * Rv[2 * c])
             a[0] += 1;
         subhalo_ksum_add(a + 2, m);
         for(d = 0; d < 3; d++) {
-            const double dv = rr[k].vel[d] - cp[3 + d];
+            const double dv = rr[k].vel[d] - cp->Vel[d];
             subhalo_ksum_add(a + 4 + 2 * d, m * dv);
             subhalo_ksum_add(a + 10 + 2 * d, m * dv * dv);
         }
@@ -307,11 +307,11 @@ deferred_distributed(const struct Coll * C, const struct CoreOut * core, const s
         double * v = V + NV * c;
         const int64_t pk = pos[k];
         if(pk < kc[3 * c + 1]) {
-            const double * cp = core->d + CORE_ND * c;
+            const struct SubhaloCore * cp = &core->d[c].core;
             double * w = W + NW * c;
             subhalo_ksum_add(w, rr[k].m);
             for(d = 0; d < 3; d++)
-                subhalo_ksum_add(w + 2 + 2 * d, rr[k].m * (rr[k].vel[d] - cp[3 + d]));
+                subhalo_ksum_add(w + 2 + 2 * d, rr[k].m * (rr[k].vel[d] - cp->Vel[d]));
         }
         for(b = 1; b <= kc[3 * c + 2]; b++) {
             const double xb = XG[(NB + 1) * c + b];
@@ -337,7 +337,7 @@ deferred_distributed(const struct Coll * C, const struct CoreOut * core, const s
             continue;
         const double * v = VG + NV * c;
         const double * a = AG + NA * c, * w = WG + NW * c;
-        const double * cp = core->d + CORE_ND * c;
+        const struct SubhaloCore * cp = &core->d[c].core;
         double * o = rp->dfr + 8 * c;
         /* the velocity trio: the serial recipe's function on the same sums */
         double Sb[3][2], S2[3][2], Sc[3][2];
@@ -350,7 +350,7 @@ deferred_distributed(const struct Coll * C, const struct CoreOut * core, const s
             Sc[d][0] = w[2 + 2 * d];
             Sc[d][1] = w[3 + 2 * d];
         }
-        subhalo_deferred_velocities(bv, cv, &vrms, cp + 3, subhalo_ksum_value(a + 2), subhalo_ksum_value(w), Sb, S2, Sc, vkms);
+        subhalo_deferred_velocities(bv, cv, &vrms, cp->Vel, subhalo_ksum_value(a + 2), subhalo_ksum_value(w), Sb, S2, Sc, vkms);
         for(d = 0; d < 3; d++) {
             o[1 + d] = cv[d];
             o[4 + d] = bv[d];
@@ -417,7 +417,7 @@ round_holder_sums(const struct Coll * C, const struct CoreOut * core, struct Rou
             continue;
         nb++;
         const struct CandState * cs = &C->cs[cc];
-        const double * cp = core->d + CORE_ND * (cc - C->c0);
+        const struct SubhaloCore * cp = &core->d[cc - C->c0].core;
         double * h = hs + NHS * (cc - C->c0);
         const double m = P[i].Mass;
         const int type = P[i].Type;
@@ -432,7 +432,7 @@ round_holder_sums(const struct Coll * C, const struct CoreOut * core, struct Rou
             const double dx = NEAREST(P[i].Pos[d] - cs->RefPos[d], BoxSize);
             const double dv = (P[i].Vel[d] - cs->RefVel[d]) / a + up->Hubble * a * dx;
             k2 += dv * dv;
-            dxc[d] = NEAREST(P[i].Pos[d] - cp[d], BoxSize);
+            dxc[d] = NEAREST(P[i].Pos[d] - cp->Pos[d], BoxSize);
             dvc[d] = P[i].Vel[d] - cs->RefVel[d];
         }
         double phi = C->En[i] - 0.5 * k2;
@@ -538,11 +538,11 @@ round_props(const struct Coll * C, const struct CoreOut * core, struct RoundProp
         const int32_t cc = C->Cand[i];
         if(!in_round(C, cc) || !(C->Flag[i] & CF_BOUND) || C->cs[cc].state != SUBHALO_ST_ALIVE || !subhalo_part_live(&P[i]))
             continue;
-        const double * cp = core->d + CORE_ND * (cc - C->c0);
+        const struct SubhaloCore * cp = &core->d[cc - C->c0].core;
         struct RadRec * e = &rr[nb++];
         double r2 = 0;
         for(d = 0; d < 3; d++) {
-            e->dx[d] = NEAREST(P[i].Pos[d] - cp[d], BoxSize);
+            e->dx[d] = NEAREST(P[i].Pos[d] - cp->Pos[d], BoxSize);
             e->vel[d] = P[i].Vel[d];
             r2 += e->dx[d] * e->dx[d];
         }
@@ -700,10 +700,10 @@ round_props(const struct Coll * C, const struct CoreOut * core, struct RoundProp
             c = (int64_t) rr[k].key[2];
             if(pos[k] > rp->kc[SUBHALO_NSO * c])
                 continue;
-            const double * cp = core->d + CORE_ND * c;
+            const struct SubhaloCore * cp = &core->d[c].core;
             double dvk[3];
             for(d = 0; d < 3; d++)
-                dvk[d] = rr[k].vel[d] - cp[3 + d];
+                dvk[d] = rr[k].vel[d] - cp->Vel[d];
             const double m = rr[k].m;
             double * j = jl + 9 * c;
             j[0] += m * (rr[k].dx[1] * dvk[2] - rr[k].dx[2] * dvk[1]);
@@ -786,13 +786,13 @@ subhalo_collective_test_props(const int32_t * label, int64_t nlabels, const doub
     C.c1 = nlabels;
     C.cs = (struct CandState *) mymalloc("SubTestPropsCs", sizeof(struct CandState) * (nlabels + 1));
     memset(C.cs, 0, sizeof(struct CandState) * (nlabels + 1));
-    co.d = (double *) mymalloc("SubTestPropsCore", sizeof(double) * CORE_ND * (nlabels + 1));
-    memset(co.d, 0, sizeof(double) * CORE_ND * (nlabels + 1));
+    co.d = (struct CoreRow *) mymalloc("SubTestPropsCore", sizeof(struct CoreRow) * (nlabels + 1));
+    memset(co.d, 0, sizeof(struct CoreRow) * (nlabels + 1));
     for(c = 0; c < nlabels; c++) {
         C.cs[c].state = SUBHALO_ST_ALIVE;
         for(d = 0; d < 3; d++) {
-            C.cs[c].RefPos[d] = co.d[CORE_ND * c + d] = core[6 * c + d];
-            C.cs[c].RefVel[d] = co.d[CORE_ND * c + 3 + d] = core[6 * c + 3 + d];
+            C.cs[c].RefPos[d] = co.d[c].core.Pos[d] = core[6 * c + d];
+            C.cs[c].RefVel[d] = co.d[c].core.Vel[d] = core[6 * c + 3 + d];
         }
     }
     C.Cand = (int32_t *) mymalloc("SubTestPropsCand", sizeof(int32_t) * (C.NumPart + 1));

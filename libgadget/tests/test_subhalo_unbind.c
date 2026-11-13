@@ -271,6 +271,16 @@ is_sorted(const double * E, const int64_t * I, int64_t n)
     return 1;
 }
 
+/* subhalo_sink_test on cores given by their parts: satellite s, ancestor a. */
+static int
+sink_cores(const double sPos[3], const double sVel[3], const double aPos[3], const double aVel[3], double aSigmaX,
+           double aSigmaV, double sSigmaX, double sSigmaV, int symmetric)
+{
+    struct SubhaloCore s = {{sPos[0], sPos[1], sPos[2]}, {sVel[0], sVel[1], sVel[2]}, sSigmaX, sSigmaV};
+    struct SubhaloCore a = {{aPos[0], aPos[1], aPos[2]}, {aVel[0], aVel[1], aVel[2]}, aSigmaX, aSigmaV};
+    return subhalo_sink_test(&s, &a, symmetric, BOXSIZE);
+}
+
 static double
 dist_periodic(const double x[3], const double y[3])
 {
@@ -727,8 +737,8 @@ test_satellite(void ** state)
     subhalo_core(&h.c, &up, 20, hp, hv, &hsx, &hsv);
     message(0, "Cores: satellite at %.2f kpc/h from the host core, host SigmaX %.3f SigmaV %.2f, satellite SigmaX %.3f SigmaV %.2f\n",
             dist_periodic(sp, hp), hsx, hsv, ssx, ssv);
-    assert_int_equal(subhalo_sink_test(sp, sv, hp, hv, hsx, hsv, ssx, ssv, 0, BOXSIZE), 0);
-    assert_int_equal(subhalo_sink_test(sp, sv, hp, hv, hsx, hsv, ssx, ssv, 1, BOXSIZE), 0);
+    assert_int_equal(sink_cores(sp, sv, hp, hv, hsx, hsv, ssx, ssv, 0), 0);
+    assert_int_equal(sink_cores(sp, sv, hp, hv, hsx, hsv, ssx, ssv, 1), 0);
 
     /* move the satellite rigidly onto the host core with the host core velocity */
     for(i = NHALO; i < NHALO + NSAT; i++)
@@ -739,8 +749,8 @@ test_satellite(void ** state)
     subhalo_core(&s.c, &up, 20, sp, sv, &ssx, &ssv);
     message(0, "Moved satellite: core offset %.3g, |dv| %.3g\n", dist_periodic(sp, hp),
             sqrt((sv[0] - hv[0]) * (sv[0] - hv[0]) + (sv[1] - hv[1]) * (sv[1] - hv[1]) + (sv[2] - hv[2]) * (sv[2] - hv[2])));
-    assert_int_equal(subhalo_sink_test(sp, sv, hp, hv, hsx, hsv, ssx, ssv, 0, BOXSIZE), 1);
-    assert_int_equal(subhalo_sink_test(sp, sv, hp, hv, hsx, hsv, ssx, ssv, 1, BOXSIZE), 1);
+    assert_int_equal(sink_cores(sp, sv, hp, hv, hsx, hsv, ssx, ssv, 0), 1);
+    assert_int_equal(sink_cores(sp, sv, hp, hv, hsx, hsv, ssx, ssv, 1), 1);
 
     cand_free(&h);
     myfree(insat);
@@ -1476,17 +1486,17 @@ test_sink_forms(void ** state)
     const double aPos[3] = {BOXSIZE - 1, 10, 10}, sPos[3] = {2, 10, 10};   /* |dx| = 3 periodic */
     const double aVel[3] = {0, 0, 0}, sVel[3] = {5, 0, 0};                  /* |dv| = 5 */
     /* compact ancestor core, diffuse satellite core: 3/1 + 5/10 = 3.5 asymmetric, 0.3 + 0.05 symmetric */
-    assert_int_equal(subhalo_sink_test(sPos, sVel, aPos, aVel, 1, 10, 10, 100, 0, BOXSIZE), 0);
-    assert_int_equal(subhalo_sink_test(sPos, sVel, aPos, aVel, 1, 10, 10, 100, 1, BOXSIZE), 1);
+    assert_int_equal(sink_cores(sPos, sVel, aPos, aVel, 1, 10, 10, 100, 0), 0);
+    assert_int_equal(sink_cores(sPos, sVel, aPos, aVel, 1, 10, 10, 100, 1), 1);
     /* diffuse ancestor: both forms sink (0.3 + 0.05), and only through the periodic offset */
-    assert_int_equal(subhalo_sink_test(sPos, sVel, aPos, aVel, 10, 100, 1, 10, 0, BOXSIZE), 1);
-    assert_int_equal(subhalo_sink_test(sPos, sVel, aPos, aVel, 10, 100, 1, 10, 1, BOXSIZE), 1);
+    assert_int_equal(sink_cores(sPos, sVel, aPos, aVel, 10, 100, 1, 10, 0), 1);
+    assert_int_equal(sink_cores(sPos, sVel, aPos, aVel, 10, 100, 1, 10, 1), 1);
     /* the boundary: 1.5 + 0.5 = 2 does not sink, just below does */
-    assert_int_equal(subhalo_sink_test(sPos, sVel, aPos, aVel, 2, 10, 1e-3, 1e-3, 0, BOXSIZE), 0);
-    assert_int_equal(subhalo_sink_test(sPos, sVel, aPos, aVel, 2.0001, 10, 1e-3, 1e-3, 0, BOXSIZE), 1);
+    assert_int_equal(sink_cores(sPos, sVel, aPos, aVel, 2, 10, 1e-3, 1e-3, 0), 0);
+    assert_int_equal(sink_cores(sPos, sVel, aPos, aVel, 2.0001, 10, 1e-3, 1e-3, 0), 1);
     /* zero dispersions: any offset is infinite, a coincident core is zero */
-    assert_int_equal(subhalo_sink_test(sPos, sVel, aPos, aVel, 0, 0, 0, 0, 1, BOXSIZE), 0);
-    assert_int_equal(subhalo_sink_test(aPos, aVel, aPos, aVel, 0, 0, 0, 0, 0, BOXSIZE), 1);
+    assert_int_equal(sink_cores(sPos, sVel, aPos, aVel, 0, 0, 0, 0, 1), 0);
+    assert_int_equal(sink_cores(aPos, aVel, aPos, aVel, 0, 0, 0, 0, 0), 1);
 }
 
 /* Subsampled potential with a subsampleable type absent from the sample and the never

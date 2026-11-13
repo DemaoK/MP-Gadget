@@ -141,7 +141,7 @@ struct SubNode {
     int64_t keep;                   /* list entries kept by the last compaction */
     size_t region;                  /* arena offset where the lists of the subtree start */
     struct SubCandidate c;
-    double CorePos[3], CoreVel[3], SigmaX, SigmaV;
+    struct SubhaloCore core;
     MyIDType mbID;                  /* the most-bound tracer when it died or sank */
     double mbPos[3], mbVel[3];
     int has_mb;
@@ -277,15 +277,15 @@ node_core(struct SubNode * v, const struct SubhaloUnbindParams * up, int CoreSiz
 {
     int d;
     if(v->state == SUBHALO_ST_ALIVE) {
-        subhalo_core(&v->c, up, CoreSize, v->CorePos, v->CoreVel, &v->SigmaX, &v->SigmaV);
+        subhalo_core(&v->c, up, CoreSize, v->core.Pos, v->core.Vel, &v->core.SigmaX, &v->core.SigmaV);
         v->has_core = 1;
     }
     else if(v->state == SUBHALO_ST_DIED && v->has_mb) {
         for(d = 0; d < 3; d++) {
-            v->CorePos[d] = v->mbPos[d];
-            v->CoreVel[d] = v->mbVel[d];
+            v->core.Pos[d] = v->mbPos[d];
+            v->core.Vel[d] = v->mbVel[d];
         }
-        v->SigmaX = v->SigmaV = 0;
+        v->core.SigmaX = v->core.SigmaV = 0;
         v->has_core = 1;
     }
     else
@@ -395,7 +395,7 @@ merge_subtree(struct SubNode * nd, int x, int ref, const struct SubhaloUnbindPar
     if(u->kind != SUBHALO_MEM_RESOLVED || !(u->state == SUBHALO_ST_ALIVE || u->state == SUBHALO_ST_DIED) || !u->has_core)
         return merged;
     const struct SubNode * r = &nd[ref];
-    if(!subhalo_sink_test(u->CorePos, u->CoreVel, r->CorePos, r->CoreVel, r->SigmaX, r->SigmaV, u->SigmaX, u->SigmaV, symmetric, up->BoxSize))
+    if(!subhalo_sink_test(&u->core, &r->core, symmetric, up->BoxSize))
         return merged;
     if(u->state == SUBHALO_ST_ALIVE) {
         /* the most-bound tracer of the bound set becomes the orphan's tracer (MergeTo,
@@ -1538,12 +1538,10 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
         rs->state = x->state;
         rs->Keep = (subkey && v == ci) ? rootkeep : 0;
         rs->has_core = x->has_core;
-        for(d = 0; d < 3; d++) {
-            rs->CorePos[d] = x->has_core ? x->CorePos[d] : 0;
-            rs->CoreVel[d] = x->has_core ? x->CoreVel[d] : 0;
-        }
-        rs->SigmaX = x->has_core ? x->SigmaX : 0;
-        rs->SigmaV = x->has_core ? x->SigmaV : 0;
+        if(x->has_core)
+            rs->core = x->core;
+        else
+            memset(&rs->core, 0, sizeof(rs->core));
         rs->SinkTo = x->state == SUBHALO_ST_SUNK ? nd[x->sinkinto].TrackId : -1;
         if(x->state == SUBHALO_ST_ALIVE) {
             rs->valid = 1;

@@ -45,7 +45,7 @@ struct CandState {
     double ConvRatio;
     double Ref0[3];          /* the reference of the nearest-image sums */
     double RefPos[3], RefVel[3];
-    double CorePos[3], CoreVel[3], SigmaX, SigmaV;   /* the sinking core (loop order) */
+    struct SubhaloCore core; /* the sinking core (loop order) */
     MyIDType mbID;           /* most-bound tracer at the sinking (alive) or the previous one (died) */
     double mbPos[3], mbVel[3];
     int64_t keep;            /* relaxed source: max(Nbound, min(N, R Nbound)) */
@@ -107,10 +107,17 @@ in_round(const struct Coll * C, int32_t c)
     return c >= C->c0 && c < C->c1;
 }
 
-/* What the owner tells every rank about a candidate's bound set in energy order. */
+/* What the owner tells every rank about a candidate's bound set in energy order: one row per
+ * candidate, zero on the other ranks and summed as CORE_ND doubles. */
 #define CORE_ND 15
+struct CoreRow {
+    struct SubhaloCore core;
+    double mbPos[3], mbVel[3];   /* the most-bound tracer */
+    double has;                  /* 1: the candidate has bound particles */
+};
+_Static_assert(sizeof(struct CoreRow) == CORE_ND * sizeof(double), "struct CoreRow is reduced as CORE_ND doubles");
 struct CoreOut {
-    double * d;              /* [nc][CORE_ND]: CorePos 3, CoreVel 3, SigmaX, SigmaV, mbPos 3, mbVel 3, has */
+    struct CoreRow * d;      /* [nc] */
     MyIDType * mbID;         /* [nc] */
     int64_t * resv;          /* [nc][2 K]: (rank, index) of the reserved tracers, -1 */
 };

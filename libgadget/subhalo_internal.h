@@ -251,6 +251,13 @@ enum { SUBHALO_MEM_RESOLVED = 0, SUBHALO_MEM_ORPHAN = 1, SUBHALO_MEM_NEWBORN = 2
  * resurrected or a newborn that did not survive. */
 enum { SUBHALO_ST_NONE = 0, SUBHALO_ST_ALIVE = 1, SUBHALO_ST_DIED = 2, SUBHALO_ST_SUNK = 3, SUBHALO_ST_FAILED = 4 };
 
+/* The sinking core of a track (subhalo_core): the mass-weighted position (translated frame,
+ * comoving) and velocity (Vel units) of its most-bound tracers and their dispersions. */
+struct SubhaloCore {
+    double Pos[3], Vel[3];
+    double SigmaX, SigmaV;
+};
+
 /* A member track of an oversized key (the design 7.8 member table), identical on every rank, sorted
  * by TrackId: resolved tracks keyed to it, orphans hosted by it, or a newborn central. Parent spans
  * the serial nest tree of the whole group (central decided as the serial key does); a resolved member
@@ -288,7 +295,7 @@ struct SubhaloMember {
     int64_t SinkTrackId;     /* the member it sank into, -1 */
     int64_t FinalParent;     /* NestedParentTrackId after the group's hierarchy (nearest surviving ancestor) */
     int64_t Central;         /* the group's central after the hierarchy, -1 if nothing survived */
-    double CorePos[3], CoreVel[3], SigmaX, SigmaV;   /* the sinking core (translated frame, Vel units) */
+    struct SubhaloCore core;
 };
 
 /* An in-place candidate, identical on every rank, sorted by (round, g, TrackId): the rounds are
@@ -754,7 +761,7 @@ struct SubhaloResult {
     int32_t Keep;            /* a sub-tree root: own-tag remainder particles inside its relaxed source */
     int32_t has_core;
     int32_t pad;
-    double CorePos[3], CoreVel[3], SigmaX, SigmaV;   /* the sinking core (translated frame, Vel units) */
+    struct SubhaloCore core;
     int64_t SinkTo;          /* the node it sank into in the key (TrackId), -1 */
 };
 

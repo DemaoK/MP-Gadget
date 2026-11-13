@@ -1565,13 +1565,12 @@ subhalo_core_distance(const double sPos[3], const double sVel[3], const double a
 }
 
 int
-subhalo_sink_test(const double sPos[3], const double sVel[3], const double aPos[3], const double aVel[3],
-                  double aSigmaX, double aSigmaV, double sSigmaX, double sSigmaV, int symmetric, double BoxSize)
+subhalo_sink_test(const struct SubhaloCore * s, const struct SubhaloCore * a, int symmetric, double BoxSize)
 {
     /* AreOverlappingInPhaseSpace, subhalo_merge.cpp:21-26 */
-    double D = subhalo_core_distance(sPos, sVel, aPos, aVel, aSigmaX, aSigmaV, BoxSize);
+    double D = subhalo_core_distance(s->Pos, s->Vel, a->Pos, a->Vel, a->SigmaX, a->SigmaV, BoxSize);
     if(symmetric) {
-        const double Ds = subhalo_core_distance(sPos, sVel, aPos, aVel, sSigmaX, sSigmaV, BoxSize);
+        const double Ds = subhalo_core_distance(s->Pos, s->Vel, a->Pos, a->Vel, s->SigmaX, s->SigmaV, BoxSize);
         if(Ds < D)
             D = Ds;
     }

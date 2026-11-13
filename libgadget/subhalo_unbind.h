@@ -124,10 +124,9 @@ void subhalo_core(const struct SubCandidate * c, const struct SubhaloUnbindParam
 double subhalo_core_distance(const double sPos[3], const double sVel[3], const double aPos[3], const double aVel[3],
                              double aSigmaX, double aSigmaV, double BoxSize);
 
-/* HBT sinking test of satellite s against ancestor a using the cores above
+/* HBT sinking test of satellite core s against ancestor core a
  * (|dx| / SigmaX_a + |dv| / SigmaV_a < 2, or the symmetric form when symmetric != 0). */
-int subhalo_sink_test(const double sPos[3], const double sVel[3], const double aPos[3], const double aVel[3],
-                      double aSigmaX, double aSigmaV, double sSigmaX, double sSigmaV, int symmetric, double BoxSize);
+int subhalo_sink_test(const struct SubhaloCore * s, const struct SubhaloCore * a, int symmetric, double BoxSize);
 
 /* k nearest tracers (ReassignParticles): one read-only tree per key in the arena (its nodes may
  * take the whole remainder: take query buffers first), queried in batches; rows nearest first,

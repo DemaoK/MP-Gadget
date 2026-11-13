@@ -308,7 +308,7 @@ round_cores(const struct Coll * C, struct CoreOut * out)
     const int TracerTypes = C->up->TracerTypes;
     const double BoxSize = C->up->BoxSize;
     int64_t i, c0;
-    out->d = (double *) mymalloc("SubCollCoreOutD", sizeof(double) * CORE_ND * (nc + 1));
+    out->d = (struct CoreRow *) mymalloc("SubCollCoreOutD", sizeof(struct CoreRow) * (nc + 1));
     out->mbID = (MyIDType *) mymalloc("SubCollCoreOutId", sizeof(MyIDType) * (nc + 1));
     out->resv = (int64_t *) mymalloc("SubCollCoreOutRes", sizeof(int64_t) * 2 * NR * (nc + 1));
     /* per candidate and kind (2 c: non-tracers, 2 c + 1: tracers): the heap capacity min(count, K)
@@ -367,10 +367,10 @@ round_cores(const struct Coll * C, struct CoreOut * out)
     const int64_t nin = subhalo_alltoallv(r, sendcounts, sizeof(struct CoreRec), (void **) &in, 0, NULL, C->Comm);
     ta_free(sendcounts);
     qsort(in, nin, sizeof(struct CoreRec), cmp_corerec_owner);
-    double * d = (double *) mymalloc("SubCollCoreD", sizeof(double) * CORE_ND * (nc + 1));
+    struct CoreRow * d = (struct CoreRow *) mymalloc("SubCollCoreD", sizeof(struct CoreRow) * (nc + 1));
     MyIDType * id = (MyIDType *) mymalloc("SubCollCoreId", sizeof(MyIDType) * (nc + 1));
     int64_t * rv = (int64_t *) mymalloc("SubCollCoreRes", sizeof(int64_t) * 2 * NR * (nc + 1));
-    memset(d, 0, sizeof(double) * CORE_ND * (nc + 1));
+    memset(d, 0, sizeof(struct CoreRow) * (nc + 1));
     memset(id, 0, sizeof(MyIDType) * (nc + 1));
     for(i = 0; i < 2 * NR * nc; i++)
         rv[i] = -1;
@@ -380,7 +380,7 @@ round_cores(const struct Coll * C, struct CoreOut * out)
         while(b < nin && in[b].cand == in[a].cand)
             b++;
         const int64_t c = in[a].cand - C->c0;
-        double * o = d + CORE_ND * c;
+        struct CoreRow * o = &d[c];
         /* subhalo_core: the origin is the most bound particle, tracers first, then fill */
         int64_t num = 0, j;
         int pass, k;
@@ -406,14 +406,14 @@ round_cores(const struct Coll * C, struct CoreOut * out)
             pos2[k] /= msum;
             vel[k] /= msum;
             vel2[k] /= msum;
-            o[k] = subhalo_wrap_box(in[a].Pos[k] + pos[k], BoxSize);
-            o[3 + k] = vel[k];
+            o->core.Pos[k] = subhalo_wrap_box(in[a].Pos[k] + pos[k], BoxSize);
+            o->core.Vel[k] = vel[k];
             const double vx = pos2[k] - pos[k] * pos[k], vv = vel2[k] - vel[k] * vel[k];
             sx2 += vx > 0 ? vx : 0;
             sv2 += vv > 0 ? vv : 0;
         }
-        o[6] = sqrt(sx2);
-        o[7] = sqrt(sv2);
+        o->core.SigmaX = sqrt(sx2);
+        o->core.SigmaV = sqrt(sv2);
         int64_t mb = a, nr = 0;
         for(j = a; j < b; j++)
             if(in[j].tracer) {
@@ -421,10 +421,10 @@ round_cores(const struct Coll * C, struct CoreOut * out)
                 break;
             }
         for(k = 0; k < 3; k++) {
-            o[8 + k] = in[mb].Pos[k];
-            o[11 + k] = in[mb].Vel[k];
+            o->mbPos[k] = in[mb].Pos[k];
+            o->mbVel[k] = in[mb].Vel[k];
         }
-        o[14] = 1;
+        o->has = 1;
         id[c] = in[mb].ID;
         for(j = a; j < b && nr < NR; j++)
             if(in[j].tracer) {
@@ -514,10 +514,10 @@ dead_mb(struct Coll * C)
             continue;
         s->mbID = ids[nc + c];
         for(d = 0; d < 3; d++) {
-            s->mbPos[d] = s->CorePos[d] = pv[6 * nc + 6 * c + d];
-            s->mbVel[d] = s->CoreVel[d] = pv[6 * nc + 6 * c + 3 + d];
+            s->mbPos[d] = s->core.Pos[d] = pv[6 * nc + 6 * c + d];
+            s->mbVel[d] = s->core.Vel[d] = pv[6 * nc + 6 * c + 3 + d];
         }
-        s->SigmaX = s->SigmaV = 0;
+        s->core.SigmaX = s->core.SigmaV = 0;
     }
     myfree(pv);
     myfree(ids);
@@ -570,28 +570,21 @@ round_sinking(struct Coll * C)
             if(j == xm || M[j].g != M[xm].g || M[j].kind != SUBHALO_MEM_RESOLVED || !member_ancestor(M, j, xm, nmem))
                 continue;
             int st;
-            const double * pos, * vel;
-            double sx, sv;
+            const struct SubhaloCore * core;
             if(M[j].cand >= 0) {
                 const struct CandState * y = &C->cs[M[j].cand];
                 st = y->state;
                 if(!y->has_core) continue;
-                pos = y->CorePos;
-                vel = y->CoreVel;
-                sx = y->SigmaX;
-                sv = y->SigmaV;
+                core = &y->core;
             }
             else {
                 st = M[j].state;
                 if(!M[j].has_core) continue;
-                pos = M[j].CorePos;
-                vel = M[j].CoreVel;
-                sx = M[j].SigmaX;
-                sv = M[j].SigmaV;
+                core = &M[j].core;
             }
             if(st != SUBHALO_ST_ALIVE && st != SUBHALO_ST_DIED)
                 continue;
-            if(!subhalo_sink_test(pos, vel, x->CorePos, x->CoreVel, x->SigmaX, x->SigmaV, sx, sv, C->sp->SubhaloSinkSymmetric, C->up->BoxSize))
+            if(!subhalo_sink_test(core, &x->core, C->sp->SubhaloSinkSymmetric, C->up->BoxSize))
                 continue;
             nsink++;
             if(M[j].cand >= 0) {
@@ -905,7 +898,7 @@ fill_alive_record(const struct Coll * C, int64_t c, const struct CoreOut * fin, 
     subhalo_get_units(&ULen, &UMass, &UVel);
     const double lenfac = ULen / 3.085678e21;
     const double * h = rp->hs + NHS * q;
-    const double * cp = fin->d + CORE_ND * q;
+    const struct CoreRow * cp = &fin->d[q];
     const double * pr = rp->prof + 8 * q;
     const double * Mso = rp->Mso + SUBHALO_NSO * q;
     const int64_t * kc = rp->kc + SUBHALO_NSO * q;
@@ -922,15 +915,15 @@ fill_alive_record(const struct Coll * C, int64_t c, const struct CoreOut * fin, 
     }
     rec->Flags |= s->flags | SUBHALO_FLAG_INPLACE;
     for(d = 0; d < 3; d++) {
-        rec->CorePos[d] = subhalo_wrap_box(cp[d] - ctx->Offset[d], BoxSize);
-        rec->CoreVel[d] = (float) (cp[3 + d] / a);
+        rec->CorePos[d] = subhalo_wrap_box(cp->core.Pos[d] - ctx->Offset[d], BoxSize);
+        rec->CoreVel[d] = (float) (cp->core.Vel[d] / a);
         rec->CoMPos[d] = subhalo_wrap_box(s->RefPos[d] - ctx->Offset[d], BoxSize);
         rec->CoMVel[d] = (float) (s->RefVel[d] / a);
-        rec->MostBoundPos[d] = subhalo_wrap_box(cp[8 + d] - ctx->Offset[d], BoxSize);
-        rec->MostBoundVel[d] = (float) (cp[11 + d] / a);
+        rec->MostBoundPos[d] = subhalo_wrap_box(cp->mbPos[d] - ctx->Offset[d], BoxSize);
+        rec->MostBoundVel[d] = (float) (cp->mbVel[d] / a);
     }
-    rec->CoreSigmaX = (float) cp[6];
-    rec->CoreSigmaV = (float) (cp[7] / a);
+    rec->CoreSigmaX = (float) cp->core.SigmaX;
+    rec->CoreSigmaV = (float) (cp->core.SigmaV / a);
     rec->MostBoundID = fin->mbID[q];
     rec->Vmax = (float) sqrt(G * pr[0] / a);
     rec->Rmax = (float) pr[1];
@@ -1971,7 +1964,7 @@ struct SerialInfo {
     int32_t has_core, rank;  /* rank: the rank holding the result (the repair's track owner) */
     float Mbound, Vmax;
     MyIDType MostBoundID;
-    double CorePos[3], CoreVel[3], SigmaX, SigmaV;
+    struct SubhaloCore core;
 };
 
 /* The per-key, per-candidate and per-member vectors every rank holds, as charged by the plan's
@@ -2100,13 +2093,7 @@ gather_serial(struct Coll * C)
         e->Mbound = rs->rec.Mbound;
         e->Vmax = rs->rec.Vmax;
         e->MostBoundID = rs->rec.MostBoundID;
-        int d;
-        for(d = 0; d < 3; d++) {
-            e->CorePos[d] = rs->CorePos[d];
-            e->CoreVel[d] = rs->CoreVel[d];
-        }
-        e->SigmaX = rs->SigmaX;
-        e->SigmaV = rs->SigmaV;
+        e->core = rs->core;
     }
     int * counts = ta_malloc("SubCollSerCnt", int, C->NTask);
     int * displ = ta_malloc("SubCollSerDispl", int, C->NTask);
@@ -2139,13 +2126,7 @@ gather_serial(struct Coll * C)
         m->Mbound = all[i].Mbound;
         m->Vmax = all[i].Vmax;
         m->MostBoundID = all[i].MostBoundID;
-        int d;
-        for(d = 0; d < 3; d++) {
-            m->CorePos[d] = all[i].CorePos[d];
-            m->CoreVel[d] = all[i].CoreVel[d];
-        }
-        m->SigmaX = all[i].SigmaX;
-        m->SigmaV = all[i].SigmaV;
+        m->core = all[i].core;
     }
     myfree(all);
 }
@@ -2223,16 +2204,13 @@ set_loop_cores(struct Coll * C)
         struct CandState * s = &C->cs[c];
         if(s->state != SUBHALO_ST_ALIVE)
             continue;
-        const double * o = lc.d + CORE_ND * (c - C->c0);
-        s->has_core = o[14] > 0;
+        const struct CoreRow * o = &lc.d[c - C->c0];
+        s->has_core = o->has > 0;
+        s->core = o->core;
         for(d = 0; d < 3; d++) {
-            s->CorePos[d] = o[d];
-            s->CoreVel[d] = o[3 + d];
-            s->mbPos[d] = o[8 + d];
-            s->mbVel[d] = o[11 + d];
+            s->mbPos[d] = o->mbPos[d];
+            s->mbVel[d] = o->mbVel[d];
         }
-        s->SigmaX = o[6];
-        s->SigmaV = o[7];
         s->mbID = lc.mbID[c - C->c0];
         s->has_mb = s->has_core;
     }
@@ -2327,11 +2305,11 @@ run_round(struct Coll * C, int r, const int64_t * slotof, const struct SubTrack 
         if(s->state != SUBHALO_ST_ALIVE)
             continue;
         const int64_t q = c - C->c0;
-        const double * o = fin.d + CORE_ND * q;
+        const struct CoreRow * o = &fin.d[q];
         s->mbID = fin.mbID[q];
         for(d = 0; d < 3; d++) {
-            s->mbPos[d] = o[8 + d];
-            s->mbVel[d] = o[11 + d];
+            s->mbPos[d] = o->mbPos[d];
+            s->mbVel[d] = o->mbVel[d];
         }
         s->has_mb = 1;
         s->Mbound_rec = (float) rp.hs[NHS * q + HS_M];
