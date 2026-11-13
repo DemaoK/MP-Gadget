@@ -5742,7 +5742,7 @@ ad_tie_withheld(const void * t, int64_t r, int64_t A)
 }
 
 /* The withholding: strictly below the distance, in the owner's dispersions of the stored records,
- * across the box edge, not with a zero dispersion, against each particle's owner in a nest. */
+ * across the box edge, not with a zero dispersion of the owner, against each particle's owner in a nest. */
 static void
 test_subhalo_admit_distance(void ** state)
 {
@@ -5774,7 +5774,7 @@ test_subhalo_admit_distance(void ** state)
     ad_distance_case(AD_Q, 0.25, 3.0f, 0.0625f, 12, 0, 1, "D 10 at the distance 12");
     /* 0.75 in S's own dispersions: the symmetric sinking form does not enter */
     ad_distance_case(AD_Q, 0.25, 4.01f, 0.0625f, 12, 1, 0, "D 12.02 with SubhaloSinkSymmetric = 1");
-    /* the nest H > S > S2 with D(S2, S) = 11.98 and D(S2, H), D(S, H) above 800: X (H's) still goes
+    /* the nest H > S > S2 with D(S2, S) = 11.98 and D(S2, H), D(S, H) of 800 or more: X (H's) still goes
      * to S2, S's particles offered to S2 are withheld */
     const struct AdCore core[3] = {{{AD_Q, AD_Q, AD_Q}, {0, 0, 0}, 0.0625f, 0.5f},
                                    {{AD_Q + 50, AD_Q, AD_Q}, {0, 0, 0}, 0.0625f, 0.5f},
