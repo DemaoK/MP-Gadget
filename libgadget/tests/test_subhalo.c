@@ -470,6 +470,13 @@ test_subhalo_param_checks(void ** state)
     EXPECT(0, "", "DM tracers among gas, DM and BH potential types refused: '%s'\n", msg);
     p.SubhaloPotentialTypes = 2;
     EXPECT(0, "", "equal masks refused: '%s'\n", msg);
+    /* the ends of the masks' range: one type, all six types, and the values just outside */
+    for(k = 0; k < 4; k++) {
+        const int mask[4] = {-1, 1, 63, 64};
+        p = def;
+        p.SubhaloTracerTypes = p.SubhaloPotentialTypes = mask[k];
+        EXPECT(mask[k] < 1 || mask[k] > 63, "SubhaloTracerTypes", "both masks = %d judged wrongly: '%s'\n", mask[k], msg);
+    }
     p = def;
     p.SubhaloFieldSO = 1;
     p.SubhaloSORefineMinPart = -1;

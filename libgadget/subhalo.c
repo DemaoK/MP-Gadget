@@ -103,7 +103,7 @@ static const struct SubhaloParamDesc SubhaloParamTable[] = {
     SUBPAR(SubhaloMaxUnbindIterations, INT, 50, 1, DBL_MAX, 0, "Iteration cap of the unbinding loop."),
     SUBPAR(SubhaloRestartFresh, INT, 0, 0, 1, 0, "If 1, start with an empty track table when no complete finder state is found at restart; otherwise abort."),
     SUBPAR(SubhaloTracerTypes, INT, 2+16, 1, 63, 0, "Bitmask of tracer particle types; every tracer type must be in SubhaloPotentialTypes."),
-    SUBPAR(SubhaloPotentialTypes, INT, 1+2+16+32, 1, 63, 0, "Bitmask of particle types that source the potential and are unbound; it must hold every tracer type."),
+    SUBPAR(SubhaloPotentialTypes, INT, 1+2+16+32, 1, 63, 0, "Bitmask of particle types that source the potential; it must hold every tracer type."),
     SUBPAR(SubhaloMinNumPart, INT, 20, 1, DBL_MAX, 0, "Minimum number of bound particles of a resolved subhalo."),
     SUBPAR(SubhaloMinNumTracerPart, INT, 10, 1, DBL_MAX, 0, "Minimum number of bound tracer particles of a resolved subhalo."),
     /* at most SUBHALO_MAXTRACERS: the tracer IDs live in the track record */
