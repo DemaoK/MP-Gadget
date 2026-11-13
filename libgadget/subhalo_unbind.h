@@ -72,6 +72,27 @@ struct SubhaloUnbindParams {
 #define SUBHALO_UNBIND_SCRATCH_BYTES_PER_PART 96
 #define SUBHALO_UNBIND_BYTES_PER_PART (16 + SUBHALO_UNBIND_SCRATCH_BYTES_PER_PART)
 
+/* The step decision of the unbinding loop, one rule for subhalo_unbind and the in-place loop
+ * (subhalo_collective.c). Death: a bound set below either survival threshold (HBT). */
+static inline int
+subhalo_unbind_dies(int64_t Nbound, int64_t NboundTracer, const struct SubhaloUnbindParams * up)
+{
+    return Nbound < up->MinNumPart || NboundTracer < up->MinNumTracerPart;
+}
+
+/* Outcome of an iteration that survived: count convergence Nbound >= Nlast * BoundMassPrecision
+ * (HBT), else the cap after MaxIter iterations (MaxIter > 0; the caller sets SUBHALO_FLAG_ITERCAP). */
+enum SubhaloUnbindStep { SUBHALO_STEP_CONTINUE = 0, SUBHALO_STEP_CONVERGED, SUBHALO_STEP_CAPPED };
+static inline enum SubhaloUnbindStep
+subhalo_unbind_step(int64_t Nbound, int64_t Nlast, int Iterations, const struct SubhaloUnbindParams * up)
+{
+    if((double) Nbound >= (double) Nlast * up->BoundMassPrecision)
+        return SUBHALO_STEP_CONVERGED;
+    if(up->MaxIter > 0 && Iterations >= up->MaxIter)
+        return SUBHALO_STEP_CAPPED;
+    return SUBHALO_STEP_CONTINUE;
+}
+
 /* Unbind c in place. Returns 1 if it survives, 0 if it died (Nbound 0, Index a permutation).
  * On survival Index[0, Nbound) is the bound set in ascending Energy (after a subsampled loop the
  * max(SampleSize, 0.1 Nbound) most bound re-ordered by exact self-energy, as HBT), then the unbound

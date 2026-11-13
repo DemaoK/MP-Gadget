@@ -4780,6 +4780,80 @@ test_collective_edge_centre(void ** state)
     outcome_free(&o[0]);
 }
 
+/* The unbinding step at its boundaries: A, a cold ball of US_NC tracers, and US_END - US_NC fast
+ * particles through it in A's source but not previously bound. */
+#define US_NC 200
+#define US_END 220
+
+static void
+us_particle(MyIDType id, double atime, struct SynPart * s, void * ud)
+{
+    const double cA[3] = {500, 500, 500}, zero[3] = {0, 0, 0}, fast[2][3] = {{3000, 0, 0}, {-3000, 0, 0}};
+    (void) ud;
+    if(id >= US_END)
+        return;
+    if(id < US_NC) {
+        syn_ball(id, 171, cA, 1.0, zero, 2, atime, s);
+        s->tag = s->bound = 0;
+        s->rank = id;
+    }
+    else {
+        syn_ball(id, 172, cA, 1.0, fast[id % 2], 0, atime, s);
+        s->tag = 0;
+    }
+}
+
+/* Thresholds at US_NC and BoundMassPrecision 1: A survives with US_NC bound and converges at the
+ * second iteration (Nbound == Nlast); with SubhaloMaxUnbindIterations 1 it stops at the cap. */
+static void
+us_check(int64_t collective)
+{
+    const char * name = collective ? "in place" : "serial";
+    int cap;
+    for(cap = 0; cap < 2; cap++) {
+        Cosmology CP;
+        struct SubhaloParams sp = default_subhalo_params();
+        sp.SubhaloFieldSO = 0;
+        sp.SubhaloPotentialSampleSize = 0;
+        sp.SubhaloTreeOpenAngle = COLL_TEST_THETA;
+        sp.SubhaloCollectiveMinPart = collective;
+        sp.SubhaloMinNumPart = sp.SubhaloMinNumTracerPart = US_NC;
+        sp.SubhaloBoundMassPrecision = cap ? 0.995 : 1;
+        sp.SubhaloMaxUnbindIterations = cap ? 1 : 50;
+        syn_setup(&CP, US_END + SYN_NFIELD, sp);
+        struct SubTrack rec = syn_rec(0, US_NC, US_NC * SYN_M, -1, 0, 0, 0);
+        syn_records(&rec, 1);
+        syn_place(us_particle, NULL, 0.55, 1);
+        int64_t ng;
+        const int ret = run_finder_call(1, &CP, &ng);
+        CHECK(ret == 1 && ng == 1, "unbinding step (%s): %ld groups\n", name, ng);
+        struct Outcome o;
+        outcome_take(&o);
+        const struct SubhaloCallStats cs = *subhalo_last_call_stats();
+        syn_teardown();
+        const int capped = !!(o.rec[0].Flags & SUBHALO_FLAG_ITERCAP);
+        message(0, "unbinding step (%s, cap %d): %ld candidates in place; A Nbound %d capped %d; %ld capped in the call\n", name, cap,
+                o.st.NCands, o.rec[0].Nbound, capped, cs.NItercap);
+        CHECK((o.st.NCands > 0) == (collective > 0), "unbinding step (%s): %ld candidates in place\n", name, o.st.NCands);
+        CHECK(o.rec[0].Nbound == US_NC, "unbinding step (%s, cap %d): A Nbound %d, not the %d at both thresholds\n", name, cap,
+              o.rec[0].Nbound, US_NC);
+        CHECK(capped == cap, "unbinding step (%s, cap %d): A capped %d\n", name, cap, capped);
+        outcome_free(&o);
+    }
+}
+
+static void
+test_collective_step_serial(void ** state)
+{
+    us_check(0);
+}
+
+static void
+test_collective_step_inplace(void ** state)
+{
+    us_check(100);
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_collective_serial_vs_inplace),
@@ -4811,6 +4885,8 @@ int main(void) {
         cmocka_unit_test(test_collective_dead_tracer),
         cmocka_unit_test(test_collective_sunk_tracer),
         cmocka_unit_test(test_collective_edge_centre),
+        cmocka_unit_test(test_collective_step_serial),
+        cmocka_unit_test(test_collective_step_inplace),
     };
     const char * only = getenv("SUBHALO_TEST_ONLY");
     if(only && only[0]) {

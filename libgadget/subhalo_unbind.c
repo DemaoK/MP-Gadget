@@ -1159,7 +1159,7 @@ subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * up, s
     c->NboundPositive = -1;
 
     /* A source below the thresholds cannot survive: the first iteration would kill it. */
-    if(N < up->MinNumPart || N <= 0 || count_tracers(Index, N, up->TracerTypes, up->MinNumTracerPart) < up->MinNumTracerPart)
+    if(N <= 0 || subhalo_unbind_dies(N, count_tracers(Index, N, up->TracerTypes, up->MinNumTracerPart), up))
         return 0;
 
     /* Shuffle once: each iteration's subsample is the first SampleSize subsampleable particles
@@ -1197,7 +1197,7 @@ subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * up, s
 
         /* survival thresholds (subhalo_unbind.cpp:629-674) */
         const int64_t ntr = count_tracers(Index, Nbound, up->TracerTypes, up->MinNumTracerPart);
-        if(Nbound < up->MinNumPart || ntr < up->MinNumTracerPart) {
+        if(subhalo_unbind_dies(Nbound, ntr, up)) {
             c->Nbound = 0;
             c->NboundTracer = 0;
             c->Mbound = 0;
@@ -1212,13 +1212,12 @@ subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * up, s
         /* frame of the bound set (subhalo_unbind.cpp:690-692) */
         Mbound = bound_frame(Index, Nbound, RefPos, RefVel, up->BoxSize);
 
-        /* count convergence (subhalo_unbind.cpp:695) */
-        if((double) Nbound >= (double) Nlast * up->BoundMassPrecision)
-            break;
-        if(up->MaxIter > 0 && c->Iterations >= up->MaxIter) {
+        /* count convergence (subhalo_unbind.cpp:695), else the iteration cap */
+        const enum SubhaloUnbindStep step = subhalo_unbind_step(Nbound, Nlast, c->Iterations, up);
+        if(step == SUBHALO_STEP_CAPPED)
             c->Flags |= SUBHALO_FLAG_ITERCAP;
+        if(step != SUBHALO_STEP_CONTINUE)
             break;
-        }
     }
 
     sort_energy_index(Energy, Index, Nbound, arena);

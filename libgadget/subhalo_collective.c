@@ -117,6 +117,14 @@ round_sums(const struct Coll * C, double * out)
     myfree(loc);
 }
 
+/* Bound tracers of a candidate's round sums: sums of ones, integers below 2^53 on every rank and
+ * after the reduction, so the double and its conversion are exact. */
+static inline int64_t
+sums_tracers(const double * v)
+{
+    return (int64_t) v[8];
+}
+
 /* The HBT loop (subhalo_unbind without subsampling) for the iterating candidates of the round,
  * every source particle of an iterating candidate starting bound. A dead candidate's particles
  * are left unbound. Collective. */
@@ -147,7 +155,7 @@ unbind_loop(struct Coll * C)
         s->ran = 1;
         s->capped = 0;
         C->st.NCandidates++;
-        if(s->N < up->MinNumPart || s->N <= 0 || v[8] < up->MinNumTracerPart) {
+        if(s->N <= 0 || subhalo_unbind_dies(s->N, sums_tracers(v), up)) {
             s->iterating = 0;
             s->Nbound = 0;
             s->state = -1;           /* dead, resolved below */
@@ -180,7 +188,7 @@ unbind_loop(struct Coll * C)
             const double * v = S + NSUM * (c - C->c0);
             s->Nbound = (int64_t) v[0];
             s->ConvRatio = s->Nlast > 0 ? (double) s->Nbound / (double) s->Nlast : 0;
-            if(s->Nbound < up->MinNumPart || v[8] < up->MinNumTracerPart) {
+            if(subhalo_unbind_dies(s->Nbound, sums_tracers(v), up)) {
                 s->iterating = 0;
                 s->state = -1;
                 s->Nbound = 0;
@@ -191,18 +199,17 @@ unbind_loop(struct Coll * C)
                 s->RefPos[d] = subhalo_wrap_box(s->Ref0[d] + v[2 + d] / v[1], up->BoxSize);
                 s->RefVel[d] = v[5 + d] / v[1];
             }
-            if((double) s->Nbound >= (double) s->Nlast * up->BoundMassPrecision) {
-                s->iterating = 0;
+            const enum SubhaloUnbindStep step = subhalo_unbind_step(s->Nbound, s->Nlast, s->iterations, up);
+            if(step == SUBHALO_STEP_CONTINUE) {
+                any = 1;
                 continue;
             }
-            if(up->MaxIter > 0 && s->iterations >= up->MaxIter) {
+            s->iterating = 0;
+            if(step == SUBHALO_STEP_CAPPED) {
                 /* the flag of an earlier unbinding of the round is kept (ORed, as unbind_counted) */
                 s->flags |= SUBHALO_FLAG_ITERCAP;
                 s->capped = 1;
-                s->iterating = 0;
-                continue;
             }
-            any = 1;
         }
     }
     /* the deaths: the particles are all unbound */
