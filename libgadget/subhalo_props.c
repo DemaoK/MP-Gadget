@@ -12,7 +12,7 @@
 #include "partmanager.h"
 #include "slotsmanager.h"
 #include "cosmology.h"
-#include "subhalo_unbind.h"
+#include "subhalo_props.h"
 #include "subhalo_sort.h"
 
 /* (radius, P index) pairs of the radial order, ties by particle ID then P index. 16 bytes per
@@ -71,6 +71,7 @@ subhalo_props_hbt(struct SubTrack * rec, const struct SubCandidate * c, const st
     const int64_t n = c->Nbound;
     const double a = up->atime;
     const double BoxSize = up->BoxSize;
+    struct SubhaloPropSums s;
     int64_t i;
     int d, t;
 
@@ -89,14 +90,15 @@ subhalo_props_hbt(struct SubTrack * rec, const struct SubCandidate * c, const st
                 mbt = p;
         }
     }
-    rec->Nbound = (int32_t) n;
-    rec->NboundTracer = (int32_t) ntr;
-    rec->Mbound = (float) M;
+    s.N = n;
+    s.NTracer = ntr;
+    s.M = M;
     for(t = 0; t < 6; t++) {
-        rec->NboundType[t] = (int32_t) Nt[t];
-        rec->MboundType[t] = (float) Mt[t];
+        s.NType[t] = Nt[t];
+        s.MType[t] = Mt[t];
     }
-    rec->Flags |= c->Flags;
+    s.Flags = c->Flags;
+    subhalo_finish_counts(rec, &s);
     if(n <= 0)
         return;
 
@@ -104,21 +106,21 @@ subhalo_props_hbt(struct SubTrack * rec, const struct SubCandidate * c, const st
     double CorePos[3], CoreVel[3], SigmaX, SigmaV;
     subhalo_core(c, up, CoreSize, CorePos, CoreVel, &SigmaX, &SigmaV);
     for(d = 0; d < 3; d++) {
-        rec->CorePos[d] = subhalo_wrap_box(CorePos[d] - Offset[d], BoxSize);
-        rec->CoreVel[d] = (float) (CoreVel[d] / a);
-        rec->CoMPos[d] = subhalo_wrap_box(c->RefPos[d] - Offset[d], BoxSize);
-        rec->CoMVel[d] = (float) (c->RefVel[d] / a);
+        s.core.Pos[d] = CorePos[d];
+        s.core.Vel[d] = CoreVel[d];
+        s.CoMPos[d] = c->RefPos[d];
+        s.CoMVel[d] = c->RefVel[d];
     }
-    rec->CoreSigmaX = (float) SigmaX;
-    rec->CoreSigmaV = (float) (SigmaV / a);
+    s.core.SigmaX = SigmaX;
+    s.core.SigmaV = SigmaV;
 
     /* the most-bound tracer (HBT MostBoundParticleId after CountParticleTypes,
      * subhalo_unbind.cpp:768-775); the most bound particle if no tracer is bound */
     const int64_t mb = mbt >= 0 ? mbt : c->Index[0];
-    rec->MostBoundID = P[mb].ID;
+    s.MostBoundID = P[mb].ID;
     for(d = 0; d < 3; d++) {
-        rec->MostBoundPos[d] = subhalo_wrap_box(P[mb].Pos[d] - Offset[d], BoxSize);
-        rec->MostBoundVel[d] = (float) (P[mb].Vel[d] / a);
+        s.MostBoundPos[d] = P[mb].Pos[d];
+        s.MostBoundVel[d] = P[mb].Vel[d];
     }
 
     /* Vmax, Rmax over the whole bound profile from CorePos, radii floored at the softening (HBT's
@@ -139,8 +141,8 @@ subhalo_props_hbt(struct SubTrack * rec, const struct SubCandidate * c, const st
             }
         }
         arena->used = mark;
-        rec->Vmax = (float) sqrt(up->G * best / a);
-        rec->Rmax = (float) Rmax;
+        s.Best = best;
+        s.Rmax = Rmax;
     }
 
     /* Ekin, Epot per unit mass in the final frame; phi = E - K (- u) of the final pass;
@@ -161,9 +163,9 @@ subhalo_props_hbt(struct SubTrack * rec, const struct SubCandidate * c, const st
         K += m * 0.5 * k2;
         U += m * phi;
     }
-    rec->Ekin = (float) (K / M);
-    rec->Epot = (float) (0.5 * U / M);
-    rec->KinToPot = rec->Epot != 0 ? (float) (K / M / fabs(0.5 * U / M)) : -1;
+    s.K = K;
+    s.U = U;
+    subhalo_finish_hbt(rec, &s, up, Offset);
 }
 
 /* ================================================================== Rockstar recipes
@@ -316,31 +318,18 @@ subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c, con
                        const double rho[SUBHALO_NSO], int CoreSize, const double Offset[3], struct SubhaloArena * arena)
 {
     const int64_t n = c->Nbound;
-    const double a = up->atime, G = up->G, BoxSize = up->BoxSize;
+    const double a = up->atime, BoxSize = up->BoxSize;
     const double rfloor = up->h / 2.8;               /* GravitySoftening, Plummer-equivalent */
-    const double vu = subhalo_vel_to_kms(1.0);       /* internal velocity unit -> km/s */
-    const double vkms = subhalo_vel_to_kms(a);       /* internal Vel -> physical peculiar km/s */
-    /* J and JVir in physical kpc/h km/s whatever the run's length unit (design 7.10); the spins use
-     * the internal sums */
-    double ULen, UMass, UVel;
-    subhalo_get_units(&ULen, &UMass, &UVel);
-    const double lenfac = ULen / 3.085678e21;
+    struct SubhaloPropUnits u;
+    subhalo_finish_units(&u, a);
+    const double vkms = u.vkms;
+    struct SubhaloPropSums s;
     int64_t i, k;
-    int d, s;
+    int d, sd;
     (void) Offset;
 
     /* every column this function owns is absent until computed */
-    for(s = 0; s < SUBHALO_NSO; s++)
-        rec->MBoundSO[s] = rec->RBoundSO[s] = -1;
-    rec->VmaxVir = rec->RmaxVir = rec->Rhalf = rec->Renclose = -1;
-    for(d = 0; d < 3; d++) {
-        rec->J[d] = rec->JVir[d] = -1;
-        rec->AxisA[d] = rec->AxisA500[d] = -1;
-    }
-    rec->SpinPeebles = rec->SpinBullock = rec->Xoff = rec->Voff = rec->RsKlypin = -1;
-    rec->BtoA = rec->CtoA = rec->BtoA500 = rec->CtoA500 = -1;
-    for(d = 0; d < 6; d++)
-        rec->InertiaTensor[d] = -1;
+    subhalo_finish_rockstar_undefined(rec);
     if(n <= 0) {
         deferred_on_order(rec, NULL, 0, NULL, rho, rfloor, vkms);   /* the deferred columns: -1 */
         return;
@@ -361,9 +350,9 @@ subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c, con
      * the particles whose enclosed density exceeds the virial threshold, the half-mass radius */
     int64_t kc[SUBHALO_NSO];
     double Mso[SUBHALO_NSO];
-    for(s = 0; s < SUBHALO_NSO; s++) {
-        kc[s] = -1;
-        Mso[s] = 0;
+    for(sd = 0; sd < SUBHALO_NSO; sd++) {
+        kc[sd] = -1;
+        Mso[sd] = 0;
     }
     /* M(<= r) as a compensated sum: the value of the distributed profile of subhalo_collective_props.c
      * for the same radial order, exactly so for equal masses */
@@ -373,10 +362,10 @@ subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c, con
         subhalo_ksum_add(Mk, P[pr[k].p].Mass);
         const double M = subhalo_ksum_value(Mk);
         const double dens = M / (4.0 / 3.0 * M_PI * r * r * r);
-        for(s = 0; s < SUBHALO_NSO; s++)
-            if(dens > rho[s]) {
-                kc[s] = k;
-                Mso[s] = M;
+        for(sd = 0; sd < SUBHALO_NSO; sd++)
+            if(dens > rho[sd]) {
+                kc[sd] = k;
+                Mso[sd] = M;
             }
         if(dens > rho[0] && M / r > best) {
             best = M / r;
@@ -385,19 +374,18 @@ subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c, con
         if(rhalf < 0 && M >= 0.5 * Mtot)
             rhalf = r;
     }
-    for(s = 0; s < SUBHALO_NSO; s++)
-        if(kc[s] >= 0) {
-            rec->MBoundSO[s] = (float) Mso[s];
-            rec->RBoundSO[s] = (float) cbrt(3 * Mso[s] / (4 * M_PI * rho[s]));
-        }
-    rec->Rhalf = (float) rhalf;
-    rec->Renclose = (float) pr[n - 1].r;
-    const double Mvir = Mso[0];
-    const double Rvir = kc[0] >= 0 ? cbrt(3 * Mvir / (4 * M_PI * rho[0])) : -1;
-    if(kc[0] >= 0 && best > 0) {
-        rec->VmaxVir = (float) (sqrt(G * best / a) * vu);
-        rec->RmaxVir = (float) rbest;
+    for(sd = 0; sd < SUBHALO_NSO; sd++) {
+        s.Cross[sd] = kc[sd];
+        s.Mso[sd] = Mso[sd];
     }
+    s.BestVir = best;
+    s.RmaxVir = rbest;
+    s.Rhalf = rhalf;
+    s.Renclose = pr[n - 1].r;
+    subhalo_finish_profile(rec, &s, up, rho, &u);
+    /* J, the inertia tensor, spins and offsets are each path's own (subhalo_collective.c, 7.5) */
+    const double G = up->G, vu = u.vu, lenfac = u.lenfac, Mvir = Mso[0];
+    const double Rvir = kc[0] >= 0 ? cbrt(3 * Mvir / (4 * M_PI * rho[0])) : -1;
 
     /* J and the inertia tensor over the full set (J in the bound-CoM velocity frame); JVir and the
      * Xoff/Voff means inside the virial aperture, crossing particle included, in the core frame.
@@ -806,13 +794,10 @@ void
 subhalo_props_baryons(struct SubTrack * rec, const struct SubCandidate * c, int MetalReturnOn)
 {
     const int64_t n = c->Nbound;
+    struct SubhaloPropSums s;
     int64_t i;
     int j;
-    rec->StarFormationRate = rec->GasMetalMass = rec->StellarMetalMass = -1;
-    rec->BlackholeMass = rec->BlackholeAccretionRate = rec->MassHeIonized = -1;
-    for(j = 0; j < NMETALS; j++)
-        rec->GasMetalElemMass[j] = rec->StellarMetalElemMass[j] = -1;
-    rec->MostMassiveBHID = (MyIDType) -1;
+    subhalo_finish_baryons_undefined(rec);
     if(n <= 0)
         return;
     /* add_particle_to_group (fof.c:631-667) over the bound set */
@@ -846,17 +831,16 @@ subhalo_props_baryons(struct SubTrack * rec, const struct SubCandidate * c, int 
             }
         }
     }
-    rec->StarFormationRate = (float) sfr;
-    rec->MassHeIonized = (float) heiii;
-    rec->BlackholeMass = (float) bhm;
-    rec->BlackholeAccretionRate = (float) mdot;
-    rec->MostMassiveBHID = bhid;
-    if(MetalReturnOn) {
-        rec->GasMetalMass = (float) gz;
-        rec->StellarMetalMass = (float) sz;
-        for(j = 0; j < NMETALS; j++) {
-            rec->GasMetalElemMass[j] = (float) gze[j];
-            rec->StellarMetalElemMass[j] = (float) sze[j];
-        }
+    s.Sfr = sfr;
+    s.HeIII = heiii;
+    s.BhMass = bhm;
+    s.BhMdot = mdot;
+    s.BhId = bhid;
+    s.GasZ = gz;
+    s.StarZ = sz;
+    for(j = 0; j < NMETALS; j++) {
+        s.GasZElem[j] = gze[j];
+        s.StarZElem[j] = sze[j];
     }
+    subhalo_finish_baryons(rec, &s, MetalReturnOn);
 }

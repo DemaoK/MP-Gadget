@@ -30,6 +30,7 @@
 #include "forcetree.h"
 #include "walltime.h"
 #include "subhalo_collective_internal.h"
+#include "subhalo_props.h"
 
 struct SubhaloCollectiveStats CollStats;
 
@@ -878,99 +879,80 @@ rec_vmax(double best, const struct SubhaloUnbindParams * up)
     return v;
 }
 
-/* The record of an alive candidate of the current round (owner only), with the formulas of
- * subhalo_props_hbt, subhalo_props_rockstar and subhalo_props_baryons and the unit conversions
- * of process_serial_key; the hierarchy columns and the exclusive/tail counts come later. */
+/* The record of an alive candidate of the current round (owner only) from the round's reduced sums;
+ * the hierarchy columns and the exclusive/tail counts come later. */
 static void
 fill_alive_record(const struct Coll * C, int64_t c, const struct CoreOut * fin, const struct RoundProps * rp,
                   struct SubTrack * rec, const struct SubTrack * old)
 {
     const struct SubhaloUnbindParams * up = C->up;
     const struct SubhaloCallCtx * ctx = C->ctx;
-    const struct CandState * s = &C->cs[c];
+    const struct CandState * cs = &C->cs[c];
     const struct SubhaloInplaceCand * cd = &C->plan->Cands[c];
     const struct SubhaloMember * m = &C->plan->Members[cd->member];
     const int64_t q = c - C->c0;
-    const double a = up->atime, G = up->G, BoxSize = up->BoxSize;
-    const double vu = subhalo_vel_to_kms(1.0), vkms = subhalo_vel_to_kms(a);
-    const double * rho = ctx->rho;
-    double ULen, UMass, UVel;
-    subhalo_get_units(&ULen, &UMass, &UVel);
-    const double lenfac = ULen / 3.085678e21;
     const double * h = rp->hs + NHS * q;
     const struct CoreRow * cp = &fin->d[q];
     const double * pr = rp->prof + 8 * q;
-    const double * Mso = rp->Mso + SUBHALO_NSO * q;
-    const int64_t * kc = rp->kc + SUBHALO_NSO * q;
+    const double * jv = rp->jv + 9 * q;
+    struct SubhaloPropUnits u;
+    struct SubhaloPropSums s;
     int d, t;
 
+    subhalo_finish_units(&u, up->atime);
     subhalo_track_carry(rec, old, cd->TrackId, ctx->SnapNum);
-    /* HBT (subhalo_props_hbt) */
-    rec->Nbound = (int32_t) h[HS_N];
-    rec->NboundTracer = (int32_t) h[HS_NTR];
-    rec->Mbound = (float) h[HS_M];
+    s.N = (int64_t) h[HS_N];
+    s.NTracer = (int64_t) h[HS_NTR];
+    s.M = h[HS_M];
     for(t = 0; t < 6; t++) {
-        rec->NboundType[t] = (int32_t) h[HS_NT + t];
-        rec->MboundType[t] = (float) h[HS_MT + t];
+        s.NType[t] = (int64_t) h[HS_NT + t];
+        s.MType[t] = h[HS_MT + t];
     }
-    rec->Flags |= s->flags | SUBHALO_FLAG_INPLACE;
+    s.Flags = cs->flags | SUBHALO_FLAG_INPLACE;
+    s.core = cp->core;
+    s.MostBoundID = fin->mbID[q];
     for(d = 0; d < 3; d++) {
-        rec->CorePos[d] = subhalo_wrap_box(cp->core.Pos[d] - ctx->Offset[d], BoxSize);
-        rec->CoreVel[d] = (float) (cp->core.Vel[d] / a);
-        rec->CoMPos[d] = subhalo_wrap_box(s->RefPos[d] - ctx->Offset[d], BoxSize);
-        rec->CoMVel[d] = (float) (s->RefVel[d] / a);
-        rec->MostBoundPos[d] = subhalo_wrap_box(cp->mbPos[d] - ctx->Offset[d], BoxSize);
-        rec->MostBoundVel[d] = (float) (cp->mbVel[d] / a);
+        s.CoMPos[d] = cs->RefPos[d];
+        s.CoMVel[d] = cs->RefVel[d];
+        s.MostBoundPos[d] = cp->mbPos[d];
+        s.MostBoundVel[d] = cp->mbVel[d];
     }
-    rec->CoreSigmaX = (float) cp->core.SigmaX;
-    rec->CoreSigmaV = (float) (cp->core.SigmaV / a);
-    rec->MostBoundID = fin->mbID[q];
-    rec->Vmax = (float) sqrt(G * pr[0] / a);
-    rec->Rmax = (float) pr[1];
-    {
-        const double K = h[HS_K], U = h[HS_U], M = h[HS_M];
-        rec->Ekin = (float) (K / M);
-        rec->Epot = (float) (0.5 * U / M);
-        rec->KinToPot = rec->Epot != 0 ? (float) (K / M / fabs(0.5 * U / M)) : -1;
+    s.Best = pr[0];
+    s.Rmax = pr[1];
+    s.K = h[HS_K];
+    s.U = h[HS_U];
+    for(d = 0; d < SUBHALO_NSO; d++) {
+        s.Cross[d] = rp->kc[SUBHALO_NSO * q + d];
+        s.Mso[d] = rp->Mso[SUBHALO_NSO * q + d];
     }
-    for(d = 0; d < 3; d++) {
-        rec->CoreVel[d] *= vu;
-        rec->MostBoundVel[d] *= vu;
-        rec->CoMVel[d] *= vu;
+    s.BestVir = pr[2];
+    s.RmaxVir = pr[3];
+    s.Rhalf = pr[4];
+    s.Renclose = pr[5];
+    s.Sfr = h[HS_SFR];
+    s.HeIII = h[HS_HE];
+    s.BhMass = h[HS_BHM];
+    s.BhMdot = h[HS_MDOT];
+    s.BhId = rp->bhid[q];
+    s.GasZ = h[HS_GZ];
+    s.StarZ = h[HS_SZ];
+    for(t = 0; t < NMETALS; t++) {
+        s.GasZElem[t] = h[HS_GZE + t];
+        s.StarZElem[t] = h[HS_SZE + t];
     }
-    rec->CoreSigmaV *= vu;
-    rec->Vmax *= vu;
-    rec->Ekin *= vu * vu;
-    rec->Epot *= vu * vu;
 
-    /* Rockstar (subhalo_props_rockstar) */
-    int sd;
-    for(sd = 0; sd < SUBHALO_NSO; sd++)
-        rec->MBoundSO[sd] = rec->RBoundSO[sd] = -1;
-    rec->VmaxVir = rec->RmaxVir = rec->Rhalf = rec->Renclose = -1;
-    for(d = 0; d < 3; d++) {
-        rec->J[d] = rec->JVir[d] = -1;
-        rec->AxisA[d] = rec->AxisA500[d] = -1;
-    }
-    rec->SpinPeebles = rec->SpinBullock = rec->Xoff = rec->Voff = rec->RsKlypin = -1;
-    rec->BtoA = rec->CtoA = rec->BtoA500 = rec->CtoA500 = -1;
-    for(d = 0; d < 6; d++)
-        rec->InertiaTensor[d] = -1;
-    const double Mtot = h[HS_M];
-    for(sd = 0; sd < SUBHALO_NSO; sd++)
-        if(kc[sd] >= 0) {
-            rec->MBoundSO[sd] = (float) Mso[sd];
-            rec->RBoundSO[sd] = (float) cbrt(3 * Mso[sd] / (4 * M_PI * rho[sd]));
-        }
-    rec->Rhalf = (float) pr[4];
-    rec->Renclose = (float) pr[5];
-    const double Mvir = Mso[0];
-    const double Rvir = kc[0] >= 0 ? cbrt(3 * Mvir / (4 * M_PI * rho[0])) : -1;
+    subhalo_finish_counts(rec, &s);
+    subhalo_finish_hbt(rec, &s, up, ctx->Offset);
+    subhalo_finish_kms(rec, u.vu);
+    subhalo_finish_rockstar_undefined(rec);
+    subhalo_finish_profile(rec, &s, up, ctx->rho, &u);
+    /* J, the inertia tensor, spins and offsets are each path's own: -ffast-math groups their
+     * three-term norms by the surrounding code, so a shared form would change the serial bits (7.5) */
+    const double a = up->atime, G = up->G, vu = u.vu, vkms = u.vkms, lenfac = u.lenfac;
+    const int64_t * kc = s.Cross;
+    const double Mtot = s.M, Mvir = s.Mso[0];
+    const double Rvir = kc[0] >= 0 ? cbrt(3 * Mvir / (4 * M_PI * ctx->rho[0])) : -1;
     const double best = pr[2], rbest = pr[3];
-    if(kc[0] >= 0 && best > 0) {
-        rec->VmaxVir = (float) (sqrt(G * best / a) * vu);
-        rec->RmaxVir = (float) rbest;
-    }
     double J[3], jmag = 0;
     for(d = 0; d < 3; d++) {
         J[d] = h[HS_J + d] / Mtot;
@@ -986,7 +968,6 @@ fill_alive_record(const struct Coll * C, int64_t c, const struct CoreOut * fin, 
             rec->SpinPeebles = (float) (jmag * sqrt(fabs(eps)) / (G * Mtot));
     }
     if(kc[0] >= 0 && Mvir > 0) {
-        const double * jv = rp->jv + 9 * q;
         double jj = 0, xo = 0, vo = 0, Jv[3];
         for(d = 0; d < 3; d++) {
             Jv[d] = jv[d] / Mvir;
@@ -1002,7 +983,7 @@ fill_alive_record(const struct Coll * C, int64_t c, const struct CoreOut * fin, 
         if(best > 0)
             rec->RsKlypin = (float) subhalo_klypin_rs(Rvir, Mvir, best, rbest);
     }
-    /* the deferred columns (subhalo_props_deferred) */
+    /* the deferred columns (subhalo_props_deferred) and the shapes, final in round_props */
     {
         const double * df = rp->dfr + 8 * q;
         rec->Rs = (float) df[0];
@@ -1021,24 +1002,8 @@ fill_alive_record(const struct Coll * C, int64_t c, const struct CoreOut * fin, 
         rec->AxisA[d] = sh[2 + d];
         rec->AxisA500[d] = sh[7 + d];
     }
-
-    /* baryons (subhalo_props_baryons) */
-    rec->StarFormationRate = (float) h[HS_SFR];
-    rec->MassHeIonized = (float) h[HS_HE];
-    rec->BlackholeMass = (float) h[HS_BHM];
-    rec->BlackholeAccretionRate = (float) h[HS_MDOT];
-    rec->MostMassiveBHID = rp->bhid[q];
-    rec->GasMetalMass = rec->StellarMetalMass = -1;
-    for(t = 0; t < NMETALS; t++)
-        rec->GasMetalElemMass[t] = rec->StellarMetalElemMass[t] = -1;
-    if(ctx->MetalReturnOn) {
-        rec->GasMetalMass = (float) h[HS_GZ];
-        rec->StellarMetalMass = (float) h[HS_SZ];
-        for(t = 0; t < NMETALS; t++) {
-            rec->GasMetalElemMass[t] = (float) h[HS_GZE + t];
-            rec->StellarMetalElemMass[t] = (float) h[HS_SZE + t];
-        }
-    }
+    subhalo_finish_baryons_undefined(rec);
+    subhalo_finish_baryons(rec, &s, ctx->MetalReturnOn);
     /* a resurrected orphan: the orphan tracer state is not a Subhalo column */
     if(m->kind == SUBHALO_MEM_ORPHAN) {
         rec->SnapTracerLost = -1;
