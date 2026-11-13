@@ -32,10 +32,10 @@ size_t subhalo_arena_bytes_per_part(void);
 #define SUBHALO_INPLACE_CAND_BYTES 4096
 #define SUBHALO_INPLACE_MEMBER_BYTES 768
 /* Transient per-candidate scratch of a round's properties on every rank (static assertions in
- * subhalo_collective.c); charged by the memory check and, with SUBHALO_INPLACE_CAND_BYTES, the packing. */
+ * subhalo_collective_props.c); charged by the memory check and, with SUBHALO_INPLACE_CAND_BYTES, the packing. */
 #define SUBHALO_INPLACE_CAND_PROPS_BYTES 6144
 /* Bytes per particle admitted to an in-place receiver in the rounds' list (struct CollAdm,
- * static assertion in subhalo_collective.c); charged by the memory check. */
+ * static assertion in subhalo_collective_internal.h); charged by the memory check. */
 #define SUBHALO_INPLACE_ADM_BYTES 16
 
 /* Estimated cost of a serial key of N particles and M member tracks (only ratios matter): N log2 N

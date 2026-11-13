@@ -198,7 +198,7 @@ double subhalo_klypin_f_to_c(double f);
  * a double fit returning -1 on bad input, softening-floored edge radii, Vrms over the aperture's own
  * mass, only the crossing particle left out of the fit. Outputs final: velocities physical peculiar
  * km/s, Rs comoving in the run's length unit. subhalo_props_rockstar gives the same values
- * bitwise; subhalo_collective.c in place, with the same compensated sums (equal if they are exact). */
+ * bitwise; subhalo_collective_props.c in place, with the same compensated sums (equal if they are exact). */
 void subhalo_props_deferred(struct SubTrack * rec, const struct SubCandidate * c,
                             const struct SubhaloUnbindParams * up, const double rho[SUBHALO_NSO],
                             int CoreSize, struct SubhaloArena * arena);

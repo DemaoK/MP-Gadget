@@ -365,7 +365,7 @@ subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c, con
         kc[s] = -1;
         Mso[s] = 0;
     }
-    /* M(<= r) as a compensated sum: the value of the distributed profile of subhalo_collective.c
+    /* M(<= r) as a compensated sum: the value of the distributed profile of subhalo_collective_props.c
      * for the same radial order, exactly so for equal masses */
     double Mk[2] = {0, 0}, best = 0, rbest = -1, rhalf = -1;
     for(k = 0; k < n; k++) {
@@ -502,7 +502,7 @@ subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c, con
 
 /* ================================================================== deferred recipes
  * Rockstar's NFW fit (nfw.c:51-144), core/bulk velocities and Vrms (properties.c) on the bound virial
- * aperture; the bin and fit helpers are shared with the distributed version in subhalo_collective.c. */
+ * aperture; the bin and fit helpers are shared with the distributed version in subhalo_collective_props.c. */
 
 /* Out of line and unspecialised: every caller runs this one compiled evaluation, so -ffast-math cannot
  * reorder f differently at an inlined call site and give the paths different RsKlypin. */

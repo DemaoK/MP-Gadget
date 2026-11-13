@@ -51,7 +51,7 @@ GADGET_OBJS =  \
 	 fof.o fofpetaio.o petaio.o \
 	 subhalo.o subhalo_gather.o subhalo_track.o subhalo_io.o \
 	 subhalo_unbind.o subhalo_props.o \
-	 subhalo_so.o subhalo_collective.o \
+	 subhalo_so.o subhalo_collective.o subhalo_collective_walk.o subhalo_collective_props.o \
 	 domain.o exchange.o slotsmanager.o partmanager.o \
 	 blackhole.o bhinfo.o bhdynfric.o \
 	 timebinmgr.o \
