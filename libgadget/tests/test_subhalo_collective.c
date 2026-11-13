@@ -4141,6 +4141,230 @@ test_collective_vote_inplace_receivers(void ** state)
     AvN = AvMax = 0;
 }
 
+/* ------------------------------------------------------------------ the two paths on one decision */
+
+/* A death in the re-unbinding: X sinks its satellite Y, then heavy gas (HX, HY, T) leaves X's tracers
+ * unbound; X takes tau (its rank-0 tracer) and its dead core, and sinks into the central A. */
+#define DR_HX 2000
+#define DR_TAU 2001
+#define DR_XI 2002
+#define DR_XO 2012
+#define DR_HY 2022
+#define DR_YT 2023
+#define DR_T 2043
+#define DR_END 2044
+#define DR_K (43007.1 * 0.1)
+#define DR_S 8.2
+#define DR_V 80.
+
+static int
+dr_type(MyIDType id)
+{
+    return id == DR_HX || id == DR_HY || id == DR_T ? 0 : 1;
+}
+
+/* A unit vector of pair k (from (k, salt)) and a unit vector orthogonal to it. */
+static void
+dr_pair(int64_t k, uint64_t salt, double u[3], double w[3])
+{
+    const double c0[3] = {0, 0, 0};
+    double r[3], n = 0, dot = 0;
+    int d;
+    rand_in_ball(k, salt, 1.0, c0, u);
+    for(d = 0; d < 3; d++)
+        n += u[d] * u[d];
+    for(d = 0; d < 3; d++)
+        u[d] /= sqrt(n);
+    rand_in_ball(k, salt + 7, 1.0, c0, r);
+    for(d = 0; d < 3; d++)
+        dot += r[d] * u[d];
+    n = 0;
+    for(d = 0; d < 3; d++) {
+        w[d] = r[d] - dot * u[d];
+        n += w[d] * w[d];
+    }
+    for(d = 0; d < 3; d++)
+        w[d] /= sqrt(n);
+}
+
+/* Particle j of a symmetric set about (c, v): pairs (+u, +w), (-u, -w) at radius r, speed vt. */
+static void
+dr_paired(int64_t j, uint64_t salt, const double c[3], const double v[3], double r, double vt, double atime, struct SynPart * s)
+{
+    double u[3], w[3];
+    const int sg = (j % 2) ? -1 : 1;
+    int d;
+    dr_pair(j / 2, salt, u, w);
+    for(d = 0; d < 3; d++) {
+        s->pos[d] = c[d] + sg * r * u[d] / atime;
+        s->vel[d] = atime * (v[d] + sg * vt * w[d]);
+    }
+}
+
+static void
+dr_particle(MyIDType id, double atime, struct SynPart * s, void * ud)
+{
+    const double cA[3] = {500, 500, 500}, zero[3] = {0, 0, 0};
+    const double cY[3] = {500, 500 + DR_S / atime, 500}, vY[3] = {0, 0, DR_V};
+    int d;
+    (void) ud;
+    if(id >= DR_END)
+        return;
+    if(id < DR_HX) {
+        syn_ball(id, 121, cA, id < DR_HX / 2 ? 2.0 : 20.0, zero, 10, atime, s);
+        s->mass = 10 * SYN_M;
+        s->tag = s->bound = 0;
+        s->rank = id;
+        return;
+    }
+    if(id < DR_HY) {
+        s->tag = s->bound = 1;
+        if(id == DR_HX) {
+            for(d = 0; d < 3; d++)
+                s->pos[d] = cA[d];
+            s->mass = 0.1;
+            s->rank = 21;
+        }
+        else if(id == DR_TAU) {
+            for(d = 0; d < 3; d++)
+                s->pos[d] = cA[d];
+            s->pos[0] += 0.02 / atime;
+            s->rank = 0;
+        }
+        else if(id < DR_XO) {
+            dr_paired(id - DR_XI, 122, cA, zero, 1.0, sqrt(1.8 * DR_K), atime, s);
+            s->rank = 1 + id - DR_XI;
+        }
+        else {
+            /* the outer pairs in the x-z plane, away from Y's offset along y */
+            const int64_t j = id - DR_XO;
+            const int sg = (j % 2) ? -1 : 1;
+            const double ph = 2 * M_PI * (j / 2) / 5. + 0.3, vt = sqrt(1.4 * DR_K / 24.);
+            const double u[3] = {cos(ph), 0, sin(ph)}, w[3] = {-0.6 * sin(ph), 0.8, 0.6 * cos(ph)};
+            for(d = 0; d < 3; d++) {
+                s->pos[d] = cA[d] + sg * 24. * u[d] / atime;
+                s->vel[d] = atime * sg * vt * w[d];
+            }
+            s->rank = 11 + j;
+        }
+        return;
+    }
+    if(id < DR_T) {
+        s->tag = s->bound = 2;
+        if(id == DR_HY) {
+            for(d = 0; d < 3; d++) {
+                s->pos[d] = cY[d];
+                s->vel[d] = atime * vY[d];
+            }
+            s->mass = 0.1;
+            s->rank = 20;
+        }
+        else {
+            dr_paired(id - DR_YT, 123, cY, vY, 1.0, 50, atime, s);
+            s->rank = id - DR_YT;
+        }
+        return;
+    }
+    /* T: X's, never bound, 4 kpc/h from HY */
+    for(d = 0; d < 3; d++)
+        s->pos[d] = cY[d];
+    s->pos[0] += 4. / atime;
+    s->vel[0] = atime * 2000;
+    s->mass = 0.5;
+    s->tag = 1;
+    s->bound = -1;
+    s->rank = 22;
+}
+
+static void
+dr_run(int64_t collective, struct Outcome * o)
+{
+    Cosmology CP;
+    struct SubhaloParams sp = default_subhalo_params();
+    sp.SubhaloFieldSO = 0;
+    sp.SubhaloPotentialSampleSize = 0;
+    sp.SubhaloTreeOpenAngle = COLL_TEST_THETA;
+    sp.SubhaloCollectiveMinPart = collective;
+    /* the in-place path reassigns no non-tracers */
+    sp.SubhaloReassignGas = 0;
+    SynTypeFn = dr_type;
+    syn_setup(&CP, DR_END + SYN_NFIELD, sp);
+    SynTypeFn = NULL;
+    struct SubTrack recs[3];
+    recs[0] = syn_rec(0, 2000, 2.0, -1, 0, 0, 0);
+    recs[1] = syn_rec(1, 22, 0.01, 0, 0, 1, 1);
+    recs[2] = syn_rec(2, 21, 0.01, 1, 0, 2, 2);
+    syn_records(recs, 3);
+    syn_place(dr_particle, NULL, 0.55, 1);
+    int64_t ng;
+    const int ret = run_finder_call(1, &CP, &ng);
+    CHECK(ret == 1 && ng == 1, "re-unbinding death: %ld groups\n", ng);
+    outcome_take(o);
+    syn_teardown();
+}
+
+/* X's record: dead in the re-unbinding (Y sank into it alive), tau as its tracer, sunk into A. */
+static void
+dr_check(const struct Outcome * o, const char * what)
+{
+    const struct SubTrack * X = &o->rec[1], * Y = &o->rec[2];
+    int64_t i, it = -1;
+    for(i = 0; i < o->n; i++)
+        if(o->r[i].ID == DR_TAU)
+            it = i;
+    message(0, "re-unbinding death (%s): %ld candidates; X Nbound %d SnapDeath %d Sink %ld SnapSink %d MostBoundID %ld Pos %g %g %g "
+               "TracerPos %g %g %g; Y Nbound %d Sink %ld SnapSink %d; A Nbound %d\n", what, o->st.NCands, X->Nbound, X->SnapDeath,
+            X->SinkTrackId, X->SnapSink, (long) X->MostBoundID, X->MostBoundPos[0], X->MostBoundPos[1], X->MostBoundPos[2],
+            X->TracerPos[0], X->TracerPos[1], X->TracerPos[2], Y->Nbound, Y->SinkTrackId, Y->SnapSink, o->rec[0].Nbound);
+    message(0, "re-unbinding death (%s): A's core %g %g %g, %g %g %g km/s, sigma %g kpc/h %g km/s\n", what, o->rec[0].CorePos[0],
+            o->rec[0].CorePos[1], o->rec[0].CorePos[2], o->rec[0].CoreVel[0], o->rec[0].CoreVel[1], o->rec[0].CoreVel[2],
+            o->rec[0].CoreSigmaX, o->rec[0].CoreSigmaV);
+    CHECK(Y->Nbound == 0 && Y->SinkTrackId == 1 && Y->SnapSink == 1, "re-unbinding death (%s): Y Nbound %d Sink %ld SnapSink %d\n", what,
+          Y->Nbound, Y->SinkTrackId, Y->SnapSink);
+    CHECK(X->Nbound == 0 && X->SnapDeath == 1 && o->rec[0].Nbound > 0, "re-unbinding death (%s): X Nbound %d SnapDeath %d\n", what,
+          X->Nbound, X->SnapDeath);
+    CHECK(it >= 0 && X->MostBoundID == DR_TAU, "re-unbinding death (%s): X's tracer %ld, not tau\n", what, (long) X->MostBoundID);
+    int d;
+    for(d = 0; d < 3; d++)
+        CHECK(X->MostBoundPos[d] == o->r[it].Pos[d] && X->TracerPos[d] == X->MostBoundPos[d],
+              "re-unbinding death (%s): X's MostBoundPos[%d] %g, tau at %g, TracerPos %g\n", what, d, X->MostBoundPos[d], o->r[it].Pos[d],
+              X->TracerPos[d]);
+    CHECK(X->SinkTrackId == 0 && X->SnapSink == 1 && X->DescendantTrackId == 0,
+          "re-unbinding death (%s): X Sink %ld SnapSink %d Descendant %ld\n", what, X->SinkTrackId, X->SnapSink, X->DescendantTrackId);
+}
+
+static void
+test_collective_reunbind_death(void ** state)
+{
+    struct Outcome a, s, b;
+    dr_run(0, &a);
+    dr_run(100, &s);
+    dr_run(20, &b);
+    CHECK(a.st.NCands == 0 && s.st.NCands == 1 && b.st.NCands == 3, "re-unbinding death: %ld / %ld / %ld in-place candidates\n",
+          a.st.NCands, s.st.NCands, b.st.NCands);
+    dr_check(&a, "serial");
+    dr_check(&s, "sub-tree key");
+    dr_check(&b, "in place");
+    const struct Outcome * oo[2] = {&s, &b};
+    int k, d;
+    for(k = 0; k < 2; k++) {
+        const struct SubTrack * x = &a.rec[1], * y = &oo[k]->rec[1];
+        int same = x->MostBoundID == y->MostBoundID && x->SinkTrackId == y->SinkTrackId && x->SnapSink == y->SnapSink
+                   && x->SnapDeath == y->SnapDeath && x->DescendantTrackId == y->DescendantTrackId
+                   && x->NestedParentTrackId == y->NestedParentTrackId && x->OrphanIDs[0] == y->OrphanIDs[0];
+        for(d = 0; d < 3; d++)
+            same = same && x->MostBoundPos[d] == y->MostBoundPos[d] && x->MostBoundVel[d] == y->MostBoundVel[d]
+                   && x->TracerPos[d] == y->TracerPos[d] && x->TracerVel[d] == y->TracerVel[d];
+        CHECK(same, "re-unbinding death: X's record serially and %s differ\n", k ? "in place" : "in the sub-tree key");
+    }
+    CHECK(p2_check_tags(b.r, b.n, b.rec, b.nt, "re-unbinding death") == 0, "re-unbinding death: tag invariants\n");
+    compare_outcomes(&a, &s, 1e-3, 1e-2, 0, "re-unbinding death, sub-tree key");
+    compare_outcomes(&a, &b, 1e-3, 1e-2, 0, "re-unbinding death, in place");
+    outcome_free(&b);
+    outcome_free(&s);
+    outcome_free(&a);
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_collective_serial_vs_inplace),
@@ -4167,6 +4391,7 @@ int main(void) {
         cmocka_unit_test(test_collective_vote_plan),
         cmocka_unit_test(test_collective_vote_subtree_majority),
         cmocka_unit_test(test_collective_vote_inplace_receivers),
+        cmocka_unit_test(test_collective_reunbind_death),
     };
     const char * only = getenv("SUBHALO_TEST_ONLY");
     if(only && only[0]) {

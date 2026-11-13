@@ -245,6 +245,30 @@ set_mb_from(struct SubNode * v, int64_t p)
     v->has_mb = 1;
 }
 
+/* The state of x after either of its unbindings; a resolved track that died takes its previous
+ * most-bound tracer, the first own-tag tracer of its own source in BindRank order (as dead_mb). */
+static void
+node_unbound(struct SubNode * x, int alive, const int32_t * ownlist, int64_t start, int TracerTypes)
+{
+    int64_t j;
+    if(alive) {
+        x->state = SUBHALO_ST_ALIVE;
+        return;
+    }
+    if(x->kind != SUBHALO_MEM_RESOLVED) {
+        x->state = SUBHALO_ST_FAILED;
+        return;
+    }
+    x->state = SUBHALO_ST_DIED;
+    for(j = 0; j < x->own_n; j++) {
+        const int64_t pi = start + ownlist[x->own_off + j];
+        if(P[pi].TrackId == x->TrackId && is_tracer(pi, TracerTypes)) {
+            set_mb_from(x, pi);
+            return;
+        }
+    }
+}
+
 /* The core used by the sinking test: of the bound set for a survivor (subhalo_core); for a
  * track that just died, its previous most-bound tracer with zero dispersion (HBT
  * GetCorePhaseSpaceProperties for Nbound == 0, subhalo_merge.cpp:93-104). */
@@ -1129,21 +1153,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
                 x->c.Energy = (double *) arena_need(arena, sizeof(double) * (cap + 1), g, "candidate energies");
                 int alive = unbind_counted(&x->c, x->kind == SUBHALO_MEM_RESOLVED ? x->old : NULL, up, arena, &ks);
                 arena->used = mark;
-                if(alive)
-                    x->state = SUBHALO_ST_ALIVE;
-                else if(x->kind == SUBHALO_MEM_RESOLVED) {
-                    x->state = SUBHALO_ST_DIED;
-                    /* its previous most-bound tracer (first own-tag tracer in BindRank order) */
-                    for(j = 0; j < x->own_n; j++) {
-                        const int64_t pi = start + ownlist[x->own_off + j];
-                        if(P[pi].TrackId == x->TrackId && is_tracer(pi, TracerTypes)) {
-                            set_mb_from(x, pi);
-                            break;
-                        }
-                    }
-                }
-                else
-                    x->state = SUBHALO_ST_FAILED;
+                node_unbound(x, alive, ownlist, start, TracerTypes);
                 node_core(x, up, CoreSize);
                 /* sinking of the subtree into x, then x unbound again (subhalo_unbind.cpp:828-835) */
                 if(x->state == SUBHALO_ST_ALIVE && MergeTrapped
@@ -1151,7 +1161,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
                     x->c.Energy = (double *) arena_need(arena, sizeof(double) * (cap + 1), g, "candidate energies");
                     alive = unbind_counted(&x->c, NULL, up, arena, &ks);
                     arena->used = mark;
-                    x->state = alive ? SUBHALO_ST_ALIVE : (x->kind == SUBHALO_MEM_RESOLVED ? SUBHALO_ST_DIED : SUBHALO_ST_FAILED);
+                    node_unbound(x, alive, ownlist, start, TracerTypes);
                     node_core(x, up, CoreSize);
                 }
                 /* x's admitted particles: the bound ones are taken, the others leave its list before

@@ -1188,7 +1188,7 @@ free_cores(struct CoreOut * o)
 }
 
 /* The previous most-bound tracer of the round's dead candidates, as process_serial_key sets it after
- * the first unbinding: the first own-tag tracer in (BindRank, ID) order over all ranks. Collective. */
+ * either unbinding: the first own-tag tracer in (BindRank, ID) order over all ranks. Collective. */
 static void
 dead_mb(struct Coll * C)
 {
