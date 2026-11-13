@@ -4803,21 +4803,24 @@ us_particle(MyIDType id, double atime, struct SynPart * s, void * ud)
     }
 }
 
-/* Thresholds at US_NC and BoundMassPrecision 1: A survives with US_NC bound and converges at the
- * second iteration (Nbound == Nlast); with SubhaloMaxUnbindIterations 1 it stops at the cap. */
+/* Thresholds at US_NC and BoundMassPrecision 1: A survives with US_NC bound and converges when
+ * Nbound == Nlast; with SubhaloMaxUnbindIterations 1 it stops at the cap. One above US_NC, the
+ * particle threshold kills it in the loop and the tracer threshold at the entry. */
 static void
 us_check(int64_t collective)
 {
     const char * name = collective ? "in place" : "serial";
-    int cap;
-    for(cap = 0; cap < 2; cap++) {
+    int mode;
+    for(mode = 0; mode < 4; mode++) {
+        const int cap = mode == 1, dies = mode >= 2;
         Cosmology CP;
         struct SubhaloParams sp = default_subhalo_params();
         sp.SubhaloFieldSO = 0;
         sp.SubhaloPotentialSampleSize = 0;
         sp.SubhaloTreeOpenAngle = COLL_TEST_THETA;
         sp.SubhaloCollectiveMinPart = collective;
-        sp.SubhaloMinNumPart = sp.SubhaloMinNumTracerPart = US_NC;
+        sp.SubhaloMinNumPart = US_NC + (mode == 2);
+        sp.SubhaloMinNumTracerPart = US_NC + (mode == 3);
         sp.SubhaloBoundMassPrecision = cap ? 0.995 : 1;
         sp.SubhaloMaxUnbindIterations = cap ? 1 : 50;
         syn_setup(&CP, US_END + SYN_NFIELD, sp);
@@ -4832,12 +4835,12 @@ us_check(int64_t collective)
         const struct SubhaloCallStats cs = *subhalo_last_call_stats();
         syn_teardown();
         const int capped = !!(o.rec[0].Flags & SUBHALO_FLAG_ITERCAP);
-        message(0, "unbinding step (%s, cap %d): %ld candidates in place; A Nbound %d capped %d; %ld capped in the call\n", name, cap,
+        message(0, "unbinding step (%s, mode %d): %ld candidates in place; A Nbound %d capped %d; %ld capped in the call\n", name, mode,
                 o.st.NCands, o.rec[0].Nbound, capped, cs.NItercap);
         CHECK((o.st.NCands > 0) == (collective > 0), "unbinding step (%s): %ld candidates in place\n", name, o.st.NCands);
-        CHECK(o.rec[0].Nbound == US_NC, "unbinding step (%s, cap %d): A Nbound %d, not the %d at both thresholds\n", name, cap,
-              o.rec[0].Nbound, US_NC);
-        CHECK(capped == cap, "unbinding step (%s, cap %d): A capped %d\n", name, cap, capped);
+        CHECK(o.rec[0].Nbound == (dies ? 0 : US_NC), "unbinding step (%s, mode %d): A Nbound %d, not %d\n", name, mode,
+              o.rec[0].Nbound, dies ? 0 : US_NC);
+        CHECK(capped == cap, "unbinding step (%s, mode %d): A capped %d\n", name, mode, capped);
         outcome_free(&o);
     }
 }

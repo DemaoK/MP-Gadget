@@ -117,8 +117,8 @@ round_sums(const struct Coll * C, double * out)
     myfree(loc);
 }
 
-/* Bound tracers of a candidate's round sums: sums of ones, integers below 2^53 on every rank and
- * after the reduction, so the double and its conversion are exact. */
+/* Bound tracers of a candidate's round sums: a sum of ones, an integer-valued double, so the
+ * conversion keeps its value. */
 static inline int64_t
 sums_tracers(const double * v)
 {

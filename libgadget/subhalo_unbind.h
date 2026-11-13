@@ -96,7 +96,8 @@ subhalo_unbind_step(int64_t Nbound, int64_t Nlast, int Iterations, const struct 
 /* Unbind c in place. Returns 1 if it survives, 0 if it died (Nbound 0, Index a permutation).
  * On survival Index[0, Nbound) is the bound set in ascending Energy (after a subsampled loop the
  * max(SampleSize, 0.1 Nbound) most bound re-ordered by exact self-energy, as HBT), then the unbound
- * in ascending Energy; RefPos/RefVel the bound CoM frame; Flags |= ITERCAP when MaxIter is hit. */
+ * in ascending Energy; RefPos/RefVel the bound CoM frame; Flags |= ITERCAP when the loop
+ * stops at MaxIter without converging. */
 int subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * up, struct SubhaloArena * arena);
 
 /* Frame of the rescue: the core is c's particles with TrackId == BoundTrackId == c->TrackId and
