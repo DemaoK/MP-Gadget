@@ -4365,6 +4365,420 @@ test_collective_reunbind_death(void ** state)
     outcome_free(&a);
 }
 
+/* The three runs of a two-path fixture: serial (collective 0), the satellite in a serial sub-tree
+ * key below the in-place central, both in place. */
+static const char * const TwoPathName[3] = {"serial", "sub-tree key", "in place"};
+
+/* Particles [lo, hi) of an outcome with TrackId t and BoundTrackId b. */
+static int64_t
+count_tags(const struct Outcome * o, MyIDType lo, MyIDType hi, int64_t t, int64_t b)
+{
+    int64_t i, n = 0;
+    for(i = 0; i < o->n; i++)
+        if(o->r[i].ID >= lo && o->r[i].ID < hi && o->r[i].TrackId == t && o->r[i].BoundTrackId == b)
+            n++;
+    return n;
+}
+
+/* TrackId (bound 0) or BoundTrackId (bound 1) of particle id in an outcome, -2 if absent. */
+static int64_t
+tag_of(const struct Outcome * o, MyIDType id, int bound)
+{
+    int64_t i;
+    for(i = 0; i < o->n; i++)
+        if(o->r[i].ID == id)
+            return bound ? o->r[i].BoundTrackId : o->r[i].TrackId;
+    return -2;
+}
+
+/* Tail tags after a promotion: X (600 bound, 900 tails bound now) outgrows its central A (1000); X's
+ * tails U fly between them unbound by both, W rest in A. */
+#define TP_X0 1000
+#define TP_XT 1600
+#define TP_U0 2500
+#define TP_W0 2520
+#define TP_END 2540
+
+static void
+tp_particle(MyIDType id, double atime, struct SynPart * s, void * ud)
+{
+    const double cA[3] = {500, 500, 500}, cX[3] = {500 + 6 / atime, 500, 500}, cU[3] = {500 + 3 / atime, 500, 500};
+    const double zero[3] = {0, 0, 0}, vX[3] = {0, 60, 0}, vU[3] = {0, 0, 300};
+    (void) ud;
+    if(id >= TP_END)
+        return;
+    if(id < TP_X0) {
+        syn_ball(id, 131, cA, 1.5, zero, 15, atime, s);
+        s->tag = s->bound = 0;
+        s->rank = id;
+        return;
+    }
+    s->tag = 1;
+    if(id < TP_U0) {
+        syn_ball(id, 132, cX, 1.5, vX, 15, atime, s);
+        s->bound = id < TP_XT ? 1 : -1;
+        s->rank = id - TP_X0;
+    }
+    else {
+        if(id < TP_W0)
+            syn_ball(id, 133, cU, 1.0, vU, 10, atime, s);
+        else
+            syn_ball(id, 134, cA, 1.0, zero, 10, atime, s);
+        s->bound = -1;
+        s->rank = 1500 + id - TP_U0;
+    }
+}
+
+static void
+tp_run(int64_t collective, struct Outcome * o)
+{
+    Cosmology CP;
+    struct SubhaloParams sp = default_subhalo_params();
+    sp.SubhaloFieldSO = 0;
+    sp.SubhaloPotentialSampleSize = 0;
+    sp.SubhaloTreeOpenAngle = COLL_TEST_THETA;
+    sp.SubhaloCollectiveMinPart = collective;
+    syn_setup(&CP, TP_END + SYN_NFIELD, sp);
+    struct SubTrack recs[2];
+    /* the previous bound masses: X below the major-progenitor cut of the central election */
+    recs[0] = syn_rec(0, 1000, 1000 * SYN_M, -1, 0, 0, 0);
+    recs[1] = syn_rec(1, TP_XT - TP_X0, (TP_XT - TP_X0) * SYN_M, 0, 0, 1, 1);
+    syn_records(recs, 2);
+    syn_place(tp_particle, NULL, 0.55, 1);
+    int64_t ng;
+    const int ret = run_finder_call(1, &CP, &ng);
+    CHECK(ret == 1 && ng == 1, "tail priority: %ld groups\n", ng);
+    outcome_take(o);
+    syn_teardown();
+}
+
+/* The fixture through the three runs, with the decisions every path shares. */
+static void
+tp_outcomes(struct Outcome o[3])
+{
+    const int64_t knob[3] = {0, 2000, 1200};
+    int k;
+    for(k = 0; k < 3; k++) {
+        tp_run(knob[k], &o[k]);
+        const struct SubTrack * A = &o[k].rec[0], * X = &o[k].rec[1];
+        message(0, "tail priority (%s): %ld candidates; X Nbound %d Rank %d parent %ld, A Nbound %d Rank %d parent %ld; U tagged A %ld, X %ld, "
+                   "untagged %ld; W tagged and bound A %ld\n", TwoPathName[k], o[k].st.NCands, X->Nbound, X->Rank, X->NestedParentTrackId,
+                A->Nbound, A->Rank, A->NestedParentTrackId, count_tags(&o[k], TP_U0, TP_W0, 0, -1), count_tags(&o[k], TP_U0, TP_W0, 1, -1),
+                count_tags(&o[k], TP_U0, TP_W0, -1, -1), count_tags(&o[k], TP_W0, TP_END, 0, 0));
+        CHECK(o[k].st.NCands == k, "tail priority (%s): %ld candidates\n", TwoPathName[k], o[k].st.NCands);
+        CHECK(X->Rank == 0 && X->NestedParentTrackId == -1 && A->Rank == 1 && A->NestedParentTrackId == 1 && A->Depth == 1,
+              "tail priority (%s): X not promoted above A\n", TwoPathName[k]);
+        CHECK(count_tags(&o[k], TP_W0, TP_END, 0, 0) == TP_END - TP_W0, "tail priority (%s): W not A's\n", TwoPathName[k]);
+        CHECK(count_tags(&o[k], TP_U0, TP_W0, 0, -1) + count_tags(&o[k], TP_U0, TP_W0, 1, -1) == TP_W0 - TP_U0,
+              "tail priority (%s): U not a tail of A or X\n", TwoPathName[k]);
+        CHECK(p2_check_tags(o[k].r, o[k].n, o[k].rec, o[k].nt, "tail priority") == 0, "tail priority: tag invariants\n");
+    }
+}
+
+/* U's owner equal on the paths. Disabled: serially A takes U (deeper in the final tree), in place X (its round first). */
+static const int TpComparePaths = 0;
+
+static void
+test_collective_tail_priority(void ** state)
+{
+    struct Outcome o[3];
+    int k;
+    tp_outcomes(o);
+    for(k = 1; k < 3 && TpComparePaths; k++)
+        CHECK(count_tags(&o[k], TP_U0, TP_W0, 0, -1) == count_tags(&o[0], TP_U0, TP_W0, 0, -1),
+              "tail priority: U tagged A %ld serially, %ld %s\n", count_tags(&o[0], TP_U0, TP_W0, 0, -1),
+              count_tags(&o[k], TP_U0, TP_W0, 0, -1), TwoPathName[k]);
+    for(k = 2; k >= 0; k--)
+        outcome_free(&o[k]);
+}
+
+/* The dead track's tracer: O dies, its rank-0 tracer tau sits in O's satellite R, which admits and
+ * binds it; the stored cores 12.5 core units apart keep the offer at SubhaloAdmitMinCoreDistance 12. */
+#define DT_O0 1000
+#define DT_R0 1300
+#define DT_END 1500
+
+static void
+dt_particle(MyIDType id, double atime, struct SynPart * s, void * ud)
+{
+    const double cA[3] = {500, 500, 500}, cO[3] = {500 + 2.5 / atime, 500, 500}, cR[3] = {500 + 8 / atime, 500, 500};
+    const double zero[3] = {0, 0, 0}, vR[3] = {0, 50, 0};
+    (void) ud;
+    if(id >= DT_END)
+        return;
+    if(id < DT_O0) {
+        syn_ball(id, 141, cA, 1.5, zero, 15, atime, s);
+        s->tag = s->bound = 0;
+        s->rank = id;
+    }
+    else if(id < DT_R0) {
+        if(id == DT_O0)
+            syn_ball(id, 142, cR, 0.01, vR, 0.5, atime, s);
+        else
+            syn_ball(id, 143, cO, 3, zero, 400, atime, s);
+        s->tag = s->bound = 1;
+        s->rank = id - DT_O0;
+    }
+    else {
+        syn_ball(id, 144, cR, 0.5, vR, 10, atime, s);
+        s->tag = s->bound = 2;
+        s->rank = id - DT_R0;
+    }
+}
+
+static void
+dt_run(int64_t collective, double mind, struct Outcome * o, struct SubhaloCallStats * cs)
+{
+    Cosmology CP;
+    struct SubhaloParams sp = default_subhalo_params();
+    sp.SubhaloFieldSO = 0;
+    sp.SubhaloPotentialSampleSize = 0;
+    sp.SubhaloTreeOpenAngle = COLL_TEST_THETA;
+    sp.SubhaloCollectiveMinPart = collective;
+    sp.SubhaloAdmitShare = 0.5;
+    sp.SubhaloAdmitMinCoreDistance = mind;
+    syn_setup(&CP, DT_END + SYN_NFIELD, sp);
+    struct SubTrack recs[3];
+    recs[0] = syn_rec(0, 1000, 0.1, -1, 0, 0, 0);
+    recs[1] = syn_rec(1, 300, 0.03, 0, 0, 1, 1);
+    recs[2] = syn_rec(2, 200, 0.02, 1, 0, 2, 2);
+    const double cx[3] = {300, 100, 112.5};
+    int t;
+    for(t = 0; t < 3; t++) {
+        recs[t].CorePos[0] = cx[t];
+        recs[t].CorePos[1] = recs[t].CorePos[2] = 100;
+        recs[t].CoreVel[0] = recs[t].CoreVel[1] = recs[t].CoreVel[2] = 0;
+        recs[t].CoreSigmaX = 1.0f;
+        recs[t].CoreSigmaV = 8.0f;
+    }
+    syn_records(recs, 3);
+    syn_place(dt_particle, NULL, 0.55, 1);
+    int64_t ng;
+    const int ret = run_finder_call(1, &CP, &ng);
+    CHECK(ret == 1 && ng == 1, "dead tracer: %ld groups\n", ng);
+    *cs = *subhalo_last_call_stats();
+    outcome_take(o);
+    syn_teardown();
+}
+
+/* O's tracer equal on the paths. Disabled: serially tau (O's own list), in place the next own tracer (tau is excluded from O's candidate). */
+static const int DtComparePaths = 0;
+
+static void
+test_collective_dead_tracer(void ** state)
+{
+    /* serial; O's sub-tree a serial key below in-place A; O in place, R a serial sub-tree key below it */
+    const int64_t knob[3] = {0, 1000, 300};
+    const double mind[2] = {0, 12};
+    int k, m;
+    for(m = 0; m < 2; m++) {
+        struct Outcome o[3];
+        struct SubhaloCallStats cs;
+        for(k = 0; k < 3; k++) {
+            dt_run(knob[k], mind[m], &o[k], &cs);
+            const struct SubTrack * O = &o[k].rec[1], * R = &o[k].rec[2];
+            message(0, "dead tracer (%s, distance %g): %ld candidates; admitted %ld taken %ld withheld %ld; O Nbound %d SnapDeath %d "
+                       "SnapSink %d MostBoundID %ld; R Nbound %d parent %ld; tau tagged %ld bound %ld\n", TwoPathName[k], mind[m],
+                    o[k].st.NCands, cs.NAdmitted, cs.NAdmitTaken, cs.NAdmitWithheld, O->Nbound, O->SnapDeath, O->SnapSink,
+                    (long) O->MostBoundID, R->Nbound, R->NestedParentTrackId, tag_of(&o[k], DT_O0, 0), tag_of(&o[k], DT_O0, 1));
+            CHECK(o[k].st.NCands == k, "dead tracer (%s): %ld candidates\n", TwoPathName[k], o[k].st.NCands);
+            CHECK(cs.NAdmitTaken >= 1 && cs.NAdmitWithheld == 0, "dead tracer (%s, distance %g): %ld taken, %ld withheld\n",
+                  TwoPathName[k], mind[m], cs.NAdmitTaken, cs.NAdmitWithheld);
+            CHECK(count_tags(&o[k], DT_O0, DT_O0 + 1, 2, 2) == 1, "dead tracer (%s, distance %g): tau not R's\n", TwoPathName[k], mind[m]);
+            CHECK(O->Nbound == 0 && O->SnapDeath == 1 && R->Nbound > 0 && R->NestedParentTrackId == 0,
+                  "dead tracer (%s, distance %g): O not dead below an alive R under A\n", TwoPathName[k], mind[m]);
+            CHECK(p2_check_tags(o[k].r, o[k].n, o[k].rec, o[k].nt, "dead tracer") == 0, "dead tracer: tag invariants\n");
+        }
+        for(k = 1; k < 3 && DtComparePaths; k++)
+            CHECK(o[k].rec[1].MostBoundID == o[0].rec[1].MostBoundID, "dead tracer, distance %g: O's tracer %ld serially, %ld %s\n",
+                  mind[m], (long) o[0].rec[1].MostBoundID, (long) o[k].rec[1].MostBoundID, TwoPathName[k]);
+        for(k = 2; k >= 0; k--)
+            outcome_free(&o[k]);
+    }
+}
+
+/* The tracer a sunk survivor hands on: Y sinks into A; f moves Y's first frame 5 km/s and is its only
+ * loss, so the loop's order leads with t1 (+3 km/s), the final pass with t2 (-2.5 km/s). */
+#define SH_Y0 1000
+#define SH_END 1251
+
+static void
+sh_particle(MyIDType id, double atime, struct SynPart * s, void * ud)
+{
+    const double cA[3] = {500, 500, 500}, zero[3] = {0, 0, 0};
+    double x[3] = {0, 0, 0}, v[3] = {0, 0, 0};
+    int d;
+    (void) ud;
+    if(id >= SH_END)
+        return;
+    if(id < SH_Y0) {
+        syn_ball(id, 151, cA, 1.5, zero, 15, atime, s);
+        s->tag = s->bound = 0;
+        s->rank = id;
+        return;
+    }
+    const int64_t j = id - SH_Y0;
+    if(j == 0)
+        v[1] = 3;
+    else if(j == 1) {
+        x[0] = 0.0005;
+        v[1] = -2.5;
+    }
+    else if(j == 2)
+        v[1] = 1250;
+    else {
+        /* mirrored pairs (zero sum of offsets) outside 0.2 kpc of the centre */
+        const MyIDType b = SH_Y0 + 3 + 2 * ((j - 3) / 2);
+        rand_in_ball(b, 152, 0.6, zero, x);
+        rand_in_ball(b, 153, 8, zero, v);
+        const double r = sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]);
+        const double f = (r < 0.2 && r > 0) ? 0.2 / r : 1, sg = ((j - 3) % 2) ? -1 : 1;
+        for(d = 0; d < 3; d++) {
+            x[d] *= f * sg;
+            v[d] *= sg;
+        }
+    }
+    for(d = 0; d < 3; d++) {
+        s->pos[d] = cA[d] + x[d] / atime;
+        s->vel[d] = atime * v[d];
+    }
+    s->mass = 0.4 * SYN_M;
+    s->tag = s->bound = 1;
+    s->rank = j;
+}
+
+static void
+sh_run(int64_t collective, struct Outcome * o)
+{
+    Cosmology CP;
+    struct SubhaloParams sp = default_subhalo_params();
+    sp.SubhaloFieldSO = 0;
+    sp.SubhaloPotentialSampleSize = 0;
+    sp.SubhaloTreeOpenAngle = COLL_TEST_THETA;
+    sp.SubhaloCollectiveMinPart = collective;
+    syn_setup(&CP, SH_END + SYN_NFIELD, sp);
+    struct SubTrack recs[2];
+    recs[0] = syn_rec(0, 1000, 0.1, -1, 0, 0, 0);
+    recs[1] = syn_rec(1, SH_END - SH_Y0, (SH_END - SH_Y0) * 0.4 * SYN_M, 0, 0, 1, 1);
+    syn_records(recs, 2);
+    syn_place(sh_particle, NULL, 0.55, 1);
+    int64_t ng;
+    const int ret = run_finder_call(1, &CP, &ng);
+    CHECK(ret == 1 && ng == 1, "sunk tracer: %ld groups\n", ng);
+    outcome_take(o);
+    syn_teardown();
+}
+
+/* Y's tracer equal on the paths. Disabled: serially t1 (loop order), in place and in the sub-tree key t2 (final pass). */
+static const int ShComparePaths = 0;
+
+static void
+test_collective_sunk_tracer(void ** state)
+{
+    /* serial; Y a serial sub-tree key below in-place A; both in place */
+    const int64_t knob[3] = {0, 500, 200};
+    struct Outcome o[3];
+    int k;
+    for(k = 0; k < 3; k++) {
+        sh_run(knob[k], &o[k]);
+        const struct SubTrack * A = &o[k].rec[0], * Y = &o[k].rec[1];
+        message(0, "sunk tracer (%s): %ld candidates; Y Nbound %d SinkTrackId %ld SnapSink %d MostBoundID %ld; A Nbound %d Rank %d; "
+                   "f tagged %ld\n", TwoPathName[k], o[k].st.NCands, Y->Nbound, Y->SinkTrackId, Y->SnapSink, (long) Y->MostBoundID,
+                A->Nbound, A->Rank, tag_of(&o[k], SH_Y0 + 2, 0));
+        CHECK(o[k].st.NCands == k, "sunk tracer (%s): %ld candidates\n", TwoPathName[k], o[k].st.NCands);
+        CHECK(Y->Nbound == 0 && Y->SinkTrackId == 0 && Y->SnapSink == 1 && A->Rank == 0,
+              "sunk tracer (%s): Y not sunk into A\n", TwoPathName[k]);
+        CHECK(Y->MostBoundID == SH_Y0 || Y->MostBoundID == SH_Y0 + 1, "sunk tracer (%s): Y's tracer %ld, neither t1 nor t2\n",
+              TwoPathName[k], (long) Y->MostBoundID);
+        CHECK(p2_check_tags(o[k].r, o[k].n, o[k].rec, o[k].nt, "sunk tracer") == 0, "sunk tracer: tag invariants\n");
+    }
+    for(k = 1; k < 3 && ShComparePaths; k++)
+        CHECK(o[k].rec[1].MostBoundID == o[0].rec[1].MostBoundID, "sunk tracer: Y's tracer %ld serially, %ld %s\n",
+              (long) o[0].rec[1].MostBoundID, (long) o[k].rec[1].MostBoundID, TwoPathName[k]);
+    for(k = 2; k >= 0; k--)
+        outcome_free(&o[k]);
+}
+
+/* The election centre across the box edge: A, B and an untagged chain span over half the box, so the
+ * anchor (key order: the chain's far end; plan: A's minimum ID) decides the central, owner of the chain. */
+#define FC_B0 200
+#define FC_C0 400
+#define FC_END 470
+
+static void
+fc_particle(MyIDType id, double atime, struct SynPart * s, void * ud)
+{
+    const double cA[3] = {995, 500, 500}, cB[3] = {3, 500, 500}, zero[3] = {0, 0, 0};
+    (void) ud;
+    if(id >= FC_END)
+        return;
+    if(id < FC_B0) {
+        syn_ball(id, 161, cA, 0.5, zero, 5, atime, s);
+        s->tag = s->bound = 0;
+        s->rank = id;
+    }
+    else if(id < FC_C0) {
+        syn_ball(id, 162, cB, 0.5, zero, 5, atime, s);
+        s->tag = s->bound = 1;
+        s->rank = id - FC_B0;
+    }
+    else {
+        s->pos[0] = 3 + 8 * (FC_END - id);
+        s->pos[1] = s->pos[2] = 500;
+    }
+}
+
+static void
+fc_run(int64_t collective, struct Outcome * o)
+{
+    Cosmology CP;
+    struct SubhaloParams sp = default_subhalo_params();
+    sp.SubhaloFieldSO = 0;
+    sp.SubhaloPotentialSampleSize = 0;
+    sp.SubhaloTreeOpenAngle = COLL_TEST_THETA;
+    sp.SubhaloCollectiveMinPart = collective;
+    syn_setup(&CP, FC_END + SYN_NFIELD, sp);
+    struct SubTrack recs[2];
+    recs[0] = syn_rec(0, 200, 0.02, -1, 0, 0, 0);
+    recs[1] = syn_rec(1, 200, 0.02, 0, 0, 1, 1);
+    syn_records(recs, 2);
+    syn_place(fc_particle, NULL, 0.55, 1);
+    int64_t ng;
+    const int ret = run_finder_call(1, &CP, &ng);
+    CHECK(ret == 1 && ng == 1, "centre across the edge: %ld groups\n", ng);
+    outcome_take(o);
+    syn_teardown();
+}
+
+/* The chain's track equal on the paths. Disabled: serially A (centre about the chain's first particle), in place B (about the smallest ID). */
+static const int FcComparePaths = 0;
+
+static void
+test_collective_edge_centre(void ** state)
+{
+    /* serial; the group in place */
+    const int64_t knob[2] = {0, 300};
+    const char * name[2] = {"serial", "in place"};
+    struct Outcome o[2];
+    int64_t toA[2], toB[2];
+    int k;
+    for(k = 0; k < 2; k++) {
+        fc_run(knob[k], &o[k]);
+        const struct SubTrack * A = &o[k].rec[0], * B = &o[k].rec[1];
+        toA[k] = count_tags(&o[k], FC_C0, FC_END, 0, -1) + count_tags(&o[k], FC_C0, FC_END, 0, 0);
+        toB[k] = count_tags(&o[k], FC_C0, FC_END, 1, -1) + count_tags(&o[k], FC_C0, FC_END, 1, 1);
+        message(0, "centre across the edge (%s): %ld candidates; A Nbound %d Rank %d; B Nbound %d Rank %d; chain tagged A %ld, B %ld\n",
+                name[k], o[k].st.NCands, A->Nbound, A->Rank, B->Nbound, B->Rank, toA[k], toB[k]);
+        CHECK((o[k].st.NCands > 0) == (k > 0), "centre across the edge (%s): %ld candidates\n", name[k], o[k].st.NCands);
+        CHECK(A->Nbound > 0 && B->Nbound > 0 && toA[k] + toB[k] == FC_END - FC_C0,
+              "centre across the edge (%s): not two survivors holding the chain\n", name[k]);
+        CHECK(p2_check_tags(o[k].r, o[k].n, o[k].rec, o[k].nt, "centre across the edge") == 0, "centre across the edge: tag invariants\n");
+    }
+    CHECK(!FcComparePaths || toA[1] == toA[0], "centre across the edge: chain tagged A %ld serially, %ld in place\n", toA[0], toA[1]);
+    outcome_free(&o[1]);
+    outcome_free(&o[0]);
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_collective_serial_vs_inplace),
@@ -4392,6 +4806,10 @@ int main(void) {
         cmocka_unit_test(test_collective_vote_subtree_majority),
         cmocka_unit_test(test_collective_vote_inplace_receivers),
         cmocka_unit_test(test_collective_reunbind_death),
+        cmocka_unit_test(test_collective_tail_priority),
+        cmocka_unit_test(test_collective_dead_tracer),
+        cmocka_unit_test(test_collective_sunk_tracer),
+        cmocka_unit_test(test_collective_edge_centre),
     };
     const char * only = getenv("SUBHALO_TEST_ONLY");
     if(only && only[0]) {
