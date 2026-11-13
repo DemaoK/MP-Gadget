@@ -429,6 +429,65 @@ test_subhalo_header_params(void ** state)
     subhalo_set_testpar(saved);
 }
 
+/* The start-up check (subhalo_params_error, which set_subhalo_params aborts on): switches take 0
+ * and 1 only; the type masks are not 0 and hold every tracer type among the potential types;
+ * SubhaloSORefineMinPart is not negative with the field SO on; SubhaloGeometricParents is 0. */
+static void
+test_subhalo_param_checks(void ** state)
+{
+    const struct SubhaloParams def = default_subhalo_params();
+    struct SubhaloParams p;
+    char msg[2048] = "";
+    int bad = 0, k, v;
+#define SW(f) {#f, offsetof(struct SubhaloParams, f)}
+    const struct { const char * name; size_t off; } sw[] = {
+        SW(SubhaloFinderOn), SW(SubhaloRestartFresh), SW(SubhaloMergeTrapped), SW(SubhaloSinkSymmetric),
+        SW(SubhaloReassignGas), SW(SubhaloUnbindWithThermal), SW(SubhaloFieldSO), SW(SubhaloDebugForceExchangeFailure),
+        SW(SubhaloFinalPass),
+    };
+#undef SW
+    /* accepted (0) or refused naming the parameter (1) */
+#define EXPECT(want, name, ...) do { const int got = subhalo_params_error(&p, msg, sizeof(msg)); \
+        LOCAL_CHECK(bad, got == (want) && (!got || strstr(msg, name)), __VA_ARGS__); } while(0)
+    p = def;
+    EXPECT(0, "", "test defaults refused: %s", msg);
+    for(k = 0; k < (int) (sizeof(sw) / sizeof(sw[0])); k++)
+        for(v = -1; v <= 2; v++) {
+            p = def;
+            *(int *) ((char *) &p + sw[k].off) = v;
+            EXPECT(v < 0 || v > 1, sw[k].name, "%s = %d judged wrongly: '%s'\n", sw[k].name, v, msg);
+        }
+    p = def;
+    p.SubhaloTracerTypes = 0;
+    EXPECT(1, "SubhaloTracerTypes", "SubhaloTracerTypes = 0 judged wrongly: '%s'\n", msg);
+    p = def;
+    p.SubhaloPotentialTypes = 0;
+    EXPECT(1, "SubhaloPotentialTypes", "SubhaloPotentialTypes = 0 judged wrongly: '%s'\n", msg);
+    p = def;
+    p.SubhaloPotentialTypes = 1 + 2 + 32;
+    EXPECT(1, "every tracer type", "stars traced but not in the potential judged wrongly: '%s'\n", msg);
+    p.SubhaloTracerTypes = 2;
+    EXPECT(0, "", "DM tracers among gas, DM and BH potential types refused: '%s'\n", msg);
+    p.SubhaloPotentialTypes = 2;
+    EXPECT(0, "", "equal masks refused: '%s'\n", msg);
+    p = def;
+    p.SubhaloFieldSO = 1;
+    p.SubhaloSORefineMinPart = -1;
+    EXPECT(1, "SubhaloSORefineMinPart", "SubhaloSORefineMinPart = -1 with the field SO judged wrongly: '%s'\n", msg);
+    p.SubhaloSORefineMinPart = 0;
+    EXPECT(0, "", "SubhaloSORefineMinPart = 0 refused: '%s'\n", msg);
+    p.SubhaloFieldSO = 0;
+    p.SubhaloSORefineMinPart = -1;
+    EXPECT(0, "", "SubhaloSORefineMinPart = -1 without the field SO (unread) refused: '%s'\n", msg);
+    for(v = -1; v <= 2; v++) {
+        p = def;
+        p.SubhaloGeometricParents = v;
+        EXPECT(v != 0, "Not implemented", "SubhaloGeometricParents = %d judged wrongly: '%s'\n", v, msg);
+    }
+#undef EXPECT
+    assert_all_true(bad == 0);
+}
+
 static void
 test_subhalo_table(void ** state)
 {
@@ -6712,6 +6771,7 @@ int main(void) {
         cmocka_unit_test(test_subhalo_reserve_admission),
         cmocka_unit_test(test_subhalo_local_sort),
         cmocka_unit_test(test_subhalo_header_params),
+        cmocka_unit_test(test_subhalo_param_checks),
         cmocka_unit_test(test_subhalo_sampled_default),
         cmocka_unit_test(test_subhalo_sampled_default_full),
         cmocka_unit_test(test_subhalo_weighted_plurality),

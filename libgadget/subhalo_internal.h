@@ -126,6 +126,10 @@ double subhalo_vel_to_kms(double atime);
 /* 1 if SubhaloAdmitMinCoreDistance = MinD is inside its range (finite, not negative). */
 int subhalo_admit_distance_valid(double MinD);
 
+/* The start-up check of a finder that is on: 1 and the first broken rule in msg (the text
+ * set_subhalo_params aborts with), 0 if sp keeps the table's ranges and the rules between them. */
+int subhalo_params_error(const struct SubhaloParams * sp, char * msg, size_t size);
+
 /* The run's ImportBufferBoost (2, the parameter's default, until set_subhalo_params reads it), which
  * treewalk.c's reserve applies; the memory checks of the field SO and of the in-place walks read it. */
 double subhalo_import_buffer_boost(void);
