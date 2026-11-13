@@ -4562,9 +4562,6 @@ dt_run(int64_t collective, double mind, struct Outcome * o, struct SubhaloCallSt
     syn_teardown();
 }
 
-/* O's tracer equal on the paths. Disabled: serially tau (O's own list), in place the next own tracer (tau is excluded from O's candidate). */
-static const int DtComparePaths = 0;
-
 static void
 test_collective_dead_tracer(void ** state)
 {
@@ -4589,8 +4586,11 @@ test_collective_dead_tracer(void ** state)
             CHECK(O->Nbound == 0 && O->SnapDeath == 1 && R->Nbound > 0 && R->NestedParentTrackId == 0,
                   "dead tracer (%s, distance %g): O not dead below an alive R under A\n", TwoPathName[k], mind[m]);
             CHECK(p2_check_tags(o[k].r, o[k].n, o[k].rec, o[k].nt, "dead tracer") == 0, "dead tracer: tag invariants\n");
+            /* tau is R's, no longer in O's source: O keeps its next own tracer */
+            CHECK(O->MostBoundID == DT_O0 + 1, "dead tracer (%s, distance %g): O's tracer %ld, not the next own one\n", TwoPathName[k],
+                  mind[m], (long) O->MostBoundID);
         }
-        for(k = 1; k < 3 && DtComparePaths; k++)
+        for(k = 1; k < 3; k++)
             CHECK(o[k].rec[1].MostBoundID == o[0].rec[1].MostBoundID, "dead tracer, distance %g: O's tracer %ld serially, %ld %s\n",
                   mind[m], (long) o[0].rec[1].MostBoundID, (long) o[k].rec[1].MostBoundID, TwoPathName[k]);
         for(k = 2; k >= 0; k--)

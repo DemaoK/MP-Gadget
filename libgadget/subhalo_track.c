@@ -246,12 +246,12 @@ set_mb_from(struct SubNode * v, int64_t p)
     v->has_mb = 1;
 }
 
-/* The state of x after either of its unbindings; a resolved track that died takes its previous
- * most-bound tracer, the first own-tag tracer of its own source in BindRank order (as dead_mb). */
+/* The state of x after either of its unbindings; a resolved track that died takes the own-tag tracer
+ * of least (BindRank, ID) in its candidate list (as dead_mb), which excludes what a receiver still holds. */
 static void
-node_unbound(struct SubNode * x, int alive, const int32_t * ownlist, int64_t start, int TracerTypes)
+node_unbound(struct SubNode * x, int alive, int TracerTypes)
 {
-    int64_t j;
+    int64_t j, b = -1;
     if(alive) {
         x->state = SUBHALO_ST_ALIVE;
         return;
@@ -261,13 +261,15 @@ node_unbound(struct SubNode * x, int alive, const int32_t * ownlist, int64_t sta
         return;
     }
     x->state = SUBHALO_ST_DIED;
-    for(j = 0; j < x->own_n; j++) {
-        const int64_t pi = start + ownlist[x->own_off + j];
-        if(P[pi].TrackId == x->TrackId && is_tracer(pi, TracerTypes)) {
-            set_mb_from(x, pi);
-            return;
-        }
+    for(j = 0; j < x->c.N; j++) {
+        const int64_t pi = x->c.Index[j];
+        if(P[pi].TrackId != x->TrackId || !is_tracer(pi, TracerTypes))
+            continue;
+        if(b < 0 || P[pi].BindRank < P[b].BindRank || (P[pi].BindRank == P[b].BindRank && P[pi].ID < P[b].ID))
+            b = pi;
     }
+    if(b >= 0)
+        set_mb_from(x, b);
 }
 
 /* The core used by the sinking test: of the bound set for a survivor (subhalo_core); for a
@@ -1242,14 +1244,14 @@ node_unbind(struct KeyRun * K, struct SubNode * x, int u, int64_t cap)
     x->c.Energy = (double *) arena_need(arena, sizeof(double) * (cap + 1), K->g, "candidate energies");
     int alive = unbind_counted(&x->c, x->kind == SUBHALO_MEM_RESOLVED ? x->old : NULL, K->up, arena, &K->ks);
     arena->used = mark;
-    node_unbound(x, alive, K->ownlist, K->start, K->TracerTypes);
+    node_unbound(x, alive, K->TracerTypes);
     node_core(x, K->up, sp->SubhaloCoreSize);
     if(x->state == SUBHALO_ST_ALIVE && sp->SubhaloMergeTrapped
        && merge_subtree(K->nd, u, u, K->up, sp->SubhaloSinkSymmetric, K->TracerTypes)) {
         x->c.Energy = (double *) arena_need(arena, sizeof(double) * (cap + 1), K->g, "candidate energies");
         alive = unbind_counted(&x->c, NULL, K->up, arena, &K->ks);
         arena->used = mark;
-        node_unbound(x, alive, K->ownlist, K->start, K->TracerTypes);
+        node_unbound(x, alive, K->TracerTypes);
         node_core(x, K->up, sp->SubhaloCoreSize);
     }
 }
