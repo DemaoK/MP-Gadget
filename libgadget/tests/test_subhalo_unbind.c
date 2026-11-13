@@ -4,8 +4,9 @@
  * second attempt after a large loss; bitwise results at 1 to 8 threads and inside a worker region; the sampled
  * final pass.
  * test_timing takes sizes, thresholds, threads and the final-pass mode from SUBHALO_UNBIND_TIMING*.
- * The slow tests (threads_bitwise, threads_worker_region, final_pass_sampled, threads_par_min)
- * run only with SUBHALO_TEST_FULL=1 (make test does not set it); otherwise each prints a note.
+ * The slow tests (threads_bitwise, threads_worker_region, final_pass_sampled_large,
+ * threads_par_min) run only with SUBHALO_TEST_FULL set to anything but 0, e.g. 1 (make test does
+ * not set it); otherwise each prints a note.
  * Haloes sample the exact Hernquist distribution function (truncated at 100 scale radii) across a
  * periodic boundary; a = 1, H = 0, units kpc/h, 1e10 Msun/h, km/s. Run as: mpirun -np 1. */
 
@@ -2897,178 +2898,197 @@ fp_check_head(const struct CandResult * r, const int64_t * L, const int64_t * ra
     return K;
 }
 
+/* Part 1: below the sample size the sampled pass is the exact pass. */
+static void
+fp_below_sample(void)
+{
+    const int64_t nh = 900, nf = 400;
+    setup_pman(nh + nf);
+    make_hernquist(0, nh, HQ_M, HQ_A, HQ_RMAX, Centre, Bulk, 31, 0);
+    /* fast particles inside the sphere: unbound at the first iteration */
+    {
+        gsl_rng * rng = gsl_rng_alloc(gsl_rng_mt19937);
+        gsl_rng_set(rng, 32);
+        int64_t i;
+        int d;
+        for(i = nh; i < nh + nf; i++) {
+            double u[3];
+            memset(&P[i], 0, sizeof(P[i]));
+            P[i].Type = 1;
+            P[i].Mass = P[0].Mass;
+            P[i].ID = i;
+            random_direction(rng, u);
+            const double r = HQ_A * gsl_rng_uniform_pos(rng);
+            for(d = 0; d < 3; d++)
+                P[i].Pos[d] = wrapb(Centre[d] + r * u[d]);
+            random_direction(rng, u);
+            for(d = 0; d < 3; d++)
+                P[i].Vel[d] = Bulk[d] + 3000. * u[d];
+        }
+        gsl_rng_free(rng);
+    }
+    struct SubhaloUnbindParams ue = default_params();
+    ue.SampleSize = 1000;
+    struct SubhaloUnbindParams us = ue;
+    us.SampledFinalPass = 1;
+    const int64_t ns[2] = {nh, nh + nf};
+    int c;
+    for(c = 0; c < 2; c++) {
+        struct SubhaloArena arena = arena_alloc(ns[c]);
+        struct CandResult re, rs;
+        run_threads(&re, 1, ns[c], Centre, Bulk, 17, &ue, &arena, NULL, NULL);
+        run_threads(&rs, 1, ns[c], Centre, Bulk, 17, &us, &arena, NULL, NULL);
+        message(0, "Sampled final pass below the sample size: N %ld, Nbound %ld after %d iterations: identical to the exact pass\n",
+                (long) ns[c], (long) re.Nbound, re.Iterations);
+        assert_true(re.alive);
+        assert_true(re.Nbound <= ue.SampleSize);
+        if(c == 1)
+            assert_true(re.Nbound < ns[c] - nf / 2);
+        assert_same_result(&re, &rs);
+        cand_result_free(&rs);
+        cand_result_free(&re);
+        myfree(arena.base);
+    }
+    teardown_pman();
+}
+
+/* Part 2, one fixture: 0 DM only, 1 every other particle a non-tracer (type 0), 2 scarce
+ * tracers (60 bound, the non-tracer fill), 3 the cold sphere with Nbound = SampleSize + 1. */
+static void
+fp_above_sample(int mode)
+{
+    int k;
+    const char * label[4] = {"DM only", "half non-tracers", "60 tracers", "Nbound = SampleSize + 1"};
+    const int64_t n = mode == 3 ? 1001 : 50000;
+    const int nths[3] = {1, 2, 8};
+    int64_t i;
+    setup_pman(n);
+    make_hernquist(0, n, HQ_M, HQ_A, HQ_RMAX, Centre, Bulk, 4243, 0);
+    if(mode == 1)
+        for(i = 1; i < n; i += 2)
+            P[i].Type = 0;
+    if(mode == 2) {
+        /* 60 tracers among the particles inside 0.1 a (about 400 of them), the others type 0 */
+        int64_t ntr = 0;
+        for(i = 0; i < n; i++) {
+            const int inner = ntr < 60 && dist_periodic(P[i].Pos, Centre) < 0.1 * HQ_A;
+            P[i].Type = inner ? 1 : 0;
+            ntr += inner;
+        }
+        assert_int_equal(ntr, 60);
+    }
+    if(mode == 3) {
+        /* a cold sphere (a tenth of the dispersion): every particle stays bound */
+        int d;
+        for(i = 0; i < n; i++)
+            for(d = 0; d < 3; d++)
+                P[i].Vel[d] = Bulk[d] + 0.1 * (P[i].Vel[d] - Bulk[d]);
+    }
+    struct SubhaloUnbindParams ue = default_params();
+    ue.SampleSize = 1000;
+    struct SubhaloUnbindParams us = ue;
+    us.SampledFinalPass = 1;
+    struct SubhaloArena arena = arena_alloc(n);
+    struct CandResult re, rs[3];
+    double tun, tfp;
+    /* the loop order handed to each final pass */
+    int64_t * le = (int64_t *) malloc(sizeof(int64_t) * n);
+    int64_t * ls = (int64_t *) malloc(sizeof(int64_t) * n);
+    /* a start frame 100 km/s off: several iterations, the outskirts unbound on the way (the
+     * cold sphere starts in its own frame) */
+    const double vel0[3] = {Bulk[0] + (mode == 3 ? 0 : 100.), Bulk[1], Bulk[2]};
+    FpLoopCapture = le;
+    run_threads(&re, 1, n, Centre, vel0, 23, &ue, &arena, &tun, &tfp);
+    message(0, "Sampled final pass fixture (%s), exact pass: Nbound %ld / %ld after %d iterations, NboundPositive %ld; unbind %.3f s, final pass %.3f s\n",
+            label[mode], (long) re.Nbound, (long) n, re.Iterations, (long) re.NboundPositive, tun, tfp);
+    assert_true(re.alive);
+    if(mode == 3)
+        assert_true(re.Nbound == ue.SampleSize + 1);
+    else
+        assert_true(re.Nbound > SUBHALO_UNBIND_PAR_MIN && re.Nbound > 0.9 * n && re.Iterations > 1);
+    int64_t * rank = (int64_t *) malloc(sizeof(int64_t) * n);
+    for(i = 0; i < re.Nbound; i++)
+        rank[re.Index[i]] = i;
+    int64_t K = 0, ntr = 0;
+    for(k = 0; k < 3; k++) {
+        FpLoopCapture = ls;
+        run_threads(&rs[k], nths[k], n, Centre, vel0, 23, &us, &arena, &tun, &tfp);
+        FpLoopCapture = NULL;
+        message(0, "Sampled final pass fixture, %d thread(s): NboundPositive %ld; unbind %.3f s, final pass %.3f s\n",
+                nths[k], (long) rs[k].NboundPositive, tun, tfp);
+        /* the loop is the exact run's (it does not depend on the option or the threads) */
+        assert_memory_equal(ls, le, sizeof(int64_t) * n);
+        K = fp_check_head(&rs[k], ls, rank, &us, &ntr);
+    }
+    for(k = 1; k < 3; k++)
+        assert_same_result(&rs[0], &rs[k]);
+    fp_result_sameset(&re, &rs[0]);
+    {
+        int64_t core = 0, same = 0;
+        const int64_t T = SUBHALO_FINAL_REFINE_MARGIN * SUBHALO_FINAL_REFINE_MIN;
+        /* the first 20 tracers (or all, if fewer are bound) are the exact pass's most-bound
+         * tracers in the same order (the most-bound tracer, the core, the reserved tracers) */
+        int64_t trs[SUBHALO_FINAL_REFINE_MIN], tre[SUBHALO_FINAL_REFINE_MIN], ns = 0, ne = 0;
+        for(i = 0; i < K; i++)
+            same += rs[0].Index[i] == re.Index[i];
+        for(i = 0; i < rs[0].Nbound && ns < SUBHALO_FINAL_REFINE_MIN; i++)
+            if(type_in_test(ue.TracerTypes, P[rs[0].Index[i]].Type))
+                trs[ns++] = rs[0].Index[i];
+        for(i = 0; i < re.Nbound && ne < SUBHALO_FINAL_REFINE_MIN; i++)
+            if(type_in_test(ue.TracerTypes, P[re.Index[i]].Type))
+                tre[ne++] = re.Index[i];
+        assert_int_equal(ns, SUBHALO_FINAL_REFINE_MIN);
+        assert_int_equal(ne, SUBHALO_FINAL_REFINE_MIN);
+        assert_memory_equal(trs, tre, sizeof(trs));
+        for(i = 0; i < 20; i++)
+            core += rank[rs[0].Index[i]] < 20;
+        message(0, "Sampled vs exact (%s): head K = %ld (%ld tracers) from the loop order, all K in the exact pass's relative order, "
+                   "%ld / %ld at the exact pass's position, the bound suffix the loop's; most bound %ld (exact %ld); "
+                   "exact ranks of the sampled 5 most bound %ld %ld %ld %ld %ld; first-20 overlap %ld / 20; NboundPositive sampled %ld exact %ld\n",
+                label[mode], (long) K, (long) ntr, (long) same, (long) K, (long) rs[0].Index[0], (long) re.Index[0],
+                (long) rank[rs[0].Index[0]], (long) rank[rs[0].Index[1]], (long) rank[rs[0].Index[2]], (long) rank[rs[0].Index[3]],
+                (long) rank[rs[0].Index[4]], (long) core, (long) rs[0].NboundPositive, (long) re.NboundPositive);
+        /* DM only: the head is exactly T; with non-tracers it is longer; with 60 tracers it
+         * holds all 60 and 40 non-tracers */
+        if(mode == 0 || mode == 3)
+            assert_true(K == T);
+        else
+            assert_true(K > T);
+        if(mode == 2)
+            assert_true(ntr == 60 && rs[0].NboundTracer == 60);
+    }
+    free(rank);
+    free(ls);
+    free(le);
+    assert_int_equal(rs[0].Index[0], re.Index[0]);
+    assert_true(rs[0].NboundPositive < 0.01 * rs[0].Nbound);
+    for(k = 0; k < 3; k++)
+        cand_result_free(&rs[k]);
+    cand_result_free(&re);
+    myfree(arena.base);
+    teardown_pman();
+}
+
+/* Part 1 and the 1001-particle fixture of part 2: the sampling boundary, a fraction of a second. */
 static void
 test_final_pass_sampled(void ** state)
+{
+    const int nmax0 = omp_get_max_threads();
+    fp_below_sample();
+    fp_above_sample(3);
+    omp_set_num_threads(nmax0);
+}
+
+/* The three 5e4-particle fixtures of part 2, a few seconds each. */
+static void
+test_final_pass_sampled_large(void ** state)
 {
     if(!full_test(__func__))
         return;
     const int nmax0 = omp_get_max_threads();
-    int k;
-    /* 1. below the sample size */
-    {
-        const int64_t nh = 900, nf = 400;
-        setup_pman(nh + nf);
-        make_hernquist(0, nh, HQ_M, HQ_A, HQ_RMAX, Centre, Bulk, 31, 0);
-        /* fast particles inside the sphere: unbound at the first iteration */
-        {
-            gsl_rng * rng = gsl_rng_alloc(gsl_rng_mt19937);
-            gsl_rng_set(rng, 32);
-            int64_t i;
-            int d;
-            for(i = nh; i < nh + nf; i++) {
-                double u[3];
-                memset(&P[i], 0, sizeof(P[i]));
-                P[i].Type = 1;
-                P[i].Mass = P[0].Mass;
-                P[i].ID = i;
-                random_direction(rng, u);
-                const double r = HQ_A * gsl_rng_uniform_pos(rng);
-                for(d = 0; d < 3; d++)
-                    P[i].Pos[d] = wrapb(Centre[d] + r * u[d]);
-                random_direction(rng, u);
-                for(d = 0; d < 3; d++)
-                    P[i].Vel[d] = Bulk[d] + 3000. * u[d];
-            }
-            gsl_rng_free(rng);
-        }
-        struct SubhaloUnbindParams ue = default_params();
-        ue.SampleSize = 1000;
-        struct SubhaloUnbindParams us = ue;
-        us.SampledFinalPass = 1;
-        const int64_t ns[2] = {nh, nh + nf};
-        int c;
-        for(c = 0; c < 2; c++) {
-            struct SubhaloArena arena = arena_alloc(ns[c]);
-            struct CandResult re, rs;
-            run_threads(&re, 1, ns[c], Centre, Bulk, 17, &ue, &arena, NULL, NULL);
-            run_threads(&rs, 1, ns[c], Centre, Bulk, 17, &us, &arena, NULL, NULL);
-            message(0, "Sampled final pass below the sample size: N %ld, Nbound %ld after %d iterations: identical to the exact pass\n",
-                    (long) ns[c], (long) re.Nbound, re.Iterations);
-            assert_true(re.alive);
-            assert_true(re.Nbound <= ue.SampleSize);
-            if(c == 1)
-                assert_true(re.Nbound < ns[c] - nf / 2);
-            assert_same_result(&re, &rs);
-            cand_result_free(&rs);
-            cand_result_free(&re);
-            myfree(arena.base);
-        }
-        teardown_pman();
-    }
-    /* 2. above the sample size: DM only, every other particle a non-tracer (type 0), scarce
-     *    tracers (60 bound, the non-tracer fill) and Nbound = SampleSize + 1 */
     int mode;
-    for(mode = 0; mode < 4; mode++) {
-        const char * label[4] = {"DM only", "half non-tracers", "60 tracers", "Nbound = SampleSize + 1"};
-        const int64_t n = mode == 3 ? 1001 : 50000;
-        const int nths[3] = {1, 2, 8};
-        int64_t i;
-        setup_pman(n);
-        make_hernquist(0, n, HQ_M, HQ_A, HQ_RMAX, Centre, Bulk, 4243, 0);
-        if(mode == 1)
-            for(i = 1; i < n; i += 2)
-                P[i].Type = 0;
-        if(mode == 2) {
-            /* 60 tracers among the particles inside 0.1 a (about 400 of them), the others type 0 */
-            int64_t ntr = 0;
-            for(i = 0; i < n; i++) {
-                const int inner = ntr < 60 && dist_periodic(P[i].Pos, Centre) < 0.1 * HQ_A;
-                P[i].Type = inner ? 1 : 0;
-                ntr += inner;
-            }
-            assert_int_equal(ntr, 60);
-        }
-        if(mode == 3) {
-            /* a cold sphere (a tenth of the dispersion): every particle stays bound */
-            int d;
-            for(i = 0; i < n; i++)
-                for(d = 0; d < 3; d++)
-                    P[i].Vel[d] = Bulk[d] + 0.1 * (P[i].Vel[d] - Bulk[d]);
-        }
-        struct SubhaloUnbindParams ue = default_params();
-        ue.SampleSize = 1000;
-        struct SubhaloUnbindParams us = ue;
-        us.SampledFinalPass = 1;
-        struct SubhaloArena arena = arena_alloc(n);
-        struct CandResult re, rs[3];
-        double tun, tfp;
-        /* the loop order handed to each final pass */
-        int64_t * le = (int64_t *) malloc(sizeof(int64_t) * n);
-        int64_t * ls = (int64_t *) malloc(sizeof(int64_t) * n);
-        /* a start frame 100 km/s off: several iterations, the outskirts unbound on the way (the
-         * cold sphere starts in its own frame) */
-        const double vel0[3] = {Bulk[0] + (mode == 3 ? 0 : 100.), Bulk[1], Bulk[2]};
-        FpLoopCapture = le;
-        run_threads(&re, 1, n, Centre, vel0, 23, &ue, &arena, &tun, &tfp);
-        message(0, "Sampled final pass fixture (%s), exact pass: Nbound %ld / %ld after %d iterations, NboundPositive %ld; unbind %.3f s, final pass %.3f s\n",
-                label[mode], (long) re.Nbound, (long) n, re.Iterations, (long) re.NboundPositive, tun, tfp);
-        assert_true(re.alive);
-        if(mode == 3)
-            assert_true(re.Nbound == ue.SampleSize + 1);
-        else
-            assert_true(re.Nbound > SUBHALO_UNBIND_PAR_MIN && re.Nbound > 0.9 * n && re.Iterations > 1);
-        int64_t * rank = (int64_t *) malloc(sizeof(int64_t) * n);
-        for(i = 0; i < re.Nbound; i++)
-            rank[re.Index[i]] = i;
-        int64_t K = 0, ntr = 0;
-        for(k = 0; k < 3; k++) {
-            FpLoopCapture = ls;
-            run_threads(&rs[k], nths[k], n, Centre, vel0, 23, &us, &arena, &tun, &tfp);
-            FpLoopCapture = NULL;
-            message(0, "Sampled final pass fixture, %d thread(s): NboundPositive %ld; unbind %.3f s, final pass %.3f s\n",
-                    nths[k], (long) rs[k].NboundPositive, tun, tfp);
-            /* the loop is the exact run's (it does not depend on the option or the threads) */
-            assert_memory_equal(ls, le, sizeof(int64_t) * n);
-            K = fp_check_head(&rs[k], ls, rank, &us, &ntr);
-        }
-        for(k = 1; k < 3; k++)
-            assert_same_result(&rs[0], &rs[k]);
-        fp_result_sameset(&re, &rs[0]);
-        {
-            int64_t core = 0, same = 0;
-            const int64_t T = SUBHALO_FINAL_REFINE_MARGIN * SUBHALO_FINAL_REFINE_MIN;
-            /* the first 20 tracers (or all, if fewer are bound) are the exact pass's most-bound
-             * tracers in the same order (the most-bound tracer, the core, the reserved tracers) */
-            int64_t trs[SUBHALO_FINAL_REFINE_MIN], tre[SUBHALO_FINAL_REFINE_MIN], ns = 0, ne = 0;
-            for(i = 0; i < K; i++)
-                same += rs[0].Index[i] == re.Index[i];
-            for(i = 0; i < rs[0].Nbound && ns < SUBHALO_FINAL_REFINE_MIN; i++)
-                if(type_in_test(ue.TracerTypes, P[rs[0].Index[i]].Type))
-                    trs[ns++] = rs[0].Index[i];
-            for(i = 0; i < re.Nbound && ne < SUBHALO_FINAL_REFINE_MIN; i++)
-                if(type_in_test(ue.TracerTypes, P[re.Index[i]].Type))
-                    tre[ne++] = re.Index[i];
-            assert_int_equal(ns, SUBHALO_FINAL_REFINE_MIN);
-            assert_int_equal(ne, SUBHALO_FINAL_REFINE_MIN);
-            assert_memory_equal(trs, tre, sizeof(trs));
-            for(i = 0; i < 20; i++)
-                core += rank[rs[0].Index[i]] < 20;
-            message(0, "Sampled vs exact (%s): head K = %ld (%ld tracers) from the loop order, all K in the exact pass's relative order, "
-                       "%ld / %ld at the exact pass's position, the bound suffix the loop's; most bound %ld (exact %ld); "
-                       "exact ranks of the sampled 5 most bound %ld %ld %ld %ld %ld; first-20 overlap %ld / 20; NboundPositive sampled %ld exact %ld\n",
-                    label[mode], (long) K, (long) ntr, (long) same, (long) K, (long) rs[0].Index[0], (long) re.Index[0],
-                    (long) rank[rs[0].Index[0]], (long) rank[rs[0].Index[1]], (long) rank[rs[0].Index[2]], (long) rank[rs[0].Index[3]],
-                    (long) rank[rs[0].Index[4]], (long) core, (long) rs[0].NboundPositive, (long) re.NboundPositive);
-            /* DM only: the head is exactly T; with non-tracers it is longer; with 60 tracers it
-             * holds all 60 and 40 non-tracers */
-            if(mode == 0 || mode == 3)
-                assert_true(K == T);
-            else
-                assert_true(K > T);
-            if(mode == 2)
-                assert_true(ntr == 60 && rs[0].NboundTracer == 60);
-        }
-        free(rank);
-        free(ls);
-        free(le);
-        assert_int_equal(rs[0].Index[0], re.Index[0]);
-        assert_true(rs[0].NboundPositive < 0.01 * rs[0].Nbound);
-        for(k = 0; k < 3; k++)
-            cand_result_free(&rs[k]);
-        cand_result_free(&re);
-        myfree(arena.base);
-        teardown_pman();
-    }
+    for(mode = 0; mode < 3; mode++)
+        fp_above_sample(mode);
     omp_set_num_threads(nmax0);
 }
 
@@ -3347,6 +3367,7 @@ int main(void) {
         cmocka_unit_test(test_threads_bitwise),
         cmocka_unit_test(test_threads_worker_region),
         cmocka_unit_test(test_final_pass_sampled),
+        cmocka_unit_test(test_final_pass_sampled_large),
         cmocka_unit_test(test_threads_par_min),
         cmocka_unit_test(test_timing),
     };

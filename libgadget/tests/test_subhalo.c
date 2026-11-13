@@ -4,8 +4,9 @@
  * MP-Gadget tree build itself fails on these 125-particle-per-rank fixtures (NODECACHE_SIZE).
  * SUBHALO_TEST_ONLY=<substring> runs only the matching tests. The sort-key range checks abort
  * through endrun, so they run alone: SUBHALO_TEST_SORTKEY_OVERFLOW=grnr|trackid|bindrank
- * mpirun -np 1 .objs/test_subhalo must exit non-zero. The slow tests (sampled_default, fallback)
- * run only with SUBHALO_TEST_FULL=1 (make test does not set it); otherwise each prints a note. */
+ * mpirun -np 1 .objs/test_subhalo must exit non-zero. The slow tests (sampled_default_full,
+ * fallback) run only with SUBHALO_TEST_FULL set to anything but 0, e.g. 1 (make test does not set
+ * it); otherwise each prints a note. */
 
 /* nftw() for the temporary PIG cleanup */
 #define _GNU_SOURCE
@@ -3537,28 +3538,18 @@ sd_free(struct sd_state * s)
 
 /* The real driver with the production default (SubhaloFinalPass = 0, sampled final pass) on
  * the two-halo fixture (clump A above SubhaloPotentialSampleSize): tags and every persisted record
- * column after calls 1 and 2 are the same at 1 and 2 threads (A runs alone, threaded), and with
- * call 2 continued in memory or after reloading PIG_001. The exact pass (SubhaloFinalPass = 1)
- * gives a different binding order, so the default path is the one exercised. */
+ * column after calls 1 and 2 are the same at 2 threads (A runs alone, threaded) with call 2 after
+ * reloading PIG_001 as at 1 thread in memory. The exact pass (SubhaloFinalPass = 1) gives a
+ * different binding order, so the default path is the one exercised. */
 static void
 test_subhalo_sampled_default(void ** state)
 {
-    if(!full_test(__func__))
-        return;
     struct sd_state ref, x;
-    int bad = 0;
     sd_sequence(1, 0, 0, &ref);
-    const int Ts[3] = {2, 1, 2}, Rl[3] = {0, 1, 1};
-    int c;
-    for(c = 0; c < 3; c++) {
-        char what[96];
-        snprintf(what, sizeof(what), "sampled default, %d threads%s vs 1 thread", Ts[c], Rl[c] ? " with a reload" : "");
-        sd_sequence(Ts[c], Rl[c], 0, &x);
-        const int b = sd_compare(&ref, &x, what);
-        message(0, "%s: %d differences\n", what, b);
-        bad += b;
-        sd_free(&x);
-    }
+    sd_sequence(2, 1, 0, &x);
+    int bad = sd_compare(&ref, &x, "sampled default, 2 threads with a reload vs 1 thread");
+    message(0, "sampled default, 2 threads with a reload vs 1 thread: %d differences\n", bad);
+    sd_free(&x);
     assert_all_true(bad == 0);
     /* the default differs from the exact pass in clump A's order (the sampled pass ran) */
     sd_sequence(1, 0, 1, &x);
@@ -3568,6 +3559,31 @@ test_subhalo_sampled_default(void ** state)
     message(0, "sampled default vs exact pass, call 1: %ld of %ld BindRank differ\n", ndiff, ref.n[0]);
     CHECK(ndiff > 0, "sampled default: the binding order equals the exact pass's (%ld differences)\n", ndiff);
     sd_free(&x);
+    sd_free(&ref);
+}
+
+/* sampled_default's two factors one at a time (2 threads in memory, 1 thread with a reload), and
+ * a non-default core and reserved tracer count, which costs most of the time. */
+static void
+test_subhalo_sampled_default_full(void ** state)
+{
+    if(!full_test(__func__))
+        return;
+    struct sd_state ref, x;
+    int bad = 0;
+    sd_sequence(1, 0, 0, &ref);
+    const int Ts[2] = {2, 1}, Rl[2] = {0, 1};
+    int c;
+    for(c = 0; c < 2; c++) {
+        char what[96];
+        snprintf(what, sizeof(what), "sampled default, %d threads%s vs 1 thread", Ts[c], Rl[c] ? " with a reload" : "");
+        sd_sequence(Ts[c], Rl[c], 0, &x);
+        const int b = sd_compare(&ref, &x, what);
+        message(0, "%s: %d differences\n", what, b);
+        bad += b;
+        sd_free(&x);
+    }
+    assert_all_true(bad == 0);
     sd_free(&ref);
     /* a non-default core (37) and reserved tracer count (45): a 225-tracer exact head, 1 vs 2 threads */
     SdCoreSize = 37;
@@ -6697,6 +6713,7 @@ int main(void) {
         cmocka_unit_test(test_subhalo_local_sort),
         cmocka_unit_test(test_subhalo_header_params),
         cmocka_unit_test(test_subhalo_sampled_default),
+        cmocka_unit_test(test_subhalo_sampled_default_full),
         cmocka_unit_test(test_subhalo_weighted_plurality),
         cmocka_unit_test(test_subhalo_resurrection_order),
         cmocka_unit_test(test_subhalo_penalty_descendant),
