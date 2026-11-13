@@ -20,9 +20,8 @@
 /* Bytes treewalk.c's ev_begin reserves for the potential-only walk: 40960 + max(4097, 100 x threads)
  * buffers of index, query and result plus ImportBufferBoost x (query + result). */
 size_t subhalo_collective_walk_bytes(void);
-/* The inputs of subhalo_coll_estimate: this rank's particle counts (NUniv in oversized groups,
- * NSubPart in its sub-tree keys), owned candidates and their core records (OwnedRecv); the global
- * counts; the domain's top tree, this rank's top leaves and the tree's sizing. */
+/* The inputs of subhalo_coll_estimate: this rank's and the global counts of oversized-group
+ * particles, candidates and core records, and the top tree's sizing. */
 struct SubhaloCollSizes {
     int64_t NumPart, MaxPart, NUniv, NSubPart, NOwned, OwnedRecv;
     int64_t NCands, NMembers, NSubResults;

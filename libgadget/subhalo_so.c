@@ -813,9 +813,8 @@ so_is_central(const struct SubTrack * r)
     return r->Rank == 0 && r->HostGroup >= 0 && r->Nbound > 0;
 }
 
-/* One pass over the rows of bs in its batches, each batch then analysed (pass 1: outcome or redo
- * with a doubled R; pass 2: final values; pass 3: profile columns). Collective: every rank runs the
- * global maximum number of batches. Returns the number of walks. */
+/* One pass over the rows of bs in batches, each analysed after its walk; every rank runs the global
+ * number of batches (collective). Returns the number of walks. */
 static int
 so_run_batches(int pass, struct so_priv * pv, const struct so_batches * bs, ForceTree * tree, const struct so_cfg * cfg,
                MPI_Comm Comm)

@@ -890,9 +890,8 @@ lookup_fits(const struct SubTrackTable * tab, int SnapNum, MPI_Comm Comm)
     return 0;
 }
 
-/* Why a plan was refused: the admission vote, the in-place stage or the plan's reserve does not fit
- * on some rank. P is unchanged so far, so the domain needs no restore. The track table keeps what
- * the orphan lookup wrote (the markers' positions and velocities, SnapTracerLost of lost markers). */
+/* Why a plan was refused (vote, in-place stage or reserve); P is unchanged, so the domain needs no
+ * restore, and the track table keeps the orphan lookup. */
 static void
 plan_failed_message(const struct SubhaloPlan * plan, int SnapNum)
 {

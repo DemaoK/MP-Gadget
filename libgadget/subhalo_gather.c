@@ -1295,10 +1295,8 @@ sorted_find(const int64_t * v, int64_t n, int64_t x)
     return (lo < n && v[lo] == x) ? lo : -1;
 }
 
-/* The tables of one pass of the plan. The field-key map and the oversized keys O (FOF and
- * pseudo-keys, sorted) are the plan's, held across the passes; the others are the pass's own, on
- * the bottom of the stack in this order: key centres, centrals, member table, sub-tree keys, the
- * vote's offers and the census's messages, received messages and directory. */
+/* The tables of one pass of the plan: fkmap and O are the plan's, held across passes; the rest are
+ * the pass's own, on the bottom of the stack in field order (plan_pass_free undoes it). */
 struct PlanPass {
     const struct SubhaloTrackKey * fkmap;
     int64_t nfk;
@@ -1690,10 +1688,8 @@ cmp_subkey_g_root(const void * a, const void * b)
     return (x->root > y->root) - (x->root < y->root);
 }
 
-/* Marks the in-place candidates (the centrals of O and the promoted Q) and cuts the serial sub-tree
- * keys below them: a resolved non-candidate joins the sub-tree of its nearest ancestor-or-self whose
- * parent is a candidate; roots numbered in (g, TrackId) order from SubKeyBase. Allocates ps->sk and
- * sets ps->nsk. */
+/* Marks the in-place candidates (centrals of O, promoted Q) and cuts the sub-tree keys below them
+ * into ps->sk: roots under a candidate, numbered in (g, TrackId) order from SubKeyBase. */
 static void
 plan_cut(struct PlanPass * ps, const int64_t * Q, int64_t nQ, int64_t SubKeyBase)
 {
@@ -2089,11 +2085,8 @@ struct VoteRecordBytes {
     double held, build, rounds;
 };
 
-/* Memory check of the final plan, from the last pass's directory. Every plan: the free bytes at pack
- * time must cover the reserve and the per-MaxPart sort bytes (a->reserve_failed). With in-place
- * candidates: the collective stage's peak (subhalo_coll_estimate) must fit the free bytes less what
- * the serial stage keeps until the collective call and the slot growth. The admission vote's records
- * rb count in both. Returns 1 on every rank if some rank fails. Collective. */
+/* Memory check of the final plan: the reserve and sort bytes, and the in-place stage's peak beside
+ * what the serial stage keeps, both with the vote's records rb; 1 on every rank if one fails. */
 static int
 plan_memory_check(struct SubhaloPlan * plan, const struct PlanPass * ps, const DomainDecomp * ddecomp,
                   const struct VoteRecordBytes * rb, MPI_Comm Comm)
@@ -2291,10 +2284,8 @@ plan_admit_withheld(const void * t, int64_t r, int64_t A)
                                   pt->MinD, pt->BoxSize);
 }
 
-/* The owner of a live tracer of an oversized key as the whole key's serial run sets it
- * (process_serial_key: a resolved member's own particles, the central's only inside its FOF group
- * except in a pseudo-key, every other particle of the group to the central): its member index in
- * ps->mem, -1 if none; *kO the key's index in O. */
+/* The owner of a live tracer of an oversized key by the serial key's rule (key_owner_map): its
+ * member index in ps->mem, -1 if none; *kO the key's index in O. */
 static int64_t
 vote_owner(const struct particle_data * p, const struct PlanPass * ps, int TracerTypes, int64_t * kO)
 {
@@ -2346,15 +2337,8 @@ subhalo_plan_last_vote(void)
     return &LastVote;
 }
 
-/* The admission vote of the oversized keys: the tracers with an owner vote, exactly across ranks,
- * for the tracers whose owner has a receiver below it. For the processing tree the plan derives it
- * offers the pairs the key's serial vote offers on that tree. It depends on the keys' particles and
- * trees only, so every pass of the plan finds the same offers.
- * Needs every particle on its domain rank with its previous tags (before the exchange). Allocates
- * ps->offers on the bottom of the stack: the local particles offered, in P order, with their
- * receivers' TrackIds (ps->noff of them). The memory is checked first: returns 1 on every rank if
- * some rank cannot hold the vote (nothing is allocated then); the records of the offers are charged
- * by plan_memory_check once their keys' ranks are known. Collective. */
+/* The admission vote of the oversized keys across ranks, before the exchange: the serial vote's offers
+ * on the plan's tree, into ps->offers; 1 on every rank, nothing allocated, if it does not fit. */
 static int
 plan_vote(struct PlanPass * ps, const DomainDecomp * ddecomp, MPI_Comm Comm)
 {
@@ -2534,10 +2518,8 @@ served_key(const struct SubhaloPlan * plan, const struct SubhaloOffer * o, const
     return ok && !ok->oversized ? ok : NULL;
 }
 
-/* The bytes of the vote's records on this rank, counted before any is made: rb->held the records
- * received for the sub-tree keys processed here (whatever the senders) and the home records, kept
- * to the end of the call; rb->build the send buffer of their exchange; rb->rounds the rounds' list
- * of this rank's admitted particles (at most one per home record). Collective. */
+/* The bytes of the vote's records on this rank before any is made: those held to the end of the
+ * call, the exchange's send buffer, the rounds' admitted list (rb->held, build, rounds). Collective. */
 static void
 vote_record_bytes(const struct SubhaloPlan * plan, const struct SubhaloOffer * offers, int64_t noff, struct VoteRecordBytes * rb,
                   MPI_Comm Comm)
@@ -2595,9 +2577,8 @@ struct PlanKeys {
     int64_t nO, nQ;
 };
 
-/* The tables of one pass: the key centres and centrals of O, the member table with its decided
- * tree (sorted by TrackId, the parents carried by TrackId) and the sub-tree keys cut from it.
- * Collective. */
+/* The tables of one pass: key centres and centrals of O, the member table with its tree (by TrackId)
+ * and the sub-tree keys cut from it. Collective. */
 static inline __attribute__((always_inline)) void
 plan_pass_tables(struct SubhaloPlan * plan, struct PlanPass * ps, const struct PlanKeys * pk, struct SubTrackTable * tab,
                  MPI_Comm Comm)
@@ -2626,9 +2607,8 @@ plan_pass_tables(struct SubhaloPlan * plan, struct PlanPass * ps, const struct P
     plan->KChunk = subhalo_key_chunk(plan->TotKeys, plan->NTask);
 }
 
-/* The keys that became oversized in this pass. None ends the passes, the pass's tables kept; else
- * they join O and Q (crossing on the top while the pass's tables are freed). Returns their count.
- * Collective. */
+/* The keys newly oversized in this pass join O and Q, the pass's tables freed; returns their count
+ * (0 ends the passes and keeps the tables). Collective. */
 static int64_t
 plan_next_pass(const struct SubhaloPlan * plan, struct PlanPass * ps, struct PlanKeys * pk, int pass, MPI_Comm Comm)
 {
@@ -2693,9 +2673,8 @@ plan_fail(struct PlanPass * ps, struct PlanKeys * pk, struct SubhaloTrackKey * f
     return 1;
 }
 
-/* An in-place candidate's first frame, as process_serial_key's without the rescue: an in-place source
- * exceeds a rank's budget (tens of millions of particles at 512^3), so its escape speed dwarfs a frame
- * bias of a few km/s that kills small remnants. cv: its key's centre (position, velocity). */
+/* An in-place candidate's first frame as process_serial_key's without the rescue: the escape speed
+ * of an in-place source dwarfs a frame bias of a few km/s. cv: its key's centre. */
 static inline __attribute__((always_inline)) void
 cand_frame(struct SubhaloInplaceCand * C, const struct SubhaloMember * m, const double * cv, double vfac)
 {
@@ -3058,10 +3037,8 @@ plan_keep_offers(struct PlanPass * ps, int64_t * noff)
     return offers;
 }
 
-/* Targets into P[i].TopLeaf (the layout of the exchange); the key of a travelling field particle
- * into its GrNr, -(2 + key); a group particle of a serial sub-tree key travels as
- * -(2 + (key | SUBHALO_KEY_FOFBIT)) (subhalo_restore_field_grnr). travel: the field and group
- * particles that travel encoded. */
+/* Targets into TopLeaf for the exchange; a travelling particle's key into GrNr as -(2 + key), with
+ * SUBHALO_KEY_FOFBIT for a group particle (subhalo_restore_field_grnr); travel counts both. */
 static void
 plan_mark_particles(const struct SubhaloPlan * plan, const struct SubhaloTrackKey * fkmap, int64_t nfk, const struct SubhaloOffer * offers,
                     int64_t noff, int64_t travel[2])
@@ -3209,9 +3186,8 @@ subhalo_plan_build(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubT
     struct SubhaloTrackKey * fkmap = NULL;
     const int64_t nfk = query_field_keys(tab, &fkmap, Comm);
 
-    /* ---- passes of census and packing until nothing new is oversized: an oversized group gets its
-     *      central decided and its satellites' sub-trees cut into serial keys; an oversized sub-tree
-     *      key becomes an in-place candidate, cut in turn. Without oversized keys: one pass. ---- */
+    /* ---- passes until nothing new is oversized: an oversized group's satellites are cut into serial
+     *      sub-tree keys, an oversized sub-tree key goes in place and is cut in turn ---- */
     struct PlanKeys pk = {(int64_t *) mymalloc("SubPlanState", sizeof(int64_t)), 0, 0};
     struct PlanPass ps;
     memset(&ps, 0, sizeof(ps));

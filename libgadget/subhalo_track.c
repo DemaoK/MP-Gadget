@@ -734,9 +734,8 @@ admit_choice(const int64_t * row, int64_t self, int kk, int A, const struct Subh
     return (int) subhalo_admit_choice(btid, kk, A, need, at);
 }
 
-/* A serial key as its admission sees it: the owner map of its particles P[start, start + n), its
- * nodes and its central's node; filled by the admission: the admitted particles grouped by receiver
- * (admlist, at the receivers' adm_off, adm_n) and the votes withheld near their owner's core. */
+/* A serial key as its admission sees it: owner map, nodes and central of P[start, start + n); the
+ * admission fills admlist (grouped by receiver at adm_off, adm_n) and the withheld count. */
 struct AdmitKey {
     int32_t * owner;
     struct SubNode * nd;
@@ -785,13 +784,8 @@ cmp_admitrec_id(const void * a, const void * b)
     return (x->ID > y->ID) - (x->ID < y->ID);
 }
 
-/* Admission by neighbour majority (SubhaloAdmitShare = s): a tracer owned by node A joins the source of
- * the receiver below A to which at least the share s of its k nearest owned tracers were bound at the
- * previous call (BoundTrackId, not yet rewritten). Receivers are the resolved members with a previous
- * bound set below the key's root. The vote of a whole key (a group or pseudo-key processed serially);
- * an oversized group's is taken by the plan across ranks (plan_vote). Returns the count; the owner map
- * becomes the admission map and ak->admlist holds the admitted particles grouped by receiver
- * (adm_off, adm_n), in key order. */
+/* Admission by neighbour majority in a serial key: a tracer owned by A joins the receiver below A that
+ * bound the share SubhaloAdmitShare of its k nearest tracers; returns the count (ak->admlist). */
 static int64_t
 admit_particles(struct AdmitKey * ak, const struct SubhaloParams * sp, const struct SubhaloCallCtx * ctx, struct SubhaloArena * arena)
 {
@@ -902,9 +896,8 @@ admit_records(struct AdmitKey * ak, const struct SubhaloPlan * plan, struct Subh
     return nadm;
 }
 
-/* One serial key while it runs (design 7.2): its slice P[start, start + n), its candidates'
- * nodes and result slots, its centre, and the arena tables that its steps hand on. The steps
- * with floating-point code are always_inline: they keep the key's -ffast-math code generation. */
+/* One serial key while it runs (design 7.2): its slice, nodes, centre and arena tables. Steps with
+ * floating-point code are always_inline, keeping the key's -ffast-math code generation. */
 struct KeyRun {
     struct SerialCtx * sc;
     struct SubhaloCallCtx * ctx;
@@ -1153,9 +1146,8 @@ key_own_lists(struct KeyRun * K)
         }
 }
 
-/* The owner map, ReassignParticles (step c, subhalo_reassign_gas.cpp) for the non-tracers, the own
- * lists, and the admission by neighbour majority; adm then marks the admitted and taken particles
- * (the owner map is not read again). */
+/* The owner map, ReassignParticles (step c) for the non-tracers, the own lists and the admission;
+ * adm then marks the admitted and taken particles. */
 static inline __attribute__((always_inline)) void
 key_sources(struct KeyRun * K)
 {
@@ -1179,9 +1171,8 @@ key_sources(struct KeyRun * K)
     K->admlist = ak.admlist;
 }
 
-/* Step d, x's list: its own particles not taken by a descendant, the remainders of its children
- * (a dead child's whole list) and its admitted particles. Returns the capacity, which also leaves
- * room for the bound sets of the survivors below x that may sink into it. */
+/* Step d, x's list: its own particles not taken below, its children's remainders and its admitted
+ * particles; returns the capacity, with room for the bound sets that may sink into x. */
 static int64_t
 node_gather(struct KeyRun * K, struct SubNode * x)
 {
@@ -1287,9 +1278,8 @@ node_admitted(struct KeyRun * K, struct SubNode * x, int u)
     K->ks.NAdmitReceivers += ntaken > 0;
 }
 
-/* Step d, after x: its sequence number, then the compaction of its subtree's lists: a survivor
- * keeps its relaxed source (bound set and tail, TruncateSource), everything else nothing; x keeps
- * its whole list until its parent has gathered the remainder. */
+/* Step d, after x: its sequence number, then its subtree's lists compacted, a survivor keeping its
+ * relaxed source (TruncateSource); x keeps its whole list until its parent has gathered it. */
 static inline __attribute__((always_inline)) void
 node_compact(struct KeyRun * K, struct SubNode * x, int u)
 {
@@ -1346,10 +1336,8 @@ key_node(struct KeyRun * K, int u)
     node_compact(K, x, u);
 }
 
-/* Step d: post-order unbinding with the remainder passed up, sinking, re-unbinding (RecursiveUnbind,
- * subhalo_unbind.cpp:810-842); a subtree's lists start at its region of the arena. Then the root's
- * own list to its relaxed size too (nothing above it gathers its remainder); a sub-tree key's root
- * keeps its whole list (its tags are provisional, design 7.8). */
+/* Step d: post-order unbinding, remainder passed up, sinking, re-unbinding (RecursiveUnbind); then
+ * every survivor to its relaxed source but a sub-tree key's root (provisional tags, design 7.8). */
 static inline __attribute__((always_inline)) void
 key_unbind(struct KeyRun * K)
 {
@@ -1429,9 +1417,8 @@ key_final_pass(struct KeyRun * K)
     K->nalive = nalive;
 }
 
-/* Step f of a sub-tree key: the processing tree as it stands (no promotion: the root's parent is an
- * in-place candidate); Rank, Depth, NestedParentTrackId and CentralTrackId are written by the rounds
- * from the group's hierarchy. A dead root still claims its whole list, below every survivor. */
+/* Step f of a sub-tree key: the processing tree as it stands (the rounds write the hierarchy
+ * columns); a dead root still claims its whole list, below every survivor. */
 static void
 subkey_hierarchy(struct KeyRun * K)
 {
@@ -1496,9 +1483,8 @@ key_ranks(struct KeyRun * K)
     return X;
 }
 
-/* Step f, the final tree: a survivor's parent is its nearest surviving ancestor in the processing
- * tree; the most massive survivor X is the central: it leaves its parent and every other top
- * survivor (the decided central among them) is nested under it. */
+/* Step f, the final tree: a survivor's parent is its nearest surviving ancestor; every other top
+ * survivor nests under the most massive survivor X, the central. */
 static void
 key_final_tree(struct KeyRun * K)
 {
@@ -1644,9 +1630,8 @@ tags_claim(struct KeyRun * K)
     K->ks.NTailRejected = nrejected;
 }
 
-/* Step 8, the tags of node v's claims: BindRank in own-tag energy order (Index[0, Nbound) in
- * final-pass energy order, Index[Nbound, N) the tail in that of its unbinding), BoundTrackId the
- * binder; the exclusive and tail counts into rec. Returns the tail count inside relaxed. */
+/* Step 8, the tags of node v's claims: BindRank in own-tag energy order, BoundTrackId the binder,
+ * the exclusive and tail counts into rec; returns the tail count inside relaxed. */
 static int64_t
 node_tags(const struct KeyRun * K, int v, struct SubTrack * rec, int64_t relaxed)
 {
@@ -1817,9 +1802,8 @@ desc_votes(const struct KeyRun * K, struct SubhaloResult * rs, const struct SubN
     rs->ndesc = t;
 }
 
-/* Step h, the record of a member that did not survive, from its previous one; a track resolved at
- * the previous call that died or sank becomes an orphan with its descendant votes. An orphan that
- * stays one (or failed resurrection) keeps its record and step-1 state. */
+/* Step h, the record of a member that did not survive; a track resolved at the previous call that
+ * died or sank becomes an orphan with its descendant votes (an orphan stays as it was). */
 static inline __attribute__((always_inline)) void
 node_lost(const struct KeyRun * K, int v, const struct IdLocal * ids, double * maxmerge)
 {
