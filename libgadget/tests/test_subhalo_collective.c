@@ -4502,7 +4502,7 @@ tp_outcomes(struct Outcome o[3])
     }
 }
 
-/* U's owner equal on the paths. Disabled: serially A takes U (deeper in the final tree), in place X (its round first). */
+/* U's owner equal on the paths: off, a stated limit for a tail claimed on both sides of a central promoted in the call. */
 static const int TpComparePaths = 0;
 
 static void
