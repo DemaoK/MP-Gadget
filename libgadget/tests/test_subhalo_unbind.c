@@ -4,6 +4,8 @@
  * second attempt after a large loss; bitwise results at 1 to 8 threads and inside a worker region; the sampled
  * final pass.
  * test_timing takes sizes, thresholds, threads and the final-pass mode from SUBHALO_UNBIND_TIMING*.
+ * The slow tests (threads_bitwise, threads_worker_region, final_pass_sampled, threads_par_min)
+ * run only with SUBHALO_TEST_FULL=1 (make test does not set it); otherwise each prints a note.
  * Haloes sample the exact Hernquist distribution function (truncated at 100 scale radii) across a
  * periodic boundary; a = 1, H = 0, units kpc/h, 1e10 Msun/h, km/s. Run as: mpirun -np 1. */
 
@@ -46,6 +48,19 @@
 
 static const double Centre[3] = {3.0, BOXSIZE - 5.0, 0.5 * BOXSIZE};
 static const double Bulk[3] = {100., -50., 30.};
+
+/* True when SUBHALO_TEST_FULL is set and not "0"; otherwise a slow test returns at once with this
+ * note. The ranks agree on the answer, so a skipped test cannot unmatch later collectives. */
+static int
+full_test(const char * name)
+{
+    const char * e = getenv("SUBHALO_TEST_FULL");
+    int on = e && *e && strcmp(e, "0") != 0;
+    MPI_Allreduce(MPI_IN_PLACE, &on, 1, MPI_INT, MPI_LAND, MPI_COMM_WORLD);
+    if(!on)
+        message(0, "%s: slow test skipped (set SUBHALO_TEST_FULL=1 to run it)\n", name);
+    return on;
+}
 
 static struct SubhaloUnbindParams
 default_params(void)
@@ -2533,6 +2548,8 @@ assert_same_result(const struct CandResult * a, const struct CandResult * b)
 static void
 test_threads_bitwise(void ** state)
 {
+    if(!full_test(__func__))
+        return;
     const int nmax0 = omp_get_max_threads();
     const int64_t n = NBIG_HOST + NBIG_SAT;
     const int nths[3] = {1, 3, 8};
@@ -2669,6 +2686,8 @@ cand_unbind_final(struct TestCand * t, const struct SubhaloUnbindParams * up, st
 static void
 test_threads_worker_region(void ** state)
 {
+    if(!full_test(__func__))
+        return;
     const int nmax0 = omp_get_max_threads();
     const int dyn0 = omp_get_dynamic();
     const int T = 4;
@@ -2881,6 +2900,8 @@ fp_check_head(const struct CandResult * r, const int64_t * L, const int64_t * ra
 static void
 test_final_pass_sampled(void ** state)
 {
+    if(!full_test(__func__))
+        return;
     const int nmax0 = omp_get_max_threads();
     int k;
     /* 1. below the sample size */
@@ -3082,6 +3103,8 @@ par_min_case(struct CandResult * r, int nth, int64_t pm, int64_t n, const double
 static void
 test_threads_par_min(void ** state)
 {
+    if(!full_test(__func__))
+        return;
     const int nmax0 = omp_get_max_threads();
     const int dyn0 = omp_get_dynamic();
     const int64_t sizes[3] = {1500, 3000, 10000};

@@ -4,7 +4,8 @@
  * MP-Gadget tree build itself fails on these 125-particle-per-rank fixtures (NODECACHE_SIZE).
  * SUBHALO_TEST_ONLY=<substring> runs only the matching tests. The sort-key range checks abort
  * through endrun, so they run alone: SUBHALO_TEST_SORTKEY_OVERFLOW=grnr|trackid|bindrank
- * mpirun -np 1 .objs/test_subhalo must exit non-zero. */
+ * mpirun -np 1 .objs/test_subhalo must exit non-zero. The slow tests (sampled_default, fallback)
+ * run only with SUBHALO_TEST_FULL=1 (make test does not set it); otherwise each prints a note. */
 
 /* nftw() for the temporary PIG cleanup */
 #define _GNU_SOURCE
@@ -45,6 +46,19 @@
 #include "stub.h"
 
 /* ------------------------------------------------------------------ helpers */
+
+/* True when SUBHALO_TEST_FULL is set and not "0"; otherwise a slow test returns at once with this
+ * note. The ranks agree on the answer, so a skipped test cannot unmatch later collectives. */
+static int
+full_test(const char * name)
+{
+    const char * e = getenv("SUBHALO_TEST_FULL");
+    int on = e && *e && strcmp(e, "0") != 0;
+    MPI_Allreduce(MPI_IN_PLACE, &on, 1, MPI_INT, MPI_LAND, MPI_COMM_WORLD);
+    if(!on)
+        message(0, "%s: slow test skipped (set SUBHALO_TEST_FULL=1 to run it)\n", name);
+    return on;
+}
 
 static int
 cmp_double(const void * a, const void * b)
@@ -3529,6 +3543,8 @@ sd_free(struct sd_state * s)
 static void
 test_subhalo_sampled_default(void ** state)
 {
+    if(!full_test(__func__))
+        return;
     struct sd_state ref, x;
     int bad = 0;
     sd_sequence(1, 0, 0, &ref);
@@ -5480,6 +5496,8 @@ fb_disperse(int stage)
 static void
 test_subhalo_fallback(void ** state)
 {
+    if(!full_test(__func__))
+        return;
     Cosmology CP;
     p2_setup(&CP);
     const char * dir = getenv("SUBHALO_TEST_DIR") ? getenv("SUBHALO_TEST_DIR") : "test_subhalo_fb";

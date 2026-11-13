@@ -148,6 +148,8 @@ all: libgadget.a libgadget-utils.a
 
 build-tests: $(TESTBIN)
 
+# The unit suite. Slow subhalo tests (the unbinding thread matrix, sampled_default, fallback)
+# print a skip note unless SUBHALO_TEST_FULL=1 is set: make test SUBHALO_TEST_FULL=1 runs all.
 test : build-tests
 	trap 'err=1' ERR; for tt in $(SUITE) ; do \
 		if [[ "$(MPISUITE)" =~ .*$$tt.* ]]; then \
