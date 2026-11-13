@@ -110,136 +110,166 @@ subhalo_register_particle_blocks(struct IOTable * IOTable)
 
 /* ------------------------------------------------------------------ table columns (Appendix B) */
 
-#define SUBTRACK_PROPERTY(name, field, type, items) \
-    SIMPLE_GETTER(GTSub ## name, field, type, items, struct SubTrack) \
-    SIMPLE_SETTER(STSub ## name, field, type, items, struct SubTrack)
+/* The track columns, one line each: X(name, dtype, items, tables, schema). The name is both the
+ * struct SubTrack member and the block name; tables says which of Subhalo/ and Orphan/ hold it;
+ * schema is the version that introduced it. Each table registers its columns in this order.
+ * tools/subhalo_reader.py keeps its own list of these columns and must follow this one. */
+#define SUBTRACK_COLUMNS(X) \
+    /* group A links and snapshots, and group E: both tables */ \
+    X(TrackId,                i8, 1,                  SUBCOL_BOTH, 1) \
+    X(HostGroup,              i8, 1,                  SUBCOL_BOTH, 1) \
+    X(NestedParentTrackId,    i8, 1,                  SUBCOL_BOTH, 1) \
+    X(CentralTrackId,         i8, 1,                  SUBCOL_BOTH, 1) \
+    X(SinkTrackId,            i8, 1,                  SUBCOL_BOTH, 1) \
+    X(DescendantTrackId,      i8, 1,                  SUBCOL_BOTH, 1) \
+    X(SnapBirth,              i4, 1,                  SUBCOL_BOTH, 1) \
+    X(SnapDeath,              i4, 1,                  SUBCOL_BOTH, 1) \
+    X(SnapSink,               i4, 1,                  SUBCOL_BOTH, 1) \
+    X(SnapLastIsolation,      i4, 1,                  SUBCOL_BOTH, 1) \
+    X(MostBoundID,            u8, 1,                  SUBCOL_BOTH, 1) \
+    X(MboundPeak,             f4, 1,                  SUBCOL_BOTH, 1) \
+    X(VmaxAtMboundPeak,       f4, 1,                  SUBCOL_BOTH, 1) \
+    X(VmaxPeak,               f4, 1,                  SUBCOL_BOTH, 1) \
+    X(MboundAcc,              f4, 1,                  SUBCOL_BOTH, 1) \
+    X(VmaxAcc,                f4, 1,                  SUBCOL_BOTH, 1) \
+    X(MboundFirstAcc,         f4, 1,                  SUBCOL_BOTH, 1) \
+    X(VmaxFirstAcc,           f4, 1,                  SUBCOL_BOTH, 1) \
+    X(SnapMboundPeak,         i4, 1,                  SUBCOL_BOTH, 1) \
+    X(SnapVmaxPeak,           i4, 1,                  SUBCOL_BOTH, 1) \
+    X(SnapAcc,                i4, 1,                  SUBCOL_BOTH, 1) \
+    X(SnapFirstAcc,           i4, 1,                  SUBCOL_BOTH, 1) \
+    X(SnapLastMajorMerger,    i4, 1,                  SUBCOL_BOTH, 1) \
+    X(GeomParentTrackId,      i8, 1,                  SUBCOL_BOTH, 1) \
+    X(GeomUpParentTrackId,    i8, 1,                  SUBCOL_BOTH, 1) \
+    /* group A ranks, counts and slices */ \
+    X(Rank,                   i4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(Depth,                  i4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(Nbound,                 i4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(NboundExclusive,        i4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(NboundTracer,           i4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(Flags,                  i4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(NboundType,             i4, 6,                  SUBCOL_SUBHALO, 1) \
+    X(NboundExclusiveType,    i4, 6,                  SUBCOL_SUBHALO, 1) \
+    X(NtailType,              i4, 6,                  SUBCOL_SUBHALO, 1) \
+    X(SliceOffsetByType,      i8, 6,                  SUBCOL_SUBHALO, 1) \
+    X(SliceLengthByType,      i4, 6,                  SUBCOL_SUBHALO, 1) \
+    X(SliceNboundByType,      i4, 6,                  SUBCOL_SUBHALO, 1) \
+    X(FieldSliceOffsetByType, i8, 6,                  SUBCOL_SUBHALO, 1) \
+    X(FieldSliceLengthByType, i4, 6,                  SUBCOL_SUBHALO, 1) \
+    X(FieldSliceNboundByType, i4, 6,                  SUBCOL_SUBHALO, 1) \
+    /* group B */ \
+    X(Mbound,                 f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(MboundType,             f4, 6,                  SUBCOL_SUBHALO, 1) \
+    X(CorePos,                f8, 3,                  SUBCOL_SUBHALO, 1) \
+    X(MostBoundPos,           f8, 3,                  SUBCOL_SUBHALO, 1) \
+    X(CoMPos,                 f8, 3,                  SUBCOL_SUBHALO, 1) \
+    X(CoreVel,                f4, 3,                  SUBCOL_SUBHALO, 1) \
+    X(MostBoundVel,           f4, 3,                  SUBCOL_SUBHALO, 1) \
+    X(CoMVel,                 f4, 3,                  SUBCOL_SUBHALO, 1) \
+    X(CoreSigmaX,             f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(CoreSigmaV,             f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(Vmax,                   f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(Rmax,                   f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(VmaxVir,                f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(RmaxVir,                f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(Rhalf,                  f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(Renclose,               f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(MBoundSO,               f4, SUBHALO_NSO,        SUBCOL_SUBHALO, 1) \
+    X(RBoundSO,               f4, SUBHALO_NSO,        SUBCOL_SUBHALO, 1) \
+    X(J,                      f4, 3,                  SUBCOL_SUBHALO, 1) \
+    X(JVir,                   f4, 3,                  SUBCOL_SUBHALO, 1) \
+    X(SpinPeebles,            f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(SpinBullock,            f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(Ekin,                   f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(Epot,                   f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(KinToPot,               f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(Xoff,                   f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(Voff,                   f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(RsKlypin,               f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(BtoA,                   f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(CtoA,                   f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(BtoA500,                f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(CtoA500,                f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(AxisA,                  f4, 3,                  SUBCOL_SUBHALO, 1) \
+    X(AxisA500,               f4, 3,                  SUBCOL_SUBHALO, 1) \
+    X(InertiaTensor,          f4, 6,                  SUBCOL_SUBHALO, 1) \
+    X(Rs,                     f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(RockstarCoreVel,        f4, 3,                  SUBCOL_SUBHALO, 1) \
+    X(BulkVel,                f4, 3,                  SUBCOL_SUBHALO, 1) \
+    X(Vrms,                   f4, 1,                  SUBCOL_SUBHALO, 1) \
+    /* the Rockstar-comparable profile of the field-SO virial sphere (centrals) */ \
+    X(RsSO,                   f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(RsKlypinSO,             f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(VmaxSO,                 f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(RmaxSO,                 f4, 1,                  SUBCOL_SUBHALO, 1) \
+    /* group C */ \
+    X(StarFormationRate,      f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(GasMetalMass,           f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(StellarMetalMass,       f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(BlackholeMass,          f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(BlackholeAccretionRate, f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(MassHeIonized,          f4, 1,                  SUBCOL_SUBHALO, 1) \
+    X(GasMetalElemMass,       f4, NMETALS,            SUBCOL_SUBHALO, 1) \
+    X(StellarMetalElemMass,   f4, NMETALS,            SUBCOL_SUBHALO, 1) \
+    X(MostMassiveBHID,        u8, 1,                  SUBCOL_SUBHALO, 1) \
+    /* group D */ \
+    X(MSO,                    f4, SUBHALO_NSO,        SUBCOL_SUBHALO, 1) \
+    X(RSO,                    f4, SUBHALO_NSO,        SUBCOL_SUBHALO, 1) \
+    X(MTypeSO200c,            f4, 6,                  SUBCOL_SUBHALO, 1) \
+    X(MTypeSOVir,             f4, 6,                  SUBCOL_SUBHALO, 1) \
+    /* group F; the followed set of the orphans is schema 2 */ \
+    X(TracerPos,              f8, 3,                  SUBCOL_ORPHAN, 1) \
+    X(TracerVel,              f4, 3,                  SUBCOL_ORPHAN, 1) \
+    X(SnapTracerLost,         i4, 1,                  SUBCOL_ORPHAN, 1) \
+    X(OrphanIDs,              u8, SUBHALO_MAXTRACERS, SUBCOL_ORPHAN, 2) \
+    X(NOrphanTracers,         i4, 1,                  SUBCOL_ORPHAN, 2) \
+    X(NOrphanFound,           i4, 1,                  SUBCOL_ORPHAN, 2) \
+    X(OrphanSigmaX,           f4, 1,                  SUBCOL_ORPHAN, 2) \
+    X(OrphanScale,            f4, 1,                  SUBCOL_ORPHAN, 2)
 
-#define SUBREG(name, dtype, items, ptype, IOTable) \
-    io_register_io_block(# name, dtype, items, ptype, (property_getter) GTSub ## name, (property_setter) STSub ## name, 1, IOTable)
+enum { SUBCOL_SUBHALO = 1, SUBCOL_ORPHAN = 2, SUBCOL_BOTH = 3 };
 
-/* group A */
-SUBTRACK_PROPERTY(TrackId, TrackId, int64_t, 1)
-SUBTRACK_PROPERTY(HostGroup, HostGroup, int64_t, 1)
-SUBTRACK_PROPERTY(NestedParentTrackId, NestedParentTrackId, int64_t, 1)
-SUBTRACK_PROPERTY(CentralTrackId, CentralTrackId, int64_t, 1)
-SUBTRACK_PROPERTY(SinkTrackId, SinkTrackId, int64_t, 1)
-SUBTRACK_PROPERTY(DescendantTrackId, DescendantTrackId, int64_t, 1)
-SUBTRACK_PROPERTY(Rank, Rank, int32_t, 1)
-SUBTRACK_PROPERTY(Depth, Depth, int32_t, 1)
-SUBTRACK_PROPERTY(SnapBirth, SnapBirth, int32_t, 1)
-SUBTRACK_PROPERTY(SnapDeath, SnapDeath, int32_t, 1)
-SUBTRACK_PROPERTY(SnapSink, SnapSink, int32_t, 1)
-SUBTRACK_PROPERTY(SnapLastIsolation, SnapLastIsolation, int32_t, 1)
-SUBTRACK_PROPERTY(MostBoundID, MostBoundID, uint64_t, 1)
-/* counts */
-SUBTRACK_PROPERTY(Nbound, Nbound, int32_t, 1)
-SUBTRACK_PROPERTY(NboundExclusive, NboundExclusive, int32_t, 1)
-SUBTRACK_PROPERTY(NboundTracer, NboundTracer, int32_t, 1)
-SUBTRACK_PROPERTY(Flags, Flags, int32_t, 1)
-SUBTRACK_PROPERTY(NboundType, NboundType[0], int32_t, 6)
-SUBTRACK_PROPERTY(NboundExclusiveType, NboundExclusiveType[0], int32_t, 6)
-SUBTRACK_PROPERTY(NtailType, NtailType[0], int32_t, 6)
-/* slices */
-SUBTRACK_PROPERTY(SliceOffsetByType, SliceOffsetByType[0], int64_t, 6)
-SUBTRACK_PROPERTY(SliceLengthByType, SliceLengthByType[0], int32_t, 6)
-SUBTRACK_PROPERTY(SliceNboundByType, SliceNboundByType[0], int32_t, 6)
-SUBTRACK_PROPERTY(FieldSliceOffsetByType, FieldSliceOffsetByType[0], int64_t, 6)
-SUBTRACK_PROPERTY(FieldSliceLengthByType, FieldSliceLengthByType[0], int32_t, 6)
-SUBTRACK_PROPERTY(FieldSliceNboundByType, FieldSliceNboundByType[0], int32_t, 6)
-/* group B */
-SUBTRACK_PROPERTY(Mbound, Mbound, float, 1)
-SUBTRACK_PROPERTY(MboundType, MboundType[0], float, 6)
-SUBTRACK_PROPERTY(CorePos, CorePos[0], double, 3)
-SUBTRACK_PROPERTY(MostBoundPos, MostBoundPos[0], double, 3)
-SUBTRACK_PROPERTY(CoMPos, CoMPos[0], double, 3)
-SUBTRACK_PROPERTY(CoreVel, CoreVel[0], float, 3)
-SUBTRACK_PROPERTY(MostBoundVel, MostBoundVel[0], float, 3)
-SUBTRACK_PROPERTY(CoMVel, CoMVel[0], float, 3)
-SUBTRACK_PROPERTY(CoreSigmaX, CoreSigmaX, float, 1)
-SUBTRACK_PROPERTY(CoreSigmaV, CoreSigmaV, float, 1)
-SUBTRACK_PROPERTY(Vmax, Vmax, float, 1)
-SUBTRACK_PROPERTY(Rmax, Rmax, float, 1)
-SUBTRACK_PROPERTY(VmaxVir, VmaxVir, float, 1)
-SUBTRACK_PROPERTY(RmaxVir, RmaxVir, float, 1)
-SUBTRACK_PROPERTY(Rhalf, Rhalf, float, 1)
-SUBTRACK_PROPERTY(Renclose, Renclose, float, 1)
-SUBTRACK_PROPERTY(MBoundSO, MBoundSO[0], float, SUBHALO_NSO)
-SUBTRACK_PROPERTY(RBoundSO, RBoundSO[0], float, SUBHALO_NSO)
-SUBTRACK_PROPERTY(J, J[0], float, 3)
-SUBTRACK_PROPERTY(JVir, JVir[0], float, 3)
-SUBTRACK_PROPERTY(SpinPeebles, SpinPeebles, float, 1)
-SUBTRACK_PROPERTY(SpinBullock, SpinBullock, float, 1)
-SUBTRACK_PROPERTY(Ekin, Ekin, float, 1)
-SUBTRACK_PROPERTY(Epot, Epot, float, 1)
-SUBTRACK_PROPERTY(KinToPot, KinToPot, float, 1)
-SUBTRACK_PROPERTY(Xoff, Xoff, float, 1)
-SUBTRACK_PROPERTY(Voff, Voff, float, 1)
-SUBTRACK_PROPERTY(RsKlypin, RsKlypin, float, 1)
-SUBTRACK_PROPERTY(BtoA, BtoA, float, 1)
-SUBTRACK_PROPERTY(CtoA, CtoA, float, 1)
-SUBTRACK_PROPERTY(BtoA500, BtoA500, float, 1)
-SUBTRACK_PROPERTY(CtoA500, CtoA500, float, 1)
-SUBTRACK_PROPERTY(AxisA, AxisA[0], float, 3)
-SUBTRACK_PROPERTY(AxisA500, AxisA500[0], float, 3)
-SUBTRACK_PROPERTY(InertiaTensor, InertiaTensor[0], float, 6)
-SUBTRACK_PROPERTY(Rs, Rs, float, 1)
-SUBTRACK_PROPERTY(RockstarCoreVel, RockstarCoreVel[0], float, 3)
-SUBTRACK_PROPERTY(BulkVel, BulkVel[0], float, 3)
-SUBTRACK_PROPERTY(Vrms, Vrms, float, 1)
-SUBTRACK_PROPERTY(RsSO, RsSO, float, 1)
-SUBTRACK_PROPERTY(RsKlypinSO, RsKlypinSO, float, 1)
-SUBTRACK_PROPERTY(VmaxSO, VmaxSO, float, 1)
-SUBTRACK_PROPERTY(RmaxSO, RmaxSO, float, 1)
-/* group C */
-SUBTRACK_PROPERTY(StarFormationRate, StarFormationRate, float, 1)
-SUBTRACK_PROPERTY(GasMetalMass, GasMetalMass, float, 1)
-SUBTRACK_PROPERTY(StellarMetalMass, StellarMetalMass, float, 1)
-SUBTRACK_PROPERTY(BlackholeMass, BlackholeMass, float, 1)
-SUBTRACK_PROPERTY(BlackholeAccretionRate, BlackholeAccretionRate, float, 1)
-SUBTRACK_PROPERTY(MassHeIonized, MassHeIonized, float, 1)
-SUBTRACK_PROPERTY(GasMetalElemMass, GasMetalElemMass[0], float, NMETALS)
-SUBTRACK_PROPERTY(StellarMetalElemMass, StellarMetalElemMass[0], float, NMETALS)
-SUBTRACK_PROPERTY(MostMassiveBHID, MostMassiveBHID, uint64_t, 1)
-/* group D */
-SUBTRACK_PROPERTY(MSO, MSO[0], float, SUBHALO_NSO)
-SUBTRACK_PROPERTY(RSO, RSO[0], float, SUBHALO_NSO)
-SUBTRACK_PROPERTY(MTypeSO200c, MTypeSO200c[0], float, 6)
-SUBTRACK_PROPERTY(MTypeSOVir, MTypeSOVir[0], float, 6)
-/* group E */
-SUBTRACK_PROPERTY(MboundPeak, MboundPeak, float, 1)
-SUBTRACK_PROPERTY(VmaxAtMboundPeak, VmaxAtMboundPeak, float, 1)
-SUBTRACK_PROPERTY(VmaxPeak, VmaxPeak, float, 1)
-SUBTRACK_PROPERTY(MboundAcc, MboundAcc, float, 1)
-SUBTRACK_PROPERTY(VmaxAcc, VmaxAcc, float, 1)
-SUBTRACK_PROPERTY(MboundFirstAcc, MboundFirstAcc, float, 1)
-SUBTRACK_PROPERTY(VmaxFirstAcc, VmaxFirstAcc, float, 1)
-SUBTRACK_PROPERTY(SnapMboundPeak, SnapMboundPeak, int32_t, 1)
-SUBTRACK_PROPERTY(SnapVmaxPeak, SnapVmaxPeak, int32_t, 1)
-SUBTRACK_PROPERTY(SnapAcc, SnapAcc, int32_t, 1)
-SUBTRACK_PROPERTY(SnapFirstAcc, SnapFirstAcc, int32_t, 1)
-SUBTRACK_PROPERTY(SnapLastMajorMerger, SnapLastMajorMerger, int32_t, 1)
-SUBTRACK_PROPERTY(GeomParentTrackId, GeomParentTrackId, int64_t, 1)
-SUBTRACK_PROPERTY(GeomUpParentTrackId, GeomUpParentTrackId, int64_t, 1)
-/* group F */
-SUBTRACK_PROPERTY(TracerPos, TracerPos[0], double, 3)
-SUBTRACK_PROPERTY(TracerVel, TracerVel[0], float, 3)
-SUBTRACK_PROPERTY(SnapTracerLost, SnapTracerLost, int32_t, 1)
-SUBTRACK_PROPERTY(OrphanIDs, OrphanIDs[0], uint64_t, SUBHALO_MAXTRACERS)
-SUBTRACK_PROPERTY(NOrphanTracers, NOrphanTracers, int32_t, 1)
-SUBTRACK_PROPERTY(NOrphanFound, NOrphanFound, int32_t, 1)
-SUBTRACK_PROPERTY(OrphanSigmaX, OrphanSigmaX, float, 1)
-SUBTRACK_PROPERTY(OrphanScale, OrphanScale, float, 1)
+/* The C type of each on-disk dtype of the table */
+#define SUBCOL_CTYPE_i4 int32_t
+#define SUBCOL_CTYPE_i8 int64_t
+#define SUBCOL_CTYPE_u8 uint64_t
+#define SUBCOL_CTYPE_f4 float
+#define SUBCOL_CTYPE_f8 double
 
-/* The schema version that introduced a column: the followed set of the orphans is version 2. */
+/* Getter and setter of one column; the assertion ties its dtype and item count to the member. */
+#define SUBCOL_ACCESSORS(name, dt, items, tables, schema) \
+    _Static_assert((__builtin_types_compatible_p(__typeof__(((struct SubTrack *) 0)->name), SUBCOL_CTYPE_##dt) && (items) == 1) \
+                   || __builtin_types_compatible_p(__typeof__(((struct SubTrack *) 0)->name), SUBCOL_CTYPE_##dt[items]), \
+                   "column " #name " does not match its struct SubTrack member"); \
+    static void GTSub##name(int i, void * out, void * base, void * slot, const struct conversions * c) \
+    { memcpy(out, &((struct SubTrack *) base)[i].name, sizeof(SUBCOL_CTYPE_##dt) * (items)); } \
+    static void STSub##name(int i, void * in, void * base, void * slot, const struct conversions * c) \
+    { memcpy(&((struct SubTrack *) base)[i].name, in, sizeof(SUBCOL_CTYPE_##dt) * (items)); }
+
+SUBTRACK_COLUMNS(SUBCOL_ACCESSORS)
+
+struct SubhaloColumn {
+    const char * name;
+    const char * dtype;
+    int items;
+    int tables;
+    int schema;
+    property_getter getter;
+    property_setter setter;
+};
+
+#define SUBCOL_ENTRY(name, dt, items, tables, schema) {#name, #dt, items, tables, schema, GTSub##name, STSub##name},
+static const struct SubhaloColumn SubhaloColumns[] = { SUBTRACK_COLUMNS(SUBCOL_ENTRY) };
+#define SUBHALO_NCOLUMNS ((int) (sizeof(SubhaloColumns) / sizeof(SubhaloColumns[0])))
+
+/* The schema version that introduced the column of a registered block. */
 static int
 subhalo_column_schema(const IOTableEntry * ent)
 {
-    static const char * v2[] = {"OrphanIDs", "NOrphanTracers", "NOrphanFound", "OrphanSigmaX", "OrphanScale"};
-    size_t k;
-    if(ent->ptype == PTYPE_ORPHAN)
-        for(k = 0; k < sizeof(v2) / sizeof(v2[0]); k++)
-            if(0 == strcmp(ent->name, v2[k]))
-                return 2;
+    int k;
+    for(k = 0; k < SUBHALO_NCOLUMNS; k++)
+        if(0 == strcmp(ent->name, SubhaloColumns[k].name))
+            return SubhaloColumns[k].schema;
     return 1;
 }
 
@@ -255,37 +285,6 @@ subhalo_orphan_legacy_set(struct SubTrack * t)
     t->NOrphanFound = t->SnapTracerLost < 0;
 }
 
-/* Columns common to both tables: group A links and snapshots, and group E. */
-static void
-subhalo_register_links_and_history(int ptype, struct IOTable * T)
-{
-    SUBREG(TrackId, "i8", 1, ptype, T);
-    SUBREG(HostGroup, "i8", 1, ptype, T);
-    SUBREG(NestedParentTrackId, "i8", 1, ptype, T);
-    SUBREG(CentralTrackId, "i8", 1, ptype, T);
-    SUBREG(SinkTrackId, "i8", 1, ptype, T);
-    SUBREG(DescendantTrackId, "i8", 1, ptype, T);
-    SUBREG(SnapBirth, "i4", 1, ptype, T);
-    SUBREG(SnapDeath, "i4", 1, ptype, T);
-    SUBREG(SnapSink, "i4", 1, ptype, T);
-    SUBREG(SnapLastIsolation, "i4", 1, ptype, T);
-    SUBREG(MostBoundID, "u8", 1, ptype, T);
-    SUBREG(MboundPeak, "f4", 1, ptype, T);
-    SUBREG(VmaxAtMboundPeak, "f4", 1, ptype, T);
-    SUBREG(VmaxPeak, "f4", 1, ptype, T);
-    SUBREG(MboundAcc, "f4", 1, ptype, T);
-    SUBREG(VmaxAcc, "f4", 1, ptype, T);
-    SUBREG(MboundFirstAcc, "f4", 1, ptype, T);
-    SUBREG(VmaxFirstAcc, "f4", 1, ptype, T);
-    SUBREG(SnapMboundPeak, "i4", 1, ptype, T);
-    SUBREG(SnapVmaxPeak, "i4", 1, ptype, T);
-    SUBREG(SnapAcc, "i4", 1, ptype, T);
-    SUBREG(SnapFirstAcc, "i4", 1, ptype, T);
-    SUBREG(SnapLastMajorMerger, "i4", 1, ptype, T);
-    SUBREG(GeomParentTrackId, "i8", 1, ptype, T);
-    SUBREG(GeomUpParentTrackId, "i8", 1, ptype, T);
-}
-
 /* The two column lists of Appendix B: PTYPE_SUBHALO for Subhalo/, PTYPE_ORPHAN for Orphan/.
  * Free with destroy_io_blocks. */
 static void
@@ -295,91 +294,15 @@ subhalo_register_table_blocks(struct IOTable * T)
     T->allocated = 160;
     T->ent = (IOTableEntry *) mymalloc2("SubhaloIOTable", T->allocated * sizeof(IOTableEntry));
 
-    const int s = PTYPE_SUBHALO;
-    subhalo_register_links_and_history(s, T);
-    SUBREG(Rank, "i4", 1, s, T);
-    SUBREG(Depth, "i4", 1, s, T);
-    SUBREG(Nbound, "i4", 1, s, T);
-    SUBREG(NboundExclusive, "i4", 1, s, T);
-    SUBREG(NboundTracer, "i4", 1, s, T);
-    SUBREG(Flags, "i4", 1, s, T);
-    SUBREG(NboundType, "i4", 6, s, T);
-    SUBREG(NboundExclusiveType, "i4", 6, s, T);
-    SUBREG(NtailType, "i4", 6, s, T);
-    SUBREG(SliceOffsetByType, "i8", 6, s, T);
-    SUBREG(SliceLengthByType, "i4", 6, s, T);
-    SUBREG(SliceNboundByType, "i4", 6, s, T);
-    SUBREG(FieldSliceOffsetByType, "i8", 6, s, T);
-    SUBREG(FieldSliceLengthByType, "i4", 6, s, T);
-    SUBREG(FieldSliceNboundByType, "i4", 6, s, T);
-    SUBREG(Mbound, "f4", 1, s, T);
-    SUBREG(MboundType, "f4", 6, s, T);
-    SUBREG(CorePos, "f8", 3, s, T);
-    SUBREG(MostBoundPos, "f8", 3, s, T);
-    SUBREG(CoMPos, "f8", 3, s, T);
-    SUBREG(CoreVel, "f4", 3, s, T);
-    SUBREG(MostBoundVel, "f4", 3, s, T);
-    SUBREG(CoMVel, "f4", 3, s, T);
-    SUBREG(CoreSigmaX, "f4", 1, s, T);
-    SUBREG(CoreSigmaV, "f4", 1, s, T);
-    SUBREG(Vmax, "f4", 1, s, T);
-    SUBREG(Rmax, "f4", 1, s, T);
-    SUBREG(VmaxVir, "f4", 1, s, T);
-    SUBREG(RmaxVir, "f4", 1, s, T);
-    SUBREG(Rhalf, "f4", 1, s, T);
-    SUBREG(Renclose, "f4", 1, s, T);
-    SUBREG(MBoundSO, "f4", SUBHALO_NSO, s, T);
-    SUBREG(RBoundSO, "f4", SUBHALO_NSO, s, T);
-    SUBREG(J, "f4", 3, s, T);
-    SUBREG(JVir, "f4", 3, s, T);
-    SUBREG(SpinPeebles, "f4", 1, s, T);
-    SUBREG(SpinBullock, "f4", 1, s, T);
-    SUBREG(Ekin, "f4", 1, s, T);
-    SUBREG(Epot, "f4", 1, s, T);
-    SUBREG(KinToPot, "f4", 1, s, T);
-    SUBREG(Xoff, "f4", 1, s, T);
-    SUBREG(Voff, "f4", 1, s, T);
-    SUBREG(RsKlypin, "f4", 1, s, T);
-    SUBREG(BtoA, "f4", 1, s, T);
-    SUBREG(CtoA, "f4", 1, s, T);
-    SUBREG(BtoA500, "f4", 1, s, T);
-    SUBREG(CtoA500, "f4", 1, s, T);
-    SUBREG(AxisA, "f4", 3, s, T);
-    SUBREG(AxisA500, "f4", 3, s, T);
-    SUBREG(InertiaTensor, "f4", 6, s, T);
-    SUBREG(Rs, "f4", 1, s, T);
-    SUBREG(RockstarCoreVel, "f4", 3, s, T);
-    SUBREG(BulkVel, "f4", 3, s, T);
-    SUBREG(Vrms, "f4", 1, s, T);
-    /* the Rockstar-comparable profile of the field-SO virial sphere (centrals) */
-    SUBREG(RsSO, "f4", 1, s, T);
-    SUBREG(RsKlypinSO, "f4", 1, s, T);
-    SUBREG(VmaxSO, "f4", 1, s, T);
-    SUBREG(RmaxSO, "f4", 1, s, T);
-    SUBREG(StarFormationRate, "f4", 1, s, T);
-    SUBREG(GasMetalMass, "f4", 1, s, T);
-    SUBREG(StellarMetalMass, "f4", 1, s, T);
-    SUBREG(BlackholeMass, "f4", 1, s, T);
-    SUBREG(BlackholeAccretionRate, "f4", 1, s, T);
-    SUBREG(MassHeIonized, "f4", 1, s, T);
-    SUBREG(GasMetalElemMass, "f4", NMETALS, s, T);
-    SUBREG(StellarMetalElemMass, "f4", NMETALS, s, T);
-    SUBREG(MostMassiveBHID, "u8", 1, s, T);
-    SUBREG(MSO, "f4", SUBHALO_NSO, s, T);
-    SUBREG(RSO, "f4", SUBHALO_NSO, s, T);
-    SUBREG(MTypeSO200c, "f4", 6, s, T);
-    SUBREG(MTypeSOVir, "f4", 6, s, T);
-
-    const int o = PTYPE_ORPHAN;
-    subhalo_register_links_and_history(o, T);
-    SUBREG(TracerPos, "f8", 3, o, T);
-    SUBREG(TracerVel, "f4", 3, o, T);
-    SUBREG(SnapTracerLost, "i4", 1, o, T);
-    SUBREG(OrphanIDs, "u8", SUBHALO_MAXTRACERS, o, T);
-    SUBREG(NOrphanTracers, "i4", 1, o, T);
-    SUBREG(NOrphanFound, "i4", 1, o, T);
-    SUBREG(OrphanSigmaX, "f4", 1, o, T);
-    SUBREG(OrphanScale, "f4", 1, o, T);
+    const int ptype[2] = {PTYPE_SUBHALO, PTYPE_ORPHAN};
+    const int table[2] = {SUBCOL_SUBHALO, SUBCOL_ORPHAN};
+    int t, k;
+    for(t = 0; t < 2; t++)
+        for(k = 0; k < SUBHALO_NCOLUMNS; k++) {
+            const struct SubhaloColumn * c = &SubhaloColumns[k];
+            if(c->tables & table[t])
+                io_register_io_block(c->name, c->dtype, c->items, ptype[t], c->getter, c->setter, 1, T);
+        }
 }
 
 static const char *

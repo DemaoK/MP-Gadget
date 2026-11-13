@@ -54,7 +54,8 @@ import bigfile
 
 NTYPES = 6
 
-# Appendix B, PIG_xxx/Subhalo/ : (name, dtype, items per row)
+# Appendix B, PIG_xxx/Subhalo/ : (name, dtype, items per row). The writer's list is the table
+# SUBTRACK_COLUMNS in libgadget/subhalo_io.c; these lists and that table hold the same columns.
 SUBHALO_COLUMNS = [
     ("TrackId", "i8", 1), ("HostGroup", "i8", 1), ("NestedParentTrackId", "i8", 1),
     ("CentralTrackId", "i8", 1), ("SinkTrackId", "i8", 1), ("DescendantTrackId", "i8", 1),
