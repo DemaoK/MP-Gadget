@@ -16,7 +16,7 @@
  * Then, in registration order: twohalo, overlap, central_source, sink_orphan (persistent tracks,
  * a satellite with a tail, a central's FOF-less particles untagged, a satellite's
  * kept; sinking, orphan tracer, resurrection; all but central_source log a tag/record checksum),
- * nest_tree, deep_chain, mixed_call, admit_take and admit_votes (SubhaloAdmitShare), nocentral, fallback (serial/in-place transitions), itercap,
+ * nest_tree, deep_chain, mixed_call, admit_take, admit_votes and admit_distance (SubhaloAdmitShare, SubhaloAdmitMinCoreDistance), nocentral, fallback (serial/in-place transitions), itercap,
  * lookup (three modes), serial_keys (scheduler at 1-4 threads), reserve_admission,
  * local_sort (thread-count independent), header_params, sampled_default (SubhaloFinalPass = 0),
  * weighted_plurality and penalty_descendant (collision-penalty weights of the tracer votes),
@@ -121,6 +121,7 @@ default_subhalo_params(void)
     sp.SubhaloCoreSize = 20;
     sp.SubhaloReassignGas = 1;
     sp.SubhaloNumNeighboursForReassignment = 10;
+    sp.SubhaloAdmitMinCoreDistance = 12;
     sp.SubhaloUnbindWithThermal = 0;
     /* off in the plumbing fixtures: their sparse particle sets give the full tree fewer nodes
      * than the top-level grid; the fixtures built by p2_setup switch it on */
@@ -576,11 +577,16 @@ test_subhalo_header_params(void ** state)
     p.SubhaloCollectiveMinPart = 123456789012L;
     p.SubhaloLookupBatchBytes = 3L * 1024 * 1024 + 1;
     char buf[4096];
-    /* SubhaloAdmitShare is written only when on: a run without it keeps its header text */
+    /* the admission's parameters are written only when on: a run without it keeps its header text */
     subhalo_set_testpar(p);
     subhalo_format_params(buf, sizeof(buf));
-    CHECK(strstr(buf, "SubhaloAdmitShare") == NULL, "SubhaloAdmitShare = 0 is written to the header\n");
+    CHECK(strstr(buf, "SubhaloAdmit") == NULL, "SubhaloAdmitShare = 0: an admission parameter is written to the header\n");
     p.SubhaloAdmitShare = 0.1 + 0.2;
+    p.SubhaloAdmitMinCoreDistance = 0;
+    subhalo_set_testpar(p);
+    subhalo_format_params(buf, sizeof(buf));
+    CHECK(strstr(buf, "SubhaloAdmitMinCoreDistance") == NULL, "SubhaloAdmitMinCoreDistance = 0 is written to the header\n");
+    p.SubhaloAdmitMinCoreDistance = 12 + 1e-13;
     subhalo_set_testpar(p);
     subhalo_format_params(buf, sizeof(buf));
     CHECK(strlen(buf) < sizeof(buf) - 1, "SubhaloParameters fills its buffer (%zu bytes)\n", strlen(buf));
@@ -597,6 +603,7 @@ test_subhalo_header_params(void ** state)
         D(SubhaloMajorProgenitorMassRatio), D(SubhaloBoundMassPrecision), D(SubhaloSourceRelaxFactor),
         I(SubhaloPotentialSampleSize), I(SubhaloFinalPass), D(SubhaloTreeOpenAngle), I(SubhaloMergeTrapped),
         I(SubhaloSinkSymmetric), I(SubhaloCoreSize), I(SubhaloReassignGas), I(SubhaloNumNeighboursForReassignment), D(SubhaloAdmitShare),
+        D(SubhaloAdmitMinCoreDistance),
         I(SubhaloUnbindWithThermal), I(SubhaloFieldSO), I(SubhaloSOBins), D(SubhaloSOSearchFactor),
         I(SubhaloSOMaxDoublings), I(SubhaloSORefineMinPart), D(SubhaloMajorMergerRatio), I(SubhaloGeometricParents),
         I(SubhaloDebugForceExchangeFailure),
@@ -5105,6 +5112,15 @@ struct AdUd {
     int kk;             /* SubhaloNumNeighboursForReassignment, 0 for 10 */
     int star;           /* AD_TWIN: 1 Z, 2 W a star, outside the tracer types (DM only) */
     int nh;             /* AD_SMALL: H's tracers */
+    double minD;        /* SubhaloAdmitMinCoreDistance */
+    const struct AdCore * core;   /* the stored cores of the records H, S, S2; NULL: syn_rec's */
+};
+
+/* A previous record's sinking core (CorePos, CoreVel, CoreSigmaX, CoreSigmaV). */
+struct AdCore {
+    double pos[3];
+    float vel[3];
+    float sx, sv;
 };
 
 /* The neighbour number of a fixture, and whether its particle id is a star (a non-tracer). */
@@ -5356,6 +5372,7 @@ ad_run(const struct AdUd * ud, double share, int T, struct AdOut * out)
     omp_set_num_threads(T);
     struct SubhaloParams sp = default_subhalo_params();
     sp.SubhaloAdmitShare = share;
+    sp.SubhaloAdmitMinCoreDistance = ud->minD;
     sp.SubhaloNumNeighboursForReassignment = ad_k(ud);
     /* concentric satellites, and S at rest in H, stay apart */
     if((ud->mode & (AD_NESTED | AD_SIBLING | AD_REST)) && !(ud->mode & AD_SINK))
@@ -5373,6 +5390,16 @@ ad_run(const struct AdUd * ud, double share, int T, struct AdOut * out)
         recs[2] = (ud->mode & AD_NESTED) ? syn_rec(2, 60, 0.006, 1, 0, 2, 2) : syn_rec(2, 60, 0.006, 0, 0, 2, 1);
         out->ntracks = 3;
     }
+    int t, d;
+    if(ud->core)
+        for(t = 0; t < out->ntracks; t++) {
+            for(d = 0; d < 3; d++) {
+                recs[t].CorePos[d] = ud->core[t].pos[d];
+                recs[t].CoreVel[d] = ud->core[t].vel[d];
+            }
+            recs[t].CoreSigmaX = ud->core[t].sx;
+            recs[t].CoreSigmaV = ud->core[t].sv;
+        }
     syn_records(recs, out->ntracks);
     const double atime = 0.55;
     syn_place(ad_particle, (void *) ud, atime, 1);
@@ -5607,6 +5634,160 @@ test_subhalo_admit_votes(void ** state)
         ad_free(&on);
         ad_free(&off);
     }
+}
+
+/* ---- the admission withheld near the owner's core (SubhaloAdmitMinCoreDistance) ----
+ * The stored cores of the previous records are placed far from the particles (whose frames would give
+ * D > 40), so that only the records decide: H at AD_Q with dispersions 1/16 and 1/2, S 0.25 off (4 in
+ * H's dispersions) and dv off in velocity, S's own dispersions 1 and 8 (D below 1 in them). */
+#define AD_Q 100.
+struct AdPair {
+    MyIDType ID;
+    int64_t Receiver;
+};
+static struct AdPair * AdPairs = NULL;
+static int64_t AdPairN = 0;
+
+static void
+ad_hook(MyIDType ID, int64_t Receiver, int source)
+{
+    (void) source;
+    AdPairs = realloc(AdPairs, sizeof(struct AdPair) * (AdPairN + 1));
+    AdPairs[AdPairN].ID = ID;
+    AdPairs[AdPairN].Receiver = Receiver;
+    AdPairN++;
+}
+
+/* The receiver offered ID in the last hooked call, -1 if none. */
+static int64_t
+ad_pair(MyIDType ID)
+{
+    int64_t i;
+    for(i = 0; i < AdPairN; i++)
+        if(AdPairs[i].ID == ID)
+            return AdPairs[i].Receiver;
+    return -1;
+}
+
+/* One call with the hook; the offers of every rank gathered on every rank. */
+static void
+ad_run_hooked(const struct AdUd * ud, double share, struct AdOut * out)
+{
+    AdPairN = 0;
+    subhalo_set_admit_hook(ad_hook);
+    ad_run(ud, share, 1, out);
+    subhalo_set_admit_hook(NULL);
+    const int NTask = get_ntask();
+    int nb = (int) (AdPairN * sizeof(struct AdPair)), r;
+    int * counts = malloc(NTask * sizeof(int)), * displ = malloc(NTask * sizeof(int));
+    MPI_Allgather(&nb, 1, MPI_INT, counts, 1, MPI_INT, MPI_COMM_WORLD);
+    int64_t tot = 0;
+    for(r = 0; r < NTask; r++) {
+        displ[r] = (int) tot;
+        tot += counts[r];
+    }
+    struct AdPair * all = malloc(tot + sizeof(struct AdPair));
+    MPI_Allgatherv(AdPairs, nb, MPI_BYTE, all, counts, displ, MPI_BYTE, MPI_COMM_WORLD);
+    free(AdPairs);
+    AdPairs = all;
+    AdPairN = tot / sizeof(struct AdPair);
+    free(displ);
+    free(counts);
+}
+
+/* One placement of S's stored core against H's (pos x0 + dx, velocity dv, H's dispersions sx, sv):
+ * below 12 S takes nothing and the call equals the rule off, every admitted particle counted withheld;
+ * at 12 or above the call equals SubhaloAdmitMinCoreDistance = 0. */
+static void
+ad_distance_case(double x0, double dx, float dv, float sx, int withhold, const char * what)
+{
+    const struct AdCore core[2] = {{{x0, AD_Q, AD_Q}, {0, 0, 0}, sx, 0.5f},
+                                   {{x0 + dx, AD_Q, AD_Q}, {0, dv, 0}, 1.0f, 8.0f}};
+    struct AdUd ud0 = {.mode = AD_SLOW, .core = core}, ud = {.mode = AD_SLOW, .minD = 12, .core = core};
+    struct AdOut off, base, on;
+    ad_run(&ud0, 0, 1, &off);
+    ad_run(&ud0, 0.5, 1, &base);
+    ad_run(&ud, 0.5, 1, &on);
+    message(0, "Admission withheld, %s: %ld admitted, %ld withheld (%ld admitted at distance 0)\n", what, on.st.NAdmitted,
+            on.st.NAdmitWithheld, base.st.NAdmitted);
+    CHECK(base.st.NAdmitted > 0 && base.st.NAdmitTaken > 0 && base.st.NAdmitWithheld == 0, "%s: at distance 0 %ld admitted, %ld taken, %ld withheld\n",
+          what, base.st.NAdmitted, base.st.NAdmitTaken, base.st.NAdmitWithheld);
+    if(withhold) {
+        CHECK(on.st.NAdmitted == 0 && on.st.NAdmitWithheld == base.st.NAdmitted, "%s: %ld admitted, %ld withheld, expected 0 and %ld\n", what,
+              on.st.NAdmitted, on.st.NAdmitWithheld, base.st.NAdmitted);
+        CHECK(ad_compare(&on, &off, what) == 0, "%s: the call differs from the rule off\n", what);
+    }
+    else {
+        CHECK(on.st.NAdmitted == base.st.NAdmitted && on.st.NAdmitWithheld == 0, "%s: %ld admitted, %ld withheld, expected %ld and 0\n", what,
+              on.st.NAdmitted, on.st.NAdmitWithheld, base.st.NAdmitted);
+        CHECK(ad_compare(&on, &base, what) == 0, "%s: the call differs from the distance 0\n", what);
+    }
+    ad_free(&off);
+    ad_free(&base);
+    ad_free(&on);
+}
+
+/* The withholding: strictly below the distance, in the owner's dispersions of the stored records,
+ * across the box edge, not with a zero dispersion of the owner, and against each particle's owner
+ * in a nest; a negative distance is not a valid parameter. */
+static void
+test_subhalo_admit_distance(void ** state)
+{
+    CHECK(!subhalo_admit_distance_valid(-1e-3) && subhalo_admit_distance_valid(0) && subhalo_admit_distance_valid(12),
+          "SubhaloAdmitMinCoreDistance: -0.001, 0 and 12 judged %d %d %d\n", subhalo_admit_distance_valid(-1e-3), subhalo_admit_distance_valid(0),
+          subhalo_admit_distance_valid(12));
+    /* D(S, H) = 4 + dv / 0.5 */
+    ad_distance_case(AD_Q, 0.25, 3.99f, 0.0625f, 1, "D 11.98");
+    ad_distance_case(AD_Q, 0.25, 4.0f, 0.0625f, 0, "D 12 exactly");
+    ad_distance_case(AD_Q, 0.25, 4.01f, 0.0625f, 0, "D 12.02");
+    ad_distance_case(0.1, BOXSIZE - 0.25, 3.99f, 0.0625f, 1, "D 11.98 across the box edge");
+    /* H's position dispersion 0 with S at H's position: the velocity term alone is 7.98 */
+    ad_distance_case(AD_Q, 0, 3.99f, 0, 0, "H's dispersion 0");
+    /* the nest H > S > S2 with D(S2, S) = 11.98 and D(S2, H), D(S, H) above 800: X (H's) still goes
+     * to S2, S's particles offered to S2 are withheld */
+    const struct AdCore core[3] = {{{AD_Q, AD_Q, AD_Q}, {0, 0, 0}, 0.0625f, 0.5f},
+                                   {{AD_Q + 50, AD_Q, AD_Q}, {0, 0, 0}, 0.0625f, 0.5f},
+                                   {{AD_Q + 50.25, AD_Q, AD_Q}, {0, 3.99f, 0}, 1.0f, 8.0f}};
+    struct AdUd ne0 = {.mode = AD_NESTED, .xs2 = 6, .core = core}, ne = {.mode = AD_NESTED, .xs2 = 6, .minD = 12, .core = core};
+    struct AdOut base, on;
+    ad_run_hooked(&ne0, 0.5, &base);
+    int64_t i, nS = 0, nH = 0, bad = 0;
+    MyIDType * id0 = malloc(sizeof(MyIDType) * (AdPairN + 1));
+    int64_t * r0 = malloc(sizeof(int64_t) * (AdPairN + 1)), n0 = AdPairN;
+    for(i = 0; i < n0; i++) {
+        struct SynPart sy;
+        memset(&sy, 0, sizeof(sy));
+        ad_particle(AdPairs[i].ID, 0.55, &sy, &ne0);
+        id0[i] = AdPairs[i].ID;
+        r0[i] = AdPairs[i].Receiver;
+        /* an S-owned particle offered to S2 is withheld; any other offer stands */
+        if(sy.tag == 1 && r0[i] == 2)
+            nS++;
+        else
+            nH++;
+    }
+    ad_run_hooked(&ne, 0.5, &on);
+    for(i = 0; i < n0; i++) {
+        struct SynPart sy;
+        memset(&sy, 0, sizeof(sy));
+        ad_particle(id0[i], 0.55, &sy, &ne0);
+        const int64_t want = sy.tag == 1 && r0[i] == 2 ? -1 : r0[i];
+        LOCAL_CHECK(bad, ad_pair(id0[i]) == want, "nest: particle %lu owned by %ld offered to %ld, expected %ld\n", (unsigned long) id0[i], sy.tag,
+                    ad_pair(id0[i]), want);
+    }
+    message(0, "Admission withheld, nest: %ld offers at distance 0 (%ld of S to S2), %ld admitted and %ld withheld at 12\n", n0, nS,
+            on.st.NAdmitted, on.st.NAdmitWithheld);
+    CHECK(nS > 0 && ad_pair(AD_X) == 2 && base.r[AD_X].TrackId == 2, "nest: %ld S-owned offers to S2, X offered to %ld\n", nS, ad_pair(AD_X));
+    CHECK(bad == 0 && AdPairN == nH && on.st.NAdmitted == nH && on.st.NAdmitWithheld == nS && on.r[AD_X].TrackId == 2,
+          "nest: %ld offers (%ld expected), %ld admitted, %ld withheld (%ld expected), X tagged %ld\n", AdPairN, nH, on.st.NAdmitted,
+          on.st.NAdmitWithheld, nS, on.r[AD_X].TrackId);
+    free(id0);
+    free(r0);
+    ad_free(&base);
+    ad_free(&on);
+    free(AdPairs);
+    AdPairs = NULL;
+    AdPairN = 0;
 }
 
 /* The threshold at k = 7, the candidate's exclusion from its own neighbours, non-tracers, the key's size
@@ -7132,6 +7313,7 @@ int main(void) {
         cmocka_unit_test(test_subhalo_admit_take),
         cmocka_unit_test(test_subhalo_admit_votes),
         cmocka_unit_test(test_subhalo_admit_rules),
+        cmocka_unit_test(test_subhalo_admit_distance),
         cmocka_unit_test(test_subhalo_rescue_loss_call),
         cmocka_unit_test(test_subhalo_nocentral),
         cmocka_unit_test(test_subhalo_fallback),

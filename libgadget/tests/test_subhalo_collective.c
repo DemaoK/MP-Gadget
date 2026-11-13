@@ -118,6 +118,7 @@ default_subhalo_params(void)
     sp.SubhaloCoreSize = 20;
     sp.SubhaloReassignGas = 1;
     sp.SubhaloNumNeighboursForReassignment = 10;
+    sp.SubhaloAdmitMinCoreDistance = 12;
     sp.SubhaloUnbindWithThermal = 0;
     /* off by default: sparse particle sets give the full tree fewer nodes than the
      * top-level grid; the fixtures that need it (p2_setup and others) switch it on */
@@ -3655,6 +3656,10 @@ av_gather(int source, int64_t * n)
 static struct FailSnap AvPre = {NULL, 0};
 static struct SubhaloCallStats AvStats;
 static struct SubhaloVoteStats AvVote;
+/* SubhaloAdmitMinCoreDistance of av_run, and AvNear: the stored cores of A, B, C, D far apart
+ * (dispersions 1/16 and 1/2) but B's at 0.25 and 3.99 from A's, D(B, A) = 11.98 (else syn_rec's) */
+static double AvMinD = 0;
+static int AvNear = 0;
 
 static void
 av_run(int64_t collective, double share, int k, struct Outcome * o)
@@ -3666,6 +3671,7 @@ av_run(int64_t collective, double share, int k, struct Outcome * o)
     sp.SubhaloTreeOpenAngle = COLL_TEST_THETA;
     sp.SubhaloCollectiveMinPart = collective;
     sp.SubhaloAdmitShare = share;
+    sp.SubhaloAdmitMinCoreDistance = AvMinD;
     if(k > 0)
         sp.SubhaloNumNeighboursForReassignment = k;
     syn_setup(&CP, ST_END + SYN_NFIELD, sp);
@@ -3674,6 +3680,18 @@ av_run(int64_t collective, double share, int k, struct Outcome * o)
     recs[1] = syn_rec(1, 360, 0.036, 0, 0, 1, 1);
     recs[2] = syn_rec(2, 200, 0.02, 0, 0, 2, 1);
     recs[3] = syn_rec(3, 100, 0.01, 1, 0, 3, 2);
+    if(AvNear) {
+        const double x[4] = {100, 100.25, 200, 300};
+        int t;
+        for(t = 0; t < 4; t++) {
+            recs[t].CorePos[0] = x[t];
+            recs[t].CorePos[1] = recs[t].CorePos[2] = 100;
+            recs[t].CoreVel[0] = recs[t].CoreVel[2] = 0;
+            recs[t].CoreVel[1] = t == 1 ? 3.99f : 0;
+            recs[t].CoreSigmaX = t == 1 ? 1.0f : 0.0625f;
+            recs[t].CoreSigmaV = t == 1 ? 8.0f : 0.5f;
+        }
+    }
     syn_records(recs, 4);
     syn_place(st_particle, NULL, 0.55, 1);
     AvN = 0;
@@ -3809,11 +3827,55 @@ av_case(double share, int k, int need)
     free(ser);
 }
 
+/* B's stored core at 11.98 from A's (B's only ancestor) with SubhaloAdmitMinCoreDistance = 12: every
+ * offer to B of the vote at distance 0 is withheld and the others stand, alike in the serial key's
+ * vote and the plan's, with equal withheld counters. */
+static void
+av_withheld_case(void)
+{
+    int64_t n0, ns, np, i, bad = 0, toB = 0;
+    AvNear = 1;
+    AvMinD = 0;
+    av_run(0, 0.5, 0, NULL);
+    struct AdmPair * all = av_gather(SUBHALO_ADMIT_KEY, &n0);
+    AvMinD = 12;
+    av_run(0, 0.5, 0, NULL);
+    struct AdmPair * ser = av_gather(SUBHALO_ADMIT_KEY, &ns);
+    const int64_t ws = AvStats.NAdmitWithheld;
+    av_run(1000, 0.5, 0, NULL);
+    struct AdmPair * pl = av_gather(SUBHALO_ADMIT_PLAN, &np);
+    const int64_t wp = AvStats.NAdmitWithheld, wv = AvVote.NWithheld;
+    for(i = 0; i < n0; i++)
+        toB += all[i].Receiver == 1;
+    int64_t j = 0;
+    for(i = 0; i < n0; i++)
+        if(all[i].Receiver != 1) {
+            LOCAL_CHECK(bad, j < ns && ser[j].ID == all[i].ID && ser[j].Receiver == all[i].Receiver,
+                        "admission withheld: pair (%ld, %ld) of the distance 0 missing from the serial vote\n", (long) all[i].ID, all[i].Receiver);
+            j++;
+        }
+    for(i = 0; i < ns && i < np; i++)
+        LOCAL_CHECK(bad, ser[i].ID == pl[i].ID && ser[i].Receiver == pl[i].Receiver,
+                    "admission withheld: pair %ld: serial (%ld, %ld) plan (%ld, %ld)\n", i, (long) ser[i].ID, ser[i].Receiver,
+                    (long) pl[i].ID, pl[i].Receiver);
+    message(0, "admission withheld: %ld pairs at distance 0 (%ld to B); at 12 %ld from the serial key, %ld from the plan's vote; withheld "
+               "%ld serial, %ld plan (%ld by the vote); %ld mismatches\n", n0, toB, ns, np, ws, wp, wv, bad);
+    CHECK(toB > 0 && n0 > toB && ns == n0 - toB && np == ns && bad == 0 && ws == toB && wp == ws && wv == ws,
+          "admission withheld: %ld pairs (%ld to B), %ld serial, %ld plan, withheld %ld / %ld / %ld, %ld mismatches\n", n0, toB, ns, np, ws, wp,
+          wv, bad);
+    AvNear = 0;
+    AvMinD = 0;
+    free(pl);
+    free(ser);
+    free(all);
+}
+
 static void
 test_collective_vote_identity(void ** state)
 {
     av_case(0.5, 0, 5);
     av_case(0.3, 7, 3);
+    av_withheld_case();
     free(AvPre.r);
     AvPre.r = NULL;
     free(AvPairs);
@@ -3895,6 +3957,7 @@ tk_run(int64_t collective, double share, int c, struct Outcome * o)
     sp.SubhaloTreeOpenAngle = COLL_TEST_THETA;
     sp.SubhaloCollectiveMinPart = collective;
     sp.SubhaloAdmitShare = share;
+    sp.SubhaloAdmitMinCoreDistance = 0;
     syn_setup(&CP, TK_END + SYN_NFIELD, sp);
     struct SubTrack recs[2];
     recs[0] = syn_rec(0, 2000, 0.2, -1, 0, 0, 0);
@@ -4199,6 +4262,7 @@ tp_call(int64_t collective, double share, int fail, struct TpCall * out)
     sp.SubhaloTreeOpenAngle = COLL_TEST_THETA;
     sp.SubhaloCollectiveMinPart = collective;
     sp.SubhaloAdmitShare = share;
+    sp.SubhaloAdmitMinCoreDistance = 0;
     sp.SubhaloDebugForceExchangeFailure = fail;
     syn_setup(&CP, TK_END + SYN_NFIELD, sp);
     struct SubTrack recs[2];
@@ -4419,6 +4483,7 @@ sm_run(int64_t collective, double share, struct Outcome * o)
     sp.SubhaloTreeOpenAngle = COLL_TEST_THETA;
     sp.SubhaloCollectiveMinPart = collective;
     sp.SubhaloAdmitShare = share;
+    sp.SubhaloAdmitMinCoreDistance = 0;
     syn_setup(&CP, SM_END + SYN_NFIELD, sp);
     struct SubTrack recs[3];
     recs[0] = syn_rec(0, 4000, 0.4, -1, 0, 0, 0);
@@ -4586,6 +4651,7 @@ ir_run(int64_t collective, double share, int c, struct Outcome * o)
     sp.SubhaloTreeOpenAngle = COLL_TEST_THETA;
     sp.SubhaloCollectiveMinPart = collective;
     sp.SubhaloAdmitShare = share;
+    sp.SubhaloAdmitMinCoreDistance = 0;
     syn_setup(&CP, IR_END + SYN_NFIELD, sp);
     struct SubTrack recs[3];
     recs[0] = syn_rec(0, 2000, 0.2, -1, 0, 0, 0);

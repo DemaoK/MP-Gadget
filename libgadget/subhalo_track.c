@@ -363,6 +363,7 @@ stats_merge(struct SubhaloCallStats * to, const struct SubhaloCallStats * ks)
         to->NAdmitted += ks->NAdmitted;
         to->NAdmitTaken += ks->NAdmitTaken;
         to->NAdmitReceivers += ks->NAdmitReceivers;
+        to->NAdmitWithheld += ks->NAdmitWithheld;
     }
 }
 
@@ -586,6 +587,7 @@ reassign_particles(int32_t * owner, int64_t start, int64_t n, int TracerTypes, c
 struct SerialAdmitTree {
     const struct SubNode * nd;
     int nn;
+    double MinD, BoxSize;   /* SubhaloAdmitMinCoreDistance and the box of the withheld test */
 };
 
 /* The admission map (the owner map's memory once the own sources are grouped): the receiver's node
@@ -622,6 +624,17 @@ admit_ancestor(const struct SubhaloAdmitTree * at, int64_t a, int64_t v)
     return 0;
 }
 
+int __attribute__((noinline))
+subhalo_admit_withheld(const double sPos[3], const float sVel[3], const double aPos[3], const float aVel[3],
+                       float aSigmaX, float aSigmaV, double MinD, double BoxSize)
+{
+    /* a core without a positive dispersion has no scale to be near in */
+    if(!(aSigmaX > 0 && aSigmaV > 0))
+        return 0;
+    const double sv[3] = {sVel[0], sVel[1], sVel[2]}, av[3] = {aVel[0], aVel[1], aVel[2]};
+    return subhalo_core_distance(sPos, sv, aPos, av, aSigmaX, aSigmaV, BoxSize) < MinD;
+}
+
 int64_t
 subhalo_admit_choice(const int64_t * btid, int kk, int64_t A, int need, const struct SubhaloAdmitTree * at)
 {
@@ -654,7 +667,9 @@ subhalo_admit_choice(const int64_t * btid, int kk, int64_t A, int need, const st
         best = r;
         bestv = votes;
     }
-    return bestv >= need ? best : -1;
+    if(bestv < need)
+        return -1;
+    return at->withheld && at->withheld(at->t, best, A) ? SUBHALO_ADMIT_WITHHELD : best;
 }
 
 /* The admission tree of a serial key: its nodes, receivers flagged by admit_recv. */
@@ -679,6 +694,14 @@ static int64_t
 key_trackid(const void * t, int64_t v)
 {
     return ((const struct SerialAdmitTree *) t)->nd[v].TrackId;
+}
+/* the stored records of the previous call, as the plan's member table holds them */
+static int
+key_withheld(const void * t, int64_t r, int64_t A)
+{
+    const struct SerialAdmitTree * kt = (const struct SerialAdmitTree *) t;
+    const struct SubTrack * s = kt->nd[r].old, * a = kt->nd[A].old;
+    return subhalo_admit_withheld(s->CorePos, s->CoreVel, a->CorePos, a->CoreVel, a->CoreSigmaX, a->CoreSigmaV, kt->MinD, kt->BoxSize);
 }
 
 /* The choice of a serial key from a row of the k + 1 nearest tracers (self dropped by value
@@ -738,18 +761,20 @@ cmp_admitrec_id(const void * a, const void * b)
  * the receiver below A to which at least the share s of its k nearest owned tracers were bound at the
  * previous call (BoundTrackId, not yet rewritten). Receivers are the resolved members with a previous
  * bound set below the key's root. The vote of a whole key (a group or pseudo-key processed serially);
- * an oversized group's is taken by the plan across ranks (plan_vote). Returns the count; the owner map
- * becomes the admission map and *admlist holds the admitted particles grouped by receiver (adm_off,
- * adm_n), in key order. */
+ * an oversized group's is taken by the plan across ranks (plan_vote). A choice withheld near the
+ * owner's core (SubhaloAdmitMinCoreDistance) leaves the particle with its owner and counts in
+ * *nwithheld. Returns the count; the owner map becomes the admission map and *admlist holds the
+ * admitted particles grouped by receiver (adm_off, adm_n), in key order. */
 static int64_t
 admit_particles(int32_t * owner, struct SubNode * nd, int nn, int ci, int64_t start, int64_t n, int TracerTypes,
                 const struct SubhaloParams * sp, const struct SubhaloCallCtx * ctx, struct SubhaloArena * arena, int64_t g,
-                int32_t ** admlist)
+                int32_t ** admlist, int64_t * nwithheld)
 {
     const int kk = sp->SubhaloNumNeighboursForReassignment;
     const int need = subhalo_admit_need(sp->SubhaloAdmitShare, kk);
-    const struct SerialAdmitTree st = {nd, nn};
-    const struct SubhaloAdmitTree at = {key_receiver, key_parent, key_depth, key_trackid, &st};
+    const struct SerialAdmitTree st = {nd, nn, sp->SubhaloAdmitMinCoreDistance, ctx->BoxSize};
+    const struct SubhaloAdmitTree at = {key_receiver, key_parent, key_depth, key_trackid, &st,
+                                        sp->SubhaloAdmitMinCoreDistance > 0 ? key_withheld : NULL};
     int64_t i, nt = 0, nc = 0, nadm = 0;
     int v, u, nrecv = 0;
     for(v = 0; v < nn; v++)
@@ -807,6 +832,8 @@ admit_particles(int32_t * owner, struct SubNode * nd, int nn, int ci, int64_t st
                     subhalo_admit_report(P[q[a]].ID, nd[got[a]].TrackId, SUBHALO_ADMIT_KEY);
                     nadm++;
                 }
+                else if(got[a] == SUBHALO_ADMIT_WITHHELD)
+                    (*nwithheld)++;
             nb = 0;
         }
     }
@@ -1040,7 +1067,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
         if(subkey)
             ks.NAdmitted = admit_records(owner, nd, nn, start, n, ctx->plan, arena, g, &admlist);
         else
-            ks.NAdmitted = admit_particles(owner, nd, nn, ci, start, n, TracerTypes, sp, ctx, arena, g, &admlist);
+            ks.NAdmitted = admit_particles(owner, nd, nn, ci, start, n, TracerTypes, sp, ctx, arena, g, &admlist, &ks.NAdmitWithheld);
         if(ks.NAdmitted > 0)
             adm = owner;
     }

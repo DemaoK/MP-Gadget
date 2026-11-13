@@ -232,6 +232,8 @@ struct SubhaloMember {
     double RefPos[3], RefVel[3];         /* previous-bound frame (translated frame, internal Vel) */
     double TracerPos[3], TracerVel[3];   /* an orphan's tracer as in the record (output frame, km/s) */
     double MarkerWeight;                 /* an orphan's membership weight in its Host (resurrection order) */
+    double CorePosPrev[3];               /* the previous record's core (the admission's withholding distance) */
+    float CoreVelPrev[3], CoreSigmaXPrev, CoreSigmaVPrev;
     /* this call: the serial sub-tree results (gathered after the serial keys) and the rounds */
     int32_t state;           /* SUBHALO_ST_* */
     int32_t Nbound;
@@ -557,6 +559,7 @@ struct SubhaloVoteStats {
     int64_t NQueries;          /* tracers whose owner has a receiver below it */
     int64_t NOffered;          /* of which offered to a receiver */
     int64_t NOfferedInplace;   /* of which owned by an in-place candidate */
+    int64_t NWithheld;         /* of the queries, those whose chosen receiver was withheld near the owner's core */
     int64_t NServed;           /* of which taken to their receivers' serial sub-tree keys */
     int64_t NHome;             /* of which offered to in-place receivers (they stay home) */
     int64_t NGuests;           /* of which owned outside that key (they travel there) */
@@ -756,10 +759,14 @@ struct SubhaloAdmitTree {
     int (*depth)(const void * t, int64_t v);
     int64_t (*trackid)(const void * t, int64_t v);
     const void * t;
+    /* 1 if receiver r's core is too close to owner A's for the admission (NULL: never) */
+    int (*withheld)(const void * t, int64_t r, int64_t A);
 };
 /* The receiver below owner A that the most of the k neighbours' previous tags btid[0..k) name, if
- * at least need of them; ties to the deeper receiver, then the smaller TrackId; -1 if none. The one
- * choice of every admission vote, so that all of them decide alike. */
+ * at least need of them; ties to the deeper receiver, then the smaller TrackId; -1 if none,
+ * SUBHALO_ADMIT_WITHHELD if the tree's withheld test refuses the choice (no other receiver is tried).
+ * The one choice of every admission vote, so that all of them decide alike. */
+enum { SUBHALO_ADMIT_WITHHELD = -2 };
 int64_t subhalo_admit_choice(const int64_t * btid, int kk, int64_t A, int need, const struct SubhaloAdmitTree * at);
 /* Every offered pair (particle ID, receiver TrackId) of a vote, reported to an optional hook with its
  * source: a serial key's vote or the plan's vote across ranks (unit tests; NULL: none). */
@@ -767,6 +774,13 @@ enum { SUBHALO_ADMIT_KEY = 0, SUBHALO_ADMIT_PLAN = 1 };
 typedef void (*subhalo_admit_hook)(MyIDType ID, int64_t Receiver, int source);
 void subhalo_set_admit_hook(subhalo_admit_hook fn);
 void subhalo_admit_report(MyIDType ID, int64_t Receiver, int source);
+/* 1 if SubhaloAdmitMinCoreDistance = MinD is finite and not negative. */
+int subhalo_admit_distance_valid(double MinD);
+/* 1 if a particle owned by A is withheld from receiver S: both cores and A's dispersions from the
+ * previous records (types of struct SubTrack), D(S, A) of subhalo_core_distance below MinD and both
+ * of A's dispersions positive. One compiled copy for every vote. */
+int subhalo_admit_withheld(const double sPos[3], const float sVel[3], const double aPos[3], const float aVel[3],
+                           float aSigmaX, float aSigmaV, double MinD, double BoxSize);
 
 /* One record emitted by the key processing (one per member hosted by a serial key, resolved or
  * orphan, at most one newborn per key, one winner per in-place key on its deciding rank). */
@@ -852,6 +866,7 @@ struct SubhaloCallStats {
     int64_t NAdmitted;       /* particles of an ancestor admitted to a satellite's source */
     int64_t NAdmitTaken;     /* of which bound by the satellite and taken by it */
     int64_t NAdmitReceivers; /* satellites that took at least one */
+    int64_t NAdmitWithheld;  /* particles whose vote chose a receiver too close to their owner's core */
 };
 /* The statistics of the last completed subhalo_find (global; for the tests and the log). */
 const struct SubhaloCallStats * subhalo_last_call_stats(void);

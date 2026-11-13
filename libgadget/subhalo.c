@@ -70,6 +70,12 @@ subhalo_isfinite(double x)
 /* Largest double below 2^62, the range in which the integer-valued parameters are converted. */
 #define SUBHALO_INT_PARAM_MAX 4.6e18
 
+int
+subhalo_admit_distance_valid(double MinD)
+{
+    return subhalo_isfinite(MinD) && MinD >= 0;
+}
+
 /* Validation of the parameters: endrun(1) on every rank, which all hold the broadcast values. */
 static void
 subhalo_validate_params(const struct SubhaloParams * sp)
@@ -101,6 +107,8 @@ subhalo_validate_params(const struct SubhaloParams * sp)
                sp->SubhaloNumNeighboursForReassignment, SUBHALO_KNN_MAXK);
     if(!subhalo_isfinite(sp->SubhaloAdmitShare) || !(sp->SubhaloAdmitShare >= 0 && sp->SubhaloAdmitShare <= 1))
         endrun(1, "SubhaloAdmitShare = %g must be in [0, 1].\n", sp->SubhaloAdmitShare);
+    if(!subhalo_admit_distance_valid(sp->SubhaloAdmitMinCoreDistance))
+        endrun(1, "SubhaloAdmitMinCoreDistance = %g must be finite and not negative.\n", sp->SubhaloAdmitMinCoreDistance);
     if(sp->SubhaloCoreSize < 1 || sp->SubhaloPotentialSampleSize < 0 || sp->SubhaloMaxUnbindIterations < 1)
         endrun(1, "SubhaloCoreSize = %d and SubhaloMaxUnbindIterations = %d must be at least 1, SubhaloPotentialSampleSize = %d not negative.\n",
                sp->SubhaloCoreSize, sp->SubhaloMaxUnbindIterations, sp->SubhaloPotentialSampleSize);
@@ -191,6 +199,7 @@ set_subhalo_params(ParameterSet * ps)
         SubParams.SubhaloReassignGas = param_get_int(ps, "SubhaloReassignGas");
         SubParams.SubhaloNumNeighboursForReassignment = param_get_int(ps, "SubhaloNumNeighboursForReassignment");
         SubParams.SubhaloAdmitShare = param_get_double(ps, "SubhaloAdmitShare");
+        SubParams.SubhaloAdmitMinCoreDistance = param_get_double(ps, "SubhaloAdmitMinCoreDistance");
         SubParams.SubhaloUnbindWithThermal = param_get_int(ps, "SubhaloUnbindWithThermal");
         SubParams.SubhaloFieldSO = param_get_int(ps, "SubhaloFieldSO");
         SubParams.SubhaloSOBins = param_get_int(ps, "SubhaloSOBins");
@@ -2293,10 +2302,10 @@ subhalo_last_call_stats(void)
 static void
 stats_reduce(const struct SubhaloCallStats * loc, struct SubhaloCallStats * tot, MPI_Comm Comm)
 {
-    int64_t a[14] = {loc->NCandidates, loc->NItercap, loc->NFinalPositive, loc->NFinalBound, loc->NTailRejected,
+    int64_t a[15] = {loc->NCandidates, loc->NItercap, loc->NFinalPositive, loc->NFinalBound, loc->NTailRejected,
                      loc->NFallbackField, loc->NFallbackReleased, loc->NRescueTried, loc->NRescued, loc->NLossTried,
-                     loc->NLossRescued, loc->NAdmitted, loc->NAdmitTaken, loc->NAdmitReceivers}, b[14];
-    MPI_Allreduce(a, b, 14, MPI_INT64, MPI_SUM, Comm);
+                     loc->NLossRescued, loc->NAdmitted, loc->NAdmitTaken, loc->NAdmitReceivers, loc->NAdmitWithheld}, b[15];
+    MPI_Allreduce(a, b, 15, MPI_INT64, MPI_SUM, Comm);
     memset(tot, 0, sizeof(*tot));
     tot->NCandidates = b[0];
     tot->NItercap = b[1];
@@ -2312,6 +2321,7 @@ stats_reduce(const struct SubhaloCallStats * loc, struct SubhaloCallStats * tot,
     tot->NAdmitted = b[11];
     tot->NAdmitTaken = b[12];
     tot->NAdmitReceivers = b[13];
+    tot->NAdmitWithheld = b[14];
     MPI_Allreduce(&loc->ArenaPeakFrac, &tot->ArenaPeakFrac, 1, MPI_DOUBLE, MPI_MAX, Comm);
     struct { double r; int rank; } in, out;
     int ThisTask;
@@ -2738,6 +2748,8 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
     ctx.MetalReturnOn = MetalReturnOn;
     ctx.Stats.WorstConvRatio = 1;
     ctx.Stats.WorstTrackId = -1;
+    /* the plan's vote is global: its withheld count enters the reduction once */
+    ctx.Stats.NAdmitWithheld = ThisTask == 0 ? subhalo_plan_last_vote()->NWithheld : 0;
 
     /* Result slots (serial keys' members and newborns, in-place candidates owned here), on the
      * top so that they survive the domain restore. */
@@ -2856,7 +2868,11 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
             SubLastStats.NRescued, SubLastStats.NRescueTried, SubLastStats.NLossRescued, SubLastStats.NLossTried,
             SubLastStats.NFinalPositive, SubLastStats.NFinalBound, SubLastStats.NTailRejected,
             SubLastStats.NFallbackField, SubLastStats.NFallbackReleased, norphsync_tot, SubLastStats.ArenaPeakFrac);
-    if(sp->SubhaloAdmitShare > 0)
+    if(sp->SubhaloAdmitShare > 0 && sp->SubhaloAdmitMinCoreDistance > 0)
+        message(0, "Subhalo admission: %ld particles of ancestors admitted to satellites by neighbour majority, %ld taken, by %ld satellites, "
+                   "%ld withheld near their owner's core.\n",
+                SubLastStats.NAdmitted, SubLastStats.NAdmitTaken, SubLastStats.NAdmitReceivers, SubLastStats.NAdmitWithheld);
+    else if(sp->SubhaloAdmitShare > 0)
         message(0, "Subhalo admission: %ld particles of ancestors admitted to satellites by neighbour majority, %ld taken, by %ld satellites.\n",
                 SubLastStats.NAdmitted, SubLastStats.NAdmitTaken, SubLastStats.NAdmitReceivers);
     if(sp->SubhaloAdmitShare > 0 && subhalo_plan_last_vote()->NQueries > 0) {

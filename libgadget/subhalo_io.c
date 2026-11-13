@@ -714,6 +714,9 @@ subhalo_format_params(char * buf, size_t size)
     const size_t len = strlen(buf);
     if(sp->SubhaloAdmitShare > 0 && len < size)
         snprintf(buf + len, size - len, "SubhaloAdmitShare = %.17g\n", sp->SubhaloAdmitShare);
+    const size_t len2 = strlen(buf);
+    if(sp->SubhaloAdmitShare > 0 && sp->SubhaloAdmitMinCoreDistance > 0 && len2 < size)
+        snprintf(buf + len2, size - len2, "SubhaloAdmitMinCoreDistance = %.17g\n", sp->SubhaloAdmitMinCoreDistance);
 }
 
 void

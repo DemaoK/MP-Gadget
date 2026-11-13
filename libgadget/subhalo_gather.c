@@ -1354,7 +1354,11 @@ plan_gather_members(struct SubTrackTable * tab, const int64_t * O, int64_t nO, s
             m->RefVel[d] = t->RefVel[d];
             m->TracerPos[d] = t->TracerPos[d];
             m->TracerVel[d] = t->TracerVel[d];
+            m->CorePosPrev[d] = t->CorePos[d];
+            m->CoreVelPrev[d] = t->CoreVel[d];
         }
+        m->CoreSigmaXPrev = t->CoreSigmaX;
+        m->CoreSigmaVPrev = t->CoreSigmaV;
         m->SinkTrackId = m->FinalParent = m->Central = -1;
         m->frank = m->fdepth = -1;
     }
@@ -2216,6 +2220,7 @@ plan_admit(struct SubhaloPlan * plan, const struct SubhaloDirKey * dk, int64_t n
 struct PlanAdmitTree {
     const struct SubhaloMember * M;
     int64_t nmem, g;
+    double MinD, BoxSize;   /* SubhaloAdmitMinCoreDistance and the box of the withheld test */
 };
 static int64_t
 plan_admit_receiver(const void * t, int64_t TrackId)
@@ -2240,6 +2245,15 @@ static int64_t
 plan_admit_trackid(const void * t, int64_t v)
 {
     return ((const struct PlanAdmitTree *) t)->M[v].TrackId;
+}
+/* the previous records' cores, as a serial key reads them from its members' records */
+static int
+plan_admit_withheld(const void * t, int64_t r, int64_t A)
+{
+    const struct PlanAdmitTree * pt = (const struct PlanAdmitTree *) t;
+    const struct SubhaloMember * s = &pt->M[r], * a = &pt->M[A];
+    return subhalo_admit_withheld(s->CorePosPrev, s->CoreVelPrev, a->CorePosPrev, a->CoreVelPrev, a->CoreSigmaXPrev, a->CoreSigmaVPrev,
+                                  pt->MinD, pt->BoxSize);
 }
 
 /* The owner of a live tracer of an oversized key as the whole key's serial run sets it
@@ -2390,7 +2404,7 @@ plan_vote(const struct SubhaloMember * mem, int64_t nmem, const int64_t * centra
     }
     int64_t nqtot = 0;
     MPI_Allreduce(&nq, &nqtot, 1, MPI_INT64, MPI_SUM, Comm);
-    int64_t noff = 0, ninp = 0;
+    int64_t noff = 0, ninp = 0, nwh = 0;
     if(nqtot > 0) {
         struct SubhaloKnnHit * hits = (struct SubhaloKnnHit *) mymalloc("SubVoteHits", sizeof(struct SubhaloKnnHit) * (nq * kk + 1));
         int32_t * nhit = (int32_t *) mymalloc("SubVoteNhit", sizeof(int32_t) * (nq + 1));
@@ -2402,12 +2416,14 @@ plan_vote(const struct SubhaloMember * mem, int64_t nmem, const int64_t * centra
             int c;
             for(c = 0; c < kk; c++)
                 btid[c] = c < nhit[k] ? hits[k * kk + c].BoundTrackId : -1;
-            const struct PlanAdmitTree pt = {mem, nmem, O[label[ql[k]]]};
-            const struct SubhaloAdmitTree at = {plan_admit_receiver, plan_admit_parent, plan_admit_depth, plan_admit_trackid, &pt};
+            const struct PlanAdmitTree pt = {mem, nmem, O[label[ql[k]]], sp->SubhaloAdmitMinCoreDistance, PartManager->BoxSize};
+            const struct SubhaloAdmitTree at = {plan_admit_receiver, plan_admit_parent, plan_admit_depth, plan_admit_trackid, &pt,
+                                                sp->SubhaloAdmitMinCoreDistance > 0 ? plan_admit_withheld : NULL};
             const int64_t r = subhalo_admit_choice(btid, kk, owner[ql[k]], need, &at);
-            got[k] = r >= 0 ? mem[r].TrackId : -1;
+            got[k] = r >= 0 ? mem[r].TrackId : (r == SUBHALO_ADMIT_WITHHELD ? -2 : -1);
         }
-        for(k = 0; k < nq; k++)
+        for(k = 0; k < nq; k++) {
+            nwh += got[k] == -2;
             if(got[k] >= 0) {
                 off[noff].index = ql[k];
                 off[noff].receiver = got[k];
@@ -2415,6 +2431,7 @@ plan_vote(const struct SubhaloMember * mem, int64_t nmem, const int64_t * centra
                 ninp += mem[owner[ql[k]]].cand > 0;
                 noff++;
             }
+        }
         myfree(got);
         myfree(nhit);
         myfree(hits);
@@ -2426,11 +2443,12 @@ plan_vote(const struct SubhaloMember * mem, int64_t nmem, const int64_t * centra
     myfree(label);
     myfree(src);
     off = (struct SubhaloOffer *) myrealloc(off, sizeof(struct SubhaloOffer) * (noff + 1));
-    int64_t cnt[3] = {nq, noff, ninp};
-    MPI_Allreduce(MPI_IN_PLACE, cnt, 3, MPI_INT64, MPI_SUM, Comm);
+    int64_t cnt[4] = {nq, noff, ninp, nwh};
+    MPI_Allreduce(MPI_IN_PLACE, cnt, 4, MPI_INT64, MPI_SUM, Comm);
     LastVote.NQueries = cnt[0];
     LastVote.NOffered = cnt[1];
     LastVote.NOfferedInplace = cnt[2];
+    LastVote.NWithheld = cnt[3];
     double dt = MPI_Wtime() - t0;
     MPI_Allreduce(MPI_IN_PLACE, &dt, 1, MPI_DOUBLE, MPI_MAX, Comm);
     LastVote.Seconds += dt;
