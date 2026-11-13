@@ -2868,18 +2868,20 @@ subhalo_find(FOFGroups * fof, DomainDecomp * ddecomp, int SnapNum, double atime,
             SubLastStats.NRescued, SubLastStats.NRescueTried, SubLastStats.NLossRescued, SubLastStats.NLossTried,
             SubLastStats.NFinalPositive, SubLastStats.NFinalBound, SubLastStats.NTailRejected,
             SubLastStats.NFallbackField, SubLastStats.NFallbackReleased, norphsync_tot, SubLastStats.ArenaPeakFrac);
-    if(sp->SubhaloAdmitShare > 0 && sp->SubhaloAdmitMinCoreDistance > 0)
-        message(0, "Subhalo admission: %ld particles of ancestors admitted to satellites by neighbour majority, %ld taken, by %ld satellites, "
-                   "%ld withheld near their owner's core.\n",
-                SubLastStats.NAdmitted, SubLastStats.NAdmitTaken, SubLastStats.NAdmitReceivers, SubLastStats.NAdmitWithheld);
-    else if(sp->SubhaloAdmitShare > 0)
-        message(0, "Subhalo admission: %ld particles of ancestors admitted to satellites by neighbour majority, %ld taken, by %ld satellites.\n",
-                SubLastStats.NAdmitted, SubLastStats.NAdmitTaken, SubLastStats.NAdmitReceivers);
+    /* the withheld counts appear only with the withholding on */
+    char wh[64] = "", vwh[64] = "";
+    if(sp->SubhaloAdmitMinCoreDistance > 0) {
+        snprintf(wh, sizeof(wh), ", %ld withheld near their owner's core", SubLastStats.NAdmitWithheld);
+        snprintf(vwh, sizeof(vwh), ", %ld withheld near their owner's core", subhalo_plan_last_vote()->NWithheld);
+    }
+    if(sp->SubhaloAdmitShare > 0)
+        message(0, "Subhalo admission: %ld particles of ancestors admitted to satellites by neighbour majority, %ld taken, by %ld satellites%s.\n",
+                SubLastStats.NAdmitted, SubLastStats.NAdmitTaken, SubLastStats.NAdmitReceivers, wh);
     if(sp->SubhaloAdmitShare > 0 && subhalo_plan_last_vote()->NQueries > 0) {
         const struct SubhaloVoteStats * vs = subhalo_plan_last_vote();
-        message(0, "Subhalo admission vote of the oversized keys across ranks: %ld tracers queried, %ld offered (%ld by in-place owners), "
+        message(0, "Subhalo admission vote of the oversized keys across ranks: %ld tracers queried, %ld offered (%ld by in-place owners)%s, "
                    "%ld taken to their receivers' sub-tree keys (%ld guests), %ld kept home for in-place receivers; %d radius pass(es), "
-                   "%.3g s.\n", vs->NQueries, vs->NOffered, vs->NOfferedInplace, vs->NServed, vs->NGuests, vs->NHome, vs->Passes, vs->Seconds);
+                   "%.3g s.\n", vs->NQueries, vs->NOffered, vs->NOfferedInplace, vwh, vs->NServed, vs->NGuests, vs->NHome, vs->Passes, vs->Seconds);
     }
     log_tagged("after the call", Comm);
 
