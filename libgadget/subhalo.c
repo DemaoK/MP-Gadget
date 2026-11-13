@@ -659,7 +659,7 @@ lookup_build_index(int64_t * nlout)
     for(c = 0; c < nc; c++) {
         int64_t cnt = 0, i;
         for(i = c * N / nc; i < (c + 1) * N / nc; i++)
-            if(!P[i].IsGarbage && !P[i].Swallowed)
+            if(subhalo_part_live(&P[i]))
                 cnt++;
         off[c + 1] = cnt;
     }
@@ -671,7 +671,7 @@ lookup_build_index(int64_t * nlout)
     for(c = 0; c < nc; c++) {
         int64_t m = off[c], i;
         for(i = c * N / nc; i < (c + 1) * N / nc; i++)
-            if(!P[i].IsGarbage && !P[i].Swallowed) {
+            if(subhalo_part_live(&P[i])) {
                 idx[m].ID = P[i].ID;
                 idx[m].i = i;
                 m++;
@@ -699,7 +699,7 @@ lookup_answer_scan(MyIDType * all, int64_t tot)
     qsort_openmp(qs, tot, sizeof(struct LookupQuery), cmp_lookupquery);
     #pragma omp parallel for
     for(i = 0; i < PartManager->NumPart; i++) {
-        if(P[i].IsGarbage || P[i].Swallowed)
+        if(!subhalo_part_live(&P[i]))
             continue;
         const MyIDType id = P[i].ID;
         int64_t lo = 0, hi = tot;
@@ -730,7 +730,7 @@ subhalo_lookup_ids(const MyIDType * ids, int64_t n, struct SubhaloIdHit * out, M
     int64_t nlive = 0;
     #pragma omp parallel for reduction(+: nlive)
     for(i = 0; i < PartManager->NumPart; i++)
-        if(!P[i].IsGarbage && !P[i].Swallowed)
+        if(subhalo_part_live(&P[i]))
             nlive++;
     /* scan when all queries together are few against the live particles; else build the index once */
     int64_t ntot = 0;
@@ -1487,7 +1487,7 @@ subhalo_count_tagged(const struct part_manager_type * pman, int64_t ntagged[6])
     for(i = 0; i < pman->NumPart; i++) {
         const struct particle_data * p = &pman->Base[i];
         /* the finder's live-particle predicate: swallowed BHs keep their tags but do not count */
-        if(p->IsGarbage || p->Swallowed || p->TrackId < 0)
+        if(!subhalo_part_live(p) || p->TrackId < 0)
             continue;
         switch(p->Type) {
             case 0: n0++; break;
@@ -1813,14 +1813,6 @@ subhalo_number_newborns(struct SubhaloResult * res, int64_t nres, int64_t TotNgr
 
 /* ------------------------------------------------------------------ step 7f: hostless and dead tracks */
 
-/* The finder's live-particle predicate: garbage and swallowed particles neither vote nor count
- * (their tags are left untouched). */
-static inline int
-subhalo_live(const struct particle_data * p)
-{
-    return !p->IsGarbage && !p->Swallowed;
-}
-
 /* The common periodic reference of a hostless track: its global minimum-ID live field particle. */
 struct FieldRef {
     int64_t TrackId;
@@ -1926,7 +1918,7 @@ subhalo_update_unhosted(struct SubTrackTable * tab, int SnapNum, double atime, i
     const double vfac = subhalo_vel_to_kms(atime);
 
     /* own-tag live field particles, grouped by track */
-#define UNH_PRED (subhalo_live(&P[i]) && P[i].GrNr < 0 && P[i].TrackId >= 0)
+#define UNH_PRED (subhalo_part_live(&P[i]) && P[i].GrNr < 0 && P[i].TrackId >= 0)
     const int nc = subhalo_par_nchunks(PartManager->NumPart);
     int64_t * off = ta_malloc("SubFieldOff", int64_t, nc + 1);
     SUBHALO_COUNT_CHUNKS(PartManager->NumPart, nc, off, UNH_PRED);

@@ -122,18 +122,13 @@ _Static_assert(SUBHALO_ARENA_FIXED_BYTES_PER_PART >= SUBHALO_UNBIND_BYTES_PER_PA
 _Static_assert(SUBHALO_PROPS_BYTES_PER_PART <= SUBHALO_UNBIND_SCRATCH_BYTES_PER_PART,
                "SUBHALO_PROPS_BYTES_PER_PART must fit in the kernel's transient scratch");
 
-enum { NODE_RESOLVED = 0, NODE_ORPHAN = 1, NODE_NEWBORN = 2 };
-/* ST_NONE: not unbound (an orphan that stays one); ST_FAILED: an orphan central that was not
- * resurrected, or a newborn that did not survive */
-enum { ST_NONE = 0, ST_ALIVE = 1, ST_DIED = 2, ST_SUNK = 3, ST_FAILED = 4 };
 #define TAG_RESERVED 0x40000000
 
 /* One candidate of a key (design 7.1): a member hosted here or the newborn. */
 struct SubNode {
     int64_t TrackId;
     const struct SubTrack * old;    /* the member's previous record, NULL for the newborn */
-    int kind, state;
-    int was_alive;                  /* sunk after surviving its own unbinding */
+    int kind, state;                /* SUBHALO_MEM_*, SUBHALO_ST_* */
     int sinkinto;                   /* node it sank into, -1 */
     int parent, child, sib, depth;  /* processing tree (children in TrackId order) */
     int visited;                    /* traversal: children entered */
@@ -159,12 +154,6 @@ struct SerialCtx {
     const int64_t * BindStart;       /* per segment: its slice of ctx->BindOrd */
     int64_t * BindCount;             /* per segment: the entries written */
 };
-
-static inline int
-part_live(const struct particle_data * p)
-{
-    return !p->IsGarbage && !p->Swallowed;
-}
 
 static inline int
 is_tracer(int64_t i, int TracerTypes)
@@ -263,11 +252,11 @@ static void
 node_core(struct SubNode * v, const struct SubhaloUnbindParams * up, int CoreSize)
 {
     int d;
-    if(v->state == ST_ALIVE) {
+    if(v->state == SUBHALO_ST_ALIVE) {
         subhalo_core(&v->c, up, CoreSize, v->CorePos, v->CoreVel, &v->SigmaX, &v->SigmaV);
         v->has_core = 1;
     }
-    else if(v->state == ST_DIED && v->has_mb) {
+    else if(v->state == SUBHALO_ST_DIED && v->has_mb) {
         for(d = 0; d < 3; d++) {
             v->CorePos[d] = v->mbPos[d];
             v->CoreVel[d] = v->mbVel[d];
@@ -379,12 +368,12 @@ merge_subtree(struct SubNode * nd, int x, int ref, const struct SubhaloUnbindPar
     if(x == ref)
         return merged;
     struct SubNode * u = &nd[x];
-    if(u->kind != NODE_RESOLVED || !(u->state == ST_ALIVE || u->state == ST_DIED) || !u->has_core)
+    if(u->kind != SUBHALO_MEM_RESOLVED || !(u->state == SUBHALO_ST_ALIVE || u->state == SUBHALO_ST_DIED) || !u->has_core)
         return merged;
     const struct SubNode * r = &nd[ref];
     if(!subhalo_sink_test(u->CorePos, u->CoreVel, r->CorePos, r->CoreVel, r->SigmaX, r->SigmaV, u->SigmaX, u->SigmaV, symmetric, up->BoxSize))
         return merged;
-    if(u->state == ST_ALIVE) {
+    if(u->state == SUBHALO_ST_ALIVE) {
         /* the most-bound tracer of the bound set becomes the orphan's tracer (MergeTo,
          * subhalo_merge.cpp:213-221), then the bound set joins the reference */
         int64_t j;
@@ -399,10 +388,9 @@ merge_subtree(struct SubNode * nd, int x, int ref, const struct SubhaloUnbindPar
         for(j = 0; j < u->c.Nbound; j++)
             rr->c.Index[rr->c.N++] = u->c.Index[j];
         u->c.Nbound = 0;
-        u->was_alive = 1;
         merged = 1;
     }
-    u->state = ST_SUNK;
+    u->state = SUBHALO_ST_SUNK;
     u->sinkinto = ref;
     return merged;
 }
@@ -492,7 +480,7 @@ cmp_idlocal(const void * a, const void * b)
 static inline int
 x_is_resurrected(const struct SubNode * x)
 {
-    return x->kind == NODE_ORPHAN && x->state == ST_ALIVE;
+    return x->kind == SUBHALO_MEM_ORPHAN && x->state == SUBHALO_ST_ALIVE;
 }
 
 /* The key centre of an ordinary or pseudo-key: mass-weighted over its live FOF particles (all
@@ -505,7 +493,7 @@ key_fof_centre(int64_t start, int64_t n, int64_t g, int pseudo, const struct Sub
     int64_t first = -1;
     double M = 0, mx[3] = {0, 0, 0}, mv[3] = {0, 0, 0};
     for(i = start; i < start + n; i++) {
-        if(!part_live(&P[i]) || !(pseudo || P[i].GrNr == g))
+        if(!subhalo_part_live(&P[i]) || !(pseudo || P[i].GrNr == g))
             continue;
         if(first < 0)
             first = i;
@@ -777,7 +765,7 @@ admit_particles(int32_t * owner, struct SubNode * nd, int nn, int ci, int64_t st
     int64_t i, nt = 0, nc = 0, nadm = 0;
     int v, u, nrecv = 0;
     for(v = 0; v < nn; v++)
-        if(v != ci && nd[v].kind == NODE_RESOLVED && nd[v].old->NPrev > 0) {
+        if(v != ci && nd[v].kind == SUBHALO_MEM_RESOLVED && nd[v].old->NPrev > 0) {
             nd[v].admit_recv = 1;
             nrecv++;
             for(u = nd[v].parent; u >= 0; u = nd[u].parent)
@@ -910,20 +898,20 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
         memset(u, 0, sizeof(*u));
         u->TrackId = m->TrackId;
         u->old = m;
-        u->kind = m->NboundPrev > 0 ? NODE_RESOLVED : NODE_ORPHAN;
+        u->kind = m->NboundPrev > 0 ? SUBHALO_MEM_RESOLVED : SUBHALO_MEM_ORPHAN;
     }
     if(nn == 0) {
         if(pseudo || subkey)
             endrun(5, "%s %ld has no member track on rank %d.\n", pseudo ? "Pseudo-key" : "Sub-tree key", g, ctx->ThisTask);
         memset(&nd[0], 0, sizeof(nd[0]));
         nd[0].TrackId = SUBHALO_PROVISIONAL(g);
-        nd[0].kind = NODE_NEWBORN;
+        nd[0].kind = SUBHALO_MEM_NEWBORN;
         nn = 1;
     }
     for(v = 0; v < nn; v++) {
         nd[v].parent = nd[v].child = nd[v].sib = nd[v].fparent = -1;
         nd[v].sinkinto = -1;
-        nd[v].state = ST_NONE;
+        nd[v].state = SUBHALO_ST_NONE;
         res[v].valid = 0;
     }
 
@@ -951,7 +939,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
         double Mmax = -1;
         int nres = 0;
         for(v = 0; v < nn; v++)
-            if(nd[v].kind == NODE_RESOLVED) {
+            if(nd[v].kind == SUBHALO_MEM_RESOLVED) {
                 nres++;
                 if(nd[v].old->Mbound > Mmax)
                     Mmax = nd[v].old->Mbound;
@@ -962,7 +950,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
             const struct SubTrack * m = nd[v].old;
             double dist;
             if(nres > 0) {
-                if(nd[v].kind != NODE_RESOLVED || m->Mbound < sp->SubhaloMajorProgenitorMassRatio * Mmax)
+                if(nd[v].kind != SUBHALO_MEM_RESOLVED || m->Mbound < sp->SubhaloMajorProgenitorMassRatio * Mmax)
                     continue;
                 dist = m->NPrev > 0 ? kinetic_distance(m->RefPos, m->RefVel, xg, vg, up) : 1e299;
                 /* nodes are in TrackId order: strict < keeps the smaller TrackId on ties */
@@ -971,7 +959,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
                     bi = v;
                 }
             }
-            else if(nd[v].kind == NODE_ORPHAN) {
+            else if(nd[v].kind == SUBHALO_MEM_ORPHAN) {
                 /* only orphans: every one is a candidate (their Mbound is 0); the largest weight of markers in
                  * the group wins, evidence of membership a stray marker cannot fake, then the kinetic distance */
                 double tp[3], tv[3];
@@ -991,7 +979,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
         if(v == ci)
             continue;
         const int p = nd[v].old ? node_index(nd, nn, nd[v].old->NestedParentTrackId) : -1;
-        nd[v].parent = (p >= 0 && p != v && nd[p].kind == NODE_RESOLVED) ? p : ci;
+        nd[v].parent = (p >= 0 && p != v && nd[p].kind == SUBHALO_MEM_RESOLVED) ? p : ci;
     }
     for(v = 0; v < nn; v++) {
         int u = v, steps = 0;
@@ -1022,12 +1010,12 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
     for(i = 0; i < n; i++) {
         const struct particle_data * p = &P[start + i];
         int o = -1;
-        if(part_live(p)) {
+        if(subhalo_part_live(p)) {
             const int t = p->TrackId >= 0 ? node_index(nd, nn, p->TrackId) : -1;
             /* the central's source is its FOF group only, as HBT's FeedCentrals: its own
              * FOF-less particles would otherwise keep accumulating, call after call, in its bound set.
              * Pseudo-keys and sub-tree keys (whose root is never the central) keep theirs. */
-            if(t >= 0 && nd[t].kind == NODE_RESOLVED && (pseudo || subkey || t != ci || p->GrNr == g))
+            if(t >= 0 && nd[t].kind == SUBHALO_MEM_RESOLVED && (pseudo || subkey || t != ci || p->GrNr == g))
                 o = t;                      /* a resolved member's own particles (a satellite's also in the field) */
             else if(pseudo || p->GrNr == g)
                 o = ci;                     /* every other FOF particle feeds the central */
@@ -1089,20 +1077,20 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
             nd[u].visited = 1;
             /* post: process u */
             struct SubNode * x = &nd[u];
-            if(x->kind == NODE_ORPHAN && u != ci) {
-                x->state = ST_NONE;
+            if(x->kind == SUBHALO_MEM_ORPHAN && u != ci) {
+                x->state = SUBHALO_ST_NONE;
                 x->seq = -1;
             }
             else {
                 int c;
                 int64_t input = x->own_n + x->adm_n, reserve = 0, s;
                 for(c = x->child; c >= 0; c = nd[c].sib) {
-                    if(nd[c].state == ST_ALIVE) input += nd[c].c.N - nd[c].c.Nbound;
-                    else if(nd[c].state == ST_DIED || nd[c].state == ST_FAILED) input += nd[c].c.N;
+                    if(nd[c].state == SUBHALO_ST_ALIVE) input += nd[c].c.N - nd[c].c.Nbound;
+                    else if(nd[c].state == SUBHALO_ST_DIED || nd[c].state == SUBHALO_ST_FAILED) input += nd[c].c.N;
                 }
                 if(MergeTrapped)
                     for(s = x->firstseq; s < nseq; s++)
-                        if(nd[nd[s].byseq].state == ST_ALIVE)
+                        if(nd[nd[s].byseq].state == SUBHALO_ST_ALIVE)
                             reserve += nd[nd[s].byseq].c.Nbound;
                 const int64_t cap = input + reserve;
                 x->c.Index = (int64_t *) arena_need(arena, sizeof(int64_t) * (cap + 1), g, "candidate list");
@@ -1113,8 +1101,8 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
                         x->c.Index[x->c.N++] = start + ownlist[x->own_off + j];
                 for(c = x->child; c >= 0; c = nd[c].sib) {
                     int64_t a0 = -1;
-                    if(nd[c].state == ST_ALIVE) a0 = nd[c].c.Nbound;
-                    else if(nd[c].state == ST_DIED || nd[c].state == ST_FAILED) a0 = 0;
+                    if(nd[c].state == SUBHALO_ST_ALIVE) a0 = nd[c].c.Nbound;
+                    else if(nd[c].state == SUBHALO_ST_DIED || nd[c].state == SUBHALO_ST_FAILED) a0 = 0;
                     if(a0 >= 0)
                         for(j = a0; j < nd[c].c.N; j++)
                             x->c.Index[x->c.N++] = nd[c].c.Index[j];
@@ -1127,24 +1115,24 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
                     x->c.RefPos[d] = xg[d];
                     x->c.RefVel[d] = vg[d];
                 }
-                if(x->kind == NODE_RESOLVED && x->old->NPrev > 0)
+                if(x->kind == SUBHALO_MEM_RESOLVED && x->old->NPrev > 0)
                     for(d = 0; d < 3; d++) {
                         x->c.RefPos[d] = x->old->RefPos[d];
                         x->c.RefVel[d] = x->old->RefVel[d];
                     }
-                else if(x->kind == NODE_ORPHAN)
+                else if(x->kind == SUBHALO_MEM_ORPHAN)
                     orphan_tracer(x->old, ctx, x->c.RefPos, x->c.RefVel);
                 x->c.TrackId = x->TrackId;
                 x->c.Seed = node_seed(x->TrackId, ctx->SnapNum);
                 x->c.Flags = 0;
                 const size_t mark = arena->used;
                 x->c.Energy = (double *) arena_need(arena, sizeof(double) * (cap + 1), g, "candidate energies");
-                int alive = unbind_counted(&x->c, x->kind == NODE_RESOLVED ? x->old : NULL, up, arena, &ks);
+                int alive = unbind_counted(&x->c, x->kind == SUBHALO_MEM_RESOLVED ? x->old : NULL, up, arena, &ks);
                 arena->used = mark;
                 if(alive)
-                    x->state = ST_ALIVE;
-                else if(x->kind == NODE_RESOLVED) {
-                    x->state = ST_DIED;
+                    x->state = SUBHALO_ST_ALIVE;
+                else if(x->kind == SUBHALO_MEM_RESOLVED) {
+                    x->state = SUBHALO_ST_DIED;
                     /* its previous most-bound tracer (first own-tag tracer in BindRank order) */
                     for(j = 0; j < x->own_n; j++) {
                         const int64_t pi = start + ownlist[x->own_off + j];
@@ -1155,15 +1143,15 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
                     }
                 }
                 else
-                    x->state = ST_FAILED;
+                    x->state = SUBHALO_ST_FAILED;
                 node_core(x, up, CoreSize);
                 /* sinking of the subtree into x, then x unbound again (subhalo_unbind.cpp:828-835) */
-                if(x->state == ST_ALIVE && MergeTrapped
+                if(x->state == SUBHALO_ST_ALIVE && MergeTrapped
                    && merge_subtree(nd, u, u, up, sp->SubhaloSinkSymmetric, TracerTypes)) {
                     x->c.Energy = (double *) arena_need(arena, sizeof(double) * (cap + 1), g, "candidate energies");
                     alive = unbind_counted(&x->c, NULL, up, arena, &ks);
                     arena->used = mark;
-                    x->state = alive ? ST_ALIVE : (x->kind == NODE_RESOLVED ? ST_DIED : ST_FAILED);
+                    x->state = alive ? SUBHALO_ST_ALIVE : (x->kind == SUBHALO_MEM_RESOLVED ? SUBHALO_ST_DIED : SUBHALO_ST_FAILED);
                     node_core(x, up, CoreSize);
                 }
                 /* x's admitted particles: the bound ones are taken, the others leave its list before
@@ -1197,7 +1185,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
                 for(s = x->firstseq; s < x->seq; s++) {
                     struct SubNode * w = &nd[nd[s].byseq];
                     int64_t keep = 0;
-                    if(w->state == ST_ALIVE)
+                    if(w->state == SUBHALO_ST_ALIVE)
                         keep = w->keep;
                     if(keep > 0)
                         memmove(dst, w->c.Index, sizeof(int64_t) * keep);
@@ -1211,7 +1199,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
                 dst += align16(sizeof(int64_t) * (x->c.N + 1));
                 arena->used = dst - arena->base;
                 /* the relaxed source size applied at the parent's compaction */
-                if(x->state == ST_ALIVE) {
+                if(x->state == SUBHALO_ST_ALIVE) {
                     int64_t nkeep = (int64_t) (x->c.Nbound * R);
                     if(nkeep < x->c.Nbound) nkeep = x->c.Nbound;
                     if(nkeep > x->c.N) nkeep = x->c.N;
@@ -1233,10 +1221,10 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
     }
     /* the root's own list to its relaxed size too (nothing above it gathers its remainder);
      * a sub-tree key's root keeps its whole list (its tags are provisional, design 7.8) */
-    if(nd[ci].state == ST_ALIVE && !subkey)
+    if(nd[ci].state == SUBHALO_ST_ALIVE && !subkey)
         nd[ci].c.N = nd[ci].keep;
     for(v = 0; v < nn; v++)
-        if(nd[v].state == ST_ALIVE && v != ci)
+        if(nd[v].state == SUBHALO_ST_ALIVE && v != ci)
             nd[v].c.N = nd[v].keep;
 
     /* ---- g: the final pass, the HBT and Rockstar bound properties and the baryonic sums of
@@ -1245,7 +1233,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
     int nalive = 0;
     for(v = 0; v < nn; v++) {
         struct SubNode * x = &nd[v];
-        if(x->state != ST_ALIVE)
+        if(x->state != SUBHALO_ST_ALIVE)
             continue;
         nalive++;
         struct SubTrack * rec = &res[v].rec;
@@ -1281,15 +1269,15 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
          * candidate); Rank, Depth, NestedParentTrackId and CentralTrackId are written by the
          * rounds from the group's hierarchy */
         for(v = 0; v < nn; v++) {
-            if(nd[v].state != ST_ALIVE)
+            if(nd[v].state != SUBHALO_ST_ALIVE)
                 continue;
             int u = nd[v].parent;
-            while(u >= 0 && nd[u].state != ST_ALIVE)
+            while(u >= 0 && nd[u].state != SUBHALO_ST_ALIVE)
                 u = nd[u].parent;
             nd[v].fparent = u;
         }
         for(v = 0; v < nn; v++) {
-            if(nd[v].state != ST_ALIVE)
+            if(nd[v].state != SUBHALO_ST_ALIVE)
                 continue;
             int u = v, dd = 0;
             while(nd[u].fparent >= 0 && dd <= nn) {
@@ -1312,7 +1300,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
         }
     }
     /* a dead sub-tree root still claims its whole list, below every survivor */
-    if(subkey && nd[ci].state != ST_ALIVE)
+    if(subkey && nd[ci].state != SUBHALO_ST_ALIVE)
         nd[ci].fdepth = -1;
     if(nalive > 0 && !subkey) {
         /* ranks: insertion by CompareMass (a key has few members) */
@@ -1322,7 +1310,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
         for(r = 0; r < nalive; r++) {
             int b = -1;
             for(v = 0; v < nn; v++)
-                if(nd[v].state == ST_ALIVE && nd[v].rank < 0 && (b < 0 || mass_before(&res[v].rec, &res[b].rec)))
+                if(nd[v].state == SUBHALO_ST_ALIVE && nd[v].rank < 0 && (b < 0 || mass_before(&res[v].rec, &res[b].rec)))
                     b = v;
             nd[b].rank = r;
         }
@@ -1331,10 +1319,10 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
                 X = v;
         /* surviving parent: the nearest surviving ancestor in the processing tree */
         for(v = 0; v < nn; v++) {
-            if(nd[v].state != ST_ALIVE)
+            if(nd[v].state != SUBHALO_ST_ALIVE)
                 continue;
             int u = nd[v].parent;
-            while(u >= 0 && nd[u].state != ST_ALIVE)
+            while(u >= 0 && nd[u].state != SUBHALO_ST_ALIVE)
                 u = nd[u].parent;
             nd[v].fparent = u;
         }
@@ -1342,16 +1330,16 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
          * survivor (the decided central among them) is nested under it */
         nd[X].fparent = -1;
         for(v = 0; v < nn; v++) {
-            if(nd[v].state != ST_ALIVE || v == X)
+            if(nd[v].state != SUBHALO_ST_ALIVE || v == X)
                 continue;
             int u = nd[v].parent;
-            while(u >= 0 && nd[u].state != ST_ALIVE)
+            while(u >= 0 && nd[u].state != SUBHALO_ST_ALIVE)
                 u = nd[u].parent;
             if(u < 0)
                 nd[v].fparent = X;
         }
         for(v = 0; v < nn; v++) {
-            if(nd[v].state != ST_ALIVE)
+            if(nd[v].state != SUBHALO_ST_ALIVE)
                 continue;
             int u = v, dd = 0;
             while(nd[u].fparent >= 0 && dd <= nn) {
@@ -1361,7 +1349,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
             nd[v].fdepth = dd;
         }
         for(v = 0; v < nn; v++) {
-            if(nd[v].state != ST_ALIVE)
+            if(nd[v].state != SUBHALO_ST_ALIVE)
                 continue;
             struct SubTrack * rec = &res[v].rec;
             rec->HostGroup = pseudo ? -1 : g;
@@ -1398,7 +1386,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
     }
     for(v = 0; v < nn; v++) {
         struct SubNode * x = &nd[v];
-        if(x->state != ST_ALIVE)
+        if(x->state != SUBHALO_ST_ALIVE)
             continue;
         int nr = 0;
         for(j = 0; j < x->c.Nbound; j++) {
@@ -1413,7 +1401,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
     int64_t nrejected = 0;
     for(v = 0; v < nn; v++) {
         struct SubNode * x = &nd[v];
-        if(x->state != ST_ALIVE && !(subkey && v == ci))
+        if(x->state != SUBHALO_ST_ALIVE && !(subkey && v == ci))
             continue;
         for(j = 0; j < x->c.N; j++) {
             const int64_t li = x->c.Index[j] - start;
@@ -1433,7 +1421,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
     int32_t rootkeep = 0;
     for(v = 0; v < nn; v++) {
         struct SubNode * x = &nd[v];
-        const int alive = x->state == ST_ALIVE;
+        const int alive = x->state == SUBHALO_ST_ALIVE;
         if(!alive && !(subkey && v == ci))
             continue;
         struct SubTrack dummy;
@@ -1471,7 +1459,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
     /* everything else in the key is untagged (swallowed particles keep their tags); a guest its
      * receiver did not take leaves with the tags it came with, its owner's */
     for(i = 0; i < n; i++) {
-        if(tagnode[i] >= 0 || !part_live(&P[start + i]))
+        if(tagnode[i] >= 0 || !subhalo_part_live(&P[start + i]))
             continue;
         if(P[start + i].GrNr < -1 && ((-(P[start + i].GrNr + 2)) & SUBHALO_KEY_GUESTBIT))
             continue;
@@ -1486,7 +1474,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
         int64_t nbo = 0;
         for(v = 0; v < nn; v++) {
             const struct SubNode * x = &nd[v];
-            if(x->state != ST_ALIVE)
+            if(x->state != SUBHALO_ST_ALIVE)
                 continue;
             int64_t own = 0;
             for(j = 0; j < x->c.Nbound; j++) {
@@ -1514,7 +1502,7 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
     arena->used = 0;
     int ndead = 0;
     for(v = 0; v < nn; v++)
-        if(!subkey && nd[v].kind == NODE_RESOLVED && (nd[v].state == ST_DIED || nd[v].state == ST_SUNK) && nd[v].old->NTracers > 0)
+        if(!subkey && nd[v].kind == SUBHALO_MEM_RESOLVED && (nd[v].state == SUBHALO_ST_DIED || nd[v].state == SUBHALO_ST_SUNK) && nd[v].old->NTracers > 0)
             ndead++;
     struct IdLocal * ids = NULL;
     if(ndead > 0) {
@@ -1546,18 +1534,18 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
         }
         rs->SigmaX = x->has_core ? x->SigmaX : 0;
         rs->SigmaV = x->has_core ? x->SigmaV : 0;
-        rs->SinkTo = x->state == ST_SUNK ? nd[x->sinkinto].TrackId : -1;
-        if(x->state == ST_ALIVE) {
+        rs->SinkTo = x->state == SUBHALO_ST_SUNK ? nd[x->sinkinto].TrackId : -1;
+        if(x->state == SUBHALO_ST_ALIVE) {
             rs->valid = 1;
             rs->history = 1;
-            rs->newborn = x->kind == NODE_NEWBORN;
+            rs->newborn = x->kind == SUBHALO_MEM_NEWBORN;
             /* a track that arrived as a satellite of the central this call */
             if(X >= 0 && v != X && x->old && (x->old->Rank <= 0 || x->old->CentralTrackId != nd[X].TrackId)
                && x->old->Mbound > maxmerge)
                 maxmerge = x->old->Mbound;
             continue;
         }
-        if(x->kind == NODE_NEWBORN) {
+        if(x->kind == SUBHALO_MEM_NEWBORN) {
             rs->valid = 0;
             continue;
         }
@@ -1570,19 +1558,19 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
         rec->CentralTrackId = X >= 0 ? nd[X].TrackId : SUBHALO_NOTRACK;
         /* a track dying or sinking in a group with another central is a satellite at its death
          * (SnapLastIsolation, as HBT ranks the new orphan); older orphans keep their history */
-        if(!pseudo && X >= 0 && X != v && x->kind == NODE_RESOLVED && (x->state == ST_DIED || x->state == ST_SUNK)
+        if(!pseudo && X >= 0 && X != v && x->kind == SUBHALO_MEM_RESOLVED && (x->state == SUBHALO_ST_DIED || x->state == SUBHALO_ST_SUNK)
            && rec->SnapLastIsolation < 0)
             rec->SnapLastIsolation = ctx->SnapNum - 1;
-        if(x->kind == NODE_RESOLVED && (x->state == ST_DIED || x->state == ST_SUNK)) {
+        if(x->kind == SUBHALO_MEM_RESOLVED && (x->state == SUBHALO_ST_DIED || x->state == SUBHALO_ST_SUNK)) {
             record_mb(rec, x, ctx);
-            const int64_t sink = x->state == ST_SUNK ? nd[x->sinkinto].TrackId : SUBHALO_NOTRACK;
+            const int64_t sink = x->state == SUBHALO_ST_SUNK ? nd[x->sinkinto].TrackId : SUBHALO_NOTRACK;
             subhalo_track_make_orphan(rec, sink, ctx->SnapNum);
             /* the nearest surviving ancestor */
             int u = x->parent;
-            while(u >= 0 && nd[u].state != ST_ALIVE)
+            while(u >= 0 && nd[u].state != SUBHALO_ST_ALIVE)
                 u = nd[u].parent;
             rec->NestedParentTrackId = u >= 0 ? nd[u].TrackId : (X >= 0 && X != v ? nd[X].TrackId : -1);
-            if(x->state == ST_SUNK && x->sinkinto == X && x->old->Mbound > maxmerge)
+            if(x->state == SUBHALO_ST_SUNK && x->sinkinto == X && x->old->Mbound > maxmerge)
                 maxmerge = x->old->Mbound;
             /* descendant votes: the tracers in this key, the others pending (every one in a
              * sub-tree key: the provisional tags are final only after the rounds) */
@@ -1601,8 +1589,8 @@ process_serial_key(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloAr
                 }
                 if(lo < n && ids[lo].ID == key.ID) {
                     const struct particle_data * tp = &P[ids[lo].i];
-                    rs->DescOwner[t] = part_live(tp) ? tp->BoundTrackId : -1;
-                    rs->DescWeight[t] = part_live(tp) ? subhalo_tracer_weight(tp->TracerPenalty) : 1;
+                    rs->DescOwner[t] = subhalo_part_live(tp) ? tp->BoundTrackId : -1;
+                    rs->DescWeight[t] = subhalo_part_live(tp) ? subhalo_tracer_weight(tp->TracerPenalty) : 1;
                 }
                 else
                     rs->DescOwner[t] = SUBHALO_DESC_PENDING;

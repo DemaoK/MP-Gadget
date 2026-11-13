@@ -48,7 +48,6 @@ struct SubhaloCollectiveStats {
     int64_t NAdded;               /* serial tails given to their surviving serial binder */
     int64_t NRepairTracks;        /* serial tracks whose ranks were repaired */
     int64_t NRepairQueries;       /* own-tag particles of those tracks that asked their new rank */
-    double TagSortSeconds;        /* the decisions and the in-place own-tag ranks */
     double RepairSeconds;         /* the distributed serial repair */
     double TagSeconds;            /* the whole final tag pass */
     /* memory: the admission estimate and the measured high water, the largest over the ranks (bytes) */

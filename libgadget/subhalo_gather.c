@@ -55,14 +55,6 @@ cmp_int64(const void * a, const void * b)
 
 /* ------------------------------------------------------------------ steps 0 and 2: tracers and host vote */
 
-/* The finder's live-particle predicate: garbage and swallowed particles neither vote nor count,
- * but their tags are left untouched. */
-static inline int
-part_live(const struct particle_data * p)
-{
-    return !p->IsGarbage && !p->Swallowed;
-}
-
 /* A tracer tuple of step 0. */
 struct TracerTuple {
     int64_t TrackId;
@@ -108,7 +100,7 @@ subhalo_host_vote(struct SubTrackTable * tab, MPI_Comm Comm)
     if(K < 1 || K > SUBHALO_MAXTRACERS)
         endrun(1, "SubhaloNumTracerHostFinding = %d outside [1, %d].\n", K, SUBHALO_MAXTRACERS);
     /* own-bound live tracer-type particles */
-#define VOTE_PRED (part_live(&P[i]) && P[i].TrackId >= 0 && P[i].BoundTrackId == P[i].TrackId && ((TracerTypes >> P[i].Type) & 1))
+#define VOTE_PRED (subhalo_part_live(&P[i]) && P[i].TrackId >= 0 && P[i].BoundTrackId == P[i].TrackId && ((TracerTypes >> P[i].Type) & 1))
     const int nc = subhalo_par_nchunks(PartManager->NumPart);
     int64_t * off = ta_malloc("SubVoteOff", int64_t, nc + 1);
     SUBHALO_COUNT_CHUNKS(PartManager->NumPart, nc, off, VOTE_PRED);
@@ -265,7 +257,7 @@ subhalo_previous_frames(struct SubTrackTable * tab, MPI_Comm Comm)
     int64_t i, j;
     int k;
 
-#define FRAME_PRED (part_live(&P[i]) && P[i].BoundTrackId >= 0)
+#define FRAME_PRED (subhalo_part_live(&P[i]) && P[i].BoundTrackId >= 0)
     const int nc = subhalo_par_nchunks(PartManager->NumPart);
     int64_t * off = ta_malloc("SubFrameOff", int64_t, nc + 1);
     SUBHALO_COUNT_CHUNKS(PartManager->NumPart, nc, off, FRAME_PRED);
@@ -1190,11 +1182,11 @@ census_key(const struct particle_data * p, const struct SubhaloTrackKey * map, i
 /* The keys of the tracks tagging this rank's live field particles, from their home ranks
  * (request/reply). Allocates the map on the bottom of the stack. Collective. */
 static int64_t
-query_field_keys(struct SubTrackTable * tab, struct SubhaloTrackKey ** mapout, int home_only, MPI_Comm Comm)
+query_field_keys(struct SubTrackTable * tab, struct SubhaloTrackKey ** mapout, MPI_Comm Comm)
 {
     const int NTask = tab->NTask;
     int64_t i, n = 0;
-#define FK_PRED (part_live(&P[i]) && (home_only ? P[i].GrNr == -1 : P[i].GrNr < 0) && P[i].TrackId >= 0)
+#define FK_PRED (subhalo_part_live(&P[i]) && P[i].GrNr < 0 && P[i].TrackId >= 0)
     const int nc = subhalo_par_nchunks(PartManager->NumPart);
     int64_t * off = ta_malloc("SubFKOff", int64_t, nc + 1);
     SUBHALO_COUNT_CHUNKS(PartManager->NumPart, nc, off, FK_PRED);
@@ -1342,10 +1334,8 @@ plan_gather_members(struct SubTrackTable * tab, const int64_t * O, int64_t nO, s
         m->kind = t->NboundPrev > 0 ? SUBHALO_MEM_RESOLVED : SUBHALO_MEM_ORPHAN;
         m->cand = -1;
         m->PrevRank = t->Rank;
-        m->NboundPrev = t->NboundPrev;
         m->SnapTracerLost = t->SnapTracerLost;
         m->MboundPrev = t->Mbound;
-        m->VmaxPrev = t->Vmax;
         m->NPrev = t->NPrev;
         m->MarkerWeight = t->MarkerWeight;
         int d;
@@ -1390,7 +1380,7 @@ plan_key_centres(const int64_t * O, int64_t nO, int64_t TotNgroups, const struct
     int64_t i, k;
     int d;
     const double BoxSize = PartManager->BoxSize;
-    /* nO is the same on every rank (the reductions below are guarded by it): nothing to do */
+    /* nO is the same on every rank: nothing to do */
     if(nO == 0)
         return;
     MyIDType * idmin = (MyIDType *) mymalloc("SubCenId", sizeof(MyIDType) * (nO + 1));
@@ -1404,7 +1394,7 @@ plan_key_centres(const int64_t * O, int64_t nO, int64_t TotNgroups, const struct
 #define KEY_OF(p) (((p)->GrNr >= 0) ? (p)->GrNr : ((p)->TrackId >= 0 ? field_key(fkmap, nfk, (p)->TrackId) : -1))
     for(i = 0; i < PartManager->NumPart; i++) {
         const struct particle_data * p = &P[i];
-        if(!part_live(p))
+        if(!subhalo_part_live(p))
             continue;
         const int64_t g = KEY_OF(p);
         if(g < 1 || (p->GrNr < 0 && g <= TotNgroups))
@@ -1413,13 +1403,12 @@ plan_key_centres(const int64_t * O, int64_t nO, int64_t TotNgroups, const struct
         if(k >= 0 && p->ID < idmin[k])
             idmin[k] = p->ID;
     }
-    if(nO > 0)
-        MPI_Allreduce(idmin, gidmin, nO, MPI_UINT64_T, MPI_MIN, Comm);
+    MPI_Allreduce(idmin, gidmin, nO, MPI_UINT64_T, MPI_MIN, Comm);
     memset(ref, 0, sizeof(double) * 3 * (nO + 1));
     memset(sum, 0, sizeof(double) * 8 * (nO + 1));
     for(i = 0; i < PartManager->NumPart; i++) {
         const struct particle_data * p = &P[i];
-        if(!part_live(p))
+        if(!subhalo_part_live(p))
             continue;
         const int64_t g = KEY_OF(p);
         if(g < 1 || (p->GrNr < 0 && g <= TotNgroups))
@@ -1429,11 +1418,10 @@ plan_key_centres(const int64_t * O, int64_t nO, int64_t TotNgroups, const struct
             for(d = 0; d < 3; d++)
                 ref[3 * k + d] = p->Pos[d];
     }
-    if(nO > 0)
-        MPI_Allreduce(ref, gref, 3 * nO, MPI_DOUBLE, MPI_SUM, Comm);
+    MPI_Allreduce(ref, gref, 3 * nO, MPI_DOUBLE, MPI_SUM, Comm);
     for(i = 0; i < PartManager->NumPart; i++) {
         const struct particle_data * p = &P[i];
-        if(!part_live(p))
+        if(!subhalo_part_live(p))
             continue;
         const int64_t g = KEY_OF(p);
         if(g < 1 || (p->GrNr < 0 && g <= TotNgroups))
@@ -1449,8 +1437,7 @@ plan_key_centres(const int64_t * O, int64_t nO, int64_t TotNgroups, const struct
         }
     }
 #undef KEY_OF
-    if(nO > 0)
-        MPI_Allreduce(sum, cv, 8 * nO, MPI_DOUBLE, MPI_SUM, Comm);
+    MPI_Allreduce(sum, cv, 8 * nO, MPI_DOUBLE, MPI_SUM, Comm);
     for(k = 0; k < nO; k++) {
         const double M = cv[8 * k + 6];
         for(d = 0; d < 3; d++) {
@@ -1795,11 +1782,11 @@ allgather_sorted(const int64_t * v, int64_t n, int64_t ** out, MPI_Comm Comm)
 
 /* One census of the keys (the pass's sub-tree keys included), the directory and the packing.
  * Allocates on the bottom, in this order, *msgp, *inp, *dkp (the caller frees them in reverse
- * order); sendcounts is NTask long. Returns ndir. Collective. */
+ * order). Returns ndir. Collective. */
 static int64_t
 plan_census_pass(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubTrackTable * tab, const struct SubhaloTrackKey * fkmap, int64_t nfk,
                  const struct SubhaloMember * mem, int64_t nmem, const struct SubhaloOffer * offers, int64_t noffers,
-                 const int64_t * O, int64_t nO, struct SubhaloDirMsg ** msgp, struct SubhaloDirMsg ** inp, struct SubhaloDirKey ** dkp, int64_t * nin_out, MPI_Comm Comm)
+                 const int64_t * O, int64_t nO, struct SubhaloDirMsg ** msgp, struct SubhaloDirMsg ** inp, struct SubhaloDirKey ** dkp, MPI_Comm Comm)
 {
     const int NTask = plan->NTask, ThisTask = plan->ThisTask;
     const int64_t TotNgroups = plan->TotNgroups, TotKeys = plan->TotKeys, KChunk = plan->KChunk;
@@ -1811,7 +1798,7 @@ plan_census_pass(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubTra
     memset(&res, 0, sizeof(res));
     /* threaded, order-preserving; a swallowed BH stays in its group key (FOF counted it), a
      * swallowed field BH stays home */
-#define CENSUS_KEY(i) (part_live(&P[i]) ? pass_key(i, fkmap, nfk, mem, nmem, offers, noffers) : P[i].GrNr)
+#define CENSUS_KEY(i) (subhalo_part_live(&P[i]) ? pass_key(i, fkmap, nfk, mem, nmem, offers, noffers) : P[i].GrNr)
     const int64_t NumPart = PartManager->NumPart;
     const int nc = subhalo_par_nchunks(NumPart);
     int64_t * off = ta_malloc("SubCensusOff", int64_t, nc + 1);
@@ -1897,8 +1884,6 @@ plan_census_pass(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubTra
         d->g = G->base.GrNr;
         for(t = 0; t < 6; t++)
             d->cnt[t] = G->LenType[t];
-        for(t = 0; t < 3; t++)
-            d->ref[t] = G->base.FirstPos[t];
         d->rank = ThisTask;
         d->kind = 1;
         d->track = -1;
@@ -1966,8 +1951,6 @@ plan_census_pass(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubTra
             d->has_group = 1;
             for(t = 0; t < 6; t++)
                 foflen[kk] += in[i].cnt[t];
-            for(t = 0; t < 3; t++)
-                d->ref[t] = in[i].ref[t];
         }
         else if(in[i].kind == 2) {
             if(d->ostart < 0)
@@ -2036,7 +2019,6 @@ plan_census_pass(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubTra
     *msgp = msg;
     *inp = in;
     *dkp = dk;
-    *nin_out = nin;
     return ndir;
 }
 
@@ -2144,7 +2126,7 @@ plan_admit(struct SubhaloPlan * plan, const struct SubhaloDirKey * dk, int64_t n
     int64_t nuniv = 0;
     #pragma omp parallel for reduction(+: nuniv)
     for(i = 0; i < PartManager->NumPart; i++) {
-        if(P[i].IsGarbage || P[i].Swallowed)
+        if(!subhalo_part_live(&P[i]))
             continue;
         const int64_t key = plan_key(&P[i], fkmap, nfk, plan->Members, plan->NMembers);
         if(key < 0)
@@ -2197,7 +2179,6 @@ plan_admit(struct SubhaloPlan * plan, const struct SubhaloDirKey * dk, int64_t n
             st = s;
     double info[4] = {(double) st, a->need, a->avail, a->persist};
     MPI_Bcast(info, 4, MPI_DOUBLE, wsh.r, Comm);
-    a->worst_short = wsh.v;
     a->failed = wsh.v > 0;
     a->failrank = wsh.r;
     a->failstage = (int) info[0];
@@ -2266,7 +2247,7 @@ vote_owner(const struct particle_data * p, const struct SubhaloMember * mem, int
            int TracerTypes, int64_t * kO)
 {
     *kO = -1;
-    if(!part_live(p) || !((TracerTypes >> p->Type) & 1))
+    if(!subhalo_part_live(p) || !((TracerTypes >> p->Type) & 1))
         return -1;
     const int64_t base = census_key(p, fkmap, nfk);
     const int64_t k = base >= 0 ? sorted_find(O, nO, base) : -1;
@@ -2571,7 +2552,7 @@ subhalo_plan_build(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubT
 
     /* ---- the keys of the field particles ---- */
     struct SubhaloTrackKey * fkmap = NULL;
-    const int64_t nfk = query_field_keys(tab, &fkmap, 0, Comm);
+    const int64_t nfk = query_field_keys(tab, &fkmap, Comm);
 
     /* ---- passes of census and packing until nothing new is oversized: an oversized group gets its
      *      central decided and its satellites' sub-trees cut into serial keys; an oversized sub-tree
@@ -2585,7 +2566,7 @@ subhalo_plan_build(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubT
     struct SubhaloSubKey * sk = NULL;
     double * cv = NULL;
     int64_t * centralT = NULL;
-    int64_t nmem = 0, nsk = 0, ndir = 0, nin = 0;
+    int64_t nmem = 0, nsk = 0, ndir = 0;
     struct SubhaloOffer * offers = NULL;
     int64_t noff = 0;
     memset(&LastVote, 0, sizeof(LastVote));
@@ -2621,7 +2602,7 @@ subhalo_plan_build(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubT
             myfree(fkmap);
             return 1;
         }
-        ndir = plan_census_pass(plan, fof, tab, fkmap, nfk, mem, nmem, offers, noff, O, nO, &msg, &in, &dk, &nin, Comm);
+        ndir = plan_census_pass(plan, fof, tab, fkmap, nfk, mem, nmem, offers, noff, O, nO, &msg, &in, &dk, Comm);
 
         /* new oversized keys of this pass */
         int64_t nnew = 0;
@@ -2679,7 +2660,6 @@ subhalo_plan_build(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubT
         message(0, "Subhalo plan pass %d: %ld new oversized groups or pseudo-keys, %ld sub-tree keys promoted in place; "
                    "%ld oversized keys and %ld promoted roots so far.\n", pass, nOn, nQn, nO, nQ);
     }
-    plan->SplitPasses = pass;
     const int64_t * O = st;
     const int64_t KChunk = plan->KChunk;
     message(0, "Subhalo plan: %ld serial keys (largest %ld), %ld oversized keys in place (%ld moved by %d census round(s)); "
@@ -2797,9 +2777,6 @@ subhalo_plan_build(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubT
             lk->Length = dk[k].Length;
             lk->oversized = dk[k].oversized;
             lk->target = dk[k].oversized ? in[i].rank : dk[k].target;
-            lk->decider = dk[k].decider;
-            for(t = 0; t < 3; t++)
-                lk->ref[t] = dk[k].ref[t];
         }
     plan->NLocalKeys = subhalo_alltoallv(rep, sendcounts, sizeof(struct SubhaloLocalKey), (void **) &plan->LocalKeys, 1, NULL, Comm);
     /* from directory ranks in rank order: already sorted by g; make sure */
@@ -2840,8 +2817,6 @@ subhalo_plan_build(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubT
             e->g = dk[k].g;
             e->Length = dk[k].g <= TotNgroups ? dk[k].Length - dk[k].NField : 0;
             e->decider = dk[k].decider;
-            for(t = 0; t < 3; t++)
-                e->ref[t] = dk[k].ref[t];
         }
     /* byte counts of the Allgatherv: the global total is checked before any narrowing */
     const int64_t ibytes64 = novloc * (int64_t) sizeof(struct SubhaloInplaceKey);
@@ -2904,7 +2879,6 @@ subhalo_plan_build(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubT
             e->cen[t] = cv[8 * k + t];
             e->vel[t] = cv[8 * k + 3 + t];
         }
-        e->mass = cv[8 * k + 6];
         e->central = -1;
         if(centralT[k] != SUBHALO_NOTRACK) {
             const struct SubhaloMember * m = subhalo_plan_member(plan, centralT[k]);
@@ -2912,16 +2886,12 @@ subhalo_plan_build(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubT
                 endrun(5, "Subhalo plan: the central %ld of key %ld is not a candidate.\n", centralT[k], e->g);
             e->central = m->cand;
         }
-        e->NMembers = 0;
         if(e->decider < 0)
             e->decider = subhalo_key_dir_rank(e->g, KChunk);
     }
-    for(i = 0; i < plan->NMembers; i++) {
-        const int64_t kk = subhalo_plan_inplace_index(plan, plan->Members[i].g);
-        if(kk < 0)
+    for(i = 0; i < plan->NMembers; i++)
+        if(subhalo_plan_inplace_index(plan, plan->Members[i].g) < 0)
             endrun(5, "Subhalo plan: member %ld of a key %ld that is not in place.\n", plan->Members[i].TrackId, plan->Members[i].g);
-        plan->Inplace[kk].NMembers++;
-    }
     for(i = 0; i < plan->NCands; i++) {
         struct SubhaloInplaceCand * c = &plan->Cands[i];
         c->gidx = (int32_t) subhalo_plan_inplace_index(plan, c->g);
@@ -3014,10 +2984,10 @@ subhalo_plan_build(struct SubhaloPlan * plan, const FOFGroups * fof, struct SubT
         P[i].TopLeaf = ThisTask;
         if(P[i].IsGarbage)
             continue;
-        const int64_t own = part_live(&P[i]) ? plan_key(&P[i], fkmap, nfk, plan->Members, plan->NMembers) : P[i].GrNr;
+        const int64_t own = subhalo_part_live(&P[i]) ? plan_key(&P[i], fkmap, nfk, plan->Members, plan->NMembers) : P[i].GrNr;
         int64_t key = own, mark = 0;
         const struct SubhaloLocalKey * lk = NULL;
-        if(noff > 0 && part_live(&P[i])) {
+        if(noff > 0 && subhalo_part_live(&P[i])) {
             const int64_t okey = offer_key(i, offers, noff, plan->Members, plan->NMembers);
             const struct SubhaloLocalKey * ok = okey >= 0 ? local_key(plan, okey) : NULL;
             /* an offer whose sub-tree key went in place stays with its own key */
@@ -3397,7 +3367,6 @@ subhalo_build_segments(const struct SubhaloPlan * plan, struct SubhaloKeySeg ** 
         if(a) {
             seg->Length = a->Length;
             seg->inplace = 0;
-            seg->decider = plan->ThisTask;
             if(seg->n != seg->Length)
                 bad = 1;
             nserial++;
@@ -3412,11 +3381,7 @@ subhalo_build_segments(const struct SubhaloPlan * plan, struct SubhaloKeySeg ** 
             else {
                 seg->Length = ip->Length;
                 seg->inplace = 1;
-                seg->decider = ip->decider;
                 seg->ipindex = ip - plan->Inplace;
-                int d;
-                for(d = 0; d < 3; d++)
-                    seg->ref[d] = ip->ref[d];
             }
         }
     }
@@ -3509,7 +3474,6 @@ serial_stats_key(double dt, int64_t n, int alone)
 {
     struct SubhaloSerialStats * ss = &SerialStats;
     ss->NKeys++;
-    ss->KeyTimeSum += dt;
     if(n > ss->LargestN)
         ss->LargestN = n;
     if(dt > ss->KeyTimeMax) {

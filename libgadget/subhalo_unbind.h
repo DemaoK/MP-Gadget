@@ -183,6 +183,11 @@ void subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c
                             const struct SubhaloUnbindParams * up, const double rho[SUBHALO_NSO],
                             int CoreSize, const double Offset[3], struct SubhaloArena * arena);
 
+/* The shape fit of both modes: the smallest aperture for which a shape is reported, and the
+ * iteration cap. */
+#define SUBHALO_SHAPE_MINPART 20
+#define SUBHALO_SHAPE_ITERATIONS 10
+
 /* Rockstar f_to_c: the NFW concentration with c / (ln(1 + c) - c / (1 + c)) = f, -1 on failure. */
 double subhalo_klypin_f_to_c(double f);
 

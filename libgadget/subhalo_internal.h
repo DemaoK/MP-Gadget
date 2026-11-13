@@ -66,6 +66,14 @@ static inline int subhalo_mpi_bytes_fit(int64_t n, size_t elsize) {
  * the exponent bits of an IEEE double. */
 int subhalo_isfinite(double x);
 
+/* The finder's live-particle predicate: garbage and swallowed particles neither vote nor count,
+ * but their tags are left untouched. */
+static inline int
+subhalo_part_live(const struct particle_data * p)
+{
+    return !p->IsGarbage && !p->Swallowed;
+}
+
 /* x wrapped into [0, BoxSize) by repeated whole-box shifts (the finder's one periodic wrap). */
 static inline double
 subhalo_wrap_box(double x, double BoxSize)
@@ -182,23 +190,19 @@ struct SubhaloLocalKey {
     int64_t Length;         /* global length (fof->Group[].Length) */
     int target;             /* processing rank of a serial key; ThisTask for an oversized key */
     int oversized;          /* 1: processed in place */
-    int decider;            /* lowest rank holding particles of the key */
-    int pad;
-    double ref[3];          /* FirstPos of the group, translated frame */
+    int pad[2];
+    double spare[3];        /* unused: keeps the size of the exchanged record */
 };
 
 /* An oversized key processed in place (FOF group or pseudo-key), global, sorted by g. Length: its
- * FOF particles left after the sub-tree cut (informative). cen, vel: mass-weighted centre and mean Vel
- * of its FOF particles (a pseudo-key's all), the frame of a candidate without a previous-bound one. */
+ * FOF particles left after the sub-tree cut. cen, vel: mass-weighted centre and mean Vel of its FOF
+ * particles (a pseudo-key's all), the frame of a candidate without a previous-bound one. */
 struct SubhaloInplaceKey {
     int64_t g;
     int64_t Length;
     int decider;            /* the owner of the key's candidate records: lowest rank holding its particles */
     int central;            /* index of its depth-0 candidate in plan->Cands */
-    double ref[3];
     double cen[3], vel[3];
-    double mass;
-    int64_t NMembers;       /* member tracks of the key in plan->Members */
 };
 
 /* ---- oversized groups, design 7.8 (plan in subhalo_gather.c, rounds in subhalo_collective.c) ---- */
@@ -225,9 +229,8 @@ struct SubhaloMember {
     int32_t depth;           /* depth in the processing tree (the central 0) */
     int32_t root;            /* 1: the root of SubKey (its processing parent is an in-place candidate) */
     int32_t PrevRank;
-    int32_t NboundPrev;
     int32_t SnapTracerLost;
-    float MboundPrev, VmaxPrev;
+    float MboundPrev;
     int64_t NPrev;
     double RefPos[3], RefVel[3];         /* previous-bound frame (translated frame, internal Vel) */
     double TracerPos[3], TracerVel[3];   /* an orphan's tracer as in the record (output frame, km/s) */
@@ -302,8 +305,6 @@ struct SubhaloCollAdmit {
     double stage[SUBHALO_COLL_NSTAGE];   /* this rank: the transient peak of each stage */
     double need;             /* this rank: persist + max(stage) */
     double avail;            /* this rank: free bytes left for the collective call */
-    double worst_short;      /* largest need - avail over the ranks (> 0: failed) */
-    int64_t NumPart, NUniv, NSubPart;    /* this rank's inputs: particles, particles of oversized groups, of its sub-tree keys */
     /* the reserve admission of every plan: the free bytes at pack time against cfg.ReserveBytes +
      * cfg.SortBytesPerPart * MaxPart */
     int reserve_failed;      /* 1: some rank is short of the reserve */
@@ -325,7 +326,6 @@ struct SubhaloPlan {
     int64_t NCands;
     int64_t * RoundStart;                    /* [NRounds + 1] */
     int NRounds;
-    int SplitPasses;                         /* census passes that cut sub-tree keys */
     struct SubhaloSubKey * SubKeys;          /* [NSubKeys] */
     int64_t NSubKeys;
     /* all four on the top of the main stack, allocated in this order */
@@ -360,7 +360,7 @@ struct SubhaloDirMsg {
     int64_t g;
     int64_t cnt[6];
     int64_t ntags;          /* kind 0: distinct TrackIds >= 0 among this rank's particles of g */
-    double ref[3];
+    double spare[3];        /* unused: keeps the size of the exchanged record */
     int32_t rank;
     int32_t kind;
     int64_t nfield;         /* kind 0: of cnt, field particles (GrNr < 0) keyed to g by their track */
@@ -373,7 +373,7 @@ struct SubhaloDirKey {
     int64_t Length;
     int64_t LenType[6];
     int64_t Tags;           /* upper bound on the distinct member tracks: the sum of the ntags */
-    double ref[3];
+    double spare[3];        /* unused: keeps the entry's size */
     int64_t cstart, ccount; /* census contributions in the directory's message array, by rank */
     int64_t NField;         /* field particles in Length */
     int64_t ostart, ocount; /* kind-2 (hosted orphan) messages in the message array */
@@ -440,9 +440,8 @@ struct SubhaloKeySeg {
     int64_t start, n;       /* particles P[start .. start + n) */
     int64_t Length;         /* global length of the key */
     int inplace;            /* 1 for an oversized key (n may be < Length) */
-    int decider;            /* in place: lowest holding rank */
     int64_t ipindex;        /* in place: index into plan->Inplace, else -1 */
-    double ref[3];          /* in place: common reference position */
+    double spare[3];        /* unused: keeps sizeof, which the plan's budget charges per key */
     int64_t Tracks;         /* serial: the distinct tracks tagging its particles (for the cost model) */
 };
 
@@ -702,7 +701,6 @@ struct SubhaloSerialStats {
     double ThreadMeanSum;     /* sum over calls of the mean per-worker summed key time */
     int NThreads;             /* workers of the team of the last call */
     int NQueues;              /* queues of the last call (omp_get_max_threads()) */
-    double KeyTimeSum;        /* summed key times (alone keys counted once, at their wall time) */
     /* least-squares sums of the single-threaded key times t against x = N log2 max(N, 2) (the fit
      * t = a x + b calibrates SUBHALO_COST_KEY / SUBHALO_COST_ITER = b / a) */
     double FitN, FitX, FitXX, FitY, FitXY;

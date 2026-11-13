@@ -278,7 +278,7 @@ so1_ngbiter(TreeWalkQuerySO1 * I, TreeWalkResultSO1 * O, TreeWalkNgbIterBase * i
         return;
     }
     const int other = iter->other;
-    if(P[other].IsGarbage || P[other].Swallowed)
+    if(!subhalo_part_live(&P[other]))
         return;
     const struct so_priv * pv = SO_PRIV(lv->tw);
     const int k = so_bin(iter->r, I->Rlo, I->Scale, pv->NB);
@@ -333,7 +333,7 @@ so2_ngbiter(TreeWalkQuerySO2 * I, TreeWalkResultSO2 * O, TreeWalkNgbIterBase * i
         return;
     }
     const int other = iter->other;
-    if(P[other].IsGarbage || P[other].Swallowed)
+    if(!subhalo_part_live(&P[other]))
         return;
     const struct so_priv * pv = SO_PRIV(lv->tw);
     const int NT = pv->ty.NT;
@@ -439,7 +439,7 @@ so3_ngbiter(TreeWalkQuerySO3 * I, TreeWalkResultSO3 * O, TreeWalkNgbIterBase * i
         return;
     }
     const int other = iter->other;
-    if(P[other].IsGarbage || P[other].Swallowed)
+    if(!subhalo_part_live(&P[other]))
         return;
     if(!(iter->r <= I->R))
         return;
@@ -1031,7 +1031,7 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
     int tmask = 0;
     #pragma omp parallel for reduction(+: nlive) reduction(|: tmask)
     for(i = 0; i < PartManager->NumPart; i++) {
-        if(P[i].IsGarbage || P[i].Swallowed)
+        if(!subhalo_part_live(&P[i]))
             continue;
         nlive++;
         tmask |= 1 << P[i].Type;
@@ -1042,7 +1042,7 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
     double mmmg[2] = {0, -DBL_MAX};                /* the largest mass, minus the smallest positive */
     int64_t nliveg = 0;
     for(i = 0; i < PartManager->NumPart; i++) {
-        if(P[i].IsGarbage || P[i].Swallowed)
+        if(!subhalo_part_live(&P[i]))
             continue;
         if(P[i].Mass > mmmg[0])
             mmmg[0] = P[i].Mass;
@@ -1196,7 +1196,7 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
     int * anchor = (int *) mymalloc("SOanchor", so_imax(bcap, 1) * sizeof(int));
     int64_t na = 0;
     for(i = 0; i < PartManager->NumPart && na < bcap; i++) {
-        if(P[i].IsGarbage || P[i].Swallowed)
+        if(!subhalo_part_live(&P[i]))
             continue;
         anchor[na++] = (int) i;
     }

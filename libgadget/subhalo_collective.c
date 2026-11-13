@@ -47,12 +47,6 @@
 #define CF_UNIV    16    /* a particle of an oversized key: the final tag pass writes it */
 #define CF_RELEASE 32    /* a field particle tagged by an orphan or the central: untagged by the final pass */
 
-/* Shape fit as subhalo_props.c */
-#define SHAPE_MINPART 20
-#define SHAPE_ITERATIONS 10
-#define KLYPIN_RMAX_TO_RS 2.1626
-#define KLYPIN_RS_CONSTANT 0.216216
-
 static struct SubhaloCollectiveStats CollStats;
 static subhalo_collective_hook PretagHook = NULL;
 
@@ -79,9 +73,8 @@ struct CandState {
     int absorbed;            /* a survivor sank into it this round */
     int has_core;
     int has_mb;
-    int pad;
-    int64_t N, Nbound, Nlast, Ntracer;
-    double Mbound, ConvRatio;
+    int64_t N, Nbound, Nlast;
+    double ConvRatio;
     double Ref0[3];          /* the reference of the nearest-image sums */
     double RefPos[3], RefVel[3];
     double CorePos[3], CoreVel[3], SigmaX, SigmaV;   /* the sinking core (loop order) */
@@ -125,12 +118,6 @@ struct Coll {
     int nwalks;
     struct SubhaloCallStats st;
 };
-
-static inline int
-part_live(const struct particle_data * p)
-{
-    return !p->IsGarbage && !p->Swallowed;
-}
 
 static inline int
 is_tracer(int64_t i, int TracerTypes)
@@ -400,7 +387,7 @@ coll_walk(struct Coll * C, double * Sum)
     const int PotentialTypes = C->up->PotentialTypes;
     for(i = 0; i < NumPart; i++) {
         const int32_t c = C->Cand[i];
-        if(c < C->c0 || c >= C->c1 || !(C->Flag[i] & CF_BOUND) || !C->cs[c].iterating || !part_live(&P[i]))
+        if(c < C->c0 || c >= C->c1 || !(C->Flag[i] & CF_BOUND) || !C->cs[c].iterating || !subhalo_part_live(&P[i]))
             continue;
         nq++;
         if((PotentialTypes >> P[i].Type) & 1)
@@ -411,7 +398,7 @@ coll_walk(struct Coll * C, double * Sum)
     nq = nt = 0;
     for(i = 0; i < NumPart; i++) {
         const int32_t c = C->Cand[i];
-        if(c < C->c0 || c >= C->c1 || !(C->Flag[i] & CF_BOUND) || !C->cs[c].iterating || !part_live(&P[i]))
+        if(c < C->c0 || c >= C->c1 || !(C->Flag[i] & CF_BOUND) || !C->cs[c].iterating || !subhalo_part_live(&P[i]))
             continue;
         ql[nq++] = (int) i;
         if((PotentialTypes >> P[i].Type) & 1)
@@ -829,10 +816,10 @@ coll_energy(const struct Coll * C, int64_t i, double sum, const struct CandState
 }
 
 #define NSUM 9
-/* Per candidate of the round (bound particles, or the whole source with all = 1): count, mass,
- * sum m dx about Ref0, sum m Vel, tracers. Collective. */
+/* Per candidate of the round, over its bound particles: count, mass, sum m dx about Ref0, sum m Vel,
+ * tracers. Collective. */
 static void
-round_sums(const struct Coll * C, int all, double * out)
+round_sums(const struct Coll * C, double * out)
 {
     const int64_t nc = C->c1 - C->c0;
     double * loc = (double *) mymalloc("SubCollSums", sizeof(double) * NSUM * (nc + 1));
@@ -841,7 +828,7 @@ round_sums(const struct Coll * C, int all, double * out)
     int d;
     for(i = 0; i < C->NumPart; i++) {
         const int32_t c = C->Cand[i];
-        if(!in_round(C, c) || !part_live(&P[i]) || (!all && !(C->Flag[i] & CF_BOUND)))
+        if(!in_round(C, c) || !subhalo_part_live(&P[i]) || !(C->Flag[i] & CF_BOUND))
             continue;
         double * s = loc + NSUM * (c - C->c0);
         const double m = P[i].Mass;
@@ -871,9 +858,9 @@ unbind_loop(struct Coll * C)
     double * S = (double *) mymalloc("SubCollLoopSums", sizeof(double) * NSUM * (nc + 1));
     /* every source particle bound; the source counts (subhalo_unbind's early return) */
     for(i = 0; i < C->NumPart; i++)
-        if(in_round(C, C->Cand[i]) && C->cs[C->Cand[i]].iterating && part_live(&P[i]))
+        if(in_round(C, C->Cand[i]) && C->cs[C->Cand[i]].iterating && subhalo_part_live(&P[i]))
             C->Flag[i] |= CF_BOUND;
-    round_sums(C, 0, S);
+    round_sums(C, S);
     int any = 0;
     for(c = C->c0; c < C->c1; c++)
         C->cs[c].ran = 0;
@@ -906,13 +893,13 @@ unbind_loop(struct Coll * C)
         /* energies of the queried particles; the bound ones stay bound */
         for(i = 0; i < C->NumPart; i++) {
             const int32_t cc = C->Cand[i];
-            if(!in_round(C, cc) || !C->cs[cc].iterating || !(C->Flag[i] & CF_BOUND) || !part_live(&P[i]))
+            if(!in_round(C, cc) || !C->cs[cc].iterating || !(C->Flag[i] & CF_BOUND) || !subhalo_part_live(&P[i]))
                 continue;
             C->En[i] = coll_energy(C, i, C->En[i], &C->cs[cc]);
             if(!(C->En[i] < 0))
                 C->Flag[i] &= ~CF_BOUND;
         }
-        round_sums(C, 0, S);
+        round_sums(C, S);
         any = 0;
         for(c = C->c0; c < C->c1; c++) {
             struct CandState * s = &C->cs[c];
@@ -928,12 +915,10 @@ unbind_loop(struct Coll * C)
                 continue;
             }
             /* frame of the bound set */
-            s->Mbound = v[1];
             for(d = 0; d < 3; d++) {
                 s->RefPos[d] = subhalo_wrap_box(s->Ref0[d] + v[2 + d] / v[1], up->BoxSize);
                 s->RefVel[d] = v[5 + d] / v[1];
             }
-            s->Ntracer = (int64_t) v[8];
             if((double) s->Nbound >= (double) s->Nlast * up->BoundMassPrecision) {
                 s->iterating = 0;
                 continue;
@@ -960,7 +945,6 @@ unbind_loop(struct Coll * C)
             const struct SubhaloMember * m = &C->plan->Members[C->plan->Cands[c].member];
             s->state = m->kind == SUBHALO_MEM_RESOLVED ? SUBHALO_ST_DIED : SUBHALO_ST_FAILED;
             s->Nbound = 0;
-            s->Mbound = 0;
         }
         if(s->ran && s->capped) {
             C->st.NItercap++;
@@ -1071,7 +1055,7 @@ round_cores(const struct Coll * C, struct CoreOut * out)
     memset(hoff, 0, sizeof(int64_t) * (2 * nc + 1));
     memset(hn, 0, sizeof(int64_t) * (2 * nc + 1));
     for(i = 0; i < C->NumPart; i++)
-        if(in_round(C, C->Cand[i]) && (C->Flag[i] & CF_BOUND) && C->cs[C->Cand[i]].state == SUBHALO_ST_ALIVE && part_live(&P[i]))
+        if(in_round(C, C->Cand[i]) && (C->Flag[i] & CF_BOUND) && C->cs[C->Cand[i]].state == SUBHALO_ST_ALIVE && subhalo_part_live(&P[i]))
             hoff[2 * (C->Cand[i] - C->c0) + is_tracer(i, TracerTypes)]++;
     int64_t n = 0;
     for(c0 = 0; c0 < 2 * nc; c0++) {
@@ -1083,7 +1067,7 @@ round_cores(const struct Coll * C, struct CoreOut * out)
     struct CoreRec * r = (struct CoreRec *) mymalloc("SubCollCoreRec", sizeof(struct CoreRec) * (n + 1));
     for(i = 0; i < C->NumPart; i++) {
         const int32_t c = C->Cand[i];
-        if(!(in_round(C, c) && (C->Flag[i] & CF_BOUND) && C->cs[c].state == SUBHALO_ST_ALIVE && part_live(&P[i])))
+        if(!(in_round(C, c) && (C->Flag[i] & CF_BOUND) && C->cs[c].state == SUBHALO_ST_ALIVE && subhalo_part_live(&P[i])))
             continue;
         struct CoreRec rec;
         struct CoreRec * e = &rec;
@@ -1226,7 +1210,7 @@ dead_mb(struct Coll * C)
     }
     for(i = 0; i < C->NumPart; i++) {
         const int32_t cc = C->Cand[i];
-        if(!in_round(C, cc) || C->cs[cc].state != SUBHALO_ST_DIED || !part_live(&P[i]) || !is_tracer(i, C->up->TracerTypes)
+        if(!in_round(C, cc) || C->cs[cc].state != SUBHALO_ST_DIED || !subhalo_part_live(&P[i]) || !is_tracer(i, C->up->TracerTypes)
            || P[i].TrackId != C->plan->Cands[cc].TrackId)
             continue;
         if(P[i].BindRank < br[cc - C->c0])
@@ -1236,7 +1220,7 @@ dead_mb(struct Coll * C)
         MPI_Allreduce(br, br + nc, nc, MPI_INT64, MPI_MIN, C->Comm);
     for(i = 0; i < C->NumPart; i++) {
         const int32_t cc = C->Cand[i];
-        if(!in_round(C, cc) || C->cs[cc].state != SUBHALO_ST_DIED || !part_live(&P[i]) || !is_tracer(i, C->up->TracerTypes)
+        if(!in_round(C, cc) || C->cs[cc].state != SUBHALO_ST_DIED || !subhalo_part_live(&P[i]) || !is_tracer(i, C->up->TracerTypes)
            || P[i].TrackId != C->plan->Cands[cc].TrackId || P[i].BindRank != br[nc + cc - C->c0])
             continue;
         if(P[i].ID < ids[cc - C->c0])
@@ -1247,7 +1231,7 @@ dead_mb(struct Coll * C)
     memset(pv, 0, sizeof(double) * 12 * (nc + 1));
     for(i = 0; i < C->NumPart; i++) {
         const int32_t cc = C->Cand[i];
-        if(!in_round(C, cc) || C->cs[cc].state != SUBHALO_ST_DIED || P[i].ID != ids[nc + cc - C->c0] || !part_live(&P[i])
+        if(!in_round(C, cc) || C->cs[cc].state != SUBHALO_ST_DIED || P[i].ID != ids[nc + cc - C->c0] || !subhalo_part_live(&P[i])
            || P[i].TrackId != C->plan->Cands[cc].TrackId)
             continue;
         for(d = 0; d < 3; d++) {
@@ -1355,7 +1339,7 @@ shapes_distributed(const struct Coll * C, const struct RadRec * rr, int64_t nr, 
         endrun(1, "Subhalo properties: gsl_eigen_symmv_alloc failed\n");
     int nact = 0;
     for(c = 0; c < nc; c++) {
-        active[c] = np[c] >= SHAPE_MINPART && R[c] > 0;
+        active[c] = np[c] >= SUBHALO_SHAPE_MINPART && R[c] > 0;
         nact += active[c];
         for(d = 0; d < 9; d++)
             orth[9 * c + d] = (d % 4 == 0) ? 1 : 0;
@@ -1363,7 +1347,7 @@ shapes_distributed(const struct Coll * C, const struct RadRec * rr, int64_t nr, 
             ax2[3 * c + d] = R[c] * R[c];
         prev[2 * c] = prev[2 * c + 1] = 0;
     }
-    for(it = 0; it < SHAPE_ITERATIONS && nact > 0; it++) {
+    for(it = 0; it < SUBHALO_SHAPE_ITERATIONS && nact > 0; it++) {
         memset(T, 0, sizeof(double) * 8 * (nc + 1));
         for(k = 0; k < nr; k++) {
             c = (int64_t) rr[k].key[2];
@@ -1395,7 +1379,7 @@ shapes_distributed(const struct Coll * C, const struct RadRec * rr, int64_t nr, 
             if(!active[c])
                 continue;
             const double * t = TG + 8 * c;
-            if(t[6] < SHAPE_MINPART || !(t[7] > 0)) {
+            if(t[6] < SUBHALO_SHAPE_MINPART || !(t[7] > 0)) {
                 active[c] = 0;
                 continue;
             }
@@ -1718,7 +1702,7 @@ round_holder_sums(const struct Coll * C, const struct CoreOut * core, struct Rou
     int64_t nb = 0;
     for(i = 0; i < C->NumPart; i++) {
         const int32_t cc = C->Cand[i];
-        if(!in_round(C, cc) || !(C->Flag[i] & CF_BOUND) || C->cs[cc].state != SUBHALO_ST_ALIVE || !part_live(&P[i]))
+        if(!in_round(C, cc) || !(C->Flag[i] & CF_BOUND) || C->cs[cc].state != SUBHALO_ST_ALIVE || !subhalo_part_live(&P[i]))
             continue;
         nb++;
         const struct CandState * cs = &C->cs[cc];
@@ -1841,7 +1825,7 @@ round_props(const struct Coll * C, const struct CoreOut * core, struct RoundProp
     nb = 0;
     for(i = 0; i < C->NumPart; i++) {
         const int32_t cc = C->Cand[i];
-        if(!in_round(C, cc) || !(C->Flag[i] & CF_BOUND) || C->cs[cc].state != SUBHALO_ST_ALIVE || !part_live(&P[i]))
+        if(!in_round(C, cc) || !(C->Flag[i] & CF_BOUND) || C->cs[cc].state != SUBHALO_ST_ALIVE || !subhalo_part_live(&P[i]))
             continue;
         const double * cp = core->d + CORE_ND * (cc - C->c0);
         struct RadRec * e = &rr[nb++];
@@ -2158,7 +2142,7 @@ round_sinking(struct Coll * C)
     /* the bound sets move: serial ones by their BoundTrackId, in-place ones by their candidate */
     int64_t i;
     for(i = 0; i < C->NumPart; i++) {
-        if(!part_live(&P[i]))
+        if(!subhalo_part_live(&P[i]))
             continue;
         if(C->Flag[i] & CF_SBOUND) {
             const int64_t b = member_lookup_c(C, P[i].BoundTrackId);
@@ -2204,7 +2188,7 @@ init_admitted(struct Coll * C)
             C->Adm = (struct CollAdm *) mymalloc2("SubCollAdm", sizeof(struct CollAdm) * (n + 1));
         n = 0;
         for(i = 0; plan->NHomeRecs > 0 && i < C->NumPart; i++) {
-            if(C->Cand[i] < 0 || !part_live(&P[i]))
+            if(C->Cand[i] < 0 || !subhalo_part_live(&P[i]))
                 continue;
             struct SubhaloHomeRec key;
             key.ID = P[i].ID;
@@ -2265,7 +2249,7 @@ round_within(struct Coll * C)
     int64_t i, n = 0, ntot = 0, k, c;
     for(i = 0; i < C->NumPart; i++) {
         const int32_t cc = C->Cand[i];
-        if(in_round(C, cc) && C->cs[cc].state == SUBHALO_ST_ALIVE && !(C->Flag[i] & CF_BOUND) && part_live(&P[i])
+        if(in_round(C, cc) && C->cs[cc].state == SUBHALO_ST_ALIVE && !(C->Flag[i] & CF_BOUND) && subhalo_part_live(&P[i])
            && C->cs[cc].keep > C->cs[cc].Nbound && !(C->NAdm > 0 && admitted_to(C, i, cc)))
             n++;
     }
@@ -2276,7 +2260,7 @@ round_within(struct Coll * C)
     n = 0;
     for(i = 0; i < C->NumPart; i++) {
         const int32_t cc = C->Cand[i];
-        if(!(in_round(C, cc) && C->cs[cc].state == SUBHALO_ST_ALIVE && !(C->Flag[i] & CF_BOUND) && part_live(&P[i])
+        if(!(in_round(C, cc) && C->cs[cc].state == SUBHALO_ST_ALIVE && !(C->Flag[i] & CF_BOUND) && subhalo_part_live(&P[i])
              && C->cs[cc].keep > C->cs[cc].Nbound) || (C->NAdm > 0 && admitted_to(C, i, cc)))
             continue;
         u[n].key[0] = P[i].ID;
@@ -2545,16 +2529,8 @@ fill_alive_record(const struct Coll * C, int64_t c, const struct CoreOut * fin, 
         rec->SpinBullock = (float) (sqrt(jj) / sqrt(2 * G * Mvir * a * Rvir));
         rec->Xoff = (float) sqrt(xo);
         rec->Voff = (float) (sqrt(vo) * vkms);
-        if(best > 0) {
-            const double f = Rvir * best / (Mvir * KLYPIN_RS_CONSTANT);
-            double rs = rbest / KLYPIN_RMAX_TO_RS;
-            if(f >= 4.625) {
-                const double conc = subhalo_klypin_f_to_c(f);
-                if(conc > 0)
-                    rs = Rvir / conc;
-            }
-            rec->RsKlypin = (float) rs;
-        }
+        if(best > 0)
+            rec->RsKlypin = (float) subhalo_klypin_rs(Rvir, Mvir, best, rbest);
     }
     /* the deferred columns (subhalo_props_deferred) */
     {
@@ -3242,7 +3218,7 @@ serial_repair(struct Coll * C, struct SerChg * chg, int64_t nchg)
     /* 4. the remaining own-tag particles of the affected tracks ask their new rank */
     int64_t nq = 0;
     for(i = 0; i < C->NumPart; i++) {
-        if(!(C->Flag[i] & CF_UNIV) || (C->Flag[i] & CF_ADDED) || P[i].TrackId < 0 || !part_live(&P[i]))
+        if(!(C->Flag[i] & CF_UNIV) || (C->Flag[i] & CF_ADDED) || P[i].TrackId < 0 || !subhalo_part_live(&P[i]))
             continue;
         if(bsearch(&P[i].TrackId, allaff, naff, sizeof(int64_t), cmp_int64_c))
             nq++;
@@ -3251,7 +3227,7 @@ serial_repair(struct Coll * C, struct SerChg * chg, int64_t nchg)
     memset(sendcounts, 0, sizeof(int64_t) * C->NTask);
     nq = 0;
     for(i = 0; i < C->NumPart; i++) {
-        if(!(C->Flag[i] & CF_UNIV) || (C->Flag[i] & CF_ADDED) || P[i].TrackId < 0 || !part_live(&P[i]))
+        if(!(C->Flag[i] & CF_UNIV) || (C->Flag[i] & CF_ADDED) || P[i].TrackId < 0 || !subhalo_part_live(&P[i]))
             continue;
         if(!bsearch(&P[i].TrackId, allaff, naff, sizeof(int64_t), cmp_int64_c))
             continue;
@@ -3482,7 +3458,6 @@ coll_final_tags(struct Coll * C, const int64_t * slotof)
         }
     }
     myfree(tr);
-    CollStats.TagSortSeconds = MPI_Wtime() - t0;
     /* ---- the serial ranks and counts ---- */
     serial_repair(C, chg, nchg);
     /* ---- the exclusive and tail counts of the in-place records ---- */
@@ -3613,9 +3588,6 @@ subhalo_coll_estimate(struct SubhaloCollAdmit * a, int64_t NumPart, int64_t MaxP
             mx = a->stage[s];
     }
     a->need = a->persist + mx;
-    a->NumPart = NumPart;
-    a->NUniv = NUniv;
-    a->NSubPart = NSubPart;
 }
 
 /* The serial sub-tree results into the member table on every rank: state, counts, Keep, record
@@ -3717,7 +3689,7 @@ init_sources(struct Coll * C)
         C->En[i] = 0;
         C->ClaimE[i] = 0;
         const struct particle_data * p = &P[i];
-        if(!part_live(p))
+        if(!subhalo_part_live(p))
             continue;
         int64_t u = -1, ku = -1;
         const struct SubhaloMember * m = p->TrackId >= 0 ? member_of(C, p->TrackId) : NULL;
@@ -3837,7 +3809,7 @@ run_round(struct Coll * C, int r, const int64_t * slotof, const struct SubTrack 
     coll_walk(C, C->En);
     for(i = 0; i < C->NumPart; i++) {
         const int32_t cc = C->Cand[i];
-        if(!in_round(C, cc) || !C->cs[cc].iterating || !(C->Flag[i] & CF_BOUND) || !part_live(&P[i]))
+        if(!in_round(C, cc) || !C->cs[cc].iterating || !(C->Flag[i] & CF_BOUND) || !subhalo_part_live(&P[i]))
             continue;
         C->En[i] = coll_energy(C, i, C->En[i], &C->cs[cc]);
         if(C->En[i] >= 0)

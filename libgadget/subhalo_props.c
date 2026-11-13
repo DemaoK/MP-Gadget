@@ -13,6 +13,7 @@
 #include "slotsmanager.h"
 #include "cosmology.h"
 #include "subhalo_unbind.h"
+#include "subhalo_sort.h"
 
 /* (radius, P index) pairs of the radial order, ties by particle ID then P index. 16 bytes per
  * bound particle: the only per-particle scratch of the property functions. */
@@ -29,8 +30,7 @@ rpair_less(const struct RPair * x, const struct RPair * y)
     return P[x->p].ID < P[y->p].ID || (P[x->p].ID == P[y->p].ID && x->p < y->p);
 }
 #define RPAIR_LESS(x, y) rpair_less((x), (y))
-
-static void rpair_sort(struct RPair * a, int64_t n);
+SUBHALO_DEFINE_SORT(rpair_sort, struct RPair, RPAIR_LESS)
 
 /* The radial order of the bound set Index[0, Nbound) about cen (translated comoving), radii
  * NEAREST-periodic and floored at rfloor, in SUBHALO_PROPS_BYTES_PER_PART * Nbound of arena
@@ -189,91 +189,6 @@ subhalo_so_thresholds(const Cosmology * CP, double atime, double rho[SUBHALO_NSO
     rho[4] = 2500 * rhocrit;
 }
 
-/* Allocation-free introsort, the algorithm of subhalo_unbind.c's private SUBHALO_DEFINE_SORT; the
- * order is strict and total, so the result is unique. */
-static void
-rpair_isort(struct RPair * a, int64_t n)
-{
-    int64_t i, j;
-    for(i = 1; i < n; i++) {
-        struct RPair x = a[i];
-        for(j = i; j > 0 && RPAIR_LESS(&x, &a[j - 1]); j--)
-            a[j] = a[j - 1];
-        a[j] = x;
-    }
-}
-
-static void
-rpair_sift(struct RPair * a, int64_t root, int64_t n)
-{
-    for(;;) {
-        int64_t child = 2 * root + 1;
-        if(child >= n)
-            return;
-        if(child + 1 < n && RPAIR_LESS(&a[child], &a[child + 1]))
-            child++;
-        if(!RPAIR_LESS(&a[root], &a[child]))
-            return;
-        struct RPair t = a[root];
-        a[root] = a[child];
-        a[child] = t;
-        root = child;
-    }
-}
-
-static void
-rpair_intro(struct RPair * a, int64_t n, int depth)
-{
-    while(n > 16) {
-        struct RPair t;
-        if(depth-- <= 0) {
-            int64_t i;
-            for(i = n / 2 - 1; i >= 0; i--)
-                rpair_sift(a, i, n);
-            for(i = n - 1; i > 0; i--) {
-                t = a[0]; a[0] = a[i]; a[i] = t;
-                rpair_sift(a, 0, i);
-            }
-            return;
-        }
-        const int64_t mid = n / 2;
-        if(RPAIR_LESS(&a[mid], &a[0])) { t = a[mid]; a[mid] = a[0]; a[0] = t; }
-        if(RPAIR_LESS(&a[n - 1], &a[0])) { t = a[n - 1]; a[n - 1] = a[0]; a[0] = t; }
-        if(RPAIR_LESS(&a[n - 1], &a[mid])) { t = a[n - 1]; a[n - 1] = a[mid]; a[mid] = t; }
-        const struct RPair pivot = a[mid];
-        int64_t i = -1, j = n;
-        for(;;) {
-            do i++; while(RPAIR_LESS(&a[i], &pivot));
-            do j--; while(RPAIR_LESS(&pivot, &a[j]));
-            if(i >= j)
-                break;
-            t = a[i]; a[i] = a[j]; a[j] = t;
-        }
-        if(j + 1 < n - j - 1) {
-            rpair_intro(a, j + 1, depth);
-            a += j + 1;
-            n -= j + 1;
-        }
-        else {
-            rpair_intro(a + j + 1, n - j - 1, depth);
-            n = j + 1;
-        }
-    }
-    rpair_isort(a, n);
-}
-
-static void
-rpair_sort(struct RPair * a, int64_t n)
-{
-    int depth = 2;
-    int64_t m = n;
-    while(m > 1) {
-        m >>= 1;
-        depth += 2;
-    }
-    rpair_intro(a, n, depth);
-}
-
 /* Eigen-decomposition of a symmetric 3x3 matrix (destroyed), eigenvalues in descending order,
  * eigenvectors as the columns of evec. */
 static void
@@ -286,26 +201,22 @@ eigen3(double mat[9], double eval[3], double evec[9], gsl_eigen_symmv_workspace 
     gsl_eigen_symmv_sort(&ev.vector, &em.matrix, GSL_EIGEN_SORT_VAL_DESC);
 }
 
-/* Smallest aperture for which a shape is reported. */
-#define SHAPE_MINPART 20
-#define SHAPE_ITERATIONS 10
-
 /* Allgood et al. (2006) reduced inertia tensor, Rockstar calc_shape (WEIGHTED_SHAPES): weights
- * m / q2 over pr[0, np) inside the ellipsoid of major axis R, at most SHAPE_ITERATIONS, until both
- * ratios change by < 1 %. Outputs untouched below SHAPE_MINPART particles (a later short iteration
- * keeps the previous result); AxisA is a unit vector with its largest component positive. */
+ * m / q2 over pr[0, np) inside the ellipsoid of major axis R, at most SUBHALO_SHAPE_ITERATIONS, until
+ * both ratios change by < 1 %. Outputs untouched below SUBHALO_SHAPE_MINPART particles (a later short
+ * iteration keeps the previous result); AxisA is a unit vector with its largest component positive. */
 static void
 allgood_shape(const struct RPair * pr, int64_t np, const double cen[3], double R, double rfloor, double BoxSize,
               gsl_eigen_symmv_workspace * ws, float * BtoA, float * CtoA, float AxisA[3])
 {
-    if(np < SHAPE_MINPART || !(R > 0))
+    if(np < SUBHALO_SHAPE_MINPART || !(R > 0))
         return;
     double orth[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};   /* rows: the axis directions */
     double ax2[3] = {R * R, R * R, R * R};                  /* squared semi-axes */
     const double minq2 = (rfloor / R) * (rfloor / R);
     double ba_prev = 0, ca_prev = 0;
     int it, d, e;
-    for(it = 0; it < SHAPE_ITERATIONS; it++) {
+    for(it = 0; it < SUBHALO_SHAPE_ITERATIONS; it++) {
         double T[9] = {0}, wsum = 0;
         int64_t j, cnt = 0;
         for(j = 0; j < np; j++) {
@@ -328,7 +239,7 @@ allgood_shape(const struct RPair * pr, int64_t np, const double cen[3], double R
                 for(e = 0; e <= d; e++)
                     T[3 * d + e] += w * dx[d] * dx[e];
         }
-        if(cnt < SHAPE_MINPART || !(wsum > 0))
+        if(cnt < SUBHALO_SHAPE_MINPART || !(wsum > 0))
             return;
         for(d = 0; d < 3; d++)
             for(e = 0; e <= d; e++) {
