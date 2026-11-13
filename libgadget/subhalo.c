@@ -98,7 +98,8 @@ struct SubhaloParamDesc {
  * Doubles must be finite; rules between parameters are in subhalo_params_error. */
 static const struct SubhaloParamDesc SubhaloParamTable[] = {
     SUBPAR(SubhaloFinderOn, INT, 0, 0, 1, 0, "Run the subhalo finder at every PART/PIG output. Requires SnapshotWithFOF = 1 and FOFSaveParticles = 1."),
-    SUBPAR(SubhaloMaxGatherFraction, DOUBLE, 0.5, 0, DBL_MAX, SUBPAR_LO_OPEN, "Fraction of the particle slots left free on a rank after its own group particles have left that may be filled by whole groups."),
+    /* at most 1: a larger budget would exceed the free slots it is a fraction of */
+    SUBPAR(SubhaloMaxGatherFraction, DOUBLE, 0.5, 0, 1, SUBPAR_LO_OPEN, "Fraction of the particle slots left free on a rank after its own group particles have left that may be filled by whole groups."),
     SUBPAR(SubhaloCollectiveMinPart, COUNT, 0, 0, DBL_MAX, 0, "Testing knob: candidate keys above this particle count are processed in place even if they would fit a rank. 0 = off."),
     SUBPAR(SubhaloMaxUnbindIterations, INT, 50, 1, DBL_MAX, 0, "Iteration cap of the unbinding loop."),
     SUBPAR(SubhaloRestartFresh, INT, 0, 0, 1, 0, "If 1, start with an empty track table when no complete finder state is found at restart; otherwise abort."),

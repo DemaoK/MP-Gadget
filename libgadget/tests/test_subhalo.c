@@ -470,6 +470,13 @@ test_subhalo_param_checks(void ** state)
     EXPECT(0, "", "DM tracers among gas, DM and BH potential types refused: '%s'\n", msg);
     p.SubhaloPotentialTypes = 2;
     EXPECT(0, "", "equal masks refused: '%s'\n", msg);
+    /* a gather budget is a share of the free slots: above 0, at most all of them */
+    for(k = 0; k < 4; k++) {
+        const double frac[4] = {0, 0.5, 1, 1.5};
+        p = def;
+        p.SubhaloMaxGatherFraction = frac[k];
+        EXPECT(frac[k] <= 0 || frac[k] > 1, "SubhaloMaxGatherFraction", "SubhaloMaxGatherFraction = %g judged wrongly: '%s'\n", frac[k], msg);
+    }
     /* the ends of the masks' range: one type, all six types, and the values just outside */
     for(k = 0; k < 4; k++) {
         const int mask[4] = {-1, 1, 63, 64};
