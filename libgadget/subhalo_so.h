@@ -6,7 +6,8 @@
  * out to SubhaloSOSearchFactor x the radius of Mbound at the loosest threshold, doubled while the outer
  * bin is above it, linear sub-bins across a crossing bin when Nbound >= SubhaloSORefineMinPart, the
  * crossing interpolated in log M - log r (resolution one sub-bin). Pass 3: the profile inside the
- * published f4 RSO[vir] in 128-bit fixed point, so layout independent (passes 1-2 sum doubles). A rank
+ * published f4 RSO[vir] in 128-bit fixed point: for the same centre, live particles and published
+ * MSO/RSO[vir] it is layout independent (passes 1-2 sum doubles). A rank
  * with centrals but no live particle routes them to the lowest rank that has one. Short memory for the
  * treewalk reserve, checked after the tree build, halves the pass-1 bins (down to 16), then skips pass
  * 2, pass 3 or the whole call (columns -1) with a warning; it never aborts for this. */

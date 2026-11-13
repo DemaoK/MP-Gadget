@@ -307,11 +307,6 @@ subhalo_klypin_f_to_c(double f)
     return -1;
 }
 
-/* Rockstar's RMAX_TO_RS and RS_CONSTANT (nfw.c, the NFW values Rmax / Rs and
- * Vmax^2 Rvir / (G Mvir) * f(c) / c). */
-#define KLYPIN_RMAX_TO_RS 2.1626
-#define KLYPIN_RS_CONSTANT 0.216216
-
 static void deferred_on_order(struct SubTrack * rec, const struct RPair * pr, int64_t n, const double cvel[3],
                               const double rho[SUBHALO_NSO], double rfloor, double vkms);
 

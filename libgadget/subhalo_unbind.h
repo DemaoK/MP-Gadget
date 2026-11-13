@@ -185,6 +185,10 @@ void subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c
 
 /* Rockstar f_to_c: the NFW concentration with c / (ln(1 + c) - c / (1 + c)) = f, -1 on failure. */
 double subhalo_klypin_f_to_c(double f);
+/* Rockstar's RMAX_TO_RS and RS_CONSTANT (nfw.c, the NFW values Rmax / Rs and
+ * Vmax^2 Rvir / (G Mvir) * f(c) / c). */
+#define KLYPIN_RMAX_TO_RS 2.1626
+#define KLYPIN_RS_CONSTANT 0.216216
 
 /* ------------------------------------------------------------------ deferred properties (subhalo_props.c) */
 
