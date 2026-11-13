@@ -4441,7 +4441,7 @@ tp_run(int64_t collective, struct Outcome * o)
     syn_setup(&CP, TP_END + SYN_NFIELD, sp);
     struct SubTrack recs[2];
     /* the previous bound masses: X below the major-progenitor cut of the central election */
-    recs[0] = syn_rec(0, 1000, 1000 * SYN_M, -1, 0, 0, 0);
+    recs[0] = syn_rec(0, 1000, 1000 * (double) (float) SYN_M, -1, 0, 0, 0);
     recs[1] = syn_rec(1, TP_XT - TP_X0, (TP_XT - TP_X0) * SYN_M, 0, 0, 1, 1);
     syn_records(recs, 2);
     syn_place(tp_particle, NULL, 0.55, 1);
