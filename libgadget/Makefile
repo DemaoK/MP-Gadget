@@ -127,8 +127,8 @@ all: libgadget.a libgadget-utils.a
 .objs/test_fof: tests/test_fof.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
 	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
 
-.objs/test_subhalo: tests/test_subhalo.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
-	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
+.objs/test_subhalo: tests/test_subhalo.c tests/subhalo_testlib.h libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
+	$(MPICC) $(TCFLAGS) -I../tests/ $(filter-out %.h,$^) $(LIBS) -o $@
 
 .objs/test_subhalo_unbind: tests/test_subhalo_unbind.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
 	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
@@ -139,8 +139,8 @@ all: libgadget.a libgadget-utils.a
 .objs/test_subhalo_so: tests/test_subhalo_so.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
 	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
 
-.objs/test_subhalo_collective: tests/test_subhalo_collective.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
-	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
+.objs/test_subhalo_collective: tests/test_subhalo_collective.c tests/subhalo_testlib.h libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
+	$(MPICC) $(TCFLAGS) -I../tests/ $(filter-out %.h,$^) $(LIBS) -o $@
 
 .objs/test_forcetree: tests/test_forcetree.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
 	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
