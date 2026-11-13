@@ -4793,7 +4793,7 @@ fc_run(int64_t collective, struct Outcome * o)
     syn_teardown();
 }
 
-/* The chain's track equal on the paths. Disabled: serially A (centre about the chain's first particle), in place B (about the smallest ID). */
+/* The chain's track equal on the paths: off, a stated limit for groups spanning at least half the box. */
 static const int FcComparePaths = 0;
 
 static void
