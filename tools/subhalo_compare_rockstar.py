@@ -263,12 +263,30 @@ class Rockstar(object):
     def row(self, ids):
         return _lookup(self._id_sorted, self._id_row, ids)
 
+    def _snapshot_bins(self):
+        """The halos_<name>.<chunk>.bin files of this snapshot: one header per name tells its snapshot,
+        so a folder of many snapshots costs one small read each, not one per chunk."""
+        names = {}
+        for fn in sorted(glob.glob(os.path.join(self.dir, "halos_*.bin"))):
+            if not fn.endswith(".coalesced.bin"):
+                names.setdefault(os.path.basename(fn)[:-4].rsplit(".", 1)[0], []).append(fn)
+        for files in names.values():
+            for fn in files:
+                with open(fn, "rb", buffering=0) as f:
+                    raw = f.read(_BIN_HEADER_SIZE)
+                if len(raw) < _BIN_HEADER_SIZE:
+                    continue
+                h = np.frombuffer(raw[:_BIN_HEADER.itemsize], _BIN_HEADER)[0]
+                if int(h["magic"]) != ROCKSTAR_MAGIC:
+                    raise InputError("%s: not a Rockstar binary catalogue (magic %x)" % (fn, int(h["magic"])))
+                if int(h["snap"]) == self.snap:
+                    return files
+                break
+        return []
+
     def _read_bins(self):
-        files = sorted(glob.glob(os.path.join(self.dir, "halos_*.bin")))
         ids, owner = [], []
-        for fn in files:
-            if fn.endswith(".coalesced.bin"):
-                continue
+        for fn in self._snapshot_bins():
             with open(fn, "rb") as f:
                 raw = f.read(_BIN_HEADER_SIZE)
                 if len(raw) < _BIN_HEADER_SIZE:
