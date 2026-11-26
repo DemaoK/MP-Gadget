@@ -19,6 +19,7 @@
 #include "gravshort.h"
 #pragma GCC diagnostic pop
 #include "subhalo_unbind.h"
+#include "subhalo_sort.h"
 
 /* ------------------------------------------------------------------ small utilities */
 
@@ -150,65 +151,6 @@ static inline int
 id_less(int64_t a, int64_t b)
 {
     return P[a].ID < P[b].ID || (P[a].ID == P[b].ID && a < b);
-}
-
-/* In-place introsort, allocation-free and thread-safe. Every comparator below is a strict total
- * order (ties by ID and P index), so the result is unique whatever the algorithm or order of P. */
-#define SUBHALO_DEFINE_SORT(NAME, T, LESS)                                              \
-static void NAME##_isort(T * a, int64_t n) {                                            \
-    int64_t i, j;                                                                       \
-    for(i = 1; i < n; i++) {                                                            \
-        T x = a[i];                                                                     \
-        for(j = i; j > 0 && LESS((&x), (&a[j - 1])); j--)                               \
-            a[j] = a[j - 1];                                                            \
-        a[j] = x;                                                                       \
-    }                                                                                   \
-}                                                                                       \
-static void NAME##_sift(T * a, int64_t root, int64_t n) {                               \
-    for(;;) {                                                                           \
-        int64_t child = 2 * root + 1;                                                   \
-        if(child >= n) return;                                                          \
-        if(child + 1 < n && LESS((&a[child]), (&a[child + 1]))) child++;                \
-        if(!LESS((&a[root]), (&a[child]))) return;                                      \
-        T t = a[root]; a[root] = a[child]; a[child] = t;                                \
-        root = child;                                                                   \
-    }                                                                                   \
-}                                                                                       \
-static void NAME##_hsort(T * a, int64_t n) {                                            \
-    int64_t i;                                                                          \
-    for(i = n / 2 - 1; i >= 0; i--) NAME##_sift(a, i, n);                               \
-    for(i = n - 1; i > 0; i--) {                                                        \
-        T t = a[0]; a[0] = a[i]; a[i] = t;                                              \
-        NAME##_sift(a, 0, i);                                                           \
-    }                                                                                   \
-}                                                                                       \
-static void NAME##_intro(T * a, int64_t n, int depth) {                                 \
-    while(n > 16) {                                                                     \
-        if(depth-- <= 0) { NAME##_hsort(a, n); return; }                                \
-        const int64_t mid = n / 2;                                                      \
-        T t;                                                                            \
-        if(LESS((&a[mid]), (&a[0]))) { t = a[mid]; a[mid] = a[0]; a[0] = t; }           \
-        if(LESS((&a[n - 1]), (&a[0]))) { t = a[n - 1]; a[n - 1] = a[0]; a[0] = t; }     \
-        if(LESS((&a[n - 1]), (&a[mid]))) { t = a[n - 1]; a[n - 1] = a[mid]; a[mid] = t; } \
-        const T pivot = a[mid];                                                         \
-        int64_t i = -1, j = n;                                                          \
-        for(;;) {                                                                       \
-            do i++; while(LESS((&a[i]), (&pivot)));                                     \
-            do j--; while(LESS((&pivot), (&a[j])));                                     \
-            if(i >= j) break;                                                           \
-            t = a[i]; a[i] = a[j]; a[j] = t;                                            \
-        }                                                                               \
-        /* [0, j] and [j + 1, n), both non-empty; recurse on the smaller */             \
-        if(j + 1 < n - j - 1) { NAME##_intro(a, j + 1, depth); a += j + 1; n -= j + 1; } \
-        else { NAME##_intro(a + j + 1, n - j - 1, depth); n = j + 1; }                  \
-    }                                                                                   \
-    NAME##_isort(a, n);                                                                 \
-}                                                                                       \
-static void NAME(T * a, int64_t n) {                                                    \
-    int depth = 2;                                                                      \
-    int64_t m = n;                                                                      \
-    while(m > 1) { m >>= 1; depth += 2; }                                               \
-    NAME##_intro(a, n, depth);                                                          \
 }
 
 /* Parallel merge sort with NAME's unique output: one introsorted block per thread, then pairwise
@@ -721,12 +663,6 @@ pair_r2(const double x[3], const double y[3], double BoxSize, const int wrap)
     return ex * ex + ey * ey + ez * ez;
 }
 
-static inline double
-periodic_r2(const double x[3], const double y[3], double BoxSize)
-{
-    return pair_r2(x, y, BoxSize, 1);
-}
-
 /* sum_j m_j W(|x_j - y|, h) over the tree, excluding the source self (HBT EvaluatePotential:
  * open when len^2 > r^2 theta^2 against the node's centre of mass). theta2 < 1/3 guarantees that
  * a node containing the target is always opened (its cell diagonal is sqrt(3) len). */
@@ -1123,7 +1059,7 @@ count_tracers_all(const int64_t * Index, int64_t n, int TracerTypes)
 }
 
 /* Bound (Energy < 0) to the front of (Index, Energy)[0, n), returning their number; the bound
- * keep their order. n <= CHUNK_MIN: the swap loop; above, a stable partition (decision 34: the
+ * keep their order. n <= CHUNK_MIN: the swap loop; above, a stable partition (the
  * swap loop's unbound order cannot be parallelised, and only a dead candidate's list shows it). */
 static int64_t
 partition_bound(int64_t * Index, double * Energy, int64_t n, struct SubhaloArena * arena)
@@ -1223,7 +1159,7 @@ subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * up, s
     c->NboundPositive = -1;
 
     /* A source below the thresholds cannot survive: the first iteration would kill it. */
-    if(N < up->MinNumPart || N <= 0 || count_tracers(Index, N, up->TracerTypes, up->MinNumTracerPart) < up->MinNumTracerPart)
+    if(N <= 0 || subhalo_unbind_dies(N, count_tracers(Index, N, up->TracerTypes, up->MinNumTracerPart), up))
         return 0;
 
     /* Shuffle once: each iteration's subsample is the first SampleSize subsampleable particles
@@ -1261,7 +1197,7 @@ subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * up, s
 
         /* survival thresholds (subhalo_unbind.cpp:629-674) */
         const int64_t ntr = count_tracers(Index, Nbound, up->TracerTypes, up->MinNumTracerPart);
-        if(Nbound < up->MinNumPart || ntr < up->MinNumTracerPart) {
+        if(subhalo_unbind_dies(Nbound, ntr, up)) {
             c->Nbound = 0;
             c->NboundTracer = 0;
             c->Mbound = 0;
@@ -1276,13 +1212,12 @@ subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * up, s
         /* frame of the bound set (subhalo_unbind.cpp:690-692) */
         Mbound = bound_frame(Index, Nbound, RefPos, RefVel, up->BoxSize);
 
-        /* count convergence (subhalo_unbind.cpp:695) */
-        if((double) Nbound >= (double) Nlast * up->BoundMassPrecision)
-            break;
-        if(up->MaxIter > 0 && c->Iterations >= up->MaxIter) {
+        /* count convergence (subhalo_unbind.cpp:695), else the iteration cap */
+        const enum SubhaloUnbindStep step = subhalo_unbind_step(Nbound, Nlast, c->Iterations, up);
+        if(step == SUBHALO_STEP_CAPPED)
             c->Flags |= SUBHALO_FLAG_ITERCAP;
+        if(step != SUBHALO_STEP_CONTINUE)
             break;
-        }
     }
 
     sort_energy_index(Energy, Index, Nbound, arena);
@@ -1308,45 +1243,165 @@ subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * up, s
     return 1;
 }
 
+/* A rescue core member and its sort key: BindRank, then ID. */
+struct RescueMember {
+    int64_t rank;
+    int64_t idx;
+};
+
+static int
+cmp_rescue_member(const void * a, const void * b)
+{
+    const struct RescueMember * x = (const struct RescueMember *) a, * y = (const struct RescueMember *) b;
+    if(x->rank != y->rank)
+        return (x->rank > y->rank) - (x->rank < y->rank);
+    return (P[x->idx].ID > P[y->idx].ID) - (P[x->idx].ID < P[y->idx].ID);
+}
+
+static int
+cmp_double(const void * a, const void * b)
+{
+    const double x = *(const double *) a, y = *(const double *) b;
+    return (x > y) - (x < y);
+}
+
+/* Median of x[0, n), n >= 1 (x sorted in place): the middle value, the mean of the two middle ones for even n. */
+static double
+median_sorted(double * x, int64_t n)
+{
+    qsort(x, n, sizeof(double), cmp_double);
+    return (n % 2) ? x[n / 2] : 0.5 * (x[n / 2 - 1] + x[n / 2]);
+}
+
+static int
+frame_isfinite(const double Pos[3], const double Vel[3])
+{
+    int d;
+    for(d = 0; d < 3; d++)
+        if(!subhalo_isfinite(Pos[d]) || !subhalo_isfinite(Vel[d]))
+            return 0;
+    return 1;
+}
+
+static double
+speed_about(const MyFloat v[3], const double c[3])
+{
+    const double a = v[0] - c[0], b = v[1] - c[1], e = v[2] - c[2];
+    return sqrt(a * a + b * b + e * e);
+}
+
 int
-subhalo_unbind_rescue(struct SubCandidate * c, int64_t K, const struct SubhaloUnbindParams * up, struct SubhaloArena * arena, int * tried)
+subhalo_rescue_frame(const struct SubCandidate * c, int64_t K, const struct SubhaloUnbindParams * up,
+                     struct SubhaloArena * arena, double Pos[3], double Vel[3])
 {
     const size_t mark = arena->used;
-    const int64_t N = c->N;
-    int64_t i, nc = 0;
-    if(tried)
-        *tried = 0;
-    /* one buffer, the core list then the death order; with less arena left the kernel's source sort
-     * falls back to serial and its tree leaves widen until the nodes fit */
-    int64_t * buf = (int64_t *) arena_need(arena, sizeof(int64_t) * (N + 1), "rescue order");
+    const int64_t N = c->N, T = c->TrackId;
+    int64_t i, nc = 0, nkept = 0;
+    int d, it;
+    struct RescueMember * m = (struct RescueMember *) arena_need(arena, sizeof(struct RescueMember) * (N + 1), "rescue core");
     for(i = 0; i < N; i++) {
         const struct particle_data * p = &P[c->Index[i]];
-        if(p->TrackId == c->TrackId && p->BindRank >= 0 && p->BindRank < K)
-            buf[nc++] = c->Index[i];
+        if(p->TrackId == T && p->BoundTrackId == T && p->BindRank >= 0 && p->BindRank < K) {
+            m[nc].rank = p->BindRank;
+            m[nc].idx = c->Index[i];
+            nc++;
+        }
     }
-    double CorePos[3], CoreVel[3];
-    if(nc < 1 || nc < K / 2 || !(bound_frame(buf, nc, CorePos, CoreVel, up->BoxSize) > 0)) {
+    if(nc < 1 || nc < K / 2) {
         arena->used = mark;
         return 0;
     }
-    if(tried)
-        *tried = 1;
+    /* a non-finite position or velocity gives no frame: no median, clip distance or wrapped centre */
+    for(i = 0; i < nc; i++)
+        for(d = 0; d < 3; d++)
+            if(!subhalo_isfinite(P[m[i].idx].Vel[d]) || !subhalo_isfinite(P[m[i].idx].Pos[d])) {
+                arena->used = mark;
+                return 0;
+            }
+    /* (BindRank, ID) order: the medians, the clip and the sums do not depend on the list order */
+    qsort(m, nc, sizeof(struct RescueMember), cmp_rescue_member);
+    int64_t * kept = (int64_t *) arena_need(arena, sizeof(int64_t) * (nc + 1), "rescue core kept");
+    double * w = (double *) arena_need(arena, sizeof(double) * (nc + 1), "rescue core speeds");
+    double cv[3], cp[3] = {0, 0, 0};
+    for(d = 0; d < 3; d++) {
+        for(i = 0; i < nc; i++)
+            w[i] = P[m[i].idx].Vel[d];
+        cv[d] = median_sorted(w, nc);
+    }
+    for(i = 0; i < nc; i++)
+        w[i] = speed_about(P[m[i].idx].Vel, cv);
+    const double s = median_sorted(w, nc);
+    if(!(s > 0) || !subhalo_isfinite(s)) {
+        arena->used = mark;
+        return 0;
+    }
+    const double r = SUBHALO_RESCUE_CLIP * s;
+    for(it = 0; it < SUBHALO_RESCUE_ITERATIONS; it++) {
+        int64_t nk = 0;
+        for(i = 0; i < nc; i++)
+            if(speed_about(P[m[i].idx].Vel, cv) <= r)
+                kept[nk++] = m[i].idx;
+        double tp[3], tv[3];
+        /* fewer than 3 within the clip, or a frame whose sums overflow: the last frame stands */
+        if(nk < 3 || !(bound_frame(kept, nk, tp, tv, up->BoxSize) > 0) || !frame_isfinite(tp, tv))
+            break;
+        for(d = 0; d < 3; d++) {
+            cp[d] = tp[d];
+            cv[d] = tv[d];
+        }
+        nkept = nk;
+    }
+    arena->used = mark;
+    if(nkept == 0)
+        return 0;
+    for(d = 0; d < 3; d++) {
+        Pos[d] = cp[d];
+        Vel[d] = cv[d];
+    }
+    return 1;
+}
+
+int
+subhalo_unbind_rescue(struct SubCandidate * c, int alive, int64_t NPrev, int64_t K, const struct SubhaloUnbindParams * up,
+                      struct SubhaloArena * arena, struct SubhaloSecondAttempt * sa)
+{
+    if(sa)
+        memset(sa, 0, sizeof(*sa));
+    if(alive && !subhalo_rescue_large_loss(c->Nbound, NPrev))
+        return alive;
+    double CorePos[3], CoreVel[3];
+    if(!subhalo_rescue_frame(c, K, up, arena, CorePos, CoreVel))
+        return alive;
+    const size_t mark = arena->used;
+    const int64_t N = c->N;
+    /* the first result's order; with less arena left the kernel's source sort falls back to serial and
+     * its tree leaves widen until the nodes fit */
+    int64_t * buf = (int64_t *) arena_need(arena, sizeof(int64_t) * (N + 1), "rescue order");
     memcpy(buf, c->Index, sizeof(int64_t) * N);
-    const struct SubCandidate dead = *c;
+    const struct SubCandidate first = *c;
     int d;
     for(d = 0; d < 3; d++) {
         c->RefPos[d] = CorePos[d];
         c->RefVel[d] = CoreVel[d];
     }
-    const int alive = subhalo_unbind(c, up, arena);
-    if(alive)
+    /* the cap flag of the result that stands is its own attempt's */
+    c->Flags &= ~SUBHALO_FLAG_ITERCAP;
+    const int second = subhalo_unbind(c, up, arena);
+    const int stood = second && (!alive || c->Nbound > first.Nbound);
+    if(sa) {
+        sa->tried = 1;
+        sa->stood = stood;
+        sa->Itercap = (c->Flags & SUBHALO_FLAG_ITERCAP) != 0;
+        sa->ConvergenceRatio = c->ConvergenceRatio;
+    }
+    if(stood)
         c->Flags |= SUBHALO_FLAG_RESCUED;
     else {
-        *c = dead;
+        *c = first;
         memcpy(c->Index, buf, sizeof(int64_t) * N);
     }
     arena->used = mark;
-    return alive;
+    return alive || stood;
 }
 
 /* The head K of the sampled final pass: the shortest prefix with T = MARGIN * Kt tracers (all if
@@ -1492,11 +1547,11 @@ scaled_offset(double dist, double sigma)
     return dist > 0 ? 1e300 : 0;
 }
 
-int
-subhalo_sink_test(const double sPos[3], const double sVel[3], const double aPos[3], const double aVel[3],
-                  double aSigmaX, double aSigmaV, double sSigmaX, double sSigmaV, int symmetric, double BoxSize)
+double __attribute__((noinline))
+subhalo_core_distance(const double sPos[3], const double sVel[3], const double aPos[3], const double aVel[3],
+                      double aSigmaX, double aSigmaV, double BoxSize)
 {
-    /* PhaseSpaceDistance / AreOverlappingInPhaseSpace, subhalo_merge.cpp:13-26 */
+    /* PhaseSpaceDistance, subhalo_merge.cpp:13-20 */
     double dx2 = 0, dv2 = 0;
     int d;
     for(d = 0; d < 3; d++) {
@@ -1505,10 +1560,16 @@ subhalo_sink_test(const double sPos[3], const double sVel[3], const double aPos[
         dx2 += dx * dx;
         dv2 += dv * dv;
     }
-    const double dx = sqrt(dx2), dv = sqrt(dv2);
-    double D = scaled_offset(dx, aSigmaX) + scaled_offset(dv, aSigmaV);
+    return scaled_offset(sqrt(dx2), aSigmaX) + scaled_offset(sqrt(dv2), aSigmaV);
+}
+
+int
+subhalo_sink_test(const struct SubhaloCore * s, const struct SubhaloCore * a, int symmetric, double BoxSize)
+{
+    /* AreOverlappingInPhaseSpace, subhalo_merge.cpp:21-26 */
+    double D = subhalo_core_distance(s->Pos, s->Vel, a->Pos, a->Vel, a->SigmaX, a->SigmaV, BoxSize);
     if(symmetric) {
-        const double Ds = scaled_offset(dx, sSigmaX) + scaled_offset(dv, sSigmaV);
+        const double Ds = subhalo_core_distance(s->Pos, s->Vel, a->Pos, a->Vel, s->SigmaX, s->SigmaV, BoxSize);
         if(Ds < D)
             D = Ds;
     }
@@ -1537,10 +1598,18 @@ subhalo_knn_build_count(void)
     return n;
 }
 
+/* The neighbour distance of every k-nearest search, one compiled copy: under -ffast-math an
+ * inlined copy could round differently in each caller, and the searches must agree bitwise. */
+double __attribute__((noinline))
+subhalo_knn_r2(const double x[3], const double y[3], double BoxSize)
+{
+    return pair_r2(x, y, BoxSize, 1);
+}
+
 /* Neighbour list of one query: sorted ascending by (d2, ID, P index), at most k entries. */
 struct KnnList {
-    double d2[SUBHALO_KNN_MAXK];
-    int64_t p[SUBHALO_KNN_MAXK];
+    double d2[SUBHALO_KNN_MAXK + 1];
+    int64_t p[SUBHALO_KNN_MAXK + 1];
     int n, k;
 };
 
@@ -1611,7 +1680,7 @@ knn_rec(const struct SubhaloKnnTree * kt, int64_t n, const double q[3], const do
     if(t->sk[n].skip == n + 1) {
         int64_t j;
         for(j = t->sk[n].first; j < t->sk[n].first + t->sk[n].count; j++)
-            knn_insert(L, periodic_r2(t->src[j].x, qa, t->BoxSize), t->src[j].p);
+            knn_insert(L, subhalo_knn_r2(t->src[j].x, qa, t->BoxSize), t->src[j].p);
         return;
     }
     int64_t ch[8];
@@ -1722,8 +1791,8 @@ void
 subhalo_knn_query(const struct SubhaloKnnTree * kt, const int64_t * query, int64_t nq, int k, int64_t * out)
 {
     int64_t i;
-    if(k > SUBHALO_KNN_MAXK)
-        endrun(1, "Subhalo kernel: k = %d nearest neighbours exceeds SUBHALO_KNN_MAXK = %d\n", k, SUBHALO_KNN_MAXK);
+    if(k > SUBHALO_KNN_MAXK + 1)
+        endrun(1, "Subhalo kernel: k = %d nearest neighbours exceeds SUBHALO_KNN_MAXK + 1 = %d\n", k, SUBHALO_KNN_MAXK + 1);
     if(k <= 0)
         return;
     if(kt->t.ns <= 0) {
@@ -1755,8 +1824,8 @@ void
 subhalo_knn_tracers(const int64_t * query, int64_t nq, const int64_t * tr, int64_t nt, int k,
                     int64_t * out, double BoxSize, struct SubhaloArena * arena)
 {
-    if(k > SUBHALO_KNN_MAXK)
-        endrun(1, "Subhalo kernel: k = %d nearest neighbours exceeds SUBHALO_KNN_MAXK = %d\n", k, SUBHALO_KNN_MAXK);
+    if(k > SUBHALO_KNN_MAXK + 1)
+        endrun(1, "Subhalo kernel: k = %d nearest neighbours exceeds SUBHALO_KNN_MAXK + 1 = %d\n", k, SUBHALO_KNN_MAXK + 1);
     if(k <= 0)
         return;
     const size_t mark = arena->used;

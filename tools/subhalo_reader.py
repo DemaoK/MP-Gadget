@@ -26,7 +26,7 @@ Layout of a PIG written with SubhaloFinderOn = 1:
                          SubhaloWallTime (s, max over ranks), SubhaloPeakBytes (main-allocator
                          used high water, max over ranks), SubhaloPeakIncrementBytes (the finder's
                          own increment: high water without the field SO walks' elastic export
-                         tables minus the usage at entry, max over ranks and stages; Phase 5d)
+                         tables minus the usage at entry, max over ranks and stages)
                          of the last finder call, ...
 
 A track's in-group slice in <t>/ is rows [SliceOffsetByType[t], + SliceLengthByType[t]) and its
@@ -54,7 +54,8 @@ import bigfile
 
 NTYPES = 6
 
-# Appendix B, PIG_xxx/Subhalo/ : (name, dtype, items per row)
+# Appendix B, PIG_xxx/Subhalo/ : (name, dtype, items per row). The writer's list is the table
+# SUBTRACK_COLUMNS in libgadget/subhalo_io.c; these lists and that table hold the same columns.
 SUBHALO_COLUMNS = [
     ("TrackId", "i8", 1), ("HostGroup", "i8", 1), ("NestedParentTrackId", "i8", 1),
     ("CentralTrackId", "i8", 1), ("SinkTrackId", "i8", 1), ("DescendantTrackId", "i8", 1),
@@ -109,7 +110,7 @@ ORPHAN_COLUMNS = [
     ("SnapLastIsolation", "i4", 1), ("SnapTracerLost", "i4", 1),
 ] + _GROUP_E
 
-# Schema 2 (decision 70): the particles an orphan follows. OrphanIDs (MostBoundID first, then the
+# Schema 2: the particles an orphan follows. OrphanIDs (MostBoundID first, then the
 # first step-0 tracers, UINT64_MAX padded), their count, the markers kept at the last lookup, the
 # rms spread of the kept set about TracerPos and the clip scale fixed at death (-1: none).
 MAXTRACERS = 16
@@ -120,8 +121,8 @@ ORPHAN_SET_COLUMNS = [
 ORPHAN_COLUMNS = ORPHAN_COLUMNS + ORPHAN_SET_COLUMNS
 NO_ID = np.uint64(0xFFFFFFFFFFFFFFFF)
 
-# Appendix B marks these optional; the decision-44 SO profile columns are absent from catalogues
-# written before them (read leniently: the props rules then skip them).
+# Appendix B marks these optional. A catalogue may lack the SO profile columns (the props rules
+# then skip them) or the orphan set (filled as a schema 1 state reads: MostBoundID alone).
 OPTIONAL_COLUMNS = ("GeomParentTrackId", "GeomUpParentTrackId", "RsSO", "RsKlypinSO", "VmaxSO", "RmaxSO") \
     + tuple(c[0] for c in ORPHAN_SET_COLUMNS)
 
@@ -472,7 +473,7 @@ class SubhaloCatalogue(object):
             parts.append(idx[bound[s] == trackid])
         return np.concatenate(parts) if parts else np.zeros(0, dtype=np.int64)
 
-    # ------------------------------------------------------------------ bound ID lists (Phase 4)
+    # ------------------------------------------------------------------ bound ID lists
     @property
     def snapshot(self):
         """SnapshotIndex of the Header (the PIG number)."""
@@ -498,7 +499,7 @@ class SubhaloCatalogue(object):
            track's own energy order is not recorded; they follow in (BindRank in their tag's list,
            ID) order.
 
-        The first entries (the most-bound tracers, reserved for the track by the D10 tag rule) are
+        The first entries (the most-bound tracers, reserved for the track by the tag rule of design D10) are
         therefore exact. Returns an int64/uint64 ID array, and with return_types the type of each.
         """
         rank, ids, types, overlap = [], [], [], []

@@ -35,17 +35,12 @@
 /* definitions with per-type masses: vir (SO slot 0) and 200c (SO slot 2) */
 #define SO_DEF_VIR 0
 #define SO_DEF_200C 2
-#define SO_MINBINS 8
-#define SO_MAXBINS 256
 /* pass 1 halves its bins down to this many when the treewalk reserve does not fit */
 #define SO_SHRINKBINS 16
 /* allocator slack on top of the computed requirements */
 #define SO_SLACK (1L << 20)
 
 static int64_t SOMaxBatch = 0;
-/* treewalk.c keeps ImportBufferBoost private: the parameter's default (gadget/params.c) unless
- * subhalo_so_set_import_buffer_boost says otherwise */
-static double SOImportBufferBoost = 2.;
 
 static inline int64_t so_imin(int64_t a, int64_t b) { return a < b ? a : b; }
 static inline int64_t so_imax(int64_t a, int64_t b) { return a > b ? a : b; }
@@ -54,12 +49,6 @@ void
 subhalo_so_set_max_batch(int64_t maxbatch)
 {
     SOMaxBatch = maxbatch;
-}
-
-void
-subhalo_so_set_import_buffer_boost(double boost)
-{
-    SOImportBufferBoost = boost > 0 ? boost : 0;
 }
 
 /* Per-type slot of a definition: 0 for vir, 1 for 200c, -1 otherwise. */
@@ -193,11 +182,9 @@ subhalo_so_walk_bytes(int pass, int NB, int NT)
     /* pass 3's result has no flexible part: its accumulator is inside the struct */
     const size_t r = pass == 3 ? sizeof(TreeWalkResultSO3)
                    : (pass == 1 ? sizeof(TreeWalkResultSO1) : sizeof(TreeWalkResultSO2)) + so_acc_bytes(pass, NB, NT);
-    /* as ev_begin: bytes per buffer, the 40960-buffer reserve, then more than 4096 buffers and
-     * at least 100 per thread */
-    const size_t bpb = sizeof(struct data_index) + q + r + (size_t) ceil(SOImportBufferBoost * (q + r));
-    const int64_t nbuf = 4096 * 10 + so_imax(4096 + 1, 100 * (int64_t) omp_get_max_threads());
-    return (size_t) nbuf * bpb;
+    /* a negative boost counts as 0 here */
+    const double boost = subhalo_import_buffer_boost();
+    return subhalo_walk_reserve_bytes(q, r, boost > 0 ? boost : 0);
 }
 
 /* The pass-1 bin of radius r. Not inlined, so that pass 1 and pass 2 evaluate it with the same
@@ -278,7 +265,7 @@ so1_ngbiter(TreeWalkQuerySO1 * I, TreeWalkResultSO1 * O, TreeWalkNgbIterBase * i
         return;
     }
     const int other = iter->other;
-    if(P[other].IsGarbage || P[other].Swallowed)
+    if(!subhalo_part_live(&P[other]))
         return;
     const struct so_priv * pv = SO_PRIV(lv->tw);
     const int k = so_bin(iter->r, I->Rlo, I->Scale, pv->NB);
@@ -333,7 +320,7 @@ so2_ngbiter(TreeWalkQuerySO2 * I, TreeWalkResultSO2 * O, TreeWalkNgbIterBase * i
         return;
     }
     const int other = iter->other;
-    if(P[other].IsGarbage || P[other].Swallowed)
+    if(!subhalo_part_live(&P[other]))
         return;
     const struct so_priv * pv = SO_PRIV(lv->tw);
     const int NT = pv->ty.NT;
@@ -439,7 +426,7 @@ so3_ngbiter(TreeWalkQuerySO3 * I, TreeWalkResultSO3 * O, TreeWalkNgbIterBase * i
         return;
     }
     const int other = iter->other;
-    if(P[other].IsGarbage || P[other].Swallowed)
+    if(!subhalo_part_live(&P[other]))
         return;
     if(!(iter->r <= I->R))
         return;
@@ -630,12 +617,34 @@ so_m2(const double * subT, const struct so_types * ty, int m, int t)
     return ty->slot[t] >= 0 ? subT[(size_t) ty->NT * m + ty->slot[t]] : 0;
 }
 
+/* The constants of the passes' analysis: the SO densities, the least of them, the cap on the
+ * doublings of a row's radius and the box. */
+struct so_cfg {
+    const double * rho;            /* [SUBHALO_NSO] */
+    double rhomin;
+    int MaxDoublings;
+    double BoxSize;
+};
+
+/* The rows of one pass, list[0, nlist), walked in batches of at most bcap query slots, each batch
+ * copied into buf (the writable pv->batch). */
+struct so_batches {
+    int64_t * buf;
+    const int64_t * list;
+    int64_t nlist, bcap;
+};
+
 /* Pass-1 analysis of one row from its histogram M[NB][NT]. Returns 1 if the row must be
  * walked again with a doubled radius (radius already updated), 0 if its pass-1 outcome is final. */
 static int
-so_pass1_analyse(struct so_row * row, const double * M, int NB, const struct so_types * ty, const double rho[SUBHALO_NSO],
-                 double rhomin, int MaxDoublings, double BoxSize, double soft)
+so_pass1_analyse(struct so_row * row, const double * M, const struct so_priv * pv, const struct so_cfg * cfg)
 {
+    /* locals: the row's stores could alias the fields of *pv and *cfg */
+    const int NB = pv->NB;
+    const struct so_types * ty = &pv->ty;
+    const double * rho = cfg->rho;
+    const double rhomin = cfg->rhomin, BoxSize = cfg->BoxSize, soft = pv->soft;
+    const int MaxDoublings = cfg->MaxDoublings;
     int j[SUBHALO_NSO];
     int d, k, t;
     for(d = 0; d < SUBHALO_NSO; d++)
@@ -804,14 +813,16 @@ so_is_central(const struct SubTrack * r)
     return r->Rank == 0 && r->HostGroup >= 0 && r->Nbound > 0;
 }
 
-/* One pass over the rows list[0..nlist) in batches of at most bcap, each batch then analysed (pass 1:
- * outcome or redo with a doubled R; pass 2: final values; pass 3: profile columns). Collective:
- * every rank runs the global maximum number of batches. Returns the number of walks. */
+/* One pass over the rows of bs in batches, each analysed after its walk; every rank runs the global
+ * number of batches (collective). Returns the number of walks. */
 static int
-so_run_batches(int pass, struct so_priv * pv, int64_t * batchbuf, const int64_t * list, int64_t nlist, int64_t bcap,
-               ForceTree * tree, const double rho[SUBHALO_NSO], double rhomin, const struct SubhaloParams * par,
-               double BoxSize, double soft, MPI_Comm Comm)
+so_run_batches(int pass, struct so_priv * pv, const struct so_batches * bs, ForceTree * tree, const struct so_cfg * cfg,
+               MPI_Comm Comm)
 {
+    int64_t * batchbuf = bs->buf;
+    const int64_t * list = bs->list;
+    const int64_t nlist = bs->nlist, bcap = bs->bcap;
+    const double * rho = cfg->rho;
     int64_t nbatch = (nlist > 0 && bcap > 0) ? (nlist + bcap - 1) / bcap : 0;
     /* cannot happen: rows exist only on ranks with a live particle (the others route theirs) */
     if(nlist > 0 && bcap <= 0)
@@ -835,7 +846,7 @@ so_run_batches(int pass, struct so_priv * pv, int64_t * batchbuf, const int64_t 
             struct so_row * row = &pv->rows[batchbuf[s]];
             if(pass == 1) {
                 const double * M = (const double *) (pv->acc + s * pv->accsize);
-                row->redo = so_pass1_analyse(row, M, NB, &pv->ty, rho, rhomin, par->SubhaloSOMaxDoublings, BoxSize, soft);
+                row->redo = so_pass1_analyse(row, M, pv, cfg);
             }
             else if(pass == 3)
                 nprof += so_profile_finish(row, (const struct so3_acc *) (pv->acc + s * pv->accsize), pv);
@@ -1004,12 +1015,8 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
                       double * Rsearch, struct SubhaloSOStats * stats, MPI_Comm Comm)
 {
     const double tstart = MPI_Wtime();
+    /* the SO parameters' ranges are checked at start-up (subhalo_validate_params) */
     const int NBpar = par->SubhaloSOBins;
-    if(NBpar < SO_MINBINS || NBpar > SO_MAXBINS)
-        endrun(1, "SubhaloSOBins = %d must be in [%d, %d].\n", NBpar, SO_MINBINS, SO_MAXBINS);
-    if(!(par->SubhaloSOSearchFactor > 0) || par->SubhaloSOMaxDoublings < 0 || par->SubhaloSOMaxDoublings > 60)
-        endrun(1, "SubhaloSOSearchFactor = %g must be positive and SubhaloSOMaxDoublings = %d in [0, 60].\n",
-               par->SubhaloSOSearchFactor, par->SubhaloSOMaxDoublings);
     double rho[SUBHALO_NSO];
     int d, t;
     if(rho_in)
@@ -1031,7 +1038,7 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
     int tmask = 0;
     #pragma omp parallel for reduction(+: nlive) reduction(|: tmask)
     for(i = 0; i < PartManager->NumPart; i++) {
-        if(P[i].IsGarbage || P[i].Swallowed)
+        if(!subhalo_part_live(&P[i]))
             continue;
         nlive++;
         tmask |= 1 << P[i].Type;
@@ -1042,7 +1049,7 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
     double mmmg[2] = {0, -DBL_MAX};                /* the largest mass, minus the smallest positive */
     int64_t nliveg = 0;
     for(i = 0; i < PartManager->NumPart; i++) {
-        if(P[i].IsGarbage || P[i].Swallowed)
+        if(!subhalo_part_live(&P[i]))
             continue;
         if(P[i].Mass > mmmg[0])
             mmmg[0] = P[i].Mass;
@@ -1128,7 +1135,7 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
         list[c] = c;
     }
 
-    /* clocks (decision 47.5): /Subhalo/FieldSO/Setup, then the whole tree build as .../Tree; the
+    /* clocks: /Subhalo/FieldSO/Setup, then the whole tree build as .../Tree; the
      * caller books the walks as .../Walks */
     walltime_measure("/Subhalo/FieldSO/Setup");
     ForceTree tree = {0};
@@ -1196,7 +1203,7 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
     int * anchor = (int *) mymalloc("SOanchor", so_imax(bcap, 1) * sizeof(int));
     int64_t na = 0;
     for(i = 0; i < PartManager->NumPart && na < bcap; i++) {
-        if(P[i].IsGarbage || P[i].Swallowed)
+        if(!subhalo_part_live(&P[i]))
             continue;
         anchor[na++] = (int) i;
     }
@@ -1219,6 +1226,9 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
     pv.soft = soft;
     pv.rhovir = rho[SO_DEF_VIR];
 
+    const struct so_cfg cfg = {rho, rhomin, par->SubhaloSOMaxDoublings, BoxSize};
+    struct so_batches bs = {batchbuf, list, 0, bcap};
+
     /* pass 1, rerun for the rows whose radius doubled (at most SubhaloSOMaxDoublings + 1 rounds) */
     int npass1 = 0, npass2 = 0, npass3 = 0;
     int64_t npend = skip ? 0 : nrows;
@@ -1226,7 +1236,8 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
     while(1) {
         if(!MPIU_Any(npend > 0, Comm))
             break;
-        npass1 += so_run_batches(1, &pv, batchbuf, list, npend, bcap, &tree, rho, rhomin, par, BoxSize, soft, Comm);
+        bs.nlist = npend;
+        npass1 += so_run_batches(1, &pv, &bs, &tree, &cfg, Comm);
         int64_t k, m = 0;
         for(k = 0; k < npend; k++)
             if(rows[list[k]].redo)
@@ -1254,8 +1265,10 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
                 so_finish_def(row, d, NB, &ty, rho[d], NULL, NULL, rec);
     }
     pv.accsize = acc2;
-    if(dopass2)
-        npass2 = so_run_batches(2, &pv, batchbuf, list, nref, bcap, &tree, rho, rhomin, par, BoxSize, soft, Comm);
+    if(dopass2) {
+        bs.nlist = nref;
+        npass2 = so_run_batches(2, &pv, &bs, &tree, &cfg, Comm);
+    }
 
     /* pass 3: the profile inside the published RSO[vir] of every row with a virial result */
     int64_t nprof = 0;
@@ -1263,8 +1276,10 @@ subhalo_field_so_full(struct SubTrack * recs, int64_t n, DomainDecomp * ddecomp,
         if(rows[c].rec->MSO[SO_DEF_VIR] > 0 && rows[c].rec->RSO[SO_DEF_VIR] > 0)
             list[nprof++] = c;
     pv.accsize = acc3;
-    if(dopass3)
-        npass3 = so_run_batches(3, &pv, batchbuf, list, nprof, bcap, &tree, rho, rhomin, par, BoxSize, soft, Comm);
+    if(dopass3) {
+        bs.nlist = nprof;
+        npass3 = so_run_batches(3, &pv, &bs, &tree, &cfg, Comm);
+    }
     /* rows with an edge above rho[vir] (VmaxSO set); pv.nprofile counts those with enough particles */
     int64_t nprofdef = 0;
     for(c = 0; c < nprof; c++)

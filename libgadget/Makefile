@@ -50,9 +50,10 @@ include ../Makefile.version
 GADGET_OBJS =  \
 	 gdbtools.o hci.o\
 	 fof.o fofpetaio.o petaio.o \
-	 subhalo.o subhalo_gather.o subhalo_track.o subhalo_io.o \
+	 subhalo.o subhalo_table.o subhalo_lookup.o subhalo_newborn.o subhalo_orphan.o \
+	 subhalo_gather.o subhalo_serial.o subhalo_track.o subhalo_io.o \
 	 subhalo_unbind.o subhalo_props.o \
-	 subhalo_so.o subhalo_collective.o \
+	 subhalo_so.o subhalo_collective.o subhalo_collective_walk.o subhalo_collective_props.o \
 	 domain.o exchange.o slotsmanager.o partmanager.o \
 	 blackhole.o bhinfo.o bhdynfric.o \
 	 timebinmgr.o \
@@ -128,8 +129,8 @@ all: libgadget.a libgadget-utils.a
 .objs/test_fof: tests/test_fof.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
 	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
 
-.objs/test_subhalo: tests/test_subhalo.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
-	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
+.objs/test_subhalo: tests/test_subhalo.c tests/subhalo_testlib.h libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
+	$(MPICC) $(TCFLAGS) -I../tests/ $(filter-out %.h,$^) $(LIBS) -o $@
 
 .objs/test_subhalo_unbind: tests/test_subhalo_unbind.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
 	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
@@ -140,8 +141,8 @@ all: libgadget.a libgadget-utils.a
 .objs/test_subhalo_so: tests/test_subhalo_so.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
 	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
 
-.objs/test_subhalo_collective: tests/test_subhalo_collective.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
-	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
+.objs/test_subhalo_collective: tests/test_subhalo_collective.c tests/subhalo_testlib.h libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
+	$(MPICC) $(TCFLAGS) -I../tests/ $(filter-out %.h,$^) $(LIBS) -o $@
 
 .objs/test_forcetree: tests/test_forcetree.c libgadget.a ../tests/stub.c ../tests/cmocka.c libgadget-utils.a
 	$(MPICC) $(TCFLAGS) -I../tests/ $^ $(LIBS) -o $@
@@ -165,6 +166,9 @@ all: libgadget.a libgadget-utils.a
 
 build-tests: $(TESTBIN)
 
+# The unit suite. Slow subhalo tests (the unbinding thread matrix, sampled_default_full,
+# fallback) print a skip note unless SUBHALO_TEST_FULL is set to anything but 0, e.g.
+# make test SUBHALO_TEST_FULL=1.
 test : build-tests
 	trap 'err=1' ERR; for tt in $(SUITE) ; do \
 		if [[ "$(MPISUITE)" =~ .*$$tt.* ]]; then \

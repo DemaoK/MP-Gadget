@@ -1,8 +1,12 @@
 /* Serial tests of the unbinding kernel (subhalo_unbind.c; design 7.4) and the k-nearest tracer
  * search: Hernquist haloes, unbound shells, subsampling, satellites, scale factor, thermal energy,
- * periodic gravity, ties, tree order, core fill, sinking, death, rescue; bitwise results at 1 to 8
- * threads and inside a worker region (decisions 37, 42.5); the sampled final pass (42.4).
+ * periodic gravity, ties, tree order, core fill, sinking, death, rescue and its clipped core frame, the
+ * second attempt after a large loss; bitwise results at 1 to 8 threads and inside a worker region; the sampled
+ * final pass.
  * test_timing takes sizes, thresholds, threads and the final-pass mode from SUBHALO_UNBIND_TIMING*.
+ * The slow tests (threads_bitwise, threads_worker_region, final_pass_sampled_large,
+ * threads_par_min) run only with SUBHALO_TEST_FULL set to anything but 0, e.g. 1 (make test does
+ * not set it); otherwise each prints a note.
  * Haloes sample the exact Hernquist distribution function (truncated at 100 scale radii) across a
  * periodic boundary; a = 1, H = 0, units kpc/h, 1e10 Msun/h, km/s. Run as: mpirun -np 1. */
 
@@ -45,6 +49,19 @@
 
 static const double Centre[3] = {3.0, BOXSIZE - 5.0, 0.5 * BOXSIZE};
 static const double Bulk[3] = {100., -50., 30.};
+
+/* True when SUBHALO_TEST_FULL is set and not "0"; otherwise a slow test returns at once with this
+ * note. The ranks agree on the answer, so a skipped test cannot unmatch later collectives. */
+static int
+full_test(const char * name)
+{
+    const char * e = getenv("SUBHALO_TEST_FULL");
+    int on = e && *e && strcmp(e, "0") != 0;
+    MPI_Allreduce(MPI_IN_PLACE, &on, 1, MPI_INT, MPI_LAND, MPI_COMM_WORLD);
+    if(!on)
+        message(0, "%s: slow test skipped (set SUBHALO_TEST_FULL=1 to run it)\n", name);
+    return on;
+}
 
 static struct SubhaloUnbindParams
 default_params(void)
@@ -252,6 +269,16 @@ is_sorted(const double * E, const int64_t * I, int64_t n)
             return 0;
     }
     return 1;
+}
+
+/* subhalo_sink_test on cores given by their parts: satellite s, ancestor a. */
+static int
+sink_cores(const double sPos[3], const double sVel[3], const double aPos[3], const double aVel[3], double aSigmaX,
+           double aSigmaV, double sSigmaX, double sSigmaV, int symmetric)
+{
+    struct SubhaloCore s = {{sPos[0], sPos[1], sPos[2]}, {sVel[0], sVel[1], sVel[2]}, sSigmaX, sSigmaV};
+    struct SubhaloCore a = {{aPos[0], aPos[1], aPos[2]}, {aVel[0], aVel[1], aVel[2]}, aSigmaX, aSigmaV};
+    return subhalo_sink_test(&s, &a, symmetric, BOXSIZE);
 }
 
 static double
@@ -710,8 +737,8 @@ test_satellite(void ** state)
     subhalo_core(&h.c, &up, 20, hp, hv, &hsx, &hsv);
     message(0, "Cores: satellite at %.2f kpc/h from the host core, host SigmaX %.3f SigmaV %.2f, satellite SigmaX %.3f SigmaV %.2f\n",
             dist_periodic(sp, hp), hsx, hsv, ssx, ssv);
-    assert_int_equal(subhalo_sink_test(sp, sv, hp, hv, hsx, hsv, ssx, ssv, 0, BOXSIZE), 0);
-    assert_int_equal(subhalo_sink_test(sp, sv, hp, hv, hsx, hsv, ssx, ssv, 1, BOXSIZE), 0);
+    assert_int_equal(sink_cores(sp, sv, hp, hv, hsx, hsv, ssx, ssv, 0), 0);
+    assert_int_equal(sink_cores(sp, sv, hp, hv, hsx, hsv, ssx, ssv, 1), 0);
 
     /* move the satellite rigidly onto the host core with the host core velocity */
     for(i = NHALO; i < NHALO + NSAT; i++)
@@ -722,8 +749,8 @@ test_satellite(void ** state)
     subhalo_core(&s.c, &up, 20, sp, sv, &ssx, &ssv);
     message(0, "Moved satellite: core offset %.3g, |dv| %.3g\n", dist_periodic(sp, hp),
             sqrt((sv[0] - hv[0]) * (sv[0] - hv[0]) + (sv[1] - hv[1]) * (sv[1] - hv[1]) + (sv[2] - hv[2]) * (sv[2] - hv[2])));
-    assert_int_equal(subhalo_sink_test(sp, sv, hp, hv, hsx, hsv, ssx, ssv, 0, BOXSIZE), 1);
-    assert_int_equal(subhalo_sink_test(sp, sv, hp, hv, hsx, hsv, ssx, ssv, 1, BOXSIZE), 1);
+    assert_int_equal(sink_cores(sp, sv, hp, hv, hsx, hsv, ssx, ssv, 0), 1);
+    assert_int_equal(sink_cores(sp, sv, hp, hv, hsx, hsv, ssx, ssv, 1), 1);
 
     cand_free(&h);
     myfree(insat);
@@ -854,7 +881,7 @@ test_thermal(void ** state)
     PartManager->NumPart = 0;
 }
 
-/* ------------------------------------------------------------------ adversarial oracles (audit J5, J6, J10, item 6) */
+/* ------------------------------------------------------------------ adversarial oracles */
 
 static void
 set_particle(int64_t i, int type, double mass, MyIDType id, double x, double y, double z)
@@ -907,8 +934,8 @@ nb_better(double d2, int64_t p, double d2w, int64_t pw)
 static void
 knn_brute(int64_t q, const int64_t * tr, int64_t nt, int k, double L, int64_t * res)
 {
-    double bd[SUBHALO_KNN_MAXK];
-    int64_t bi[SUBHALO_KNN_MAXK];
+    double bd[SUBHALO_KNN_MAXK + 1];
+    int64_t bi[SUBHALO_KNN_MAXK + 1];
     int nb = 0, a;
     int64_t j;
     for(j = 0; j < nt; j++) {
@@ -929,7 +956,7 @@ knn_brute(int64_t q, const int64_t * tr, int64_t nt, int k, double L, int64_t * 
         res[a] = a < nb ? bi[a] : -1;
 }
 
-/* Periodic gravity (J5). The audit's minimal case: box 10, frame origin 0, particles at 4.9 and
+/* Periodic gravity. The minimal case: box 10, frame origin 0, particles at 4.9 and
  * 5.1 (separation 0.2, 9.8 if unwrapped about the origin), by direct sum and by the tree, with
  * velocities that bind the pair only at the periodic separation. Then a tree-sized clump
  * straddling the unwrap cut of the frame in every axis plus a uniform background over the
@@ -1032,11 +1059,11 @@ test_periodic_gravity(void ** state)
     teardown_pman();
 }
 
-/* k nearest tracers (J5, J10): the audit's minimal cut, an exact tie with the larger ID first
+/* k nearest tracers: the minimal cut, an exact tie with the larger ID first
  * in P, and a tree-sized set (origin tracer at 0, half the tracers and queries in a cube around
  * the antipode, half uniform, integer coordinates for exact ties, scrambled IDs) against the
  * periodic brute force with (d2, ID, index) order; a tree built once and queried in batches
- * gives the same rows with one build. */
+ * gives the same rows with one build; the largest k, SUBHALO_KNN_MAXK + 1, agrees with the brute force. */
 static void
 test_knn(void ** state)
 {
@@ -1102,7 +1129,7 @@ test_knn(void ** state)
     assert_int_equal(arena.used, 0);
     int64_t bad = 0, ties = 0, idties = 0;
     for(i = 0; i < nq; i++) {
-        int64_t bi[SUBHALO_KNN_MAXK];
+        int64_t bi[SUBHALO_KNN_MAXK + 1];
         knn_brute(q[i], tr, nt, k, L, bi);
         for(a = 0; a < k; a++) {
             if(out[i * k + a] != bi[a])
@@ -1128,6 +1155,24 @@ test_knn(void ** state)
     assert_int_equal(subhalo_knn_build_count(), nb0 + 1);
     assert_memory_equal(out, out_b, sizeof(int64_t) * nq * k);
 
+    /* the largest k of a query, one above a parameter's */
+    {
+        const int kx = SUBHALO_KNN_MAXK + 1;
+        int64_t * outx = (int64_t *) mymalloc("TestOutX", sizeof(int64_t) * nq * kx);
+        subhalo_knn_tracers(q, nq, tr, nt, kx, outx, L, &arena);
+        assert_int_equal(arena.used, 0);
+        int64_t badx = 0;
+        for(i = 0; i < nq; i++) {
+            int64_t bi[SUBHALO_KNN_MAXK + 1];
+            knn_brute(q[i], tr, nt, kx, L, bi);
+            for(a = 0; a < kx; a++)
+                badx += outx[i * kx + a] != bi[a];
+        }
+        message(0, "kNN at k = %d: %ld mismatches against the brute force over %ld queries\n", kx, (long) badx, (long) nq);
+        assert_int_equal(badx, 0);
+        myfree(outx);
+    }
+
     myfree(out_b);
     myfree(out);
     myfree(q);
@@ -1136,8 +1181,8 @@ test_knn(void ** state)
     teardown_pman();
 }
 
-/* Reassignment scaling (J6, audit item 7): one tree per key queried in 256-query batches, as the
- * driver does, against the former rebuild per batch; the build counter and the times. */
+/* Reassignment scaling: one tree per key queried in batches of 256 (the driver sizes its
+ * batches by the arena), against a rebuild per batch; the build counter and the times. */
 static void
 test_knn_scaling(void ** state)
 {
@@ -1182,7 +1227,7 @@ test_knn_scaling(void ** state)
         }
         arena.used = 0;
         assert_int_equal(subhalo_knn_build_count(), c0 + 1);
-        /* the former pattern: a full rebuild for every batch */
+        /* the alternative: a full rebuild for every batch */
         int64_t * out2 = (int64_t *) mymalloc("TestOut2", sizeof(int64_t) * nq * k);
         t0 = MPI_Wtime();
         for(i = 0; i < nq; i += B)
@@ -1203,7 +1248,7 @@ test_knn_scaling(void ** state)
     }
 }
 
-/* Exact energy ties (J10): NTIE particles at one point (every potential is the same sum of
+/* Exact energy ties: NTIE particles at one point (every potential is the same sum of
  * identical terms, direct or tree) with velocities +-(k + 1) s along axis k % 3 for pair k, so
  * each pair ties exactly; IDs scrambled against P order. The bound and unbound parts must be in
  * (E, ID) order and the result, IDs and energies, identical bit for bit for a second copy laid
@@ -1302,7 +1347,7 @@ test_ties(void ** state)
     teardown_pman();
 }
 
-/* Tree energies do not depend on the order of P (J10, equal Morton keys ordered by ID): a
+/* Tree energies do not depend on the order of P (equal Morton keys ordered by ID): a
  * Hernquist cloud with every fifth particle on top of the previous one and mixed masses, laid
  * out twice in different P orders with scrambled IDs, gives bitwise identical energies. */
 static void
@@ -1441,17 +1486,17 @@ test_sink_forms(void ** state)
     const double aPos[3] = {BOXSIZE - 1, 10, 10}, sPos[3] = {2, 10, 10};   /* |dx| = 3 periodic */
     const double aVel[3] = {0, 0, 0}, sVel[3] = {5, 0, 0};                  /* |dv| = 5 */
     /* compact ancestor core, diffuse satellite core: 3/1 + 5/10 = 3.5 asymmetric, 0.3 + 0.05 symmetric */
-    assert_int_equal(subhalo_sink_test(sPos, sVel, aPos, aVel, 1, 10, 10, 100, 0, BOXSIZE), 0);
-    assert_int_equal(subhalo_sink_test(sPos, sVel, aPos, aVel, 1, 10, 10, 100, 1, BOXSIZE), 1);
+    assert_int_equal(sink_cores(sPos, sVel, aPos, aVel, 1, 10, 10, 100, 0), 0);
+    assert_int_equal(sink_cores(sPos, sVel, aPos, aVel, 1, 10, 10, 100, 1), 1);
     /* diffuse ancestor: both forms sink (0.3 + 0.05), and only through the periodic offset */
-    assert_int_equal(subhalo_sink_test(sPos, sVel, aPos, aVel, 10, 100, 1, 10, 0, BOXSIZE), 1);
-    assert_int_equal(subhalo_sink_test(sPos, sVel, aPos, aVel, 10, 100, 1, 10, 1, BOXSIZE), 1);
+    assert_int_equal(sink_cores(sPos, sVel, aPos, aVel, 10, 100, 1, 10, 0), 1);
+    assert_int_equal(sink_cores(sPos, sVel, aPos, aVel, 10, 100, 1, 10, 1), 1);
     /* the boundary: 1.5 + 0.5 = 2 does not sink, just below does */
-    assert_int_equal(subhalo_sink_test(sPos, sVel, aPos, aVel, 2, 10, 1e-3, 1e-3, 0, BOXSIZE), 0);
-    assert_int_equal(subhalo_sink_test(sPos, sVel, aPos, aVel, 2.0001, 10, 1e-3, 1e-3, 0, BOXSIZE), 1);
+    assert_int_equal(sink_cores(sPos, sVel, aPos, aVel, 2, 10, 1e-3, 1e-3, 0), 0);
+    assert_int_equal(sink_cores(sPos, sVel, aPos, aVel, 2.0001, 10, 1e-3, 1e-3, 0), 1);
     /* zero dispersions: any offset is infinite, a coincident core is zero */
-    assert_int_equal(subhalo_sink_test(sPos, sVel, aPos, aVel, 0, 0, 0, 0, 1, BOXSIZE), 0);
-    assert_int_equal(subhalo_sink_test(aPos, aVel, aPos, aVel, 0, 0, 0, 0, 0, BOXSIZE), 1);
+    assert_int_equal(sink_cores(sPos, sVel, aPos, aVel, 0, 0, 0, 0, 1), 0);
+    assert_int_equal(sink_cores(aPos, aVel, aPos, aVel, 0, 0, 0, 0, 0), 1);
 }
 
 /* Subsampled potential with a subsampleable type absent from the sample and the never
@@ -1532,10 +1577,41 @@ test_death(void ** state)
     teardown_pman();
 }
 
+/* An arena with the kernel's per-particle scratch budget beyond a caller's allocation already in it;
+ * *mark is that allocation's end, where every kernel call must leave the arena. */
+static struct SubhaloArena
+arena_alloc_marked(int64_t n, size_t * mark)
+{
+    struct SubhaloArena a = arena_alloc(n + 1);
+    a.peak = 0;
+    assert_non_null(subhalo_arena_get(&a, 40));
+    *mark = a.used;
+    return a;
+}
+
+/* Sentinel outputs: all six components set, so that an untouched return can be checked in full. */
+static void
+frame_sentinel(double pos[3], double vel[3])
+{
+    int d;
+    for(d = 0; d < 3; d++) {
+        pos[d] = -1. - d;
+        vel[d] = -10. - d;
+    }
+}
+
+static int
+frame_is_sentinel(const double pos[3], const double vel[3])
+{
+    double sp[3], sv[3];
+    frame_sentinel(sp, sv);
+    return memcmp(pos, sp, sizeof(sp)) == 0 && memcmp(vel, sv, sizeof(sv)) == 0;
+}
+
 /* The rescue of a stripped satellite of track 0: a bound core of NC particles (own tag, BindRank
  * 0 .. NC-1) plus a tail of 2 NC at 300 km/s, half of it own-tag beyond the core's BindRanks, half
  * another track's with low BindRanks. The mean frame of the whole source unbinds everything; the
- * core frame from the source keeps the core. Own-tag particles with core BindRanks outside the
+ * clipped core frame from the source keeps the core. Own-tag particles with core BindRanks outside the
  * source, 500 km/s off, count for nothing. A gate or a rescue that fails leaves the candidate's
  * fields and Index order as at its first death (Energy is scratch). */
 static void
@@ -1561,7 +1637,8 @@ test_rescue(void ** state)
     gsl_rng * rng = gsl_rng_alloc(gsl_rng_mt19937);
     gsl_rng_set(rng, 32);
     int64_t i;
-    int d, tried;
+    int d;
+    struct SubhaloSecondAttempt sa;
     for(i = nc; i < n; i++) {
         double u[3];
         random_direction(rng, u);
@@ -1609,7 +1686,8 @@ test_rescue(void ** state)
         corev[d] = cv / nc;
     }
     struct SubhaloUnbindParams up = default_params();
-    struct SubhaloArena arena = arena_alloc(n);
+    size_t mark;
+    struct SubhaloArena arena = arena_alloc_marked(n, &mark);
     struct TestCand t;
     int64_t * order = (int64_t *) mymalloc("TestRescueOrder", sizeof(int64_t) * n);
     struct SubCandidate dead;
@@ -1617,10 +1695,10 @@ test_rescue(void ** state)
     /* the rescue keeps the core and nothing of the tail, within the kernel's scratch allowance */
     cand_init(&t, 0, n, mean, meanv, 5);
     assert_int_equal(subhalo_unbind(&t.c, &up, &arena), 0);
-    assert_int_equal(subhalo_unbind_rescue(&t.c, nc, &up, &arena, &tried), 1);
-    assert_int_equal(tried, 1);
-    assert_true(t.c.Flags & SUBHALO_FLAG_RESCUED);
-    assert_int_equal(arena.used, 0);
+    assert_int_equal(subhalo_unbind_rescue(&t.c, 0, n, nc, &up, &arena, &sa), 1);
+    assert_true(sa.tried == 1 && sa.stood == 1 && sa.Itercap == 0 && sa.ConvergenceRatio == t.c.ConvergenceRatio);
+    assert_true(t.c.Flags == SUBHALO_FLAG_RESCUED);
+    assert_int_equal(arena.used, mark);
     int64_t ntail = 0;
     for(i = 0; i < t.c.Nbound; i++)
         ntail += t.Index[i] >= nc;
@@ -1637,10 +1715,10 @@ test_rescue(void ** state)
     assert_int_equal(subhalo_unbind(&t.c, &up, &arena), 0);
     memcpy(order, t.Index, sizeof(int64_t) * n);
     dead = t.c;
-    assert_int_equal(subhalo_unbind_rescue(&t.c, 2 * n + 2, &up, &arena, &tried), 0);
-    assert_int_equal(tried, 0);
+    assert_int_equal(subhalo_unbind_rescue(&t.c, 0, n, 2 * n + 2, &up, &arena, &sa), 0);
+    assert_true(sa.tried == 0 && sa.stood == 0 && sa.Itercap == 0 && sa.ConvergenceRatio == 0);
     assert_true(memcmp(order, t.Index, sizeof(int64_t) * n) == 0 && memcmp(&dead, &t.c, sizeof(dead)) == 0);
-    assert_int_equal(arena.used, 0);
+    assert_int_equal(arena.used, mark);
     cand_free(&t);
 
     /* a core in the hot tail fails: the fields and the order are those of the first death */
@@ -1649,11 +1727,11 @@ test_rescue(void ** state)
     assert_int_equal(subhalo_unbind(&t.c, &up, &arena), 0);
     memcpy(order, t.Index, sizeof(int64_t) * n);
     dead = t.c;
-    assert_int_equal(subhalo_unbind_rescue(&t.c, nc, &up, &arena, &tried), 0);
-    assert_int_equal(tried, 1);
+    assert_int_equal(subhalo_unbind_rescue(&t.c, 0, n, nc, &up, &arena, &sa), 0);
+    assert_true(sa.tried == 1 && sa.stood == 0);
     assert_true(memcmp(order, t.Index, sizeof(int64_t) * n) == 0 && memcmp(&dead, &t.c, sizeof(dead)) == 0);
     assert_false(t.c.Flags & SUBHALO_FLAG_RESCUED);
-    assert_int_equal(arena.used, 0);
+    assert_int_equal(arena.used, mark);
     cand_free(&t);
 
     /* the gate counts the source only: nc/4 in-source core particles and nc outside do not make K/2 */
@@ -1664,10 +1742,10 @@ test_rescue(void ** state)
     assert_int_equal(subhalo_unbind(&t.c, &up, &arena), 0);
     memcpy(order, t.Index, sizeof(int64_t) * n);
     dead = t.c;
-    assert_int_equal(subhalo_unbind_rescue(&t.c, nc, &up, &arena, &tried), 0);
-    assert_int_equal(tried, 0);
+    assert_int_equal(subhalo_unbind_rescue(&t.c, 0, n, nc, &up, &arena, &sa), 0);
+    assert_int_equal(sa.tried, 0);
     assert_true(memcmp(order, t.Index, sizeof(int64_t) * n) == 0 && memcmp(&dead, &t.c, sizeof(dead)) == 0);
-    assert_int_equal(arena.used, 0);
+    assert_int_equal(arena.used, mark);
     cand_free(&t);
 
     /* K = max(SubhaloCoreSize, 0.1 NboundPrev) */
@@ -1677,7 +1755,696 @@ test_rescue(void ** state)
     teardown_pman();
 }
 
-/* ------------------------------------------------------------------ Phase 5b: intra-key threading */
+/* The rescue frame of a remnant of track 0: NR particles of a small Hernquist sphere, BindRank by
+ * radius (the core K = 20 innermost); NX non-members 500 km/s off; NI non-members inside the clip
+ * (at the core mean velocity + 2 km/s, 0.5 kpc off), one condition each: TrackId 5 with BoundTrackId
+ * 0 and a core rank, BoundTrackId 5 with own tag and a core rank, BindRank -1, BindRank >= K. Without
+ * outliers the frame is the core mean, bitwise the same with every non-member in the source and in
+ * any list order; the gates leave all six outputs alone. One to three core members kicked at 300 km/s
+ * carry the core mean off the remnant, which dies from it; the rescue leaves them out and binds the
+ * same set as an unbinding from the remnant's own centre. The arena returns to the caller's mark. */
+struct RadiusRank {
+    double r;
+    int64_t i;
+};
+
+static int
+cmp_radius_rank(const void * a, const void * b)
+{
+    const struct RadiusRank * x = (const struct RadiusRank *) a, * y = (const struct RadiusRank *) b;
+    return (x->r > y->r) - (x->r < y->r);
+}
+
+static int
+cmp_int64(const void * a, const void * b)
+{
+    const int64_t x = *(const int64_t *) a, y = *(const int64_t *) b;
+    return (x > y) - (x < y);
+}
+
+/* Mass-weighted frame of the particles of P[0, nr) with BindRank < K, relative to the one of rank 0. */
+static void
+core_mean(int64_t nr, int64_t K, double pos[3], double vel[3])
+{
+    int64_t i, first = -1;
+    int d;
+    for(i = 0; i < nr; i++)
+        if(P[i].BindRank == 0)
+            first = i;
+    double M = 0, mx[3] = {0, 0, 0}, mv[3] = {0, 0, 0};
+    for(i = 0; i < nr; i++) {
+        if(P[i].BindRank >= K)
+            continue;
+        M += P[i].Mass;
+        for(d = 0; d < 3; d++) {
+            mx[d] += P[i].Mass * NEAREST(P[i].Pos[d] - P[first].Pos[d], BOXSIZE);
+            mv[d] += P[i].Mass * P[i].Vel[d];
+        }
+    }
+    for(d = 0; d < 3; d++) {
+        pos[d] = wrapb(P[first].Pos[d] + mx[d] / M);
+        vel[d] = mv[d] / M;
+    }
+}
+
+static void
+test_rescue_frame(void ** state)
+{
+    const int64_t nr = 400, nx = 40, ni = 20, nf = nr + nx, n = nf + ni, K = 20;
+    setup_pman(n);
+    const double m = make_hernquist(0, nr, 0.002, 1.0, 20.0, Centre, Bulk, 51, 0);
+    struct RadiusRank * rr = (struct RadiusRank *) mymalloc("TestRadiusRank", sizeof(struct RadiusRank) * nr);
+    int64_t i;
+    int d;
+    struct SubhaloSecondAttempt sa;
+    for(i = 0; i < nr; i++) {
+        double r2 = 0;
+        for(d = 0; d < 3; d++)
+            r2 += pow(NEAREST(P[i].Pos[d] - Centre[d], BOXSIZE), 2);
+        rr[i].r = sqrt(r2);
+        rr[i].i = i;
+    }
+    qsort(rr, nr, sizeof(struct RadiusRank), cmp_radius_rank);
+    for(i = 0; i < nr; i++)
+        P[rr[i].i].BindRank = (int32_t) i;
+    myfree(rr);
+    double cpos[3], cvel[3], pos[3], vel[3], pos2[3], vel2[3];
+    core_mean(nr, K, cpos, cvel);
+    for(i = nr; i < n; i++) {
+        const int kind = (int) (i % 4);
+        memset(&P[i], 0, sizeof(P[i]));
+        P[i].Type = 1;
+        P[i].Mass = m;
+        P[i].ID = i;
+        P[i].TrackId = kind == 0 ? 5 : 0;
+        P[i].BoundTrackId = kind == 1 ? 5 : 0;
+        P[i].BindRank = (int32_t) (kind == 2 ? -1 : (kind == 3 ? K + i : i % K));
+        for(d = 0; d < 3; d++) {
+            if(i < nf) {
+                P[i].Pos[d] = wrapb(Centre[d] + 0.1 * (double) (i % 7) - 0.3);
+                P[i].Vel[d] = Bulk[d] + (d == 0 ? 500. : 0);
+            }
+            else {
+                P[i].Pos[d] = wrapb(cpos[d] + (d == 0 ? 0.5 : 0));
+                P[i].Vel[d] = cvel[d] + (d == 0 ? 2. : 0);
+            }
+        }
+    }
+    MyFloat * vsave = (MyFloat *) mymalloc("TestRescueVel", sizeof(MyFloat) * 3 * nr);
+    for(i = 0; i < nr; i++)
+        for(d = 0; d < 3; d++)
+            vsave[3 * i + d] = P[i].Vel[d];
+    struct SubhaloUnbindParams up = default_params();
+    size_t mark;
+    struct SubhaloArena arena = arena_alloc_marked(n, &mark);
+    struct TestCand t;
+    int64_t * setc = (int64_t *) mymalloc("TestRescueSet", sizeof(int64_t) * n);
+
+    /* no outliers: the core mean to rounding; c and its Index untouched */
+    cand_init(&t, 0, nr, Centre, Bulk, 7);
+    const struct SubCandidate before = t.c;
+    assert_int_equal(subhalo_rescue_frame(&t.c, K, &up, &arena, pos, vel), 1);
+    assert_int_equal(arena.used, mark);
+    assert_true(memcmp(&before, &t.c, sizeof(before)) == 0);
+    for(i = 0; i < nr; i++)
+        assert_int_equal(t.Index[i], i);
+    for(d = 0; d < 3; d++)
+        assert_true(fabs(NEAREST(pos[d] - cpos[d], BOXSIZE)) < 1e-9 && fabs(vel[d] - cvel[d]) < 1e-9);
+    cand_free(&t);
+
+    /* every non-member, inside the clip or far off, and the list order change no bit */
+    cand_init(&t, 0, n, Centre, Bulk, 7);
+    for(i = 0; i < n; i++)
+        t.Index[i] = n - 1 - i;
+    assert_int_equal(subhalo_rescue_frame(&t.c, K, &up, &arena, pos2, vel2), 1);
+    assert_true(memcmp(pos, pos2, sizeof(pos)) == 0 && memcmp(vel, vel2, sizeof(vel)) == 0);
+    for(i = 0; i < n; i++)
+        t.Index[i] = (7 * i) % n;
+    assert_int_equal(subhalo_rescue_frame(&t.c, K, &up, &arena, pos2, vel2), 1);
+    assert_true(memcmp(pos, pos2, sizeof(pos)) == 0 && memcmp(vel, vel2, sizeof(vel)) == 0);
+    assert_int_equal(arena.used, mark);
+
+    /* gates, all outputs untouched: K = 2 n + 2; K/2 - 1 core members beside the non-members of core
+     * BindRank; a zero width */
+    frame_sentinel(pos2, vel2);
+    assert_int_equal(subhalo_rescue_frame(&t.c, 2 * n + 2, &up, &arena, pos2, vel2), 0);
+    assert_int_equal(arena.used, mark);
+    for(i = 0; i < nr; i++)
+        if(P[i].BindRank >= K / 2 - 1 && P[i].BindRank < K)
+            P[i].BindRank += (int32_t) nr;
+    assert_int_equal(subhalo_rescue_frame(&t.c, K, &up, &arena, pos2, vel2), 0);
+    assert_int_equal(arena.used, mark);
+    for(i = 0; i < nr; i++)
+        if(P[i].BindRank >= nr)
+            P[i].BindRank -= (int32_t) nr;
+    for(i = 0; i < nr; i++)
+        if(P[i].BindRank < K)
+            for(d = 0; d < 3; d++)
+                P[i].Vel[d] = Bulk[d];
+    assert_int_equal(subhalo_rescue_frame(&t.c, K, &up, &arena, pos2, vel2), 0);
+    assert_true(frame_is_sentinel(pos2, vel2));
+    assert_int_equal(arena.used, mark);
+    cand_free(&t);
+    for(i = 0; i < nr; i++)
+        for(d = 0; d < 3; d++)
+            P[i].Vel[d] = vsave[3 * i + d];
+
+    /* one to three of the 20 core members (ranks 2, 7, 13) kicked at 300 km/s; the candidate holds
+     * the remnant and the far non-members */
+    const int32_t kicked[3] = {2, 7, 13};
+    int nk;
+    for(nk = 1; nk <= 3; nk++) {
+        for(i = 0; i < nr; i++)
+            if(P[i].BindRank == kicked[nk - 1])
+                P[i].Vel[0] += 300.;
+        core_mean(nr, K, cpos, cvel);
+        cand_init(&t, 0, nf, Centre, Bulk, 9);
+        assert_int_equal(subhalo_unbind(&t.c, &up, &arena), 1);
+        const int64_t nbc = t.c.Nbound;
+        memcpy(setc, t.Index, sizeof(int64_t) * nbc);
+        qsort(setc, nbc, sizeof(int64_t), cmp_int64);
+        cand_free(&t);
+        cand_init(&t, 0, nf, cpos, cvel, 9);
+        const int alive = subhalo_unbind(&t.c, &up, &arena);
+        message(0, "Rescue frame, %d kicked: the core mean %.1f km/s off, %s from it\n", nk, fabs(cvel[0] - Bulk[0]),
+                alive ? "alive" : "dead");
+        assert_int_equal(alive, 0);
+        if(nk == 3)
+            assert_int_equal(subhalo_unbind_rescue(&t.c, 0, nr, K, &up, &arena, NULL), 1);
+        else {
+            assert_int_equal(subhalo_unbind_rescue(&t.c, 0, nr, K, &up, &arena, &sa), 1);
+            assert_true(sa.tried == 1 && sa.stood == 1);
+        }
+        assert_true(t.c.Flags & SUBHALO_FLAG_RESCUED);
+        assert_int_equal(arena.used, mark);
+        message(0, "Rescue frame, %d kicked: Nbound %ld (%ld from the centre)\n", nk, (long) t.c.Nbound, (long) nbc);
+        assert_int_equal(t.c.Nbound, nbc);
+        qsort(t.Index, nbc, sizeof(int64_t), cmp_int64);
+        assert_true(memcmp(t.Index, setc, sizeof(int64_t) * nbc) == 0);
+        for(i = 0; i < nbc; i++)
+            assert_true(setc[i] < nr && !(P[setc[i]].BindRank < K && P[setc[i]].Vel[0] > Bulk[0] + 200.));
+        cand_free(&t);
+    }
+    myfree(setc);
+    myfree(arena.base);
+    myfree(vsave);
+    teardown_pman();
+}
+
+/* Particle i of a hand-made core of track 0: x position x (y, z fixed), x velocity vx, y velocity vy,
+ * mass, tags, BindRank and ID. */
+static void
+core_particle(int64_t i, double x, double vx, double vy, double mass, int64_t track, int64_t bound, int32_t rank, int64_t id)
+{
+    memset(&P[i], 0, sizeof(P[i]));
+    P[i].Type = 1;
+    P[i].Mass = mass;
+    P[i].ID = id;
+    P[i].TrackId = track;
+    P[i].BoundTrackId = bound;
+    P[i].BindRank = rank;
+    P[i].Pos[0] = wrapb(x);
+    P[i].Pos[1] = 100.;
+    P[i].Pos[2] = 200.;
+    P[i].Vel[0] = vx;
+    P[i].Vel[1] = vy;
+    P[i].Vel[2] = 0;
+}
+
+/* Frame of the candidate over P[0, n) (Index reversed when rev) with core size K; the arena checked. */
+static int
+core_frame(int64_t n, int64_t K, int rev, double pos[3], double vel[3])
+{
+    struct SubhaloUnbindParams up = default_params();
+    size_t mark;
+    struct SubhaloArena arena = arena_alloc_marked(n, &mark);
+    struct TestCand t;
+    int64_t i;
+    cand_init(&t, 0, n, Centre, Bulk, 3);
+    if(rev)
+        for(i = 0; i < n; i++)
+            t.Index[i] = n - 1 - i;
+    const int ok = subhalo_rescue_frame(&t.c, K, &up, &arena, pos, vel);
+    assert_int_equal(arena.used, mark);
+    cand_free(&t);
+    myfree(arena.base);
+    return ok;
+}
+
+static double
+bits_double(uint64_t u)
+{
+    double x;
+    memcpy(&x, &u, sizeof(x));
+    return x;
+}
+
+/* Hand-made cores with analytic frames: (a) the re-centring drops a member the first clip kept,
+ * across the periodic edge; (b) an even core, its medians the means of the two middle values;
+ * (c) an odd core with outliers on both sides; (d) the membership gate at K/2 for even and odd K;
+ * (e) a non-finite velocity or position, an even median whose sum overflows and a frame whose sum
+ * overflows give no frame; (f) BindRank ties broken by ID: the same bits in either list order;
+ * (g) a core that needs all three re-centrings. */
+static void
+test_rescue_frame_cases(void ** state)
+{
+    setup_pman(16);
+    double pos[3], vel[3], pos2[3], vel2[3];
+    int64_t i;
+    const double B = BOXSIZE;
+
+    /* (a) vx -2..2, masses 100, 1, 1, 1, 1, x = B - 1.5 + j: seed 0, s 1, the first frame -198/104 keeps
+     * all five, the second drops the member at 2: -200/103 at x = B - 1.5 + 6/103 */
+    {
+        const double vx[5] = {-2, -1, 0, 1, 2}, ms[5] = {100, 1, 1, 1, 1};
+        for(i = 0; i < 5; i++)
+            core_particle(i, B - 1.5 + i, vx[i], 0, ms[i], 0, 0, (int32_t) i, 10 + i);
+        assert_int_equal(core_frame(5, 5, 0, pos, vel), 1);
+        message(0, "Rescue frame case (a): vx %.17g (-200/103 = %.17g)\n", vel[0], -200. / 103);
+        assert_true(fabs(vel[0] + 200. / 103) < 1e-12 && vel[1] == 0 && vel[2] == 0);
+        assert_true(fabs(NEAREST(pos[0] - wrapb(B - 1.5 + 6. / 103), B)) < 1e-9 && pos[1] == 100. && pos[2] == 200.);
+    }
+    /* (b) vx 0, 0, 0, 10, 10, 26, equal masses: seed 5, s 5, the member at 26 clipped: 4 at the mean x of
+     * the other five (the upper middle values would give 46/6) */
+    {
+        const double vx[6] = {0, 0, 0, 10, 10, 26};
+        for(i = 0; i < 6; i++)
+            core_particle(i, 50. + 2. * i, vx[i], 0, 1, 0, 0, (int32_t) i, 10 + i);
+        assert_int_equal(core_frame(6, 6, 0, pos, vel), 1);
+        assert_true(fabs(vel[0] - 4.) < 1e-12 && vel[1] == 0 && vel[2] == 0);
+        assert_true(fabs(pos[0] - 54.) < 1e-9 && pos[1] == 100. && pos[2] == 200.);
+    }
+    /* (c) vx 5, 1, 4, 2, 3, 40, -30 and vy 1, equal masses: seed (3, 1), s 2, the two outliers clipped:
+     * (3, 1) at the mean x of the first five */
+    {
+        const double vx[7] = {5, 1, 4, 2, 3, 40, -30};
+        for(i = 0; i < 7; i++)
+            core_particle(i, 50. + 2. * i, vx[i], 1, 1, 0, 0, (int32_t) i, 10 + i);
+        assert_int_equal(core_frame(7, 7, 0, pos, vel), 1);
+        assert_true(fabs(vel[0] - 3.) < 1e-12 && fabs(vel[1] - 1.) < 1e-12 && vel[2] == 0);
+        assert_true(fabs(pos[0] - 54.) < 1e-9 && pos[1] == 100. && pos[2] == 200.);
+    }
+    /* (d) the gate: K/2 = 5 members pass for K = 10 and K = 11, 4 do not */
+    {
+        int64_t Ks[2] = {10, 11};
+        int k;
+        for(k = 0; k < 2; k++) {
+            assert_int_equal(core_frame(5, Ks[k], 0, pos, vel), 1);
+            assert_true(fabs(vel[0] - 3.) < 1e-12);
+            frame_sentinel(pos, vel);
+            assert_int_equal(core_frame(4, Ks[k], 0, pos, vel), 0);
+            assert_true(frame_is_sentinel(pos, vel));
+        }
+    }
+    /* (e) NaN or Inf in one component of one member of core (c); identical vx 1e308 (an even median
+     * whose sum overflows; its width is 0) */
+    {
+        const uint64_t bad[3] = {0x7ff8000000000000ULL, 0x7ff0000000000000ULL, 0xfff0000000000000ULL};
+        int k;
+        for(k = 0; k < 3; k++) {
+            P[2].Vel[k % 2 ? 0 : 1] = bits_double(bad[k]);
+            frame_sentinel(pos, vel);
+            assert_int_equal(core_frame(7, 7, 0, pos, vel), 0);
+            assert_true(frame_is_sentinel(pos, vel));
+            P[2].Vel[0] = 4;
+            P[2].Vel[1] = 1;
+        }
+        assert_int_equal(core_frame(7, 7, 0, pos, vel), 1);
+        for(i = 0; i < 4; i++)
+            core_particle(i, 50. + 2. * i, 1e308, 0, 1e-10, 0, 0, (int32_t) i, 10 + i);
+        frame_sentinel(pos, vel);
+        assert_int_equal(core_frame(4, 4, 0, pos, vel), 0);
+        assert_true(frame_is_sentinel(pos, vel));
+    }
+    /* (e) a non-finite position (Inf, NaN) of one member of core (c) gives no frame */
+    {
+        const double vx[7] = {5, 1, 4, 2, 3, 40, -30};
+        const uint64_t bad[2] = {0x7ff0000000000000ULL, 0x7ff8000000000000ULL};
+        int k;
+        for(i = 0; i < 7; i++)
+            core_particle(i, 50. + 2. * i, vx[i], 1, 1, 0, 0, (int32_t) i, 10 + i);
+        for(k = 0; k < 2; k++) {
+            P[3].Pos[k] = bits_double(bad[k]);
+            frame_sentinel(pos, vel);
+            assert_int_equal(core_frame(7, 7, 0, pos, vel), 0);
+            assert_true(frame_is_sentinel(pos, vel));
+            P[3].Pos[0] = 56.;
+            P[3].Pos[1] = 100.;
+        }
+        assert_int_equal(core_frame(7, 7, 0, pos, vel), 1);
+    }
+    /* (e) vx 0.7e308 for all three, vy 0, 1, 2: the width is 1 (spread in vx would overflow the squared
+     * speeds and the width), and the frame's vx sum overflows: no frame */
+    {
+        for(i = 0; i < 3; i++)
+            core_particle(i, 50. + 2. * i, 0.7e308, (double) i, 1, 0, 0, (int32_t) i, 10 + i);
+        frame_sentinel(pos, vel);
+        assert_int_equal(core_frame(3, 3, 0, pos, vel), 0);
+        assert_true(frame_is_sentinel(pos, vel));
+    }
+    /* (f) six equal-mass members sharing BindRank 0, vx 0.3, 0.7, -0.7, -0.5, -0.1, 0.8, all inside every
+     * clip: summed in list order the two orders differ in the last bit (0.08333333333333336 against
+     * 0.08333333333333333); the ID order makes them the same */
+    {
+        const double vx[6] = {0.3, 0.7, -0.7, -0.5, -0.1, 0.8};
+        for(i = 0; i < 6; i++)
+            core_particle(i, B - 3. + 0.7 * i, vx[i], 0, 1, 0, 0, 0, 100 - i);
+        assert_int_equal(core_frame(6, 6, 0, pos, vel), 1);
+        assert_int_equal(core_frame(6, 6, 1, pos2, vel2), 1);
+        message(0, "Rescue frame case (f): vx %.17g and %.17g\n", vel[0], vel2[0]);
+        assert_true(memcmp(pos, pos2, sizeof(pos)) == 0 && memcmp(vel, vel2, sizeof(vel)) == 0);
+    }
+    /* (g) vx -30, -23, -19, -12, -1, 0, 23, masses 10, 1, 10, 10, 100, 10, 100: seed -12, s 11, the clip 33;
+     * the first frame -733/141 leaves out 23, the second 1567/241 keeps all seven, the third 1867/231 leaves
+     * out -30 (three re-centrings needed), at x = 50 + 2 * 1101/231 */
+    {
+        const double vx[7] = {-30, -23, -19, -12, -1, 0, 23}, ms[7] = {10, 1, 10, 10, 100, 10, 100};
+        for(i = 0; i < 7; i++)
+            core_particle(i, 50. + 2. * i, vx[i], 0, ms[i], 0, 0, (int32_t) i, 10 + i);
+        assert_int_equal(core_frame(7, 7, 0, pos, vel), 1);
+        message(0, "Rescue frame case (g): vx %.17g (1867/231 = %.17g; 1567/241 = %.17g)\n", vel[0], 1867. / 231,
+                1567. / 241);
+        assert_true(fabs(vel[0] - 1867. / 231) < 1e-12 && vel[1] == 0 && vel[2] == 0);
+        assert_true(fabs(pos[0] - (50. + 2. * 1101. / 231)) < 1e-9 && pos[1] == 100. && pos[2] == 200.);
+    }
+    teardown_pman();
+}
+
+/* A cold clump in P[first, first + n): mass m each, uniform in a sphere of radius R about cen, velocities
+ * vel plus 1 km/s Gaussian per component, IDs id0 + j, track 0's own tags with BindRank rank0 + j. */
+static void
+make_clump(int64_t first, int64_t n, double m, double R, const double cen[3], const double vel[3], unsigned long seed,
+           int64_t id0, int32_t rank0)
+{
+    gsl_rng * rng = gsl_rng_alloc(gsl_rng_mt19937);
+    gsl_rng_set(rng, seed);
+    int64_t i;
+    int d;
+    for(i = first; i < first + n; i++) {
+        double u[3];
+        random_direction(rng, u);
+        const double r = R * cbrt(gsl_rng_uniform(rng));
+        memset(&P[i], 0, sizeof(P[i]));
+        P[i].Type = 1;
+        P[i].Mass = m;
+        P[i].ID = id0 + (i - first);
+        P[i].BindRank = rank0 + (int32_t) (i - first);
+        for(d = 0; d < 3; d++) {
+            P[i].Pos[d] = wrapb(cen[d] + r * u[d]);
+            P[i].Vel[d] = vel[d] + gsl_ran_gaussian(rng, 1.);
+        }
+    }
+    gsl_rng_free(rng);
+}
+
+/* c and b hold the same result: every field (the list pointers aside), Index[0, N) and, when ne > 0, Energy[0, ne). */
+static int
+same_result(const struct SubCandidate * c, const struct SubCandidate * b, int64_t ne)
+{
+    struct SubCandidate x = *c, y = *b;
+    x.Index = y.Index = NULL;
+    x.Energy = y.Energy = NULL;
+    return memcmp(&x, &y, sizeof(x)) == 0 && memcmp(c->Index, b->Index, sizeof(int64_t) * c->N) == 0
+           && (ne <= 0 || memcmp(c->Energy, b->Energy, sizeof(double) * ne) == 0);
+}
+
+/* Unbinding of track 0's candidate over P[0, n) from the first frame (pos, vel), seed 13. */
+static int
+first_attempt(struct TestCand * t, int64_t n, const double pos[3], const double vel[3], const struct SubhaloUnbindParams * up,
+              struct SubhaloArena * arena)
+{
+    cand_init(t, 0, n, pos, vel, 13);
+    return subhalo_unbind(&t->c, up, arena);
+}
+
+/* The second attempt after a large loss. (a) A core clump of na (BindRank from 0) and a fragment clump of nb (BindRank
+ * beyond K) 20 kpc and 400 km/s off, the first frame the fragment's: the first attempt keeps the fragment. With
+ * na > nb the core frame's larger set stands, RESCUED; with na < nb the first result is restored bitwise and its
+ * final pass equals that of a candidate never tried. (b) 2 Nbound == NPrev gets no second attempt, NPrev one more
+ * does. (c) One clump from a frame 1 km/s off: both attempts bind it all; the tie keeps the first. (d) One clump
+ * from a frame that keeps its inner part, MaxIter 1: the first attempt stops at the cap, the second converges; the
+ * result that stands carries RESCUED only. (e) No rescue frame: c untouched, nothing tried. (f) A core of 15, below
+ * MinNumPart, still gives the frame: the second attempt dies, the first result stands alive. (g) The first attempt
+ * converges, the losing second stops at the cap (MaxIter 1 for it alone): the restored result has no ITERCAP. NPrev is
+ * three times the source unless stated (the rest stripped); the arena returns to the caller's mark throughout. */
+static void
+test_rescue_loss(void ** state)
+{
+    const int64_t nmax = 400, K = 20;
+    const double m = 1e-3, sep = 20., dv = 400.;
+    setup_pman(nmax);
+    struct SubhaloUnbindParams up = default_params();
+    size_t mark;
+    struct SubhaloArena arena = arena_alloc_marked(nmax, &mark);
+    struct TestCand t, u;
+    struct SubhaloSecondAttempt sa;
+    struct SubCandidate first;
+    int64_t * order = (int64_t *) mymalloc("TestLossOrder", sizeof(int64_t) * nmax);
+    double fpos[3], fvel[3];
+    int64_t i, nb1;
+    int d, k;
+
+    /* the threshold in integers is SUBHALO_RESCUE_LOSS of NPrev */
+    for(i = 0; i <= 200; i++)
+        for(k = 0; k <= i + 2; k++)
+            assert_int_equal(subhalo_rescue_large_loss(k, i), (double) k < SUBHALO_RESCUE_LOSS * (double) i);
+
+    /* (a) */
+    const int64_t sizes[2][2] = {{300, 60}, {40, 200}};
+    for(k = 0; k < 2; k++) {
+        const int64_t na = sizes[k][0], nb = sizes[k][1], n = na + nb;
+        for(d = 0; d < 3; d++) {
+            fpos[d] = wrapb(Centre[d] + (d == 0 ? sep : 0));
+            fvel[d] = Bulk[d] + (d == 0 ? dv : 0);
+        }
+        make_clump(0, na, m, 3., Centre, Bulk, 61 + k, 0, 0);
+        make_clump(na, nb, m, 3., fpos, fvel, 71 + k, na, 10000);
+        assert_int_equal(first_attempt(&t, n, fpos, fvel, &up, &arena), 1);
+        nb1 = t.c.Nbound;
+        for(i = 0; i < nb1; i++)
+            assert_true(t.Index[i] >= na);
+        assert_true(nb1 >= nb - 2 && subhalo_rescue_large_loss(nb1, 3 * n));
+        first = t.c;
+        memcpy(order, t.Index, sizeof(int64_t) * n);
+        assert_int_equal(subhalo_unbind_rescue(&t.c, 1, 3 * n, K, &up, &arena, &sa), 1);
+        assert_int_equal(arena.used, mark);
+        assert_true(sa.tried == 1 && sa.Itercap == 0 && sa.ConvergenceRatio > 0);
+        assert_true(is_permutation(t.Index, n, 0));
+        if(na > nb) {
+            message(0, "Rescue after a loss: first %ld of the fragment, second %ld of a core of %ld\n", (long) nb1,
+                    (long) t.c.Nbound, (long) na);
+            assert_int_equal(sa.stood, 1);
+            assert_true(t.c.Flags == SUBHALO_FLAG_RESCUED && t.c.Nbound > nb1 && t.c.Nbound >= na - 2);
+            for(i = 0; i < t.c.Nbound; i++)
+                assert_true(t.Index[i] < na);
+            assert_true(is_sorted(t.Energy, t.Index, t.c.Nbound));
+        }
+        else {
+            assert_int_equal(sa.stood, 0);
+            assert_true(memcmp(&first, &t.c, sizeof(first)) == 0 && memcmp(order, t.Index, sizeof(int64_t) * n) == 0);
+            assert_false(t.c.Flags & SUBHALO_FLAG_RESCUED);
+            /* the core frame alone binds the smaller core */
+            assert_int_equal(subhalo_rescue_frame(&t.c, K, &up, &arena, fpos, fvel), 1);
+            assert_int_equal(first_attempt(&u, n, fpos, fvel, &up, &arena), 1);
+            message(0, "Rescue after a loss: first %ld of the fragment kept, the core frame binds %ld\n", (long) nb1,
+                    (long) u.c.Nbound);
+            assert_true(u.c.Nbound > 0 && u.c.Nbound <= na);
+            cand_free(&u);
+            /* the final pass of the restored result is that of a candidate never tried */
+            for(d = 0; d < 3; d++) {
+                fpos[d] = wrapb(Centre[d] + (d == 0 ? sep : 0));
+                fvel[d] = Bulk[d] + (d == 0 ? dv : 0);
+            }
+            assert_int_equal(first_attempt(&u, n, fpos, fvel, &up, &arena), 1);
+            assert_true(same_result(&t.c, &u.c, 0));
+            subhalo_final_pass(&t.c, &up, &arena);
+            subhalo_final_pass(&u.c, &up, &arena);
+            assert_int_equal(arena.used, mark);
+            assert_true(same_result(&t.c, &u.c, t.c.Nbound));
+            cand_free(&u);
+        }
+        cand_free(&t);
+    }
+
+    /* (b) and (e) on the first case of (a) */
+    {
+        const int64_t na = 300, nb = 60, n = na + nb;
+        for(d = 0; d < 3; d++) {
+            fpos[d] = wrapb(Centre[d] + (d == 0 ? sep : 0));
+            fvel[d] = Bulk[d] + (d == 0 ? dv : 0);
+        }
+        make_clump(0, na, m, 3., Centre, Bulk, 61, 0, 0);
+        make_clump(na, nb, m, 3., fpos, fvel, 71, na, 10000);
+        assert_int_equal(first_attempt(&t, n, fpos, fvel, &up, &arena), 1);
+        nb1 = t.c.Nbound;
+        first = t.c;
+        memcpy(order, t.Index, sizeof(int64_t) * n);
+        assert_int_equal(subhalo_unbind_rescue(&t.c, 1, 2 * nb1, K, &up, &arena, &sa), 1);
+        assert_true(sa.tried == 0 && sa.stood == 0 && sa.Itercap == 0 && sa.ConvergenceRatio == 0);
+        assert_true(memcmp(&first, &t.c, sizeof(first)) == 0 && memcmp(order, t.Index, sizeof(int64_t) * n) == 0);
+        assert_int_equal(subhalo_unbind_rescue(&t.c, 1, 3 * n, 2 * n + 2, &up, &arena, &sa), 1);
+        assert_true(sa.tried == 0 && sa.stood == 0 && sa.Itercap == 0 && sa.ConvergenceRatio == 0);
+        assert_true(memcmp(&first, &t.c, sizeof(first)) == 0 && memcmp(order, t.Index, sizeof(int64_t) * n) == 0);
+        assert_int_equal(arena.used, mark);
+        assert_int_equal(subhalo_unbind_rescue(&t.c, 1, 2 * nb1 + 1, K, &up, &arena, NULL), 1);
+        assert_true(t.c.Flags == SUBHALO_FLAG_RESCUED && t.c.Nbound > nb1);
+        assert_int_equal(arena.used, mark);
+        cand_free(&t);
+    }
+
+    /* (c) */
+    {
+        const int64_t n = 100;
+        make_clump(0, n, m, 3., Centre, Bulk, 81, 0, 0);
+        for(d = 0; d < 3; d++)
+            fvel[d] = Bulk[d] + (d == 0 ? 1. : 0);
+        assert_int_equal(first_attempt(&t, n, Centre, fvel, &up, &arena), 1);
+        assert_int_equal(t.c.Nbound, n);
+        first = t.c;
+        memcpy(order, t.Index, sizeof(int64_t) * n);
+        /* the second attempt binds all n as well: its frame, from the first result's order */
+        assert_int_equal(subhalo_rescue_frame(&t.c, K, &up, &arena, fpos, fvel), 1);
+        cand_init(&u, 0, n, fpos, fvel, 13);
+        memcpy(u.Index, order, sizeof(int64_t) * n);
+        assert_int_equal(subhalo_unbind(&u.c, &up, &arena), 1);
+        assert_int_equal(u.c.Nbound, n);
+        cand_free(&u);
+        assert_int_equal(subhalo_unbind_rescue(&t.c, 1, 3 * n, K, &up, &arena, &sa), 1);
+        assert_true(sa.tried == 1 && sa.stood == 0);
+        assert_true(memcmp(&first, &t.c, sizeof(first)) == 0 && memcmp(order, t.Index, sizeof(int64_t) * n) == 0);
+        assert_int_equal(arena.used, mark);
+        cand_free(&t);
+    }
+
+    /* (d) a clump of 400 in 10 kpc: from 67 km/s off only its inner part is bound */
+    {
+        const int64_t n = 400;
+        struct SubhaloUnbindParams up1 = up;
+        up1.MaxIter = 1;
+        make_clump(0, n, m, 10., Centre, Bulk, 91, 0, 0);
+        for(d = 0; d < 3; d++)
+            fvel[d] = Bulk[d] + (d == 0 ? 67. : 0);
+        assert_int_equal(first_attempt(&t, n, Centre, fvel, &up1, &arena), 1);
+        nb1 = t.c.Nbound;
+        message(0, "Rescue after a loss at the iteration cap: first %ld of %ld\n", (long) nb1, (long) n);
+        assert_true(t.c.Flags == SUBHALO_FLAG_ITERCAP && subhalo_rescue_large_loss(nb1, n));
+        first = t.c;
+        memcpy(order, t.Index, sizeof(int64_t) * n);
+        assert_int_equal(subhalo_unbind_rescue(&t.c, 1, n, K, &up1, &arena, &sa), 1);
+        assert_true(sa.tried == 1 && sa.stood == 1 && sa.Itercap == 0 && sa.ConvergenceRatio == 1.);
+        assert_true(t.c.Flags == SUBHALO_FLAG_RESCUED && t.c.Nbound == n);
+        assert_int_equal(arena.used, mark);
+        cand_free(&t);
+        /* restored after a second attempt at the cap: the first's ITERCAP stays, the second's is reported */
+        make_clump(0, n / 2, m, 10., Centre, Bulk, 92, 0, 0);
+        for(d = 0; d < 3; d++) {
+            fpos[d] = wrapb(Centre[d] + (d == 0 ? 2 * sep : 0));
+            fvel[d] = Bulk[d] + (d == 0 ? dv : 0);
+        }
+        make_clump(n / 2, n / 2, m, 3., fpos, fvel, 93, n / 2, 10000);
+        for(i = 0; i < n / 4; i++)
+            P[i].Vel[1] += dv;
+        assert_int_equal(first_attempt(&t, n, fpos, fvel, &up1, &arena), 1);
+        first = t.c;
+        memcpy(order, t.Index, sizeof(int64_t) * n);
+        message(0, "Rescue after a loss at the iteration cap: first %ld of %ld, flags %d\n", (long) t.c.Nbound, (long) n, t.c.Flags);
+        assert_true(t.c.Flags == SUBHALO_FLAG_ITERCAP && subhalo_rescue_large_loss(t.c.Nbound, 3 * n));
+        assert_int_equal(subhalo_unbind_rescue(&t.c, 1, 3 * n, K, &up1, &arena, &sa), 1);
+        assert_true(sa.tried == 1 && sa.stood == 0 && sa.Itercap == 1 && sa.ConvergenceRatio < 1.);
+        assert_true(memcmp(&first, &t.c, sizeof(first)) == 0 && memcmp(order, t.Index, sizeof(int64_t) * n) == 0);
+        assert_int_equal(arena.used, mark);
+        /* the reported ratio is the second attempt's own: the same attempt standing for a dead first gives it */
+        struct SubhaloSecondAttempt sb;
+        assert_int_equal(subhalo_unbind_rescue(&t.c, 0, 3 * n, K, &up1, &arena, &sb), 1);
+        message(0, "Second attempt at the cap: ratio %.6f, the first's %.6f\n", sb.ConvergenceRatio, first.ConvergenceRatio);
+        assert_true(sb.stood == 1 && t.c.ConvergenceRatio == sa.ConvergenceRatio && sa.ConvergenceRatio != first.ConvergenceRatio);
+        /* a capped second attempt that stands reports its own cap and ratio, and the candidate carries both flags */
+        assert_true(sb.tried == 1 && sb.Itercap == 1 && sb.ConvergenceRatio == sa.ConvergenceRatio);
+        assert_int_equal(t.c.Flags, SUBHALO_FLAG_ITERCAP | SUBHALO_FLAG_RESCUED);
+        assert_int_equal(arena.used, mark);
+        cand_free(&t);
+    }
+
+    /* (f) and (g): the first attempt keeps the fragment and converges, the second binds less */
+    const int64_t sizes2[2][2] = {{15, 60}, {40, 200}};
+    for(k = 0; k < 2; k++) {
+        const int64_t na = sizes2[k][0], nb = sizes2[k][1], n = na + nb;
+        struct SubhaloUnbindParams up2 = up;
+        up2.MaxIter = k == 0 ? up.MaxIter : 1;
+        double cpos[3], cvel[3];
+        for(d = 0; d < 3; d++) {
+            fpos[d] = wrapb(Centre[d] + (d == 0 ? sep : 0));
+            fvel[d] = Bulk[d] + (d == 0 ? dv : 0);
+        }
+        make_clump(0, na, m, 3., Centre, Bulk, 101 + k, 0, 0);
+        make_clump(na, nb, m, 3., fpos, fvel, 111 + k, na, 10000);
+        assert_int_equal(first_attempt(&t, n, fpos, fvel, &up, &arena), 1);
+        assert_true(t.c.Flags == 0 && subhalo_rescue_large_loss(t.c.Nbound, 3 * n));
+        first = t.c;
+        memcpy(order, t.Index, sizeof(int64_t) * n);
+        /* the second attempt alone, from the core frame and the first result's order */
+        assert_int_equal(subhalo_rescue_frame(&t.c, K, &up, &arena, cpos, cvel), 1);
+        cand_init(&u, 0, n, cpos, cvel, 13);
+        memcpy(u.Index, order, sizeof(int64_t) * n);
+        const int second = subhalo_unbind(&u.c, &up2, &arena);
+        message(0, "Rescue after a loss, second attempt %s: first %ld of %ld, second alive %d with %ld, flags %d\n",
+                k == 0 ? "dead" : "at the cap", (long) t.c.Nbound, (long) n, second, (long) u.c.Nbound, u.c.Flags);
+        if(k == 0)
+            assert_int_equal(second, 0);
+        else
+            assert_true(u.c.Flags == SUBHALO_FLAG_ITERCAP && u.c.Nbound <= t.c.Nbound);
+        cand_free(&u);
+        assert_int_equal(subhalo_unbind_rescue(&t.c, 1, 3 * n, K, &up2, &arena, &sa), 1);
+        assert_true(sa.tried == 1 && sa.stood == 0 && sa.Itercap == k);
+        assert_true(memcmp(&first, &t.c, sizeof(first)) == 0 && memcmp(order, t.Index, sizeof(int64_t) * n) == 0);
+        assert_int_equal(t.c.Flags, 0);
+        assert_int_equal(arena.used, mark);
+        cand_free(&t);
+    }
+    myfree(order);
+    myfree(arena.base);
+    teardown_pman();
+}
+
+/* The admission threshold ceil(s k): the share n / k needs n votes, a share above it by far more than rounding
+ * needs n + 1; representable shares pin the guard of 2^-52 above a multiple of 1/k from both sides. */
+static void
+test_admit_need(void ** state)
+{
+    int k, n;
+    /* a share read as a parameter: the compiler may not cancel its division against s k */
+    volatile double s;
+    for(k = 1; k <= SUBHALO_KNN_MAXK; k++)
+        for(n = 1; n <= k; n++) {
+            s = (double) n / k;
+            assert_int_equal(subhalo_admit_need(s, k), n);
+            if(n < k) {
+                s = ((double) n / k) * (1 + 1e-12);
+                assert_int_equal(subhalo_admit_need(s, k), n + 1);
+            }
+        }
+    assert_int_equal(subhalo_admit_need(0.3, 10), 3);
+    assert_int_equal(subhalo_admit_need(0.5, 10), 5);
+    assert_int_equal(subhalo_admit_need(0.7, 10), 7);
+    assert_int_equal(subhalo_admit_need(0.50000000005, 10), 6);
+    assert_int_equal(subhalo_admit_need(5.0 / 7, 7), 5);
+    assert_int_equal(subhalo_admit_need(1.0, 64), 64);
+    assert_int_equal(subhalo_admit_need(1e-9, 10), 1);
+    /* shares whose exact product lies a few ulp above 1: a floating product's association decides them */
+    assert_int_equal(subhalo_admit_need(0x1.5555555555561p-2, 3), 2);
+    assert_int_equal(subhalo_admit_need(0x1.99999999999a7p-3, 5), 2);
+    /* the guard: 2^-52 above 1/4 counts as 1/4, 2^-53 more does not; 0.30000000000000004 is 3/10 */
+    assert_int_equal(subhalo_admit_need(0.25 + ldexp(1, -52), 4), 1);
+    assert_int_equal(subhalo_admit_need(0.25 + ldexp(1, -52) + ldexp(1, -53), 4), 2);
+    assert_int_equal(subhalo_admit_need(0.30000000000000004, 10), 3);
+    /* the guard is two units exactly: with k = 3 the products 2^53 - 2 and 2^53 + 1 of k (Q - 2) lie on
+     * either side of one vote; a share that rounds to no unit needs one vote */
+    assert_int_equal(subhalo_admit_need(0x1.5555555555558p-2, 3), 1);
+    assert_int_equal(subhalo_admit_need(0x1.555555555555ap-2, 3), 2);
+    assert_int_equal(subhalo_admit_need(0x1p-60, 10), 1);
+}
+
+/* ------------------------------------------------------------------ intra-key threading */
 
 /* A host Hernquist sphere of nhost particles (IDs 0..) at Centre and a satellite of nsat (a
  * tenth of the mass, a quarter of the scale radius; IDs from nhost) at 2 a on a circular orbit,
@@ -1708,7 +2475,7 @@ struct CandResult {
 
 /* subhalo_unbind (+ subhalo_final_pass when it survives) of P[0, n) with nth OpenMP threads. */
 /* When set, run_threads copies the loop order (Index after subhalo_unbind, before the final pass,
- * all n entries) here (test_final_pass_sampled, audit 5e R6). */
+ * all n entries) here (test_final_pass_sampled). */
 static int64_t * FpLoopCapture;
 
 static void
@@ -1783,7 +2550,7 @@ assert_same_result(const struct CandResult * a, const struct CandResult * b)
 #define NBIG_HOST 200000
 #define NBIG_SAT 20000
 
-/* The parallel mode (subhalo_unbind.h, Phase 5b) gives bit-identical results at 1, 3 and 8
+/* The parallel mode (subhalo_unbind.h) gives bit-identical results at 1, 3 and 8
  * threads on a 2.2e5-particle host + satellite candidate: the subsampled loop (SampleSize 1000:
  * subsample, gather, partition, frame, refinement on 2e4) and the exact final pass (tree over
  * 2e5), a candidate that dies after a parallel iteration (the stable partition's whole order),
@@ -1792,6 +2559,8 @@ assert_same_result(const struct CandResult * a, const struct CandResult * b)
 static void
 test_threads_bitwise(void ** state)
 {
+    if(!full_test(__func__))
+        return;
     const int nmax0 = omp_get_max_threads();
     const int64_t n = NBIG_HOST + NBIG_SAT;
     const int nths[3] = {1, 3, 8};
@@ -1884,7 +2653,7 @@ test_threads_bitwise(void ** state)
     teardown_pman();
 }
 
-/* Phase 5 audit R7: the kernel inside the scheduler's worker region. A key that is not run alone
+/* The kernel inside the scheduler's worker region. A key that is not run alone
  * is processed by one worker of subhalo_run_serial_keys' parallel region, where the kernel must
  * stay serial (omp_in_parallel) and give the same result as alone. The host + satellite candidate
  * of test_threads_bitwise (the satellite a tenth, unbound in the host frame: several iterations,
@@ -1928,6 +2697,8 @@ cand_unbind_final(struct TestCand * t, const struct SubhaloUnbindParams * up, st
 static void
 test_threads_worker_region(void ** state)
 {
+    if(!full_test(__func__))
+        return;
     const int nmax0 = omp_get_max_threads();
     const int dyn0 = omp_get_dynamic();
     const int T = 4;
@@ -2028,7 +2799,7 @@ test_threads_worker_region(void ** state)
     omp_set_num_threads(nmax0);
 }
 
-/* The sampled final pass (SubhaloFinalPass = 0, decision 42.4; subhalo_final_pass in
+/* The sampled final pass (SubhaloFinalPass = 0; subhalo_final_pass in
  * subhalo_unbind.h).
  *  1. Below the sample size it is the exact pass: a 900-particle Hernquist sphere alone
  *     (N <= SampleSize, no subsampling at all) and with 400 fast particles added (N = 1300 >
@@ -2039,7 +2810,7 @@ test_threads_worker_region(void ** state)
  *     NFW-like cusp) with SampleSize 1000, every whole-list step in parallel mode. The sampled
  *     option is bitwise thread-count independent (1, 2 and 8 threads); against the exact pass it
  *     has the same membership, frame, Mbound and unbound tail, its prefix is a permutation of the
- *     exact prefix. Audit 5e R6: the loop order is captured immediately before each final pass
+ *     exact prefix. The loop order is captured immediately before each final pass
  *     (and equals the exact run's); the head length K is derived from it (fp_head_length: the
  *     shortest prefix with 5 x 20 tracers, or all bound tracers plus the non-tracer fill, and at
  *     least 5 x 20 particles); at every thread count the K head particles are exactly the loop's
@@ -2079,7 +2850,7 @@ fp_result_sameset(const struct CandResult * a, const struct CandResult * b)
     assert_int_equal(miss, 0);
 }
 
-/* Audit 5e R6: the head length of subhalo_final_pass from the loop order L[0, n) (n = Nbound) as
+/* The head length of subhalo_final_pass from the loop order L[0, n) (n = Nbound) as
  * subhalo_unbind.h states it: the shortest prefix holding the first T = MARGIN x max(MIN,
  * FinalRefineTracers) tracers (T clamped to n) and, when fewer than T tracers are bound, the
  * first non-tracers that make up T, at least T particles. */
@@ -2112,7 +2883,7 @@ fp_rank_cmp(const void * a, const void * b)
     return (ra > rb) - (ra < rb);
 }
 
-/* Audit 5e R6: the sampled final pass's output r against the loop order L captured immediately
+/* The sampled final pass's output r against the loop order L captured immediately
  * before it (the whole list, N entries) and the exact pass's ranks: the head Index[0, K), K from
  * L, is exactly L[0, K) sorted by exact-pass rank (every one of the K particles at its exact
  * relative position); the bound suffix Index[K, Nbound) is L's (HBT's order); the unbound tail is
@@ -2137,184 +2908,205 @@ fp_check_head(const struct CandResult * r, const int64_t * L, const int64_t * ra
     return K;
 }
 
+/* Part 1: below the sample size the sampled pass is the exact pass. */
+static void
+fp_below_sample(void)
+{
+    const int64_t nh = 900, nf = 400;
+    setup_pman(nh + nf);
+    make_hernquist(0, nh, HQ_M, HQ_A, HQ_RMAX, Centre, Bulk, 31, 0);
+    /* fast particles inside the sphere: unbound at the first iteration */
+    {
+        gsl_rng * rng = gsl_rng_alloc(gsl_rng_mt19937);
+        gsl_rng_set(rng, 32);
+        int64_t i;
+        int d;
+        for(i = nh; i < nh + nf; i++) {
+            double u[3];
+            memset(&P[i], 0, sizeof(P[i]));
+            P[i].Type = 1;
+            P[i].Mass = P[0].Mass;
+            P[i].ID = i;
+            random_direction(rng, u);
+            const double r = HQ_A * gsl_rng_uniform_pos(rng);
+            for(d = 0; d < 3; d++)
+                P[i].Pos[d] = wrapb(Centre[d] + r * u[d]);
+            random_direction(rng, u);
+            for(d = 0; d < 3; d++)
+                P[i].Vel[d] = Bulk[d] + 3000. * u[d];
+        }
+        gsl_rng_free(rng);
+    }
+    struct SubhaloUnbindParams ue = default_params();
+    ue.SampleSize = 1000;
+    struct SubhaloUnbindParams us = ue;
+    us.SampledFinalPass = 1;
+    const int64_t ns[2] = {nh, nh + nf};
+    int c;
+    for(c = 0; c < 2; c++) {
+        struct SubhaloArena arena = arena_alloc(ns[c]);
+        struct CandResult re, rs;
+        run_threads(&re, 1, ns[c], Centre, Bulk, 17, &ue, &arena, NULL, NULL);
+        run_threads(&rs, 1, ns[c], Centre, Bulk, 17, &us, &arena, NULL, NULL);
+        message(0, "Sampled final pass below the sample size: N %ld, Nbound %ld after %d iterations: identical to the exact pass\n",
+                (long) ns[c], (long) re.Nbound, re.Iterations);
+        assert_true(re.alive);
+        assert_true(re.Nbound <= ue.SampleSize);
+        if(c == 1)
+            assert_true(re.Nbound < ns[c] - nf / 2);
+        assert_same_result(&re, &rs);
+        cand_result_free(&rs);
+        cand_result_free(&re);
+        myfree(arena.base);
+    }
+    teardown_pman();
+}
+
+/* Part 2, one fixture: 0 DM only, 1 every other particle a non-tracer (type 0), 2 scarce
+ * tracers (60 bound, the non-tracer fill), 3 the cold sphere with Nbound = SampleSize + 1. */
+static void
+fp_above_sample(int mode)
+{
+    int k;
+    const char * label[4] = {"DM only", "half non-tracers", "60 tracers", "Nbound = SampleSize + 1"};
+    const int64_t n = mode == 3 ? 1001 : 50000;
+    const int nths[3] = {1, 2, 8};
+    int64_t i;
+    setup_pman(n);
+    make_hernquist(0, n, HQ_M, HQ_A, HQ_RMAX, Centre, Bulk, 4243, 0);
+    if(mode == 1)
+        for(i = 1; i < n; i += 2)
+            P[i].Type = 0;
+    if(mode == 2) {
+        /* 60 tracers among the particles inside 0.1 a (about 400 of them), the others type 0 */
+        int64_t ntr = 0;
+        for(i = 0; i < n; i++) {
+            const int inner = ntr < 60 && dist_periodic(P[i].Pos, Centre) < 0.1 * HQ_A;
+            P[i].Type = inner ? 1 : 0;
+            ntr += inner;
+        }
+        assert_int_equal(ntr, 60);
+    }
+    if(mode == 3) {
+        /* a cold sphere (a tenth of the dispersion): every particle stays bound */
+        int d;
+        for(i = 0; i < n; i++)
+            for(d = 0; d < 3; d++)
+                P[i].Vel[d] = Bulk[d] + 0.1 * (P[i].Vel[d] - Bulk[d]);
+    }
+    struct SubhaloUnbindParams ue = default_params();
+    ue.SampleSize = 1000;
+    struct SubhaloUnbindParams us = ue;
+    us.SampledFinalPass = 1;
+    struct SubhaloArena arena = arena_alloc(n);
+    struct CandResult re, rs[3];
+    double tun, tfp;
+    /* the loop order handed to each final pass */
+    int64_t * le = (int64_t *) malloc(sizeof(int64_t) * n);
+    int64_t * ls = (int64_t *) malloc(sizeof(int64_t) * n);
+    /* a start frame 100 km/s off: several iterations, the outskirts unbound on the way (the
+     * cold sphere starts in its own frame) */
+    const double vel0[3] = {Bulk[0] + (mode == 3 ? 0 : 100.), Bulk[1], Bulk[2]};
+    FpLoopCapture = le;
+    run_threads(&re, 1, n, Centre, vel0, 23, &ue, &arena, &tun, &tfp);
+    message(0, "Sampled final pass fixture (%s), exact pass: Nbound %ld / %ld after %d iterations, NboundPositive %ld; unbind %.3f s, final pass %.3f s\n",
+            label[mode], (long) re.Nbound, (long) n, re.Iterations, (long) re.NboundPositive, tun, tfp);
+    assert_true(re.alive);
+    if(mode == 3)
+        assert_true(re.Nbound == ue.SampleSize + 1);
+    else
+        assert_true(re.Nbound > SUBHALO_UNBIND_PAR_MIN && re.Nbound > 0.9 * n && re.Iterations > 1);
+    int64_t * rank = (int64_t *) malloc(sizeof(int64_t) * n);
+    for(i = 0; i < re.Nbound; i++)
+        rank[re.Index[i]] = i;
+    int64_t K = 0, ntr = 0;
+    for(k = 0; k < 3; k++) {
+        FpLoopCapture = ls;
+        run_threads(&rs[k], nths[k], n, Centre, vel0, 23, &us, &arena, &tun, &tfp);
+        FpLoopCapture = NULL;
+        message(0, "Sampled final pass fixture, %d thread(s): NboundPositive %ld; unbind %.3f s, final pass %.3f s\n",
+                nths[k], (long) rs[k].NboundPositive, tun, tfp);
+        /* the loop is the exact run's (it does not depend on the option or the threads) */
+        assert_memory_equal(ls, le, sizeof(int64_t) * n);
+        K = fp_check_head(&rs[k], ls, rank, &us, &ntr);
+    }
+    for(k = 1; k < 3; k++)
+        assert_same_result(&rs[0], &rs[k]);
+    fp_result_sameset(&re, &rs[0]);
+    {
+        int64_t core = 0, same = 0;
+        const int64_t T = SUBHALO_FINAL_REFINE_MARGIN * SUBHALO_FINAL_REFINE_MIN;
+        /* the first 20 tracers (or all, if fewer are bound) are the exact pass's most-bound
+         * tracers in the same order (the most-bound tracer, the core, the reserved tracers) */
+        int64_t trs[SUBHALO_FINAL_REFINE_MIN], tre[SUBHALO_FINAL_REFINE_MIN], ns = 0, ne = 0;
+        for(i = 0; i < K; i++)
+            same += rs[0].Index[i] == re.Index[i];
+        for(i = 0; i < rs[0].Nbound && ns < SUBHALO_FINAL_REFINE_MIN; i++)
+            if(type_in_test(ue.TracerTypes, P[rs[0].Index[i]].Type))
+                trs[ns++] = rs[0].Index[i];
+        for(i = 0; i < re.Nbound && ne < SUBHALO_FINAL_REFINE_MIN; i++)
+            if(type_in_test(ue.TracerTypes, P[re.Index[i]].Type))
+                tre[ne++] = re.Index[i];
+        assert_int_equal(ns, SUBHALO_FINAL_REFINE_MIN);
+        assert_int_equal(ne, SUBHALO_FINAL_REFINE_MIN);
+        assert_memory_equal(trs, tre, sizeof(trs));
+        for(i = 0; i < 20; i++)
+            core += rank[rs[0].Index[i]] < 20;
+        message(0, "Sampled vs exact (%s): head K = %ld (%ld tracers) from the loop order, all K in the exact pass's relative order, "
+                   "%ld / %ld at the exact pass's position, the bound suffix the loop's; most bound %ld (exact %ld); "
+                   "exact ranks of the sampled 5 most bound %ld %ld %ld %ld %ld; first-20 overlap %ld / 20; NboundPositive sampled %ld exact %ld\n",
+                label[mode], (long) K, (long) ntr, (long) same, (long) K, (long) rs[0].Index[0], (long) re.Index[0],
+                (long) rank[rs[0].Index[0]], (long) rank[rs[0].Index[1]], (long) rank[rs[0].Index[2]], (long) rank[rs[0].Index[3]],
+                (long) rank[rs[0].Index[4]], (long) core, (long) rs[0].NboundPositive, (long) re.NboundPositive);
+        /* DM only: the head is exactly T; with non-tracers it is longer; with 60 tracers it
+         * holds all 60 and 40 non-tracers */
+        if(mode == 0 || mode == 3)
+            assert_true(K == T);
+        else
+            assert_true(K > T);
+        if(mode == 2)
+            assert_true(ntr == 60 && rs[0].NboundTracer == 60);
+    }
+    free(rank);
+    free(ls);
+    free(le);
+    assert_int_equal(rs[0].Index[0], re.Index[0]);
+    assert_true(rs[0].NboundPositive < 0.01 * rs[0].Nbound);
+    for(k = 0; k < 3; k++)
+        cand_result_free(&rs[k]);
+    cand_result_free(&re);
+    myfree(arena.base);
+    teardown_pman();
+}
+
+/* Part 1 and the 1001-particle fixture of part 2: the sampling boundary, a fraction of a second. */
 static void
 test_final_pass_sampled(void ** state)
 {
     const int nmax0 = omp_get_max_threads();
-    int k;
-    /* 1. below the sample size */
-    {
-        const int64_t nh = 900, nf = 400;
-        setup_pman(nh + nf);
-        make_hernquist(0, nh, HQ_M, HQ_A, HQ_RMAX, Centre, Bulk, 31, 0);
-        /* fast particles inside the sphere: unbound at the first iteration */
-        {
-            gsl_rng * rng = gsl_rng_alloc(gsl_rng_mt19937);
-            gsl_rng_set(rng, 32);
-            int64_t i;
-            int d;
-            for(i = nh; i < nh + nf; i++) {
-                double u[3];
-                memset(&P[i], 0, sizeof(P[i]));
-                P[i].Type = 1;
-                P[i].Mass = P[0].Mass;
-                P[i].ID = i;
-                random_direction(rng, u);
-                const double r = HQ_A * gsl_rng_uniform_pos(rng);
-                for(d = 0; d < 3; d++)
-                    P[i].Pos[d] = wrapb(Centre[d] + r * u[d]);
-                random_direction(rng, u);
-                for(d = 0; d < 3; d++)
-                    P[i].Vel[d] = Bulk[d] + 3000. * u[d];
-            }
-            gsl_rng_free(rng);
-        }
-        struct SubhaloUnbindParams ue = default_params();
-        ue.SampleSize = 1000;
-        struct SubhaloUnbindParams us = ue;
-        us.SampledFinalPass = 1;
-        const int64_t ns[2] = {nh, nh + nf};
-        int c;
-        for(c = 0; c < 2; c++) {
-            struct SubhaloArena arena = arena_alloc(ns[c]);
-            struct CandResult re, rs;
-            run_threads(&re, 1, ns[c], Centre, Bulk, 17, &ue, &arena, NULL, NULL);
-            run_threads(&rs, 1, ns[c], Centre, Bulk, 17, &us, &arena, NULL, NULL);
-            message(0, "Sampled final pass below the sample size: N %ld, Nbound %ld after %d iterations: identical to the exact pass\n",
-                    (long) ns[c], (long) re.Nbound, re.Iterations);
-            assert_true(re.alive);
-            assert_true(re.Nbound <= ue.SampleSize);
-            if(c == 1)
-                assert_true(re.Nbound < ns[c] - nf / 2);
-            assert_same_result(&re, &rs);
-            cand_result_free(&rs);
-            cand_result_free(&re);
-            myfree(arena.base);
-        }
-        teardown_pman();
-    }
-    /* 2. above the sample size: DM only, every other particle a non-tracer (type 0), scarce
-     *    tracers (60 bound, the non-tracer fill) and Nbound = SampleSize + 1 */
-    int mode;
-    for(mode = 0; mode < 4; mode++) {
-        const char * label[4] = {"DM only", "half non-tracers", "60 tracers", "Nbound = SampleSize + 1"};
-        const int64_t n = mode == 3 ? 1001 : 50000;
-        const int nths[3] = {1, 2, 8};
-        int64_t i;
-        setup_pman(n);
-        make_hernquist(0, n, HQ_M, HQ_A, HQ_RMAX, Centre, Bulk, 4243, 0);
-        if(mode == 1)
-            for(i = 1; i < n; i += 2)
-                P[i].Type = 0;
-        if(mode == 2) {
-            /* 60 tracers among the particles inside 0.1 a (about 400 of them), the others type 0 */
-            int64_t ntr = 0;
-            for(i = 0; i < n; i++) {
-                const int inner = ntr < 60 && dist_periodic(P[i].Pos, Centre) < 0.1 * HQ_A;
-                P[i].Type = inner ? 1 : 0;
-                ntr += inner;
-            }
-            assert_int_equal(ntr, 60);
-        }
-        if(mode == 3) {
-            /* a cold sphere (a tenth of the dispersion): every particle stays bound */
-            int d;
-            for(i = 0; i < n; i++)
-                for(d = 0; d < 3; d++)
-                    P[i].Vel[d] = Bulk[d] + 0.1 * (P[i].Vel[d] - Bulk[d]);
-        }
-        struct SubhaloUnbindParams ue = default_params();
-        ue.SampleSize = 1000;
-        struct SubhaloUnbindParams us = ue;
-        us.SampledFinalPass = 1;
-        struct SubhaloArena arena = arena_alloc(n);
-        struct CandResult re, rs[3];
-        double tun, tfp;
-        /* the loop order handed to each final pass (audit 5e R6) */
-        int64_t * le = (int64_t *) malloc(sizeof(int64_t) * n);
-        int64_t * ls = (int64_t *) malloc(sizeof(int64_t) * n);
-        /* a start frame 100 km/s off: several iterations, the outskirts unbound on the way (the
-         * cold sphere starts in its own frame) */
-        const double vel0[3] = {Bulk[0] + (mode == 3 ? 0 : 100.), Bulk[1], Bulk[2]};
-        FpLoopCapture = le;
-        run_threads(&re, 1, n, Centre, vel0, 23, &ue, &arena, &tun, &tfp);
-        message(0, "Sampled final pass fixture (%s), exact pass: Nbound %ld / %ld after %d iterations, NboundPositive %ld; unbind %.3f s, final pass %.3f s\n",
-                label[mode], (long) re.Nbound, (long) n, re.Iterations, (long) re.NboundPositive, tun, tfp);
-        assert_true(re.alive);
-        if(mode == 3)
-            assert_true(re.Nbound == ue.SampleSize + 1);
-        else
-            assert_true(re.Nbound > SUBHALO_UNBIND_PAR_MIN && re.Nbound > 0.9 * n && re.Iterations > 1);
-        int64_t * rank = (int64_t *) malloc(sizeof(int64_t) * n);
-        for(i = 0; i < re.Nbound; i++)
-            rank[re.Index[i]] = i;
-        int64_t K = 0, ntr = 0;
-        for(k = 0; k < 3; k++) {
-            FpLoopCapture = ls;
-            run_threads(&rs[k], nths[k], n, Centre, vel0, 23, &us, &arena, &tun, &tfp);
-            FpLoopCapture = NULL;
-            message(0, "Sampled final pass fixture, %d thread(s): NboundPositive %ld; unbind %.3f s, final pass %.3f s\n",
-                    nths[k], (long) rs[k].NboundPositive, tun, tfp);
-            /* the loop is the exact run's (it does not depend on the option or the threads) */
-            assert_memory_equal(ls, le, sizeof(int64_t) * n);
-            K = fp_check_head(&rs[k], ls, rank, &us, &ntr);
-        }
-        for(k = 1; k < 3; k++)
-            assert_same_result(&rs[0], &rs[k]);
-        fp_result_sameset(&re, &rs[0]);
-        {
-            int64_t core = 0, same = 0;
-            const int64_t T = SUBHALO_FINAL_REFINE_MARGIN * SUBHALO_FINAL_REFINE_MIN;
-            /* the first 20 tracers (or all, if fewer are bound) are the exact pass's most-bound
-             * tracers in the same order (the most-bound tracer, the core, the reserved tracers) */
-            int64_t trs[SUBHALO_FINAL_REFINE_MIN], tre[SUBHALO_FINAL_REFINE_MIN], ns = 0, ne = 0;
-            for(i = 0; i < K; i++)
-                same += rs[0].Index[i] == re.Index[i];
-            for(i = 0; i < rs[0].Nbound && ns < SUBHALO_FINAL_REFINE_MIN; i++)
-                if(type_in_test(ue.TracerTypes, P[rs[0].Index[i]].Type))
-                    trs[ns++] = rs[0].Index[i];
-            for(i = 0; i < re.Nbound && ne < SUBHALO_FINAL_REFINE_MIN; i++)
-                if(type_in_test(ue.TracerTypes, P[re.Index[i]].Type))
-                    tre[ne++] = re.Index[i];
-            assert_int_equal(ns, SUBHALO_FINAL_REFINE_MIN);
-            assert_int_equal(ne, SUBHALO_FINAL_REFINE_MIN);
-            assert_memory_equal(trs, tre, sizeof(trs));
-            for(i = 0; i < 20; i++)
-                core += rank[rs[0].Index[i]] < 20;
-            message(0, "Sampled vs exact (%s): head K = %ld (%ld tracers) from the loop order, all K in the exact pass's relative order, "
-                       "%ld / %ld at the exact pass's position, the bound suffix the loop's; most bound %ld (exact %ld); "
-                       "exact ranks of the sampled 5 most bound %ld %ld %ld %ld %ld; first-20 overlap %ld / 20; NboundPositive sampled %ld exact %ld\n",
-                    label[mode], (long) K, (long) ntr, (long) same, (long) K, (long) rs[0].Index[0], (long) re.Index[0],
-                    (long) rank[rs[0].Index[0]], (long) rank[rs[0].Index[1]], (long) rank[rs[0].Index[2]], (long) rank[rs[0].Index[3]],
-                    (long) rank[rs[0].Index[4]], (long) core, (long) rs[0].NboundPositive, (long) re.NboundPositive);
-            /* DM only: the head is exactly T; with non-tracers it is longer; with 60 tracers it
-             * holds all 60 and 40 non-tracers */
-            if(mode == 0 || mode == 3)
-                assert_true(K == T);
-            else
-                assert_true(K > T);
-            if(mode == 2)
-                assert_true(ntr == 60 && rs[0].NboundTracer == 60);
-        }
-        free(rank);
-        free(ls);
-        free(le);
-        assert_int_equal(rs[0].Index[0], re.Index[0]);
-        assert_true(rs[0].NboundPositive < 0.01 * rs[0].Nbound);
-        for(k = 0; k < 3; k++)
-            cand_result_free(&rs[k]);
-        cand_result_free(&re);
-        myfree(arena.base);
-        teardown_pman();
-    }
+    fp_below_sample();
+    fp_above_sample(3);
     omp_set_num_threads(nmax0);
 }
 
-/* Decision 42.5 (second round): the threading threshold PAR_MIN only shares work out. Keys below
+/* The three 5e4-particle fixtures of part 2, a few seconds each. */
+static void
+test_final_pass_sampled_large(void ** state)
+{
+    if(!full_test(__func__))
+        return;
+    const int nmax0 = omp_get_max_threads();
+    int mode;
+    for(mode = 0; mode < 3; mode++)
+        fp_above_sample(mode);
+    omp_set_num_threads(nmax0);
+}
+
+/* The threading threshold PAR_MIN only shares work out. Keys below
  * SUBHALO_UNBIND_CHUNK_MIN (1500, 3000 and 10000 particles, the host + satellite candidate of
  * test_threads_worker_region from a frame 150 km/s off, with and without subsampling, plus a
  * candidate that dies after its first iteration and the neighbour search over 3000 tracers) give
- * bit-identical results with PAR_MIN at 16384 (the Phase 5b value), its default and 1 (every
+ * bit-identical results with PAR_MIN at 16384, its default and 1 (every
  * step of more than one element in parallel mode; at 1 also with the fixed 256 loop chunks of
  * subhalo_unbind_set_loop_chunk(0)), at 1, 2 and 8 threads, all compared with the 1-thread run
  * at the default (the serial path). */
@@ -2341,6 +3133,8 @@ par_min_case(struct CandResult * r, int nth, int64_t pm, int64_t n, const double
 static void
 test_threads_par_min(void ** state)
 {
+    if(!full_test(__func__))
+        return;
     const int nmax0 = omp_get_max_threads();
     const int dyn0 = omp_get_dynamic();
     const int64_t sizes[3] = {1500, 3000, 10000};
@@ -2447,16 +3241,16 @@ env_int_list(const char * name, int64_t * v, int nmax)
     return n;
 }
 
-/* Timing table of the parallel mode (Phase 5 plan section 4 item 6), run only when
+/* Timing table of the parallel mode, run only when
  * SUBHALO_UNBIND_TIMING is set to a repeat count (it takes minutes): unbind + final pass of a
  * Hernquist sphere of 2e4, 2e5 and 1e6 particles with the production SampleSize 1000, at 1, 2,
  * 4 and 8 threads, the minimum time over the repeats, each result checked bitwise against the
  * 1-thread one. Run with `mpirun --bind-to none`: by default
  * Open MPI binds a single rank to one core, and every thread then shares it.
- * Decision 42.5 (second round) knobs: SUBHALO_UNBIND_TIMING_SIZES (e.g. 2000,4000,8000),
+ * Further knobs: SUBHALO_UNBIND_TIMING_SIZES (e.g. 2000,4000,8000),
  * SUBHALO_UNBIND_TIMING_THREADS (e.g. 1,2,4,8) and SUBHALO_UNBIND_TIMING_PARMIN (thresholds set
  * with subhalo_unbind_set_par_min, e.g. 16384,8192,4096), SUBHALO_UNBIND_TIMING_LOOPCHUNK=0
- * (subhalo_unbind_set_loop_chunk(0): the fixed 256 energy-loop chunks of Phase 5b; default
+ * (subhalo_unbind_set_loop_chunk(0): the fixed 256 energy-loop chunks; default
  * adaptive); SUBHALO_UNBIND_TIMING_FIXTURE=sat
  * times the host + satellite candidate of test_threads_worker_region (start frame 150 km/s off,
  * several iterations) instead of the sphere. The repeats of one size and thread count
@@ -2464,7 +3258,7 @@ env_int_list(const char * name, int64_t * v, int nmax)
  * only between blocks of repeats, because libgomp's team resizing made a run right after a
  * change of team size up to 100 ms slower on r30 (an artifact; production keeps one team). The
  * 1-thread run does not depend on the threshold and is taken once. SUBHALO_UNBIND_TIMING_SAMPLED=1
- * times the sampled final pass instead of the exact one (TIMING SAMPLED rows, decision 42.4). */
+ * times the sampled final pass instead of the exact one (TIMING SAMPLED rows). */
 static void
 test_timing(void ** state)
 {
@@ -2576,9 +3370,14 @@ int main(void) {
         cmocka_unit_test(test_sample_types),
         cmocka_unit_test(test_death),
         cmocka_unit_test(test_rescue),
+        cmocka_unit_test(test_rescue_frame),
+        cmocka_unit_test(test_rescue_frame_cases),
+        cmocka_unit_test(test_rescue_loss),
+        cmocka_unit_test(test_admit_need),
         cmocka_unit_test(test_threads_bitwise),
         cmocka_unit_test(test_threads_worker_region),
         cmocka_unit_test(test_final_pass_sampled),
+        cmocka_unit_test(test_final_pass_sampled_large),
         cmocka_unit_test(test_threads_par_min),
         cmocka_unit_test(test_timing),
     };

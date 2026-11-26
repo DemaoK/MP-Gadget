@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Export a sequence of the runtime subhalo finder's PIG catalogues as consistent-trees input
-(halofinder_phase4_plan.md section 1 item 2, halofinder_design.md D9, 5.1-5.4 and 7.7).
+(halofinder_design.md D9, 5.1-5.4 and 7.7).
 
 Usage:
   subhalo_to_ctrees.py OUTPUTDIR|PIG_xxx... -o CTDIR [--mass auto|bound|field] [--orphans]
@@ -39,7 +39,7 @@ Columns (ours -> consistent-trees input, units as Rockstar's out_*.list):
             for every satellite, Mbound. auto (default) = field if any central has MSO[vir] > 0,
             else bound. The header and cfg record the choice and the fallback counts.
   Vmax      Vmax (km/s, physical; HBT convention, bound particles)
-  Vrms      Vrms when filled (Phase 3), else sqrt(2 Ekin), the rms speed of the bound set in its
+  Vrms      Vrms when filled, else sqrt(2 Ekin), the rms speed of the bound set in its
             CoM frame, km/s
   Rvir      kpc/h comoving: RSO[vir] / RBoundSO[vir] matching the mass when filled, else
             consistent-trees' own fallback cbrt(3 M / (4 pi Delta_vir(a) rho_m)) (halo_io.c:232)

@@ -1,24 +1,16 @@
 #ifndef SUBHALO_COLLECTIVE_H
 #define SUBHALO_COLLECTIVE_H
 
-/* Oversized candidates unbound in place with the global tree (design 7.8). The plan has decided
- * every oversized group's central, cut the satellites' sub-trees into serial keys and listed the
- * in-place candidates by round, deepest first. After the domain restore, subhalo_collective_run:
- *  1. gathers the serial sub-tree results into the member table;
- *  2. assigns every particle of an oversized group to one candidate's source (a scratch label, the
- *     tags are not rewritten during the rounds); a central's source is its FOF group only (decision 52);
- *  3. per round: HBT's loop with one global tree and one potential-only walk per iteration, the
- *     sinking, the final pass, the cores and reserved tracers, the relaxed-source claims and the
- *     properties from distributed sorts; the unbound particles pass to the parent candidate;
- *  4. the hierarchy of every oversized group (the serial recipe) and the records;
- *  5. the final tag pass (D10), repairing the serial sub-tree ranks and counts for the particles the
- *     in-place candidates took over or returned to a surviving serial binder.
- * The plan admits the call's memory (subhalo_coll_estimate) before the exchange.
- *
- * Walk contract: result = sum_j m_j W(r_ij, h) over the query's own candidate (W =
- * grav_spline_potential, h = FORCE_SOFTENING()), geometric opening len^2 > r^2 theta^2 (theta^2 capped
- * at 0.33 as in the serial kernel); node labels in NODE.mom.hmax (round label, -1 mixed, -2 empty)
- * skip other candidates' nodes; no PM window; the query skips itself; phi = -(G / a) sum. */
+/* Oversized candidates unbound in place with the global tree (design 7.8). After the domain restore,
+ * subhalo_collective_run gathers the serial sub-tree results, gives every particle of an oversized
+ * group to one candidate's source (a central's is its FOF group, as HBT), runs the rounds deepest
+ * first (HBT's loop with one global tree and one potential-only walk per iteration, sinking, final
+ * pass, cores, claims, distributed properties), then the hierarchy, the records and the final tag
+ * pass (design D10). The plan checks the call's memory (subhalo_coll_estimate) before the exchange.
+ * Walk: result = sum_j m_j W(r_ij, h) over the query's own candidate (W = grav_spline_potential, h =
+ * FORCE_SOFTENING()), opening len^2 > r^2 theta^2 (theta^2 capped at 0.33 as in the serial kernel),
+ * node labels in NODE.mom.hmax (round label, -1 mixed, -2 empty) skip other candidates' nodes; no PM
+ * window; the query skips itself; phi = -(G / a) sum. */
 
 #include <mpi.h>
 #include <stddef.h>
@@ -28,8 +20,18 @@
 /* Bytes treewalk.c's ev_begin reserves for the potential-only walk: 40960 + max(4097, 100 x threads)
  * buffers of index, query and result plus ImportBufferBoost x (query + result). */
 size_t subhalo_collective_walk_bytes(void);
-/* The ImportBufferBoost the estimate uses (the run's parameter, set by set_subhalo_params). */
-void subhalo_collective_set_import_buffer_boost(double boost);
+/* The inputs of subhalo_coll_estimate: this rank's and the global counts of oversized-group
+ * particles, candidates and core records, and the top tree's sizing. */
+struct SubhaloCollSizes {
+    int64_t NumPart, MaxPart, NUniv, NSubPart, NOwned, OwnedRecv;
+    int64_t NCands, NMembers, NSubResults;
+    int64_t NTopNodes, NTopLeaves, NLocalLeaves;
+    double TreeAllocFactor;
+    int nthreads;
+};
+/* Memory estimate of subhalo_collective_run (particle-free; subhalo_collective.c), made before the
+ * exchange: this rank's persistent bytes and per-stage peaks; fills a->persist, stage[] and need. */
+void subhalo_coll_estimate(struct SubhaloMemCheck * a, const struct SubhaloCollSizes * z);
 
 /* Diagnostics of the last call (global). */
 struct SubhaloCollectiveStats {
@@ -43,16 +45,15 @@ struct SubhaloCollectiveStats {
     int64_t NDiedMeanFrame;       /* of which resolved tracks dead at their first unbinding, from the previous-bound frame (no rescue in place) */
     int64_t NAlive;
     int64_t NStolen;              /* serial own-tag particles taken over by an in-place ancestor */
-    int64_t NJ2;                  /* claims across the final tree (J2) given to the binding owner */
+    int64_t NJ2;                  /* claims across the final tree given to the binding owner */
     /* the final tag pass */
     int64_t NAdded;               /* serial tails given to their surviving serial binder */
     int64_t NRepairTracks;        /* serial tracks whose ranks were repaired */
     int64_t NRepairQueries;       /* own-tag particles of those tracks that asked their new rank */
-    double TagSortSeconds;        /* the decisions and the in-place own-tag ranks */
     double RepairSeconds;         /* the distributed serial repair */
     double TagSeconds;            /* the whole final tag pass */
-    /* memory: the admission estimate and the measured high water, the largest over the ranks (bytes) */
-    double EstPeakBytes;          /* persistent + largest stage, as admitted by the plan */
+    /* memory: the plan's estimate and the measured high water, the largest over the ranks (bytes) */
+    double EstPeakBytes;          /* persistent + largest stage, as checked by the plan */
     double MeasPeakBytes;         /* free bytes at the start of the call minus the least free bytes during it */
     double EstAvailBytes;         /* free bytes the plan expected at the start of the call */
     double FreeAtStartBytes;      /* measured free bytes at the start of the call */
@@ -67,6 +68,26 @@ const struct SubhaloCollectiveStats * subhalo_collective_last_stats(void);
  * over MPI_COMM_WORLD (the treewalk): every rank calls it, also without in-place candidates. */
 void subhalo_collective_run(struct SubhaloPlan * plan, struct SubhaloCallCtx * ctx, DomainDecomp * ddecomp,
                             struct SubTrackTable * tab, MPI_Comm Comm);
+
+/* One neighbour of a k-nearest search: squared distance (subhalo_knn_r2), ID and previous tag. */
+struct SubhaloKnnHit {
+    double d2;
+    MyIDType ID;
+    int64_t BoundTrackId;
+};
+/* The k nearest particles of tl[0..nt) with the query's label to each query ql[0..nq) (labels in
+ * label[], dense, below 2^24), the query itself excluded: hits[k q ..] sorted by (d2, ID), nhit[q]
+ * of them (fewer only when the label has fewer). Exact whenever it completes: the radius of a query
+ * doubles per pass until its k-th neighbour lies strictly inside. Limits of the builder and walker it
+ * shares: more than eight particles at one position abort the tree build, and a query whose exports
+ * exceed a thread's export buffer aborts the walk. Needs a decomposed domain with every particle on
+ * its domain rank. Collective over MPI_COMM_WORLD; returns the number of passes. */
+int subhalo_collective_knn(DomainDecomp * ddecomp, const int32_t * label, const int * tl, int64_t nt,
+                           const int * ql, int64_t nq, int k, struct SubhaloKnnHit * hits, int32_t * nhit);
+/* Export rounds of the last subhalo_collective_knn on this rank, summed over its passes. */
+int64_t subhalo_collective_knn_export_rounds(void);
+/* Bytes treewalk.c reserves for one pass of that walk with k neighbours. */
+size_t subhalo_collective_knn_walk_bytes(int k);
 
 /* ---- test hooks ---- */
 /* The walk alone: out[i] = sum_j m_j W(r_ij, h) over the other live PotentialTypes particles of

@@ -1,32 +1,12 @@
-/* Driver and plumbing tests of the runtime subhalo finder (MPI).
+/* Driver and plumbing tests of the runtime subhalo finder (MPI); the comment above each test says
+ * what it checks and main() registers them in order (the test_subhalo_ prefix omitted).
  * Run as: mpirun -np 4 .objs/test_subhalo with OMP_NUM_THREADS 1 or 2; above 2 threads the
  * MP-Gadget tree build itself fails on these 125-particle-per-rank fixtures (NODECACHE_SIZE).
- * Tests (the test_subhalo_ prefix omitted):
- *  1. table            track table: growth, home rank and local index, redistribution, round trips.
- *  2. sort_key         the 16-byte PIG sort key and the local comparator.
- *  3. exchange_tags    TrackId/BindRank/BoundTrackId survive domain_exchange.
- *  4. join             restart tag join from a synthetic PIG.
- *  5. fof_as_subhalo   the driver over five calls on two clumps.
- *  6. forced_failure   in-place (oversized) keys and the exchange failure path.
- *  7. plan_pack        the head/tail packing as a particle-free function, incl. cost balance.
- *  8. unhosted_direct  hostless centre across a periodic wrap, swallowed BHs, dead tracks, units.
- *  9. lifecycle_pig    driver, PIG writer and restart over four calls with an empty rank;
- *                      corrupted states rejected; header wall time and peak memory.
- * 10. many_keys        200 keys (> 32 per rank): tail packing on real particles.
- * Then, in registration order: twohalo, overlap, central_source, sink_orphan (persistent tracks,
- * a satellite with a tail, decision 52: a central's FOF-less particles untagged, a satellite's
- * kept; sinking, orphan tracer, resurrection; all but central_source log a tag/record checksum),
- * nest_tree, deep_chain, mixed_call, nocentral, fallback (serial/in-place transitions), itercap,
- * lookup (three modes), serial_keys (scheduler at 1-4 threads), reserve_admission,
- * local_sort (thread-count independent), header_params, sampled_default (SubhaloFinalPass = 0),
- * weighted_plurality and penalty_descendant (collision-penalty weights of the tracer votes),
- * orphan_set_death, _update, _lookup, _sink (decision 70: orphans following several particles;
- * life cycle also reads its PIG_003 as a version-1 state), penalty_column (the TracerPenalty snapshot
- * column, the Checkpoint header attribute, the Snapshots.txt index rule), snapshot_only (I/O table marks).
- *
  * SUBHALO_TEST_ONLY=<substring> runs only the matching tests. The sort-key range checks abort
  * through endrun, so they run alone: SUBHALO_TEST_SORTKEY_OVERFLOW=grnr|trackid|bindrank
- * mpirun -np 1 .objs/test_subhalo must exit non-zero. */
+ * mpirun -np 1 .objs/test_subhalo must exit non-zero. The slow tests (sampled_default_full,
+ * fallback) run only with SUBHALO_TEST_FULL set to anything but 0, e.g. 1 (make test does not set
+ * it); otherwise each prints a note. */
 
 /* nftw() for the temporary PIG cleanup */
 #define _GNU_SOURCE
@@ -51,6 +31,8 @@
 
 #include <libgadget/subhalo.h>
 #include <libgadget/subhalo_internal.h>
+#include <libgadget/subhalo_plan.h>
+#include <libgadget/subhalo_unbind.h>
 #include <libgadget/petaio.h>
 #include <libgadget/checkpoint.h>
 #include <libgadget/fof.h>
@@ -64,128 +46,19 @@
 #include <libgadget/gravity.h>
 #include "stub.h"
 
-static struct ClockTable CT;
-
 /* ------------------------------------------------------------------ helpers */
 
-/* Uniform assertion with a diagnostic: every rank evaluates the same data. */
-#define CHECK(cond, ...) do { if(!(cond)) { message(1, __VA_ARGS__); } assert_true(cond); } while(0)
-
-/* Count local failures, print the first few, then assert collectively with assert_all_true. */
-#define LOCAL_CHECK(bad, cond, ...) do { if(!(cond)) { if((bad) < 10) message(1, __VA_ARGS__); (bad)++; } } while(0)
-
+/* True when SUBHALO_TEST_FULL is set and not "0"; otherwise a slow test returns at once with this
+ * note. The ranks agree on the answer, so a skipped test cannot unmatch later collectives. */
 static int
-get_ntask(void)
+full_test(const char * name)
 {
-    int NTask;
-    MPI_Comm_size(MPI_COMM_WORLD, &NTask);
-    return NTask;
-}
-
-static int
-get_thistask(void)
-{
-    int ThisTask;
-    MPI_Comm_rank(MPI_COMM_WORLD, &ThisTask);
-    return ThisTask;
-}
-
-static struct SubhaloParams
-default_subhalo_params(void)
-{
-    /* Every field of struct SubhaloParams, at the defaults of design section 10. */
-    struct SubhaloParams sp;
-    memset(&sp, 0, sizeof(sp));
-    sp.SubhaloFinderOn = 1;
-    sp.SubhaloMaxGatherFraction = 0.5;
-    sp.SubhaloCollectiveMinPart = 0;
-    sp.SubhaloMaxUnbindIterations = 50;
-    sp.SubhaloRestartFresh = 1;
-    sp.SubhaloTracerTypes = 2 + 16;
-    sp.SubhaloPotentialTypes = 1 + 2 + 16 + 32;
-    sp.SubhaloMinNumPart = 20;
-    sp.SubhaloMinNumTracerPart = 10;
-    sp.SubhaloNumTracerHostFinding = 10;
-    /* the fixtures follow an orphan through its MostBoundID alone (default 10; orphan_set tests K > 1) */
-    sp.SubhaloOrphanTracers = 1;
-    sp.SubhaloLookupBatchBytes = 64L * 1024 * 1024;
-    sp.SubhaloMajorProgenitorMassRatio = 0.8;
-    sp.SubhaloBoundMassPrecision = 0.995;
-    sp.SubhaloSourceRelaxFactor = 3;
-    sp.SubhaloPotentialSampleSize = 1000;
-    sp.SubhaloFinalPass = 1;
-    sp.SubhaloTreeOpenAngle = 0.45;
-    sp.SubhaloMergeTrapped = 1;
-    sp.SubhaloSinkSymmetric = 0;
-    sp.SubhaloCoreSize = 20;
-    sp.SubhaloReassignGas = 1;
-    sp.SubhaloNumNeighboursForReassignment = 10;
-    sp.SubhaloUnbindWithThermal = 0;
-    /* off in the Phase 1 fixtures: their sparse particle sets give the full tree fewer nodes
-     * than the top-level grid; the Phase 2a/3 fixtures (p2_setup) switch it on */
-    sp.SubhaloFieldSO = 0;
-    sp.SubhaloSOBins = 64;
-    sp.SubhaloSOSearchFactor = 2;
-    sp.SubhaloSOMaxDoublings = 3;
-    sp.SubhaloSORefineMinPart = 1000;
-    sp.SubhaloMajorMergerRatio = 0.3;
-    sp.SubhaloGeometricParents = 0;
-    sp.SubhaloDebugForceExchangeFailure = 0;
-    return sp;
-}
-
-static Cosmology
-test_cosmology(void)
-{
-    Cosmology CP;
-    memset(&CP, 0, sizeof(CP));
-    CP.CMBTemperature = 2.7255;
-    CP.Omega0 = 0.3;
-    CP.OmegaBaryon = 0.045;
-    CP.OmegaLambda = 0.7;
-    CP.HubbleParam = 0.7;
-    CP.RadiationOn = 0;
-    CP.w0_fld = -1;
-    CP.MNu[0] = CP.MNu[1] = CP.MNu[2] = 0;
-    struct UnitSystem units = get_unitsystem(3.085678e21, 1.989e43, 1e5);
-    init_cosmology(&CP, 0.01, units);
-    return CP;
-}
-
-/* Deterministic per-ID random numbers, identical on every rank. */
-static uint64_t
-splitmix64(uint64_t x)
-{
-    x += 0x9E3779B97F4A7C15ULL;
-    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
-    return x ^ (x >> 31);
-}
-
-static double
-urand(uint64_t id, uint64_t salt, uint64_t k)
-{
-    uint64_t h = splitmix64(splitmix64(id * 0x100000001B3ULL + salt) ^ (k * 0x9E3779B97F4A7C15ULL));
-    return (h >> 11) * (1.0 / 9007199254740992.0);
-}
-
-/* A point uniform in the ball of radius R around c, a deterministic function of (id, salt). */
-static void
-rand_in_ball(uint64_t id, uint64_t salt, double R, const double c[3], double out[3])
-{
-    uint64_t k = 0;
-    double u[3], r2;
-    do {
-        int d;
-        r2 = 0;
-        for(d = 0; d < 3; d++) {
-            u[d] = 2 * urand(id, salt, k++) - 1;
-            r2 += u[d] * u[d];
-        }
-    } while(r2 > 1);
-    int d;
-    for(d = 0; d < 3; d++)
-        out[d] = c[d] + R * u[d];
+    const char * e = getenv("SUBHALO_TEST_FULL");
+    int on = e && *e && strcmp(e, "0") != 0;
+    MPI_Allreduce(MPI_IN_PLACE, &on, 1, MPI_INT, MPI_LAND, MPI_COMM_WORLD);
+    if(!on)
+        message(0, "%s: slow test skipped (set SUBHALO_TEST_FULL=1 to run it)\n", name);
+    return on;
 }
 
 static int
@@ -193,50 +66,6 @@ cmp_double(const void * a, const void * b)
 {
     double x = *(const double *) a, y = *(const double *) b;
     return (x > y) - (x < y);
-}
-
-/* Allocate the particle table and the slots the way test_fof.c does. */
-static void
-setup_pman(int64_t MaxPart, double BoxSize)
-{
-    particle_alloc_memory(PartManager, BoxSize, MaxPart);
-    PartManager->NumPart = 0;
-    slots_init(0.01 * PartManager->MaxPart, SlotsManager);
-    slots_set_enabled(0, sizeof(struct sph_particle_data), SlotsManager);
-    slots_set_enabled(4, sizeof(struct star_particle_data), SlotsManager);
-    slots_set_enabled(5, sizeof(struct bh_particle_data), SlotsManager);
-    int64_t newSlots[6] = {128, 0, 0, 0, 128, 128};
-    slots_reserve(1, newSlots, SlotsManager);
-}
-
-static void
-teardown_pman(void)
-{
-    slots_free(SlotsManager);
-    myfree(PartManager->Base);
-    PartManager->Base = NULL;
-    PartManager->NumPart = 0;
-    MPI_Barrier(MPI_COMM_WORLD);
-}
-
-static void
-add_dm_particle(MyIDType id, const double pos[3])
-{
-    if(PartManager->NumPart >= PartManager->MaxPart)
-        endrun(1, "test setup: MaxPart %ld too small\n", PartManager->MaxPart);
-    struct particle_data * p = &P[PartManager->NumPart++];
-    memset(p, 0, sizeof(*p));
-    p->ID = id;
-    p->Type = 1;
-    p->Mass = 1;
-    p->IsGarbage = 0;
-    p->GrNr = -1;
-    p->TrackId = -1;
-    p->BindRank = -1;
-    p->BoundTrackId = -1;
-    int d;
-    for(d = 0; d < 3; d++)
-        p->Pos[d] = pos[d];
 }
 
 /* Per-particle snapshot, gathered to every rank and sorted by ID, so assertions on it are
@@ -251,12 +80,7 @@ struct tagrec {
     double Pos[3];
 };
 
-static int
-cmp_tagrec_id(const void * a, const void * b)
-{
-    const struct tagrec * x = a, * y = b;
-    return (x->ID > y->ID) - (x->ID < y->ID);
-}
+#include "subhalo_testlib.h"
 
 static struct tagrec *
 gather_tags(int64_t * ntot)
@@ -304,20 +128,6 @@ gather_tags(int64_t * ntot)
     return all;
 }
 
-/* Copies of records 0..n-1 of the running finder's table, identical on every rank. Collective. */
-static struct SubTrack *
-fetch_all_tracks(int64_t n)
-{
-    int64_t * ids = malloc((n + 1) * sizeof(int64_t));
-    struct SubTrack * out = malloc((n + 1) * sizeof(struct SubTrack));
-    int64_t i;
-    for(i = 0; i < n; i++)
-        ids[i] = i;
-    subhalo_table_fetch(subhalo_get_table(), ids, n, out, MPI_COMM_WORLD);
-    free(ids);
-    return out;
-}
-
 /* One finder call exactly as run.c makes it, on the current particle positions. */
 static int
 run_finder_call(int snap, Cosmology * CP, int64_t * TotNgroups)
@@ -333,7 +143,7 @@ run_finder_call(int snap, Cosmology * CP, int64_t * TotNgroups)
     return ret;
 }
 
-/* The summed time of this rank's walltime clocks whose names start with prefix (decision 47.5). */
+/* The summed time of this rank's walltime clocks whose names start with prefix. */
 static double
 clock_sum(const char * prefix)
 {
@@ -345,7 +155,7 @@ clock_sum(const char * prefix)
     return t;
 }
 
-/* Phase 5c: the consistency of the per-call statistics of the last subhalo_find. */
+/* The consistency of the per-call statistics of the last subhalo_find. */
 static void
 check_call_stats(const char * what, int complete)
 {
@@ -368,7 +178,7 @@ check_call_stats(const char * what, int complete)
     CHECK(st->PeakBytes > 0 && st->PeakStage >= 0 && st->PeakStage < SUBHALO_NSTAGE && st->PeakRank >= 0 && st->PeakRank < NTask
           && (int64_t) st->StagePeakBytes[st->PeakStage] == st->PeakBytes,
           "%s: peak %ld bytes on rank %d in stage %d\n", what, st->PeakBytes, st->PeakRank, st->PeakStage);
-    /* Phase 5d: the finder's own increment: per stage at most the stage's high water less the
+    /* the finder's own increment: per stage at most the stage's high water less the
      * entry usage of some rank, the call's the largest of them */
     double imax = 0;
     for(s = 0; s < SUBHALO_NSTAGE; s++) {
@@ -382,7 +192,7 @@ check_call_stats(const char * what, int complete)
           && st->PeakIncrementRank < NTask && st->EntryBytes > 0 && st->EntryBytes < st->PeakBytes,
           "%s: own increment %ld bytes (largest stage %g) on rank %d in stage %d; entry %g, high water %ld\n", what,
           st->PeakIncrementBytes, imax, st->PeakIncrementRank, st->PeakIncrementStage, st->EntryBytes, st->PeakBytes);
-    /* the tables count with their allocator charge (audit 5d R2): whole 4096-byte allocator blocks */
+    /* the tables count with their allocator charge: whole 4096-byte allocator blocks */
     if(complete && st->FieldSOPass1Walks > 0)
         CHECK(st->FieldSOElasticBytes > 0 && fmod(st->FieldSOElasticBytes, 4096.) == 0
               && st->StageIncrBytes[SUBHALO_STAGE_FIELDSO] < st->StagePeakBytes[SUBHALO_STAGE_FIELDSO],
@@ -408,7 +218,7 @@ check_call_stats(const char * what, int complete)
               st->ExchOutMax);
 }
 
-/* Phase 5c: the PIG header's SubhaloWallTime and SubhaloPeakBytes are those of the last call. */
+/* The PIG header's SubhaloWallTime and SubhaloPeakBytes are those of the last call. */
 static void
 check_header_cost(const char * dir, int snap, const char * what)
 {
@@ -424,7 +234,7 @@ check_header_cost(const char * dir, int snap, const char * what)
         if(0 != big_block_get_attr(&bh, "SubhaloWallTime", &w, "f8", 1) || 0 != big_block_get_attr(&bh, "SubhaloPeakBytes", &pb, "u8", 1)
            || 0 != big_block_get_attr(&bh, "SubhaloPeakIncrementBytes", &pi, "u8", 1))
             ok = 0;
-        /* R3: the written SubhaloParameters is the formatter's string for the run's parameters */
+        /* the written SubhaloParameters is the formatter's string for the run's parameters */
         char want[4096];
         subhalo_format_params(want, sizeof(want));
         BigAttr * a = big_block_lookup_attr(&bh, "SubhaloParameters");
@@ -442,28 +252,10 @@ check_header_cost(const char * dir, int snap, const char * what)
     CHECK(ok && w == st->WallTime && w > 0 && pb == (uint64_t) st->PeakBytes && pb > 0,
           "%s: header SubhaloWallTime %g SubhaloPeakBytes %lu (read %d), the call's %g s and %ld bytes\n", what, w, (unsigned long) pb, ok,
           st->WallTime, st->PeakBytes);
-    /* Phase 5d: the finder's own increment round-trips too */
+    /* the finder's own increment round-trips too */
     CHECK(ok && pi == (uint64_t) st->PeakIncrementBytes && pi > 0 && pi < pb,
           "%s: header SubhaloPeakIncrementBytes %lu, the call's %ld bytes (high water %lu)\n", what, (unsigned long) pi,
           st->PeakIncrementBytes, (unsigned long) pb);
-}
-
-static void
-common_physics_setup(void)
-{
-    walltime_init(&CT);
-    struct DomainParams dp = {0};
-    dp.DomainOverDecompositionFactor = 1;
-    dp.DomainUseGlobalSorting = 0;
-    dp.TopNodeAllocFactor = 1.;
-    dp.SetAsideFactor = 1;
-    set_domain_par(dp);
-    /* FOFSaveParticles = 1 (required by the finder), b = 0.2, min length 5. */
-    set_fof_testpar(1, 0.2, 5);
-    /* Mean separation 50 => comoving linking length 10 (kpc/h); the clumps below have mean
-     * separations of 2-4 and the field lattice spacing is >= 100. */
-    fof_init(50.0);
-    init_forcetree_params(0.7);
 }
 
 /* ------------------------------------------------------------------ test 1: track table */
@@ -556,7 +348,7 @@ check_fetch(struct SubTrackTable * tab, int64_t NTotal, const int32_t * nbound_o
     free(ids);
 }
 
-/* R3: every parameter appears once in SubhaloParameters and parses back bit for bit, including
+/* Every parameter appears once in SubhaloParameters and parses back bit for bit, including
  * a non-default neighbour count and doubles that %g would round. */
 static void
 test_subhalo_header_params(void ** state)
@@ -574,8 +366,18 @@ test_subhalo_header_params(void ** state)
     p.SubhaloMajorMergerRatio = 0.30000001;
     p.SubhaloCollectiveMinPart = 123456789012L;
     p.SubhaloLookupBatchBytes = 3L * 1024 * 1024 + 1;
-    subhalo_set_testpar(p);
     char buf[4096];
+    /* the admission's parameters are written only when on: a run without it keeps its header text */
+    subhalo_set_testpar(p);
+    subhalo_format_params(buf, sizeof(buf));
+    CHECK(strstr(buf, "SubhaloAdmit") == NULL, "SubhaloAdmitShare = 0: an admission parameter is written to the header\n");
+    p.SubhaloAdmitShare = 0.1 + 0.2;
+    p.SubhaloAdmitMinCoreDistance = 0;
+    subhalo_set_testpar(p);
+    subhalo_format_params(buf, sizeof(buf));
+    CHECK(strstr(buf, "SubhaloAdmitMinCoreDistance") == NULL, "SubhaloAdmitMinCoreDistance = 0 is written to the header\n");
+    p.SubhaloAdmitMinCoreDistance = 12 + 1e-13;
+    subhalo_set_testpar(p);
     subhalo_format_params(buf, sizeof(buf));
     CHECK(strlen(buf) < sizeof(buf) - 1, "SubhaloParameters fills its buffer (%zu bytes)\n", strlen(buf));
     char g[32];
@@ -590,7 +392,8 @@ test_subhalo_header_params(void ** state)
         I(SubhaloMinNumTracerPart), I(SubhaloNumTracerHostFinding), I(SubhaloOrphanTracers), L(SubhaloLookupBatchBytes),
         D(SubhaloMajorProgenitorMassRatio), D(SubhaloBoundMassPrecision), D(SubhaloSourceRelaxFactor),
         I(SubhaloPotentialSampleSize), I(SubhaloFinalPass), D(SubhaloTreeOpenAngle), I(SubhaloMergeTrapped),
-        I(SubhaloSinkSymmetric), I(SubhaloCoreSize), I(SubhaloReassignGas), I(SubhaloNumNeighboursForReassignment),
+        I(SubhaloSinkSymmetric), I(SubhaloCoreSize), I(SubhaloReassignGas), I(SubhaloNumNeighboursForReassignment), D(SubhaloAdmitShare),
+        D(SubhaloAdmitMinCoreDistance),
         I(SubhaloUnbindWithThermal), I(SubhaloFieldSO), I(SubhaloSOBins), D(SubhaloSOSearchFactor),
         I(SubhaloSOMaxDoublings), I(SubhaloSORefineMinPart), D(SubhaloMajorMergerRatio), I(SubhaloGeometricParents),
         I(SubhaloDebugForceExchangeFailure),
@@ -624,6 +427,79 @@ test_subhalo_header_params(void ** state)
     LOCAL_CHECK(bad, nlines == nf, "%d lines for %d parameters\n", nlines, nf);
     assert_all_true(bad == 0);
     subhalo_set_testpar(saved);
+}
+
+/* The start-up check (subhalo_params_error, which set_subhalo_params aborts on): switches take 0
+ * and 1 only; the type masks are not 0 and hold every tracer type among the potential types;
+ * SubhaloSORefineMinPart is not negative with the field SO on; SubhaloGeometricParents is 0. */
+static void
+test_subhalo_param_checks(void ** state)
+{
+    const struct SubhaloParams def = default_subhalo_params();
+    struct SubhaloParams p;
+    char msg[2048] = "";
+    int bad = 0, k, v;
+#define SW(f) {#f, offsetof(struct SubhaloParams, f)}
+    const struct { const char * name; size_t off; } sw[] = {
+        SW(SubhaloFinderOn), SW(SubhaloRestartFresh), SW(SubhaloMergeTrapped), SW(SubhaloSinkSymmetric),
+        SW(SubhaloReassignGas), SW(SubhaloUnbindWithThermal), SW(SubhaloFieldSO), SW(SubhaloDebugForceExchangeFailure),
+        SW(SubhaloFinalPass),
+    };
+#undef SW
+    /* accepted (0) or refused naming the parameter (1) */
+#define EXPECT(want, name, ...) do { const int got = subhalo_params_error(&p, msg, sizeof(msg)); \
+        LOCAL_CHECK(bad, got == (want) && (!got || strstr(msg, name)), __VA_ARGS__); } while(0)
+    p = def;
+    EXPECT(0, "", "test defaults refused: %s", msg);
+    for(k = 0; k < (int) (sizeof(sw) / sizeof(sw[0])); k++)
+        for(v = -1; v <= 2; v++) {
+            p = def;
+            *(int *) ((char *) &p + sw[k].off) = v;
+            EXPECT(v < 0 || v > 1, sw[k].name, "%s = %d judged wrongly: '%s'\n", sw[k].name, v, msg);
+        }
+    p = def;
+    p.SubhaloTracerTypes = 0;
+    EXPECT(1, "SubhaloTracerTypes", "SubhaloTracerTypes = 0 judged wrongly: '%s'\n", msg);
+    p = def;
+    p.SubhaloPotentialTypes = 0;
+    EXPECT(1, "SubhaloPotentialTypes", "SubhaloPotentialTypes = 0 judged wrongly: '%s'\n", msg);
+    p = def;
+    p.SubhaloPotentialTypes = 1 + 2 + 32;
+    EXPECT(1, "every tracer type", "stars traced but not in the potential judged wrongly: '%s'\n", msg);
+    p.SubhaloTracerTypes = 2;
+    EXPECT(0, "", "DM tracers among gas, DM and BH potential types refused: '%s'\n", msg);
+    p.SubhaloPotentialTypes = 2;
+    EXPECT(0, "", "equal masks refused: '%s'\n", msg);
+    /* a gather budget is a share of the free slots: above 0, at most all of them */
+    for(k = 0; k < 4; k++) {
+        const double frac[4] = {0, 0.5, 1, 1.5};
+        p = def;
+        p.SubhaloMaxGatherFraction = frac[k];
+        EXPECT(frac[k] <= 0 || frac[k] > 1, "SubhaloMaxGatherFraction", "SubhaloMaxGatherFraction = %g judged wrongly: '%s'\n", frac[k], msg);
+    }
+    /* the ends of the masks' range: one type, all six types, and the values just outside */
+    for(k = 0; k < 4; k++) {
+        const int mask[4] = {-1, 1, 63, 64};
+        p = def;
+        p.SubhaloTracerTypes = p.SubhaloPotentialTypes = mask[k];
+        EXPECT(mask[k] < 1 || mask[k] > 63, "SubhaloTracerTypes", "both masks = %d judged wrongly: '%s'\n", mask[k], msg);
+    }
+    p = def;
+    p.SubhaloFieldSO = 1;
+    p.SubhaloSORefineMinPart = -1;
+    EXPECT(1, "SubhaloSORefineMinPart", "SubhaloSORefineMinPart = -1 with the field SO judged wrongly: '%s'\n", msg);
+    p.SubhaloSORefineMinPart = 0;
+    EXPECT(0, "", "SubhaloSORefineMinPart = 0 refused: '%s'\n", msg);
+    p.SubhaloFieldSO = 0;
+    p.SubhaloSORefineMinPart = -1;
+    EXPECT(0, "", "SubhaloSORefineMinPart = -1 without the field SO (unread) refused: '%s'\n", msg);
+    for(v = -1; v <= 2; v++) {
+        p = def;
+        p.SubhaloGeometricParents = v;
+        EXPECT(v != 0, "Not implemented", "SubhaloGeometricParents = %d judged wrongly: '%s'\n", v, msg);
+    }
+#undef EXPECT
+    assert_all_true(bad == 0);
 }
 
 static void
@@ -1062,7 +938,7 @@ join_build(struct savedrec * s, struct localrec * l, int * nsaved, int * nlocal)
     LOCAL(GEN(0, 1000), -1, -1, -1, 0);
     LOCAL(GEN(1, 1000), 100, 5, 100, 0);
     LOCAL(GEN(2, 1000), -1, -1, -1, 0);
-    /* H11: a tagged parent with a child saved untagged. The exact match keeps the child's saved
+    /* A tagged parent with a child saved untagged. The exact match keeps the child's saved
      * (absent) tag instead of inheriting the parent's; a new sibling does inherit the parent's. */
     SAVE(GEN(0, 1100), 110, 0, 110);
     SAVE(GEN(1, 1100), -1, -1, -1);
@@ -1282,7 +1158,6 @@ test_subhalo_join(void ** state)
  *           particles lose tag 0: a central's source is its FOF group only (HBT FeedCentrals)
  *  stage 4: the 30 come back to A and B is translated onto A: one group of 1560; both are major
  *           members (840, 690), the kinetic distance picks track 0 and track 1 sinks into it. */
-#define BOXSIZE 1000.
 #define T5_NA 600
 #define T5_NB 360
 #define T5_NF 1000
@@ -1359,7 +1234,7 @@ t5_position(MyIDType id, int stage, double out[3])
             return;
         }
         if(stage == 4) {
-            /* Phase 2a: B lands on A as a full ball, so that the cores coincide and A sinks */
+            /* B lands on A as a full ball, so that the cores coincide and A sinks */
             rand_in_ball(id, 7, T5_RB, T5_cA, out);
             return;
         }
@@ -1381,7 +1256,7 @@ t5_position(MyIDType id, int stage, double out[3])
 static void
 t5_expect(MyIDType id, int stage, int * label, int64_t * track)
 {
-    /* Phase 2a: at stage 4 the central decision (kinetic distance among the major members)
+    /* at stage 4 the central decision (kinetic distance among the major members)
      * picks track 0 and track 1 sinks into it */
     if(id < T5_NA) {
         *label = (stage == 3 && id < T5_NDISP) ? -1 : 0;
@@ -1523,12 +1398,12 @@ check_hosted_record(const struct SubTrack * rec, int64_t t, int64_t grnr, const 
     CHECK(rec->SinkTrackId == -1, "stage %d track %ld: SinkTrackId %ld\n", stage, t, rec->SinkTrackId);
     CHECK(rec->DescendantTrackId == t, "stage %d track %ld: DescendantTrackId %ld (itself while alive)\n", stage, t, rec->DescendantTrackId);
     /* HBT's SnapshotOfLastIsolation: -1 until the track first becomes a satellite, which never
-     * happens in Phase 1. */
+     * happens to the tracks checked here. */
     CHECK(rec->SnapLastIsolation == -1, "stage %d track %ld: SnapLastIsolation %d, expected -1 (never a satellite)\n", stage, t, rec->SnapLastIsolation);
     for(d = 0; d < 3; d++) {
         CHECK(fabs(rec->CoMPos[d] - mean[d]) < 1e-4, "stage %d track %ld: CoMPos[%d] %.8g, mean %.8g\n", stage, t, d, rec->CoMPos[d], mean[d]);
-        /* Phase 2a: the core of the 20 most bound lies near the centre of a cold clump (Phase 2b:
-         * in place too, the same HBT recipe) */
+        /* the core of the 20 most bound lies near the centre of a cold clump (in place
+         * too, the same HBT recipe) */
         CHECK(fabs(rec->CorePos[d] - rec->CoMPos[d]) < 5, "stage %d track %ld: CorePos[%d] %.8g far from CoMPos %.8g\n", stage, t, d, rec->CorePos[d], rec->CoMPos[d]);
         /* the particles have zero velocity */
         CHECK(fabs(rec->CoMVel[d]) < 1e-6, "stage %d track %ld: CoMVel[%d] = %g\n", stage, t, d, rec->CoMVel[d]);
@@ -1542,7 +1417,7 @@ check_hosted_record(const struct SubTrack * rec, int64_t t, int64_t grnr, const 
             stage, t, (unsigned long) rec->MostBoundID, (unsigned long) mb->ID);
     for(d = 0; d < 3; d++)
         CHECK(fabs(rec->MostBoundPos[d] - mb->Pos[d]) < 1e-4, "stage %d track %ld: MostBoundPos[%d]\n", stage, t, d);
-    /* Phase 2a: BindRank is the energy order; in a cold uniform clump the most bound tenth lies
+    /* BindRank is the energy order; in a cold uniform clump the most bound tenth lies
      * closer to the core than the least bound tenth. */
     double near = 0, far = 0;
     int64_t nnear = 0, nfar = 0;
@@ -1641,7 +1516,7 @@ t5_check_stage(int stage, int ret, int64_t TotNgroups, const struct tagrec * r, 
         CHECK(rec[0].SnapSink == -1 && rec[0].SnapDeath == -1 && rec[1].SnapSink == -1 && rec[1].SnapDeath == -1,
                 "stage %d: a live track has SnapSink/SnapDeath set\n", stage);
     }
-    /* History (plan 1 step 13): Mbound peaks. Track 0: 600, 600, 720, 720 (690 now), 1560;
+    /* History: Mbound peaks. Track 0: 600, 600, 720, 720 (690 now), 1560;
      * track 1: 360, 360, 360 (240 now), 840, 840 (sunk). SnapMboundPeak is not checked where
      * two calls tie. */
     static const float peak0[5] = {600, 600, 720, 720, 1560};
@@ -1936,7 +1811,7 @@ test_subhalo_forced_failure(void ** state)
     teardown_pman();
 }
 
-/* ------------------------------------------------------------------ test 7: the packing (H2) */
+/* ------------------------------------------------------------------ test 7: the packing */
 
 /* A synthetic key for subhalo_plan_pack: its particles by holder rank and type. */
 struct synkey {
@@ -2058,7 +1933,7 @@ check_synthetic_plan(const struct synkey * keys, int64_t nkeys, const struct Sub
     CHECK(bad == 0, "%s: the plan violates its capacities\n", what);
 }
 
-/* The eight-pass input of the audit appendix (four ranks, MaxPart 16871, fraction 0.5, DM only). */
+/* An input that needs eight plan passes (four ranks, MaxPart 16871, fraction 0.5, DM only). */
 static const int64_t appendix_rows[30][4] = {
     {102, 862, 758, 1116}, {1849, 289, 626, 23}, {1711, 159, 48, 748}, {96, 664, 256, 1573},
     {502, 49, 707, 1203}, {43, 54, 1064, 1275}, {1432, 1, 117, 861}, {618, 0, 700, 1028},
@@ -2180,9 +2055,9 @@ test_subhalo_plan_pack(void ** state)
         free(keys);
     }
 
-    /* (c) Phase 5c, cost balance: 8 head keys of 1000 particles, 120 of 100, a tail of 300 keys of
-     * 20, held round-robin; rank 0 has ten times the particle budget of the others. The old greedy
-     * (most free budget) put the whole head on rank 0; the cost-aware head and the water-filled
+    /* (c) cost balance: 8 head keys of 1000 particles, 120 of 100, a tail of 300 keys of
+     * 20, held round-robin; rank 0 has ten times the particle budget of the others. A greedy
+     * choice by most free budget would put the whole head on rank 0; the cost-aware head and the water-filled
      * tail must leave every rank within a few per cent of the mean estimated cost, inside the
      * capacities. */
     {
@@ -2231,7 +2106,7 @@ test_subhalo_plan_pack(void ** state)
                 nhead[0], nhead[1], nhead[2], nhead[3], mx / (tot / 4));
         CHECK(stats.NSerial == nkeys && stats.NOversized == 0, "cost balance: %ld serial, %ld in place\n", stats.NSerial, stats.NOversized);
         CHECK(mx / (tot / 4) < 1.03, "cost balance: the most loaded rank has %.4f x the mean cost\n", mx / (tot / 4));
-        /* every rank gets head keys (the old greedy gave all of them to rank 0) */
+        /* every rank gets head keys (a greedy choice by free budget would give all of them to rank 0) */
         CHECK(nhead[1] > 0 && nhead[2] > 0 && nhead[3] > 0, "cost balance: head keys per rank %ld %ld %ld %ld\n", nhead[0], nhead[1],
               nhead[2], nhead[3]);
         free(oversized);
@@ -2240,13 +2115,13 @@ test_subhalo_plan_pack(void ** state)
     }
 }
 
-/* ------------------------------------------------------------------ Phase 5d: the local sort */
+/* ------------------------------------------------------------------ the local sort */
 
 /* subhalo_local_sort (the record sort with the threaded permutation, and the indirect sort of P
  * it falls back to) leaves the same particle table at 1 to 4 threads: garbage last, then by key
  * (group, encoded travelling key, -1 first), TrackId, BindRank, ID, and the input order for full
- * ties (duplicated records). The reference is built independently of the code under test (audit
- * 5d R4): libc qsort of the input indices on the comparator below, made a total order by the
+ * ties (duplicated records). The reference is built independently of the code under test:
+ * libc qsort of the input indices on the comparator below, made a total order by the
  * input index, then an out-of-place gather; every byte of the table is compared. */
 static const struct particle_data * LocalSortIn;
 
@@ -2340,7 +2215,7 @@ test_subhalo_local_sort(void ** state)
     teardown_pman();
 }
 
-/* ------------------------------------------------------------------ Phase 5c: the serial key scheduler */
+/* ------------------------------------------------------------------ the serial key scheduler */
 
 struct sk_log {
     const char * base;
@@ -2360,7 +2235,7 @@ struct sk_ud {
 /* Writes a per-key sequence into the arena (bytes_per_part 8) and records which queue (arena,
  * alone or not) ran key k, in the order of the calls. Then takes the key's extra allowance and
  * the rest of the arena, writing all of it, and checks that the arena refuses anything beyond
- * (audit 5d R1: the key sees exactly its own allowance, not the larger buffer of its queue). */
+ * (the key sees exactly its own allowance, not the larger buffer of its queue). */
 static void
 sk_fn(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloArena * arena, int nthreads, void * userdata)
 {
@@ -2399,7 +2274,7 @@ sk_fn(const struct SubhaloKeySeg * seg, int64_t k, struct SubhaloArena * arena, 
     u->result[k] = h;
 }
 
-/* The reduced-team case (Phase 5 audit R2): each key spins for a fixed time and records the
+/* The reduced-team case: each key spins for a fixed time and records the
  * worker that ran it. */
 struct sk_timed {
     int * worker;
@@ -2431,7 +2306,7 @@ test_subhalo_serial_keys(void ** state)
         /* two large keys, ties in n (equal cost, broken by g), a spread of small ones */
         segs[k].n = k == 3 ? 150000 : (k == 50 ? 25000 : (k % 5 == 0 ? 500 : 1 + (int64_t) (urand(k, 5, 0) * 3000)));
         segs[k].Length = segs[k].n;
-        /* member counts (Phase 5d cost term); equal for the n = 500 keys so that their costs tie */
+        /* member counts (a term of the key cost); equal for the n = 500 keys so that their costs tie */
         segs[k].Tracks = k % 5 == 0 ? 3 : 1 + k % 13;
         segs[k].inplace = (k % 7 == 6);
         segs[k].ipindex = -1;
@@ -2463,7 +2338,7 @@ test_subhalo_serial_keys(void ** state)
         const struct SubhaloSerialStats * ss = subhalo_serial_last_stats();
         int64_t bad = u.bad, i, j;
         LOCAL_CHECK(bad, u.bad == 0, "serial keys, %d threads: %ld keys could not take their allowance or got more\n", T, u.bad);
-        /* each key saw exactly its own allowance, whichever keys shared its queue (audit 5d R1);
+        /* each key saw exactly its own allowance, whichever keys shared its queue;
          * every key filled its arena, so the high-water fraction is 1 up to the alignment */
         for(k = 0; k < nsegs; k++)
             if(!segs[k].inplace)
@@ -2554,7 +2429,7 @@ test_subhalo_serial_keys(void ** state)
         free(u.done);
         free(u.log);
     }
-    /* a deliberately reduced team (audit R2): 4 queues, but the scheduler called from inside an
+    /* a deliberately reduced team: 4 queues, but the scheduler called from inside an
      * active parallel region with one active level, so its own region runs on 1 worker, which
      * covers every queue. The reported workers, maximum and mean are the worker's: its maximum
      * busy time is the sum of every threaded key (not a quarter of it, as by queue). */
@@ -2628,7 +2503,7 @@ test_subhalo_serial_keys(void ** state)
 /* ------------------------------------------------------------------ test 8: hostless, swallowed, units (direct) */
 
 /* The hostless update and the host vote called directly on hand-placed particles, so that the
- * rank partition is chosen by the test (H6, H7, H10). */
+ * rank partition is chosen by the test. */
 static void
 place_direct(MyIDType id, int type, double x, double y, double z, double mass, int64_t track, int swallowed, int64_t grnr)
 {
@@ -2680,7 +2555,7 @@ test_subhalo_unhosted_direct(void ** state)
     const double atime = 0.5, vkms = 1e7 / (1e5 * atime);
 
     /* Three partitions of the periodic hostless track 0: particles at x = 0, 400, 700 in a box
-     * of 1000 (the audit's 0, 4, 7 in a box of 10). The common reference is the minimum-ID
+     * of 1000 (0, 4, 7 in a box of 10, scaled). The common reference is the minimum-ID
      * particle (x = 0); the nearest-image displacements 0, 400, -300 give 100/3. */
     int part[3][3] = {{0, 0, 0}, {0, 1, 1}, {3, 1, 2}};
     int p;
@@ -2692,14 +2567,14 @@ test_subhalo_unhosted_direct(void ** state)
         for(j = 0; j < 3; j++)
             if(part[p][j] % NTask == ThisTask)
                 place_direct(10 + j, 1, xs[j], 500, 500, 1, 0, 0, -1);
-        /* track 1: two live DM particles and a swallowed tagged BH of mass 10 (H6) */
+        /* track 1: two live DM particles and a swallowed tagged BH of mass 10 */
         if(ThisTask == 0) {
             place_direct(20, 1, 100, 100, 100, 1, 1, 0, -1);
             place_direct(22, 5, 300, 100, 100, 10, 1, 1, -1);
         }
         if(ThisTask == NTask - 1)
             place_direct(21, 1, 104, 100, 100, 1, 1, 0, -1);
-        /* track 2: only a swallowed BH: no live particle, so it dies (H6) */
+        /* track 2: only a swallowed BH: no live particle, so it dies */
         if(ThisTask == NTask / 2)
             place_direct(30, 5, 600, 600, 600, 10, 2, 1, -1);
         /* track 3: no particle at all: a non-sunk dead track */
@@ -2713,7 +2588,7 @@ test_subhalo_unhosted_direct(void ** state)
               rec[0].CoMPos[0], rec[0].CoMPos[1], rec[0].CoMPos[2], 100. / 3.);
         CHECK(rec[0].Nbound == 3 && rec[0].HostGroup == -1 && rec[0].SnapDeath == -1 && rec[0].CentralTrackId == 0,
               "partition %d: track 0 Nbound %d HostGroup %ld SnapDeath %d\n", p, rec[0].Nbound, rec[0].HostGroup, rec[0].SnapDeath);
-        /* H10: velocities in km/s with the run's unit */
+        /* velocities in km/s with the run's unit */
         CHECK(fabs(rec[0].CoMVel[0] - vkms) < 1e-3 && fabs(rec[0].CoMVel[1] + 2 * vkms) < 1e-3 && fabs(rec[0].CoMVel[2] - 0.5 * vkms) < 1e-3,
               "partition %d: hostless CoMVel (%g %g %g), expected (%g %g %g)\n", p,
               rec[0].CoMVel[0], rec[0].CoMVel[1], rec[0].CoMVel[2], vkms, -2 * vkms, 0.5 * vkms);
@@ -2739,7 +2614,7 @@ test_subhalo_unhosted_direct(void ** state)
         assert_all_true((bad == 0));
     }
 
-    /* The host vote (H6): track 1 has two live particles in group 5 and three swallowed BHs
+    /* The host vote: track 1 has two live particles in group 5 and three swallowed BHs
      * outside groups. Counting the BHs would give "no group" the strict majority. */
     PartManager->NumPart = 0;
     reset_direct_records(tab);
@@ -2917,7 +2792,7 @@ lc_position(MyIDType id, int stage, double out[3])
     const double cA[3] = {250, 250, 250}, cB[3] = {750, 750, 750};
     if(id < LC_NA) {
         if(stage >= 3) {
-            /* A dispersed: no group left anywhere (Phase 2a: a 40 kpc lattice, still bound as a
+            /* A dispersed: no group left anywhere (a 40 kpc lattice, still bound as a
              * hostless track and smaller than half the box, so its centre is unambiguous) */
             out[0] = 30. + 40. * (id % 10);
             out[1] = 30. + 40. * (id / 10);
@@ -3015,7 +2890,7 @@ set_schema_version(const char * pigname, int32_t schema)
     MPI_Barrier(MPI_COMM_WORLD);
 }
 
-/* Decision 70: PIG_snap as a version-1 state (header 1, no followed-set columns) is read with the
+/* PIG_snap as a version-1 state (header 1, no followed-set columns) is read with the
  * legacy set, the MostBoundID alone; an unknown version is skipped. */
 static void
 check_schema1_state(const char * dir, int snap, const char * what)
@@ -3153,7 +3028,7 @@ test_subhalo_lifecycle_pig(void ** state)
     sp.SubhaloRestartFresh = 0;
     subhalo_set_testpar(sp);
     Cosmology CP = test_cosmology();
-    /* velocities in units of 100 km/s (H10) */
+    /* velocities in units of 100 km/s */
     subhalo_set_units(3.085678e21, 1.989e43, 1e7);
     const int er = NTask >= 3 ? 1 : 0;
 
@@ -3391,7 +3266,7 @@ test_subhalo_many_keys(void ** state)
     common_physics_setup();
     int NTask = get_ntask(), ThisTask = get_thistask();
     struct SubhaloParams sp = default_subhalo_params();
-    /* Phase 2a: clumps of 6..10 particles survive the unbinding with these thresholds */
+    /* clumps of 6..10 particles survive the unbinding with these thresholds */
     sp.SubhaloMinNumPart = 5;
     sp.SubhaloMinNumTracerPart = 5;
     sp.SubhaloNumTracerHostFinding = 5;
@@ -3460,304 +3335,7 @@ test_subhalo_many_keys(void ** state)
     teardown_pman();
 }
 
-/* ------------------------------------------------------------------ tests 11-13: Phase 2a (plan section 5, tests 5-7) */
-
-/* Two Hernquist clumps in equilibrium (sampled from the isotropic distribution function as in
- * tests/test_subhalo_unbind.c, with this file's deterministic per-ID random numbers instead of
- * gsl), truncated at 4 scale radii, plus a field lattice. A: 2000 particles, M = 1e12 Msun/h,
- * scale 5 kpc/h (physical); B: 600, M = 2e11, scale 1.5 kpc/h; every seventh clump particle is gas (a non-tracer); the first P2_HOT
- * particles of each clump sit in its core at three times the escape speed (an unbound tail).
- * Positions are physical offsets divided by the call's scale factor (comoving), velocities
- * Vel = a v_pec. */
-#define P2_NA 2000
-#define P2_NB 600
-#define P2_NF 4096
-#define P2_NTOT (P2_NA + P2_NB + P2_NF)
-#define P2_HOT 30
-#define P2_MA 100.
-#define P2_SA 5.
-#define P2_MB 20.
-#define P2_SB 1.5
-static const double P2_cA[3] = {375., 375., 375.};
-static const double P2_cB[3] = {750., 750., 750.};
-
-struct p2rng {
-    uint64_t s;
-};
-
-static double
-p2_uniform(struct p2rng * r)
-{
-    r->s = splitmix64(r->s);
-    return (r->s >> 11) * (1.0 / 9007199254740992.0);
-}
-
-/* Hernquist DF in units G = M = a = 1 up to a constant, q2 = -E in (0, 1). */
-static double
-p2_hq_df(double q2)
-{
-    if(q2 <= 0)
-        return 0;
-    if(q2 >= 1)
-        q2 = 1 - 1e-15;
-    const double q = sqrt(q2), omq = 1 - q2;
-    const double br = 3 * asin(q) + q * sqrt(omq) * (1 - 2 * q2) * (8 * q2 * q2 - 8 * q2 - 3);
-    return br > 0 ? pow(omq, -2.5) * br : 0;
-}
-
-static double
-p2_hq_speed(double r, struct p2rng * rng)
-{
-    const double psi = 1. / (1. + r);
-    const double vesc = sqrt(2 * psi);
-    double gmax = 0;
-    int k;
-    for(k = 0; k <= 600; k++) {
-        const double v2 = vesc * vesc * pow(10., -12. + 12. * k / 600.);
-        const double g = v2 * p2_hq_df(psi - 0.5 * v2);
-        if(g > gmax) gmax = g;
-    }
-    gmax *= 1.5;
-    for(;;) {
-        const double v = vesc * p2_uniform(rng);
-        if(p2_uniform(rng) * gmax < v * v * p2_hq_df(psi - 0.5 * v * v))
-            return v;
-    }
-}
-
-static void
-p2_direction(struct p2rng * rng, double u[3])
-{
-    const double ct = 2 * p2_uniform(rng) - 1, st = sqrt(1 - ct * ct);
-    const double ph = 2 * M_PI * p2_uniform(rng);
-    u[0] = st * cos(ph);
-    u[1] = st * sin(ph);
-    u[2] = ct;
-}
-
-/* 0: clump A, 1: clump B, -1: field */
-static int
-p2_clump(MyIDType id)
-{
-    if(id < P2_NA) return 0;
-    if(id < P2_NA + P2_NB) return 1;
-    return -1;
-}
-
-static int
-p2_type(MyIDType id)
-{
-    return (p2_clump(id) >= 0 && id % 7 == 3) ? 0 : 1;
-}
-
-/* Physical offset, peculiar velocity and mass of a clump particle relative to its clump. */
-static void
-p2_clump_particle(MyIDType id, double G, double x[3], double v[3], double * mass)
-{
-    const int c = p2_clump(id);
-    const double M = c == 0 ? P2_MA : P2_MB, a = c == 0 ? P2_SA : P2_SB;
-    const int64_t N = c == 0 ? P2_NA : P2_NB;
-    const int64_t k = c == 0 ? (int64_t) id : (int64_t) id - P2_NA;
-    const double rmax = 4 * a, Xmax = pow(rmax / (rmax + a), 2);
-    struct p2rng rng = {splitmix64(id * 0x100000001B3ULL + 77)};
-    double ux[3], uv[3];
-    int d;
-    p2_direction(&rng, ux);
-    p2_direction(&rng, uv);
-    *mass = M * Xmax / N;
-    if(k < P2_HOT) {
-        /* hot core particle: three times the central escape speed */
-        const double r = 0.5 * a * p2_uniform(&rng);
-        for(d = 0; d < 3; d++) {
-            x[d] = r * ux[d];
-            v[d] = 3 * sqrt(2 * G * M / a) * uv[d];
-        }
-        return;
-    }
-    /* the cusp is cut at a few hundredths of the scale radius: the host's FOF tree (two
-     * threads) runs out of nodes on near-coincident particles */
-    const double u = 0.003 + 0.997 * p2_uniform(&rng);
-    const double s = sqrt(Xmax * u);
-    const double r = s / (1 - s);
-    const double sp = p2_hq_speed(r, &rng) * sqrt(G * M / a);
-    for(d = 0; d < 3; d++) {
-        x[d] = a * r * ux[d];
-        v[d] = sp * uv[d];
-    }
-}
-
-static double
-p2_wrap(double x)
-{
-    while(x >= BOXSIZE) x -= BOXSIZE;
-    while(x < 0) x += BOXSIZE;
-    return x;
-}
-
-/* Place every local particle for a call at scale factor atime: clump c centred at cen[c]
- * (comoving) with bulk peculiar velocity bulk[c]; the field on a 62.5 kpc/h lattice at rest, off the domain cell boundaries (enough
- * field particles on every rank for the host's threaded FOF tree). */
-static void
-p2_place(double atime, double G, const double cen[2][3], const double bulk[2][3])
-{
-    int64_t i;
-    for(i = 0; i < PartManager->NumPart; i++) {
-        struct particle_data * p = &P[i];
-        const int c = p2_clump(p->ID);
-        int d;
-        if(c < 0) {
-            const int64_t k = (int64_t) p->ID - P2_NA - P2_NB;
-            p->Pos[0] = 31.25 + 62.5 * (k % 16);
-            p->Pos[1] = 31.25 + 62.5 * ((k / 16) % 16);
-            p->Pos[2] = 31.25 + 62.5 * (k / 256);
-            p->Vel[0] = p->Vel[1] = p->Vel[2] = 0;
-            continue;
-        }
-        double x[3], v[3], m;
-        p2_clump_particle(p->ID, G, x, v, &m);
-        p->Mass = m;
-        for(d = 0; d < 3; d++) {
-            p->Pos[d] = p2_wrap(cen[c][d] + x[d] / atime);
-            p->Vel[d] = atime * (bulk[c][d] + v[d]);
-        }
-    }
-}
-
-static struct gravshort_tree_params P2_SavedTree;
-
-/* Physics, parameters (defaults; softening 0.3 kpc/h) and the particles with their gas slots. */
-static void
-p2_setup(Cosmology * CP)
-{
-    common_physics_setup();
-    petaio_init();
-    struct SubhaloParams sp = default_subhalo_params();
-    sp.SubhaloFieldSO = 1;
-    subhalo_set_testpar(sp);
-    *CP = test_cosmology();
-    P2_SavedTree = get_gravshort_treepar();
-    struct gravshort_tree_params tp = P2_SavedTree;
-    tp.FractionalGravitySoftening = 0.006;
-    set_gravshort_treepar(tp);
-    gravshort_set_softenings(50.);
-    int NTask = get_ntask(), ThisTask = get_thistask();
-    setup_pman(4 * P2_NTOT, BOXSIZE);
-    /* room for every gas particle on one rank (a whole key may land anywhere) */
-    int64_t atleast[6] = {P2_NTOT, 0, 0, 0, 128, 128};
-    slots_reserve(1, atleast, SlotsManager);
-    MyIDType id;
-    int64_t ngas = 0;
-    for(id = 0; id < P2_NTOT; id++) {
-        if((int)(id % NTask) != ThisTask)
-            continue;
-        double pos[3] = {0, 0, 0};
-        add_dm_particle(id, pos);
-        struct particle_data * p = &P[PartManager->NumPart - 1];
-        p->Type = p2_type(id);
-        if(p->Type == 0)
-            p->PI = ngas++;
-    }
-    SlotsManager->info[0].size = ngas;
-    slots_setup_id(PartManager, SlotsManager);
-    subhalo_init(-1, -1, "/nonexistent", MPI_COMM_WORLD);
-}
-
-static void
-p2_teardown(void)
-{
-    set_gravshort_treepar(P2_SavedTree);
-    gravshort_set_softenings(50.);
-    teardown_pman();
-}
-
-/* The D10 invariants on the gathered particles against the records: own-tag BindRank dense with
- * the exclusive bound rows first; BindRank is the energy order of all own-tag particles (J12),
- * so the reservation shows only as: the first min(10, own-tag tracers) tracer-type (type 1)
- * particles in rank order are bound to the track, and MostBoundID is the first of them;
- * BoundTrackId the tag, an ancestor of it or -1, bound owners resolved; Nbound, NboundTracer,
- * NboundExclusive, NtailType from the particles. Records processed in place
- * (SUBHALO_FLAG_INPLACE, Phase 2b) obey the same rules. Returns the number of violations. */
-static int
-p2_check_tags(const struct tagrec * r, int64_t n, const struct SubTrack * rec, int64_t nt, const char * what)
-{
-    int bad = 0;
-    int64_t t, i;
-    int64_t * order = malloc((n + 1) * sizeof(int64_t));
-    for(t = 0; t < nt; t++) {
-        int64_t nown = 0, nb = 0, nbt = 0, nex = 0, ntl = 0;
-        for(i = 0; i < n; i++) {
-            if(r[i].BoundTrackId == t) {
-                nb++;
-                if(r[i].Type == 1) nbt++;
-            }
-            if(r[i].TrackId == t) {
-                if(r[i].BindRank < 0 || r[i].BindRank >= n) {
-                    LOCAL_CHECK(bad, 0, "%s: track %ld particle %lu BindRank %d\n", what, t, (unsigned long) r[i].ID, r[i].BindRank);
-                    continue;
-                }
-                order[nown++] = i;
-                if(r[i].BoundTrackId == t) nex++;
-                else ntl++;
-            }
-        }
-        if(rec[t].Nbound == 0) {
-            LOCAL_CHECK(bad, nown == 0 && nb == 0, "%s: orphan %ld still has %ld own-tag and %ld bound rows\n", what, t, nown, nb);
-            continue;
-        }
-        LOCAL_CHECK(bad, nb == rec[t].Nbound && nbt == rec[t].NboundTracer, "%s: track %ld: %ld bound rows (%ld tracers), Nbound %d NboundTracer %d\n",
-                    what, t, nb, nbt, rec[t].Nbound, rec[t].NboundTracer);
-        LOCAL_CHECK(bad, nex == rec[t].NboundExclusive, "%s: track %ld: %ld exclusive rows, NboundExclusive %d\n", what, t, nex, rec[t].NboundExclusive);
-        int64_t tl = 0;
-        int k;
-        for(k = 0; k < 6; k++)
-            tl += rec[t].NtailType[k];
-        LOCAL_CHECK(bad, ntl == tl, "%s: track %ld: %ld tail rows, NtailType sum %ld\n", what, t, ntl, tl);
-        /* dense ranks: place by BindRank */
-        int64_t * byrank = malloc((nown + 1) * sizeof(int64_t));
-        for(i = 0; i < nown; i++)
-            byrank[i] = -1;
-        for(i = 0; i < nown; i++) {
-            const int32_t b = r[order[i]].BindRank;
-            if(b < nown && byrank[b] < 0) byrank[b] = order[i];
-            else LOCAL_CHECK(bad, 0, "%s: track %ld: BindRank %d duplicated or beyond %ld\n", what, t, b, nown);
-        }
-        int64_t ntr = 0, first_tracer = -1;
-        for(i = 0; i < nown; i++) {
-            if(byrank[i] < 0) continue;
-            const struct tagrec * q = &r[byrank[i]];
-            LOCAL_CHECK(bad, (q->BoundTrackId == t) == (i < nex), "%s: track %ld: BindRank %ld bound %d, exclusive prefix %ld\n",
-                        what, t, i, q->BoundTrackId == t, nex);
-            if(q->Type == 1) {
-                if(ntr == 0)
-                    first_tracer = byrank[i];
-                if(ntr < 10)
-                    LOCAL_CHECK(bad, q->BoundTrackId == t, "%s: track %ld: tracer %ld in rank order (BindRank %ld) is not bound to it\n",
-                                what, t, ntr, i);
-                ntr++;
-            }
-        }
-        LOCAL_CHECK(bad, first_tracer >= 0 && r[first_tracer].ID == rec[t].MostBoundID,
-                    "%s: track %ld: MostBoundID %lu is not the first tracer in rank order\n", what, t, (unsigned long) rec[t].MostBoundID);
-        free(byrank);
-    }
-    for(i = 0; i < n; i++) {
-        const int64_t T = r[i].TrackId, B = r[i].BoundTrackId;
-        if(T < 0) {
-            LOCAL_CHECK(bad, B == -1, "%s: untagged particle %lu bound to %ld\n", what, (unsigned long) r[i].ID, B);
-            continue;
-        }
-        if(B < 0 || B == T)
-            continue;
-        LOCAL_CHECK(bad, B < nt && rec[B].Nbound > 0, "%s: particle %lu bound to unresolved %ld\n", what, (unsigned long) r[i].ID, B);
-        int64_t u = T;
-        int steps = 0;
-        while(u >= 0 && u != B && steps++ <= nt)
-            u = rec[u].NestedParentTrackId;
-        LOCAL_CHECK(bad, u == B, "%s: particle %lu tagged %ld bound to %ld, not an ancestor\n", what, (unsigned long) r[i].ID, T, B);
-    }
-    free(order);
-    return bad;
-}
+/* ------------------------------------------------------------------ tests 11-13: two Hernquist clumps */
 
 /* A checksum of the tags and the main record columns, logged so that runs with different thread
  * counts can be compared. */
@@ -3774,7 +3352,7 @@ p2_log_checksum(const char * what, const struct tagrec * r, int64_t n, const str
         memcpy(&m, &x, sizeof(m));
         h = splitmix64(h ^ m ^ (uint64_t) rec[i].Nbound ^ ((uint64_t) rec[i].Rank << 32));
     }
-    message(0, "Phase 2a test checksum %s: %016lx\n", what, (unsigned long) h);
+    message(0, "Tracking test checksum %s: %016lx\n", what, (unsigned long) h);
 }
 
 /* A record of a resolved central hosted by its own group, with HBT properties set. */
@@ -3807,7 +3385,7 @@ p2_group_of(const struct tagrec * r, int64_t n, int clump, int64_t * len)
     return g;
 }
 
-/* Test 5 of the plan: two persistent tracks over three calls. */
+/* Two persistent tracks over three calls. */
 static void
 test_subhalo_twohalo(void ** state)
 {
@@ -3818,7 +3396,7 @@ test_subhalo_twohalo(void ** state)
     int call;
     /* a cold gas particle at rest at A's centre: the most bound particle of A, but not a tracer */
     const MyIDType coldgas = 31;
-    /* decision 47.5: the field SO stage's walltime children /Subhalo/FieldSO/{Setup,Tree,Walks}
+    /* the field SO stage's walltime children /Subhalo/FieldSO/{Setup,Tree,Walks}
      * cover the stage (this rank; new clocks would inherit the times of earlier tests' slots:
      * cleared here) */
     {
@@ -3891,8 +3469,8 @@ test_subhalo_twohalo(void ** state)
         }
         CHECK(bad == 0, "two haloes, call %d: particle tags\n", call);
         CHECK(ntail[0] >= P2_HOT && ntail[1] >= P2_HOT, "two haloes, call %d: tails %ld %ld\n", call, ntail[0], ntail[1]);
-        /* J12: BindRank is the energy order of every own-tag particle, so the cold gas particle
-         * ranks among the first ten (formerly reserved to tracers) while MostBoundID stays a tracer */
+        /* BindRank is the energy order of every own-tag particle, so the cold gas particle
+         * ranks among the first ten (energy order, not tracers first) while MostBoundID stays a tracer */
         for(i = 0; i < n; i++)
             if(r[i].ID == coldgas)
                 CHECK(r[i].Type == 0 && r[i].TrackId == 0 && r[i].BoundTrackId == 0 && r[i].BindRank < 10 && rec[0].MostBoundID != coldgas,
@@ -3908,7 +3486,7 @@ test_subhalo_twohalo(void ** state)
     p2_teardown();
 }
 
-/* R1: one call of the default-pass sequence on the two-halo fixture; the PIG saved when dir is set. */
+/* One call of the default-pass sequence on the two-halo fixture; the PIG saved when dir is set. */
 static int
 sd_call(int snap, Cosmology * CP, const char * dir)
 {
@@ -3934,7 +3512,7 @@ sd_call(int snap, Cosmology * CP, const char * dir)
     return ret;
 }
 
-/* R1: non-default core size and reserved tracer count for sd_sequence (0 = defaults) */
+/* Non-default core size and reserved tracer count for sd_sequence (0 = defaults) */
 static int SdCoreSize = 0, SdMinTracers = 0;
 
 struct sd_state {
@@ -4031,28 +3609,20 @@ sd_free(struct sd_state * s)
     }
 }
 
-/* R1: the real driver with the production default (SubhaloFinalPass = 0, sampled final pass) on
+/* The real driver with the production default (SubhaloFinalPass = 0, sampled final pass) on
  * the two-halo fixture (clump A above SubhaloPotentialSampleSize): tags and every persisted record
- * column after calls 1 and 2 are the same at 1 and 2 threads (A runs alone, threaded), and with
- * call 2 continued in memory or after reloading PIG_001. The exact pass (SubhaloFinalPass = 1)
- * gives a different binding order, so the default path is the one exercised. */
+ * column after calls 1 and 2 are the same at 2 threads (A runs alone, threaded) with call 2 after
+ * reloading PIG_001 as at 1 thread in memory. The exact pass (SubhaloFinalPass = 1) gives a
+ * different binding order, so the default path is the one exercised. */
 static void
 test_subhalo_sampled_default(void ** state)
 {
     struct sd_state ref, x;
-    int bad = 0;
     sd_sequence(1, 0, 0, &ref);
-    const int Ts[3] = {2, 1, 2}, Rl[3] = {0, 1, 1};
-    int c;
-    for(c = 0; c < 3; c++) {
-        char what[96];
-        snprintf(what, sizeof(what), "sampled default, %d threads%s vs 1 thread", Ts[c], Rl[c] ? " with a reload" : "");
-        sd_sequence(Ts[c], Rl[c], 0, &x);
-        const int b = sd_compare(&ref, &x, what);
-        message(0, "%s: %d differences\n", what, b);
-        bad += b;
-        sd_free(&x);
-    }
+    sd_sequence(2, 1, 0, &x);
+    int bad = sd_compare(&ref, &x, "sampled default, 2 threads with a reload vs 1 thread");
+    message(0, "sampled default, 2 threads with a reload vs 1 thread: %d differences\n", bad);
+    sd_free(&x);
     assert_all_true(bad == 0);
     /* the default differs from the exact pass in clump A's order (the sampled pass ran) */
     sd_sequence(1, 0, 1, &x);
@@ -4062,6 +3632,31 @@ test_subhalo_sampled_default(void ** state)
     message(0, "sampled default vs exact pass, call 1: %ld of %ld BindRank differ\n", ndiff, ref.n[0]);
     CHECK(ndiff > 0, "sampled default: the binding order equals the exact pass's (%ld differences)\n", ndiff);
     sd_free(&x);
+    sd_free(&ref);
+}
+
+/* sampled_default's two factors one at a time (2 threads in memory, 1 thread with a reload), and
+ * a non-default core and reserved tracer count, which costs most of the time. */
+static void
+test_subhalo_sampled_default_full(void ** state)
+{
+    if(!full_test(__func__))
+        return;
+    struct sd_state ref, x;
+    int bad = 0;
+    sd_sequence(1, 0, 0, &ref);
+    const int Ts[2] = {2, 1}, Rl[2] = {0, 1};
+    int c;
+    for(c = 0; c < 2; c++) {
+        char what[96];
+        snprintf(what, sizeof(what), "sampled default, %d threads%s vs 1 thread", Ts[c], Rl[c] ? " with a reload" : "");
+        sd_sequence(Ts[c], Rl[c], 0, &x);
+        const int b = sd_compare(&ref, &x, what);
+        message(0, "%s: %d differences\n", what, b);
+        bad += b;
+        sd_free(&x);
+    }
+    assert_all_true(bad == 0);
     sd_free(&ref);
     /* a non-default core (37) and reserved tracer count (45): a 225-tracer exact head, 1 vs 2 threads */
     SdCoreSize = 37;
@@ -4076,7 +3671,7 @@ test_subhalo_sampled_default(void ** state)
     sd_free(&ref);
 }
 
-/* Phase 5c: the reserve admission. The two haloes with A (2000 particles) in place: a first call
+/* The reserve admission. The two haloes with A (2000 particles) in place: a first call
  * completes and gives the plan's reserve on every rank; the second call runs with the free memory
  * squeezed to 2 MB below that reserve, where the collective stage alone still fits: the call
  * fails before the exchange (reserve_failed, the collective admission passed), the tags are
@@ -4095,7 +3690,7 @@ test_subhalo_reserve_admission(void ** state)
     p2_place(0.5, CP.GravInternal, cen, bulk);
     int64_t ng, n, i;
     int ret = run_finder_call(0, &CP, &ng);
-    const struct SubhaloCollAdmit * ad = subhalo_plan_last_admission();
+    const struct SubhaloMemCheck * ad = subhalo_plan_last_memcheck();
     CHECK(ret == 1 && ad->checked && !ad->failed && !ad->reserve_failed && ad->reserve_short < 0,
           "reserve: the first call returned %d (checked %d failed %d reserve failed %d short %g)\n", ret, ad->checked, ad->failed,
           ad->reserve_failed, ad->reserve_short);
@@ -4120,13 +3715,13 @@ test_subhalo_reserve_admission(void ** state)
         myfree(block);
     fof_finish(&fof);
     domain_free(&ddecomp);
-    ad = subhalo_plan_last_admission();
+    ad = subhalo_plan_last_memcheck();
     const struct SubhaloPlanSummary * ps = subhalo_plan_last_summary();
     message(0, "reserve: ret %d; reserve failed %d on rank %d, short %g MB (this rank needs %g MB, had %g MB); collective checked %d "
                "failed %d (needs %g MB of %g MB); plan %ld serial, %ld in place, %ld candidates\n", ret, ad->reserve_failed,
             ad->reserve_rank, ad->reserve_short / 1048576., ad->reserve_need / 1048576., ad->pack_free / 1048576., ad->checked,
             ad->failed, ad->need / 1048576., ad->avail / 1048576., ps->NSerial, ps->NOversized, ps->NCands);
-    CHECK(ret == 0 && !subhalo_last_call_complete() && !ps->Admitted, "reserve: the squeezed call returned %d\n", ret);
+    CHECK(ret == 0 && !subhalo_last_call_complete() && !ps->Fits, "reserve: the squeezed call returned %d\n", ret);
     CHECK(ad->reserve_failed && ad->reserve_short >= 2. * 1024 * 1024 && ad->reserve_short < need,
           "reserve: reserve failed %d, short %g bytes\n", ad->reserve_failed, ad->reserve_short);
     CHECK(ad->checked && !ad->failed && ad->need <= ad->avail, "reserve: the collective admission (checked %d) failed %d: %g of %g bytes\n",
@@ -4146,7 +3741,7 @@ test_subhalo_reserve_admission(void ** state)
 
     /* the memory back: the call completes */
     ret = run_finder_call(1, &CP, &ng);
-    ad = subhalo_plan_last_admission();
+    ad = subhalo_plan_last_memcheck();
     CHECK(ret == 1 && subhalo_last_call_complete() && !ad->reserve_failed, "reserve: the next call returned %d\n", ret);
     check_call_stats("reserve, next call", 1);
     p2_teardown();
@@ -4173,44 +3768,7 @@ p2_bound_com(const struct tagrec * r, const double * mass, int64_t n, int64_t t,
         com[d] = p2_wrap(ref[d] + (M > 0 ? s[d] / M : 0));
 }
 
-/* B at 5 kpc/h (physical) from A's centre on a circular orbit, 60 of its particles pulled to
- * A's centre (the overlap scenario of plan test 6), positions and velocities for atime. */
-static void
-p2_infall(Cosmology * CP, double atime)
-{
-    double cen[2][3] = {{P2_cA[0], P2_cA[1], P2_cA[2]}, {P2_cB[0], P2_cB[1], P2_cB[2]}};
-    double bulk[2][3] = {{0, 0, 0}, {0, 0, 0}};
-    /* B at 5 kpc/h (physical) from A's centre on a circular orbit: its tidal radius (about 3
-     * kpc/h) is inside its truncation radius (6 kpc/h), so its outskirts are stripped */
-    const double dphys = 5.;
-    const double MinA = P2_MA * pow(dphys / (dphys + P2_SA), 2);
-    const double vc = sqrt(CP->GravInternal * MinA / dphys);
-    cen[1][0] = P2_cA[0] + dphys / atime;
-    cen[1][1] = P2_cA[1];
-    cen[1][2] = P2_cA[2];
-    bulk[1][1] = vc;
-    p2_place(atime, CP->GravInternal, cen, bulk);
-    /* 60 of B's particles have been pulled out towards A's centre and move against B: unbound
-     * to B, bound to A (what the satellite passes up and the central binds) */
-    {
-        int64_t i;
-        for(i = 0; i < PartManager->NumPart; i++) {
-            const int64_t k = (int64_t) P[i].ID - P2_NA;
-            if(p2_clump(P[i].ID) != 1 || k < P2_HOT || k >= P2_HOT + 60)
-                continue;
-            double x[3];
-            const double c0[3] = {0, 0, 0};
-            rand_in_ball(P[i].ID, 41, 1.0, c0, x);
-            int d;
-            for(d = 0; d < 3; d++) {
-                P[i].Pos[d] = p2_wrap(P2_cA[d] + (x[d] + (d == 0 ? 1. : 0)) / atime);
-                P[i].Vel[d] = atime * (d == 1 ? -vc : 0);
-            }
-        }
-    }
-}
-
-/* Test 6 of the plan: B falls into A (one FOF group): a satellite with a stripped tail, part of
+/* B falls into A (one FOF group): a satellite with a stripped tail, part of
  * it bound by the central under the satellite's tag; the frames of the next call from the
  * BoundTrackId sums; the restart join keeps BoundTrackId. */
 static void
@@ -4302,7 +3860,7 @@ cs_moved_id(int c, int j)
     return id;
 }
 
-/* Decision 52 (HBT FeedCentrals): a central's source is its FOF group only. B falls into A as in
+/* A central's source is its FOF group only (HBT FeedCentrals). B falls into A as in
  * the overlap test, and 20 cold tracers of each clump, tagged at the first call, are moved into the
  * field far from the group: A's (the central's) are untagged, B's (the satellite's) keep tag 1.
  * test_subhalo_lifecycle_pig checks that a hostless pseudo-key keeps all its field particles. */
@@ -4372,7 +3930,7 @@ test_subhalo_central_source(void ** state)
     p2_teardown();
 }
 
-/* Test 7 of the plan: B placed on A's core with its velocity sinks; its tracer is followed at
+/* B placed on A's core with its velocity sinks; its tracer is followed at
  * the next call; isolated with 30 field particles in a new group it is resurrected. */
 static void
 test_subhalo_sink_orphan(void ** state)
@@ -4468,42 +4026,7 @@ test_subhalo_sink_orphan(void ** state)
     p2_teardown();
 }
 
-/* ------------------------------------------------------------------ audit regression fixtures (J1-J12) */
-
-/* Synthetic tracking state (halofinder_phase2a_audit_codex.md, regression items 1-5): particles
- * with chosen positions, velocities and tags, and the records of a previous call injected into
- * the table, so that one call exercises a chosen hierarchy. Every particle is a DM tracer of
- * mass SYN_M (1e6 Msun/h): a 100-particle ball of 1 kpc has v_circ ~ 20 km/s. The ids
- * [SynNTot - SYN_NFIELD, SynNTot) are a 62.5 kpc/h field lattice at rest. */
-#define SYN_M 1e-4
-#define SYN_NFIELD 4096
-static int64_t SynNTot;
-
-struct SynPart {
-    double pos[3];      /* comoving, output frame (syn_place adds CurrentParticleOffset) */
-    double vel[3];      /* internal Vel */
-    double mass;
-    int64_t tag, bound;
-    int32_t rank;
-    int swallowed;
-};
-typedef void (*syn_fn)(MyIDType id, double atime, struct SynPart * s, void * ud);
-
-/* A point of a ball of physical radius Rphys about cen (comoving) with velocity bulk plus an
- * isotropic offset of at most sigma (physical km/s), as Pos and Vel at atime. */
-static void
-syn_ball(MyIDType id, uint64_t salt, const double cen[3], double Rphys, const double bulk[3], double sigma, double atime, struct SynPart * s)
-{
-    double x[3], v[3];
-    const double c0[3] = {0, 0, 0};
-    rand_in_ball(id, salt, Rphys, c0, x);
-    rand_in_ball(id, salt + 1000, sigma, c0, v);
-    int d;
-    for(d = 0; d < 3; d++) {
-        s->pos[d] = cen[d] + x[d] / atime;
-        s->vel[d] = atime * (bulk[d] + v[d]);
-    }
-}
+/* ------------------------------------------------------------------ synthetic-state fixtures */
 
 static void
 syn_setup(Cosmology * CP, int64_t ntot, struct SubhaloParams sp)
@@ -4531,72 +4054,6 @@ syn_setup(Cosmology * CP, int64_t ntot, struct SubhaloParams sp)
     SynNTot = ntot;
 }
 
-static void
-syn_teardown(void)
-{
-    int d;
-    for(d = 0; d < 3; d++)
-        PartManager->CurrentParticleOffset[d] = 0;
-    subhalo_set_units(3.085678e21, 1.989e43, 1e5);
-    p2_teardown();
-}
-
-/* Place every local particle (and, with settags, set its tags) from fn; the lattice ids are
- * handled here. */
-static void
-syn_place(syn_fn fn, void * ud, double atime, int settags)
-{
-    int64_t i;
-    for(i = 0; i < PartManager->NumPart; i++) {
-        struct particle_data * p = &P[i];
-        struct SynPart s;
-        memset(&s, 0, sizeof(s));
-        s.mass = SYN_M;
-        s.tag = s.bound = -1;
-        s.rank = -1;
-        const int64_t k = (int64_t) p->ID - (SynNTot - SYN_NFIELD);
-        if(k >= 0) {
-            s.pos[0] = 31.25 + 62.5 * (k % 16);
-            s.pos[1] = 31.25 + 62.5 * ((k / 16) % 16);
-            s.pos[2] = 31.25 + 62.5 * (k / 256);
-        }
-        fn(p->ID, atime, &s, ud);
-        int d;
-        for(d = 0; d < 3; d++) {
-            p->Pos[d] = p2_wrap(s.pos[d] + PartManager->CurrentParticleOffset[d]);
-            p->Vel[d] = s.vel[d];
-        }
-        p->Mass = s.mass;
-        p->Swallowed = s.swallowed;
-        if(settags) {
-            p->TrackId = s.tag;
-            p->BoundTrackId = s.bound;
-            p->BindRank = s.rank;
-        }
-    }
-}
-
-/* A resolved record of the previous call (snapshot 0). */
-static struct SubTrack
-syn_rec(int64_t T, int nbound, double mbound, int64_t parent, int64_t central, int rank, int depth)
-{
-    struct SubTrack r;
-    subhalo_track_clear(&r, T);
-    r.Nbound = r.NboundExclusive = r.NboundTracer = nbound;
-    r.NboundType[1] = r.NboundExclusiveType[1] = nbound;
-    r.Mbound = r.MboundType[1] = mbound;
-    r.NestedParentTrackId = parent;
-    r.CentralTrackId = central;
-    r.Rank = rank;
-    r.Depth = depth;
-    r.HostGroup = 1;
-    r.SnapBirth = 0;
-    r.DescendantTrackId = T;
-    r.MboundPeak = mbound;
-    r.SnapMboundPeak = 0;
-    return r;
-}
-
 /* An orphan record with a stale host (HostGroup 99, CentralTrackId 0) and its tracer. */
 static struct SubTrack
 syn_orphan(int64_t T, MyIDType tracer)
@@ -4617,21 +4074,6 @@ syn_orphan(int64_t T, MyIDType tracer)
     return r;
 }
 
-/* The records of a previous call, into the running finder's table (every rank passes all). */
-static void
-syn_records(const struct SubTrack * recs, int64_t n)
-{
-    struct SubTrackTable * tab = subhalo_get_table();
-    tab->NTotal = n;
-    subhalo_table_redistribute(tab, MPI_COMM_WORLD);
-    int64_t T;
-    for(T = 0; T < n; T++) {
-        struct SubTrack * t = subhalo_table_get(tab, T);
-        if(t)
-            *t = recs[T];
-    }
-}
-
 static int64_t
 tagrec_index(const struct tagrec * r, int64_t n, MyIDType id)
 {
@@ -4644,8 +4086,8 @@ tagrec_index(const struct tagrec * r, int64_t n, MyIDType id)
     return (lo < n && r[lo].ID == id) ? lo : -1;
 }
 
-/* ---- regression item 2 and J2: a real nest tree in two groups ----
- * Group 1, the audit's chain C(0) -> X(1) -> A(2) -> D(3) along x, 5 kpc apart: C is the decided
+/* ---- a real nest tree in two groups ----
+ * Group 1, a chain C(0) -> X(1) -> A(2) -> D(3) along x, 5 kpc apart: C is the decided
  * central (largest previous Mbound) and moves at 1000 km/s; X (2000 particles) becomes the most
  * massive survivor and is promoted; the 50 particles p, tagged D and unbound to it, sit at rest
  * in C's frame: D, A and X keep them in their tails, C binds them. The deepest claim (D) is on
@@ -4784,19 +4226,19 @@ test_subhalo_nest_tree(void ** state)
     CHECK(rec[8].Nbound > 0 && rec[8].NestedParentTrackId == 4 && rec[8].Depth == 1, "nest: E Nbound %d pid %ld Depth %d\n",
           rec[8].Nbound, rec[8].NestedParentTrackId, rec[8].Depth);
     CHECK(p2_check_tags(r, n, rec, 9, "nest") == 0, "nest: tag invariants\n");
-    /* the Phase 3 hooks ran: bound SO, Rockstar Vmax, field SO of the two centrals */
+    /* the property hooks ran: bound SO, Rockstar Vmax, field SO of the two centrals */
     CHECK(rec[1].MBoundSO[0] > 0 && rec[1].VmaxVir > 0 && rec[1].MSO[2] > 0 && rec[4].MSO[2] > 0 && rec[0].MSO[2] == -1,
-          "nest: Phase 3 columns MBoundSO %g VmaxVir %g MSO200c %g / %g (satellite %g)\n", rec[1].MBoundSO[0], rec[1].VmaxVir,
+          "nest: property columns MBoundSO %g VmaxVir %g MSO200c %g / %g (satellite %g)\n", rec[1].MBoundSO[0], rec[1].VmaxVir,
           rec[1].MSO[2], rec[4].MSO[2], rec[0].MSO[2]);
     free(rec);
     free(r);
     syn_teardown();
 }
 
-/* ---- J7: deep chains, the arena high-water mark at R = 3 and R = 10, sinking on and off ----
+/* ---- deep chains, the arena high-water mark at R = 3 and R = 10, sinking on and off ----
  * A 30-node chain T0 -> T1 -> ... -> T29 (5 kpc apart, 25 bound particles each, 40 for T0) and
  * 300 hot particles in T29's tail that every node rejects: each survivor keeps up to R * 25 of
- * them, the audit's worst case for the persistent lists. */
+ * them, the worst case for the persistent lists. */
 #define DC_L 30
 #define DC_N0 40
 #define DC_N 25
@@ -4881,11 +4323,11 @@ test_subhalo_deep_chain(void ** state)
         }
 }
 
-/* ---- regression item 1, J1 and J8: lifecycle events in one call, with an empty rank, a nonzero
+/* ---- lifecycle events in one call, with an empty rank, a nonzero
  *      particle offset and a non-default velocity unit ----
  * S (0) hosts the dying D (1): D's ten tracers are six cold particles at S's centre (S binds
  * them), one cold and one hot particle in U's group (2; found remotely: bound to U, unbound) and
- * two hot ones; a newborn N in its own group numbers while those votes are pending (J1). V (3)
+ * two hot ones; a newborn N in its own group numbers while those votes are pending. V (3)
  * is an oversized group processed in place. Orphans: O1 (4) follows an S particle, O2 (5) a
  * swallowed field particle, O3 (6) an ID that does not exist, O4 (7) a moving field particle,
  * O5 (8) a V particle. Calls 2 and 3 move O1's tracer to the field, then into V. */
@@ -5028,7 +4470,7 @@ test_subhalo_mixed_call(void ** state)
         /* V in place */
         CHECK(rec[3].Nbound > 0 && (rec[3].Flags & SUBHALO_FLAG_INPLACE) && rec[3].HostGroup == gV,
               "mixed call %d: V Nbound %d Flags %d HostGroup %ld\n", call, rec[3].Nbound, rec[3].Flags, rec[3].HostGroup);
-        /* orphans (J8): current host and central, misses sticky with the last position */
+        /* orphans: current host and central, misses sticky with the last position */
         const int64_t t1 = tagrec_index(r, n, 5);
         const int64_t h1 = call == 1 ? gS : (call == 2 ? -1 : gV);
         const int64_t c1 = call == 1 ? 0 : (call == 2 ? -1 : 3);
@@ -5058,6 +4500,898 @@ test_subhalo_mixed_call(void ** state)
         free(r);
     }
     syn_teardown();
+}
+
+/* ---- admission by neighbour majority (SubhaloAdmitShare) ----
+ * One group: the central H (TrackId 0, 400 particles, 3 kpc) and the satellite S (1, 1.5 kpc off H's
+ * centre, 60 km/s across); in the nested and sibling fixtures a second satellite S2 (2) concentric with S,
+ * below S or beside it. H-owned particles are placed in S: M slow in S's frame, F fast, T in a shell
+ * about S's edge; X (owned by H) and Y (owned by S) each sit in a shell of ten tracers whose previous
+ * BoundTrackIds set its votes. Particles a fixture does not use are parked as H's, far from S. A brute
+ * force over the fixture's own positions and tags gives the admission the rule must make. */
+#define AD_H0 0
+#define AD_S0 400
+#define AD_S20 500
+#define AD_M0 560
+#define AD_F0 566
+#define AD_T0 572
+#define AD_X 596
+#define AD_Y 597
+#define AD_XS0 598
+#define AD_YS0 608
+#define AD_END 618
+#define AD_NM 6
+#define AD_NT 24
+
+/* AD_REST: S at rest in H's frame, so that H would bind what S takes; AD_LOSS: S's previous bound set also
+ * holds a fragment of 60 (the S2 ids) at 20 times the mass, 300 km/s across, in S's ball; AD_SINK: the nested
+ * S2 may sink into S. AD_TWIN: the H-owned candidate Z (X's id, Y's with reverse) at exactly the position of
+ * W, an S-bound tracer (the other id), in X's shell with shell tracers 0, 1, 2 and 8 bound to S, the rest to
+ * H: Z's ten neighbours are W and shell tracers 0-8, five for S. AD_SMALL: one key of nh H tracers in 1 kpc,
+ * AD_NSMALL S tracers and Z at S's centre; every other id is alone in the field. AD_TRIPLE (with AD_TWIN):
+ * the H-owned tracer AD_X - 1 at Z and W too, so that a Z of the largest id is third in its own query. */
+enum { AD_SLOW = 1, AD_FAST = 2, AD_SHELL = 4, AD_NESTED = 8, AD_SIBLING = 16, AD_HOT = 32, AD_REST = 64, AD_LOSS = 128,
+       AD_SINK = 256, AD_TWIN = 512, AD_SMALL = 1024, AD_TRIPLE = 2048 };
+#define AD_NSMALL 34
+
+struct AdUd {
+    int mode;
+    int xs2;            /* of X's ten shell tracers, those bound to S2 at the previous call (the rest to S) */
+    int reverse;        /* M's previous BindRanks in reverse order; AD_TWIN: Z has the larger id */
+    int kk;             /* SubhaloNumNeighboursForReassignment, 0 for 10 */
+    int star;           /* AD_TWIN: 1 Z, 2 W a star, outside the tracer types (DM only) */
+    int nh;             /* AD_SMALL: H's tracers */
+    double minD;        /* SubhaloAdmitMinCoreDistance */
+    const struct AdCore * core;   /* the stored cores of the records H, S, S2; NULL: syn_rec's */
+    int sym;            /* SubhaloSinkSymmetric */
+};
+
+/* A previous record's sinking core (CorePos, CoreVel, CoreSigmaX, CoreSigmaV). */
+struct AdCore {
+    double pos[3];
+    float vel[3];
+    float sx, sv;
+};
+
+/* The neighbour number of a fixture, and whether its particle id is a star (a non-tracer). */
+static int
+ad_k(const struct AdUd * ud)
+{
+    return ud->kk ? ud->kk : 10;
+}
+
+static int
+ad_star(const struct AdUd * ud, MyIDType id)
+{
+    if(!(ud->mode & AD_TWIN) || !ud->star)
+        return 0;
+    const MyIDType z = ud->reverse ? AD_Y : AD_X;
+    return id == (ud->star == 1 ? z : AD_X + AD_Y - z);
+}
+
+static void
+ad_particle(MyIDType id, double atime, struct SynPart * s, void * ud_)
+{
+    const struct AdUd * ud = (const struct AdUd *) ud_;
+    if(id >= AD_END)
+        return;
+    const double a1 = 1. / atime;
+    const double cH[3] = {375, 375, 375}, cS[3] = {375 + 1.5 * a1, 375, 375}, cP[3] = {375 - 1.5 * a1, 375, 375};
+    const double vy = (ud->mode & AD_REST) ? 0 : 60;
+    const double zero[3] = {0, 0, 0}, vS[3] = {0, vy, 0}, vF[3] = {300, vy, 0};
+    const int two = ud->mode & (AD_NESTED | AD_SIBLING);
+    int park = 0;
+    if(ud->mode & AD_SMALL) {
+        int d;
+        if(id < (MyIDType) ud->nh) {
+            syn_ball(id, 41, cH, 1.0, zero, 5, atime, s);
+            s->tag = s->bound = 0; s->rank = id;
+        } else if(id >= AD_S0 && id < AD_S0 + AD_NSMALL) {
+            syn_ball(id, 42, cS, 0.3, vS, 5, atime, s);
+            s->tag = s->bound = 1; s->rank = id - AD_S0;
+        } else if(id == AD_X) {
+            for(d = 0; d < 3; d++) {
+                s->pos[d] = cS[d];
+                s->vel[d] = atime * vS[d];
+            }
+            s->tag = s->bound = 0; s->rank = 450;
+        } else
+            /* 45 kpc/h from the lattice, 62.5 kpc/h from each other: no group */
+            for(d = 0; d < 3; d++)
+                s->pos[d] = 5 + 62.5 * ((d == 0 ? id : (d == 1 ? id / 16 : id / 256)) % 16);
+        return;
+    }
+    if((ud->mode & AD_TRIPLE) && id == AD_X - 1) {
+        int d;
+        for(d = 0; d < 3; d++) {
+            s->pos[d] = cS[d] + (d == 0 ? 0.05 * a1 : 0);
+            s->vel[d] = atime * vS[d];
+        }
+        s->tag = s->bound = 0; s->rank = 1000 + id;
+        return;
+    }
+    if(id < AD_S0) {
+        syn_ball(id, 41, cH, 3.0, zero, 5, atime, s);
+        s->tag = s->bound = 0; s->rank = id;
+    } else if(id < AD_S20) {
+        syn_ball(id, 42, cS, two ? 1.0 : 0.5, vS, (ud->mode & AD_HOT) ? 3000 : 5, atime, s);
+        s->tag = s->bound = 1; s->rank = id - AD_S0;
+    } else if(id < AD_M0) {
+        if(two) {
+            syn_ball(id, 43, cS, 0.3, vS, 5, atime, s);
+            s->tag = s->bound = 2; s->rank = id - AD_S20;
+        } else if(ud->mode & AD_LOSS) {
+            syn_ball(id, 48, cS, 0.5, vF, 5, atime, s);
+            s->mass = 20 * SYN_M;
+            s->tag = s->bound = 1; s->rank = 100 + id - AD_S20;
+        } else park = 1;
+    } else if(id < AD_F0) {
+        if(ud->mode & AD_SLOW) {
+            syn_ball(id, 44, cS, 0.35, vS, 3, atime, s);
+            s->tag = s->bound = 0;
+            s->rank = 400 + (ud->reverse ? AD_F0 - 1 - id : id - AD_M0);
+        } else park = 1;
+    } else if(id < AD_T0) {
+        if(ud->mode & AD_FAST) {
+            syn_ball(id, 45, cS, 0.35, vF, 3, atime, s);
+            s->tag = s->bound = 0; s->rank = 410 + id - AD_F0;
+        } else park = 1;
+    } else if(id < AD_X) {
+        if(ud->mode & AD_SHELL) {
+            double u[3];
+            rand_in_ball(id, 46, 1.0, zero, u);
+            const double r = sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+            const double rp = 0.4 + 1.6 * (id - AD_T0) / (double) AD_NT;
+            int d;
+            for(d = 0; d < 3; d++) {
+                s->pos[d] = cS[d] + rp * u[d] / (r > 0 ? r : 1) * a1;
+                s->vel[d] = atime * vS[d];
+            }
+            s->tag = s->bound = 0; s->rank = 420 + id - AD_T0;
+        } else park = 1;
+    } else if(id < AD_END) {
+        /* X and Y with their shells of ten tracers at 10-19 pc */
+        const int isx = id == AD_X || (id >= AD_XS0 && id < AD_YS0);
+        const int isy = id == AD_Y || id >= AD_YS0;
+        if((ud->mode & AD_TWIN) && id < AD_YS0) {
+            const MyIDType z = ud->reverse ? AD_Y : AD_X;
+            const double c[3] = {cS[0] + 0.05 * a1, cS[1], cS[2]};
+            /* Z and W at c exactly, the shell as X's */
+            const int j = id < AD_XS0 ? -1 : (int) (id - AD_XS0);
+            const double z1 = 1 - (2 * j + 1) / 10., rho = j < 0 ? 0 : sqrt(1 - z1 * z1), phi = 2.399963229728653 * j;
+            const double dir[3] = {rho * cos(phi), rho * sin(phi), z1}, rp = j < 0 ? 0 : 0.010 + 0.001 * j;
+            int d;
+            for(d = 0; d < 3; d++) {
+                s->pos[d] = c[d] + rp * dir[d] * a1;
+                s->vel[d] = atime * vS[d];
+            }
+            s->tag = s->bound = j < 0 ? id != z : (j < 3 || j == 8);
+            s->rank = s->bound ? 300 + (j < 0 ? 10 : j) : 1000 + id;
+        } else if((isx && two) || (isy && (ud->mode & AD_SIBLING))) {
+            double c[3] = {cS[0] + (isx ? 0.05 : -0.1) * a1, cS[1], cS[2]};
+            int d;
+            if(id == AD_X || id == AD_Y) {
+                for(d = 0; d < 3; d++) {
+                    s->pos[d] = c[d];
+                    s->vel[d] = atime * vS[d];
+                }
+                s->tag = s->bound = isx ? 0 : 1;
+                s->rank = 450;
+                return;
+            }
+            const int j = (int) (id - (isx ? AD_XS0 : AD_YS0));
+            /* golden-spiral directions */
+            const double z = 1 - (2 * j + 1) / 10., rho = sqrt(1 - z * z), phi = 2.399963229728653 * j;
+            const double dir[3] = {rho * cos(phi), rho * sin(phi), z}, rp = 0.010 + 0.001 * j;
+            for(d = 0; d < 3; d++) {
+                s->pos[d] = c[d] + rp * dir[d] * a1;
+                s->vel[d] = atime * vS[d];
+            }
+            /* X: xs2 bound to S2, the rest to S (owned by S2 when nested, so no shell tracer is a candidate);
+             * Y: seven bound to S2, three to S, each owned by its binder */
+            const int toS2 = isx ? j < ud->xs2 : j < 7;
+            s->bound = toS2 ? 2 : 1;
+            s->tag = (isx && (ud->mode & AD_NESTED)) ? 2 : s->bound;
+            s->rank = 300 + j;
+        } else park = 1;
+    }
+    if(park) {
+        syn_ball(id, 47, cP, 0.5, zero, 5, atime, s);
+        s->tag = s->bound = 0; s->rank = 1000 + id;
+    }
+}
+
+/* The rule by brute force over the fixture: the receiver each id < AD_END is admitted to, -1 if none;
+ * votes[] gets the largest vote count of each candidate (-1 for a non-candidate). parent[t] of track t. */
+static void
+ad_predict(const struct AdUd * ud, double atime, const int64_t * parent, int ntracks, int need, int * recv, int * votes)
+{
+    const int kk = ad_k(ud);
+    struct SynPart * s = calloc(AD_END, sizeof(struct SynPart));
+    int64_t i, j, nkey = 0;
+    for(i = 0; i < AD_END; i++) {
+        s[i].tag = s[i].bound = -1;
+        ad_particle(i, atime, &s[i], (void *) ud);
+        int d;
+        for(d = 0; d < 3; d++)
+            s[i].pos[d] = p2_wrap(s[i].pos[d]);
+        /* the key's tracers: owned, not a star */
+        if(ad_star(ud, i))
+            s[i].tag = -1;
+        nkey += s[i].tag >= 0;
+    }
+    double * d2 = malloc(AD_END * sizeof(double));
+    int64_t * nb = malloc(AD_END * sizeof(int64_t));
+    for(i = 0; i < AD_END; i++) {
+        recv[i] = -1;
+        votes[i] = -1;
+        const int64_t A = s[i].tag;
+        /* fewer than k other tracers in the key: no candidate */
+        if(A < 0 || nkey <= kk)
+            continue;
+        /* a candidate: its owner is a proper ancestor of a receiver (every track but H is one) */
+        int t, isanc = 0;
+        for(t = 1; t < ntracks; t++) {
+            int64_t u = parent[t];
+            while(u >= 0 && u != A) u = parent[u];
+            isanc |= u == A;
+        }
+        if(!isanc)
+            continue;
+        int64_t m = 0;
+        for(j = 0; j < AD_END; j++) {
+            if(j == i || s[j].tag < 0) continue;
+            double r2 = 0;
+            int d;
+            for(d = 0; d < 3; d++) {
+                const double dx = NEAREST(s[j].pos[d] - s[i].pos[d], BOXSIZE);
+                r2 += dx * dx;
+            }
+            /* insertion by (d2, ID) into the k nearest (ID = index here) */
+            if(m == kk && !(r2 < d2[kk - 1] || (r2 == d2[kk - 1] && j < nb[kk - 1])))
+                continue;
+            int64_t q = m < kk ? m++ : kk - 1;
+            while(q > 0 && (r2 < d2[q - 1] || (r2 == d2[q - 1] && j < nb[q - 1]))) {
+                d2[q] = d2[q - 1];
+                nb[q] = nb[q - 1];
+                q--;
+            }
+            d2[q] = r2;
+            nb[q] = j;
+        }
+        int best = -1, bestv = 0;
+        for(t = 1; t < ntracks; t++) {
+            int64_t u = parent[t];
+            while(u >= 0 && u != A) u = parent[u];
+            if(u != A) continue;
+            int v = 0, c;
+            for(c = 0; c < kk; c++)
+                v += s[nb[c]].bound == t;
+            int dt = 0, db = 0;
+            for(u = t; parent[u] >= 0; u = parent[u]) dt++;
+            if(best >= 0)
+                for(u = best; parent[u] >= 0; u = parent[u]) db++;
+            if(best < 0 || v > bestv || (v == bestv && dt > db)) {
+                best = t;
+                bestv = v;
+            }
+        }
+        votes[i] = bestv;
+        recv[i] = bestv >= need ? best : -1;
+    }
+    free(nb);
+    free(d2);
+    free(s);
+}
+
+struct AdOut {
+    struct tagrec * r;
+    struct SubTrack * rec;
+    int64_t n;
+    int ntracks;
+    struct SubhaloCallStats st;
+    int64_t knnbuilds;
+};
+
+/* One finder call on the fixture with SubhaloAdmitShare = share and T threads. */
+static void
+ad_run(const struct AdUd * ud, double share, int T, struct AdOut * out)
+{
+    Cosmology CP;
+    const int saved = omp_get_max_threads();
+    omp_set_num_threads(T);
+    struct SubhaloParams sp = default_subhalo_params();
+    sp.SubhaloAdmitShare = share;
+    sp.SubhaloAdmitMinCoreDistance = ud->minD;
+    sp.SubhaloSinkSymmetric = ud->sym;
+    sp.SubhaloNumNeighboursForReassignment = ad_k(ud);
+    /* concentric satellites, and S at rest in H, stay apart */
+    if((ud->mode & (AD_NESTED | AD_SIBLING | AD_REST)) && !(ud->mode & AD_SINK))
+        sp.SubhaloMergeTrapped = 0;
+    if(ud->star)
+        sp.SubhaloTracerTypes = 2;
+    syn_setup(&CP, AD_END + SYN_NFIELD, sp);
+    CHECK(subhalo_arena_bytes_per_part() == (size_t) (SUBHALO_ARENA_FIXED_BYTES_PER_PART + 24 + (share > 0 ? SUBHALO_ADMIT_BYTES_PER_PART : 0)),
+          "admission: arena %lu bytes per particle at share %g\n", (unsigned long) subhalo_arena_bytes_per_part(), share);
+    struct SubTrack recs[3];
+    recs[0] = syn_rec(0, 400, 0.04, -1, 0, 0, 0);
+    recs[1] = syn_rec(1, 100, 0.01, 0, 0, 1, 1);
+    out->ntracks = 2;
+    if(ud->mode & (AD_NESTED | AD_SIBLING)) {
+        recs[2] = (ud->mode & AD_NESTED) ? syn_rec(2, 60, 0.006, 1, 0, 2, 2) : syn_rec(2, 60, 0.006, 0, 0, 2, 1);
+        out->ntracks = 3;
+    }
+    int t, d;
+    if(ud->core)
+        for(t = 0; t < out->ntracks; t++) {
+            for(d = 0; d < 3; d++) {
+                recs[t].CorePos[d] = ud->core[t].pos[d];
+                recs[t].CoreVel[d] = ud->core[t].vel[d];
+            }
+            recs[t].CoreSigmaX = ud->core[t].sx;
+            recs[t].CoreSigmaV = ud->core[t].sv;
+        }
+    syn_records(recs, out->ntracks);
+    const double atime = 0.55;
+    syn_place(ad_particle, (void *) ud, atime, 1);
+    int64_t i, ng, nempty;
+    for(i = 0; i < PartManager->NumPart; i++)
+        if(ad_star(ud, P[i].ID)) {
+            slots_convert(i, 4, -1, PartManager, SlotsManager);
+            memset(&STARP(i), 0, sizeof(struct star_particle_data));
+        }
+    slots_setup_id(PartManager, SlotsManager);
+    const int64_t kb0 = subhalo_knn_build_count();
+    int ret = lifecycle_call(1, atime, &CP, 0, NULL, &ng, &nempty);
+    const int64_t kb = subhalo_knn_build_count() - kb0;
+    MPI_Allreduce(&kb, &out->knnbuilds, 1, MPI_INT64, MPI_SUM, MPI_COMM_WORLD);
+    CHECK(ret == 1 && ng == 1, "admission mode %d: ret %d, %ld groups\n", ud->mode, ret, ng);
+    out->st = *subhalo_last_call_stats();
+    out->r = gather_tags(&out->n);
+    out->rec = fetch_all_tracks(out->ntracks);
+    CHECK(p2_check_tags(out->r, out->n, out->rec, out->ntracks, "admission") == 0, "admission mode %d: tag invariants\n", ud->mode);
+    for(i = 1; i < AD_END; i++)
+        if(!(ud->mode & AD_SMALL) || i < ud->nh || (i >= AD_S0 && i < AD_S0 + AD_NSMALL) || i == AD_X)
+            CHECK(out->r[i].GrNr == out->r[0].GrNr, "admission: particle %ld in group %ld, not %ld\n", i, out->r[i].GrNr, out->r[0].GrNr);
+    syn_teardown();
+    omp_set_num_threads(saved);
+}
+
+static void
+ad_free(struct AdOut * o)
+{
+    free(o->r);
+    free(o->rec);
+}
+
+/* Tags of every particle and every persisted column of every record equal; returns the differences. */
+static int
+ad_compare(const struct AdOut * a, const struct AdOut * b, const char * what)
+{
+    int bad = 0;
+    int64_t i;
+    LOCAL_CHECK(bad, a->n == b->n && a->ntracks == b->ntracks, "%s: %ld/%ld particles\n", what, a->n, b->n);
+    if(bad)
+        return bad;
+    for(i = 0; i < a->n; i++) {
+        const struct tagrec * x = &a->r[i], * y = &b->r[i];
+        LOCAL_CHECK(bad, x->ID == y->ID && x->TrackId == y->TrackId && x->BoundTrackId == y->BoundTrackId && x->BindRank == y->BindRank,
+                    "%s: particle %lu: (%ld %ld %d) vs (%ld %ld %d)\n", what, (unsigned long) x->ID, x->TrackId, x->BoundTrackId,
+                    x->BindRank, y->TrackId, y->BoundTrackId, y->BindRank);
+    }
+    for(i = 0; i < a->ntracks; i++)
+        LOCAL_CHECK(bad, 0 == memcmp(&a->rec[i], &b->rec[i], offsetof(struct SubTrack, Host)),
+                    "%s: record %ld differs (Nbound %d/%d Vmax %g/%g)\n", what, i, a->rec[i].Nbound, b->rec[i].Nbound, a->rec[i].Vmax,
+                    b->rec[i].Vmax);
+    return bad;
+}
+
+/* The admitted count of a fixture against the brute force; returns the predicted receivers. */
+static int *
+ad_check_count(const struct AdUd * ud, const struct AdOut * o, int need, const char * what)
+{
+    int64_t parent[3] = {-1, 0, (ud->mode & AD_NESTED) ? 1 : 0};
+    int * recv = malloc(AD_END * sizeof(int)), * votes = malloc(AD_END * sizeof(int));
+    ad_predict(ud, 0.55, parent, o->ntracks, need, recv, votes);
+    int64_t i, npred = 0;
+    for(i = 0; i < AD_END; i++)
+        npred += recv[i] >= 0;
+    message(0, "Admission, %s: %ld admitted (predicted %ld), %ld taken, %ld receivers took\n", what, o->st.NAdmitted, npred,
+            o->st.NAdmitTaken, o->st.NAdmitReceivers);
+    CHECK(o->st.NAdmitted == npred, "%s: %ld admitted, the brute force admits %ld\n", what, o->st.NAdmitted, npred);
+    free(votes);
+    return recv;
+}
+
+/* Slow H-owned particles in S are taken by S; fast ones are admitted, left unbound and given back, so
+ * the call equals the call without the rule; the result does not depend on their order in the key or
+ * on the threads; with the rule off nothing is admitted and no neighbour tree is built. */
+static void
+test_subhalo_admit_take(void ** state)
+{
+    struct AdUd slow = {AD_SLOW, 0, 0}, slowrev = {AD_SLOW, 0, 1}, fast = {AD_FAST, 0, 0};
+    struct AdOut on, off, rev, thr;
+    int64_t i;
+    int bad = 0;
+    ad_run(&slow, 0.5, 1, &on);
+    int * recv = ad_check_count(&slow, &on, 5, "slow");
+    int64_t ntaken = 0;
+    for(i = AD_M0; i < AD_F0; i++) {
+        LOCAL_CHECK(bad, recv[i] == 1, "slow: particle %ld is not admitted by the brute force\n", i);
+        LOCAL_CHECK(bad, on.r[i].TrackId == 1 && on.r[i].BoundTrackId == 1, "slow: particle %ld tagged %ld bound %ld, expected S (1)\n", i,
+                    on.r[i].TrackId, on.r[i].BoundTrackId);
+    }
+    /* taken: the admitted particles that end in their receiver's bound set */
+    for(i = 0; i < AD_END; i++)
+        ntaken += recv[i] >= 0 && on.r[i].BoundTrackId == recv[i];
+    free(recv);
+    CHECK(bad == 0, "slow: the admitted particles\n");
+    CHECK(on.st.NAdmitTaken == ntaken && ntaken >= AD_NM && on.st.NAdmitReceivers == 1 && on.knnbuilds > 0,
+          "slow: %ld taken (%ld in S's bound set) by %ld receivers, %ld neighbour trees\n", on.st.NAdmitTaken, ntaken,
+          on.st.NAdmitReceivers, on.knnbuilds);
+    /* the order of the key and the threads (the admission's threaded loops forced) */
+    ad_run(&slowrev, 0.5, 1, &rev);
+    CHECK(ad_compare(&on, &rev, "slow, M in reverse BindRank order") == 0, "slow: the result depends on the key order\n");
+    subhalo_unbind_set_par_min(8);
+    ad_run(&slowrev, 0.5, 2, &thr);
+    subhalo_unbind_set_par_min(0);
+    CHECK(ad_compare(&on, &thr, "slow, 2 threads") == 0, "slow: the result depends on the threads\n");
+    CHECK(thr.st.NAloneKeys >= 1, "slow, 2 threads: %ld keys alone\n", thr.st.NAloneKeys);
+    ad_free(&rev);
+    ad_free(&thr);
+    /* S at rest in H: H would bind M too, so a taken particle left in H's source is bound twice */
+    {
+        struct AdUd rest = {AD_SLOW | AD_REST, 0, 0};
+        struct AdOut ro;
+        ad_run(&rest, 0.5, 1, &ro);
+        recv = ad_check_count(&rest, &ro, 5, "slow, at rest");
+        for(i = AD_M0; i < AD_F0; i++)
+            LOCAL_CHECK(bad, recv[i] == 1 && ro.r[i].TrackId == 1 && ro.r[i].BoundTrackId == 1,
+                        "slow, at rest: particle %ld predicted %d, tagged %ld bound %ld\n", i, recv[i], ro.r[i].TrackId, ro.r[i].BoundTrackId);
+        free(recv);
+        CHECK(bad == 0, "slow, at rest: the admitted particles\n");
+        ad_free(&ro);
+    }
+    /* rule off: nothing admitted, no tree, M stays the host's */
+    ad_run(&slow, 0, 1, &off);
+    CHECK(off.st.NAdmitted == 0 && off.st.NAdmitTaken == 0 && off.knnbuilds == 0,
+          "slow, rule off: %ld admitted, %ld neighbour trees\n", off.st.NAdmitted, off.knnbuilds);
+    for(i = AD_M0; i < AD_F0; i++)
+        LOCAL_CHECK(bad, off.r[i].TrackId == 0, "slow, rule off: particle %ld tagged %ld\n", i, off.r[i].TrackId);
+    CHECK(bad == 0, "slow, rule off: tags\n");
+    /* M moves at 60 km/s through H: H's tail without the rule, S's bound set with it */
+    CHECK(on.rec[1].Nbound >= off.rec[1].Nbound + AD_NM && on.rec[0].Nbound <= off.rec[0].Nbound,
+          "slow: S Nbound %d (off %d), H Nbound %d (off %d)\n", on.rec[1].Nbound, off.rec[1].Nbound, on.rec[0].Nbound, off.rec[0].Nbound);
+    ad_free(&on);
+    ad_free(&off);
+    /* fast: admitted, unbound, returned: equal to the rule off */
+    ad_run(&fast, 0.5, 1, &on);
+    recv = ad_check_count(&fast, &on, 5, "fast");
+    for(i = AD_F0; i < AD_T0; i++)
+        LOCAL_CHECK(bad, recv[i] == 1 && on.r[i].TrackId == 0, "fast: particle %ld predicted %d, tagged %ld\n", i, recv[i], on.r[i].TrackId);
+    free(recv);
+    CHECK(bad == 0, "fast: the admitted particles\n");
+    CHECK(on.st.NAdmitTaken == 0, "fast: %ld taken\n", on.st.NAdmitTaken);
+    ad_run(&fast, 0, 1, &off);
+    CHECK(ad_compare(&on, &off, "fast, rule on and off") == 0, "fast: the unbound admitted particles changed the call\n");
+    ad_free(&on);
+    ad_free(&off);
+}
+
+/* The threshold, nested and sibling receivers and the ties, a sibling's particle, a dying satellite. */
+static void
+test_subhalo_admit_votes(void ** state)
+{
+    struct AdOut on, off;
+    int64_t i;
+    int bad = 0;
+    /* a shell about S's edge: the count admitted equals the brute force, which sees votes on both
+     * sides of the threshold (5 of 10), with 4 (share 0.4) and 6 (share 0.6) too */
+    {
+        struct AdUd sh = {AD_SHELL, 0, 0};
+        int64_t parent[3] = {-1, 0, 0};
+        int * recv = malloc(AD_END * sizeof(int)), * votes = malloc(AD_END * sizeof(int));
+        ad_predict(&sh, 0.55, parent, 2, 5, recv, votes);
+        int hist[11] = {0};
+        for(i = AD_T0; i < AD_X; i++)
+            if(votes[i] >= 0) hist[votes[i]]++;
+        message(0, "Admission shell: votes histogram 0-10: %d %d %d %d %d %d %d %d %d %d %d\n", hist[0], hist[1], hist[2], hist[3], hist[4],
+                hist[5], hist[6], hist[7], hist[8], hist[9], hist[10]);
+        CHECK(hist[4] > 0 && hist[5] > 0 && hist[6] > 0 && hist[3] > 0, "shell: no particle at 3, 4, 5 or 6 votes (%d %d %d %d)\n",
+              hist[3], hist[4], hist[5], hist[6]);
+        free(recv);
+        free(votes);
+        const double shares[3] = {0.4, 0.5, 0.6};
+        int k;
+        for(k = 0; k < 3; k++) {
+            char what[32];
+            snprintf(what, sizeof(what), "shell at %g", shares[k]);
+            ad_run(&sh, shares[k], 1, &on);
+            recv = ad_check_count(&sh, &on, (int) (10 * shares[k] + 0.5), what);
+            /* a particle not admitted is not S's */
+            for(i = AD_T0; i < AD_X; i++)
+                LOCAL_CHECK(bad, recv[i] >= 0 || on.r[i].TrackId != 1, "%s: particle %ld not admitted but tagged S\n", what, i);
+            free(recv);
+            ad_free(&on);
+        }
+        CHECK(bad == 0, "shell: tags\n");
+    }
+    /* nested S2 below S: X goes to the receiver with more votes, to the deeper on a tie */
+    {
+        const int xs2[3] = {6, 4, 5};
+        const int64_t want[3] = {2, 1, 2};
+        int k;
+        for(k = 0; k < 3; k++) {
+            struct AdUd ne = {AD_NESTED, xs2[k], 0};
+            char what[48];
+            snprintf(what, sizeof(what), "nested, %d of 10 for S2", xs2[k]);
+            ad_run(&ne, 0.5, 1, &on);
+            int * recv = ad_check_count(&ne, &on, 5, what);
+            CHECK(recv[AD_X] == want[k], "%s: the brute force sends X to %d\n", what, recv[AD_X]);
+            CHECK(on.r[AD_X].TrackId == want[k] && on.r[AD_X].BoundTrackId == want[k], "%s: X tagged %ld bound %ld, expected %ld\n", what,
+                  on.r[AD_X].TrackId, on.r[AD_X].BoundTrackId, want[k]);
+            CHECK(on.rec[1].Nbound > 0 && on.rec[2].Nbound > 0, "%s: S Nbound %d, S2 Nbound %d\n", what, on.rec[1].Nbound, on.rec[2].Nbound);
+            free(recv);
+            ad_free(&on);
+        }
+    }
+    /* siblings S and S2: a tie to the smaller TrackId; Y, owned by S and outvoted by S2, stays S's */
+    {
+        const int xs2[2] = {5, 6};
+        const int64_t want[2] = {1, 2};
+        int k;
+        for(k = 0; k < 2; k++) {
+            struct AdUd si = {AD_SIBLING, xs2[k], 0};
+            char what[48];
+            snprintf(what, sizeof(what), "siblings, %d of 10 for S2", xs2[k]);
+            ad_run(&si, 0.5, 1, &on);
+            int * recv = ad_check_count(&si, &on, 5, what);
+            CHECK(recv[AD_X] == want[k] && recv[AD_Y] == -1, "%s: the brute force sends X to %d, Y to %d\n", what, recv[AD_X], recv[AD_Y]);
+            CHECK(on.r[AD_X].TrackId == want[k] && on.r[AD_X].BoundTrackId == want[k], "%s: X tagged %ld bound %ld, expected %ld\n", what,
+                  on.r[AD_X].TrackId, on.r[AD_X].BoundTrackId, want[k]);
+            CHECK(on.r[AD_Y].TrackId == 1, "%s: Y tagged %ld, expected its owner S (1)\n", what, on.r[AD_Y].TrackId);
+            free(recv);
+            ad_free(&on);
+        }
+    }
+    /* a dying satellite takes nothing: the call equals the rule off */
+    {
+        struct AdUd hot = {AD_SLOW | AD_HOT, 0, 0};
+        ad_run(&hot, 0.5, 1, &on);
+        CHECK(on.rec[1].Nbound == 0 && on.rec[1].SnapDeath == 1, "hot: S Nbound %d SnapDeath %d\n", on.rec[1].Nbound, on.rec[1].SnapDeath);
+        CHECK(on.st.NAdmitted >= AD_NM && on.st.NAdmitTaken == 0, "hot: %ld admitted, %ld taken\n", on.st.NAdmitted, on.st.NAdmitTaken);
+        ad_run(&hot, 0, 1, &off);
+        CHECK(ad_compare(&on, &off, "hot, rule on and off") == 0, "hot: the dead satellite's admitted particles changed the call\n");
+        ad_free(&on);
+        ad_free(&off);
+    }
+}
+
+/* ---- the admission withheld near the owner's core (SubhaloAdmitMinCoreDistance) ----
+ * Stored cores far from the particles' frames (D > 40 there), so that only the records decide. */
+#define AD_Q 100.
+struct AdPair {
+    MyIDType ID;
+    int64_t Receiver;
+};
+static struct AdPair * AdPairs = NULL;
+static int64_t AdPairN = 0;
+
+static void
+ad_hook(MyIDType ID, int64_t Receiver, int source)
+{
+    (void) source;
+    AdPairs = realloc(AdPairs, sizeof(struct AdPair) * (AdPairN + 1));
+    AdPairs[AdPairN].ID = ID;
+    AdPairs[AdPairN].Receiver = Receiver;
+    AdPairN++;
+}
+
+/* The receiver offered ID in the last hooked call, -1 if none. */
+static int64_t
+ad_pair(MyIDType ID)
+{
+    int64_t i;
+    for(i = 0; i < AdPairN; i++)
+        if(AdPairs[i].ID == ID)
+            return AdPairs[i].Receiver;
+    return -1;
+}
+
+/* One call with the hook; the offers of every rank gathered on every rank. */
+static void
+ad_run_hooked(const struct AdUd * ud, double share, struct AdOut * out)
+{
+    AdPairN = 0;
+    subhalo_set_admit_hook(ad_hook);
+    ad_run(ud, share, 1, out);
+    subhalo_set_admit_hook(NULL);
+    const int NTask = get_ntask();
+    int nb = (int) (AdPairN * sizeof(struct AdPair)), r;
+    int * counts = malloc(NTask * sizeof(int)), * displ = malloc(NTask * sizeof(int));
+    MPI_Allgather(&nb, 1, MPI_INT, counts, 1, MPI_INT, MPI_COMM_WORLD);
+    int64_t tot = 0;
+    for(r = 0; r < NTask; r++) {
+        displ[r] = (int) tot;
+        tot += counts[r];
+    }
+    struct AdPair * all = malloc(tot + sizeof(struct AdPair));
+    MPI_Allgatherv(AdPairs, nb, MPI_BYTE, all, counts, displ, MPI_BYTE, MPI_COMM_WORLD);
+    free(AdPairs);
+    AdPairs = all;
+    AdPairN = tot / sizeof(struct AdPair);
+    free(displ);
+    free(counts);
+}
+
+/* S's stored core at x0 + dx, dv from H's (H's dispersions sx and 1/2, S's 1 and 8): withheld, S takes
+ * nothing and the call equals the rule off; else the call equals the distance 0. */
+static void
+ad_distance_case(double x0, double dx, float dv, float sx, double minD, int sym, int withhold, const char * what)
+{
+    const struct AdCore core[2] = {{{x0, AD_Q, AD_Q}, {0, 0, 0}, sx, 0.5f},
+                                   {{x0 + dx, AD_Q, AD_Q}, {0, dv, 0}, 1.0f, 8.0f}};
+    struct AdUd ud0 = {.mode = AD_SLOW, .core = core, .sym = sym}, ud = {.mode = AD_SLOW, .minD = minD, .core = core, .sym = sym};
+    struct AdOut off, base, on;
+    ad_run(&ud0, 0, 1, &off);
+    ad_run(&ud0, 0.5, 1, &base);
+    ad_run(&ud, 0.5, 1, &on);
+    message(0, "Admission withheld, %s: %ld admitted, %ld withheld (%ld admitted at distance 0)\n", what, on.st.NAdmitted,
+            on.st.NAdmitWithheld, base.st.NAdmitted);
+    CHECK(base.st.NAdmitted > 0 && base.st.NAdmitTaken > 0 && base.st.NAdmitWithheld == 0, "%s: at distance 0 %ld admitted, %ld taken, %ld withheld\n",
+          what, base.st.NAdmitted, base.st.NAdmitTaken, base.st.NAdmitWithheld);
+    if(withhold) {
+        CHECK(on.st.NAdmitted == 0 && on.st.NAdmitWithheld == base.st.NAdmitted, "%s: %ld admitted, %ld withheld, expected 0 and %ld\n", what,
+              on.st.NAdmitted, on.st.NAdmitWithheld, base.st.NAdmitted);
+        CHECK(ad_compare(&on, &off, what) == 0, "%s: the call differs from the rule off\n", what);
+    }
+    else {
+        CHECK(on.st.NAdmitted == base.st.NAdmitted && on.st.NAdmitWithheld == 0, "%s: %ld admitted, %ld withheld, expected %ld and 0\n", what,
+              on.st.NAdmitted, on.st.NAdmitWithheld, base.st.NAdmitted);
+        CHECK(ad_compare(&on, &base, what) == 0, "%s: the call differs from the distance 0\n", what);
+    }
+    ad_free(&off);
+    ad_free(&base);
+    ad_free(&on);
+}
+
+/* A tie of A's receivers 1 and 2 (5 votes each, need 5): receiver 1's core near A's, receiver 2's far. */
+static int64_t ad_tie_receiver(const void * t, int64_t T) { (void) t; return T == 1 || T == 2 ? T : -1; }
+static int64_t ad_tie_parent(const void * t, int64_t v) { (void) t; return v > 0 ? 0 : -1; }
+static int ad_tie_depth(const void * t, int64_t v) { (void) t; return v > 0; }
+static int64_t ad_tie_trackid(const void * t, int64_t v) { (void) t; return v; }
+static int AdTieCalls = 0;
+static int
+ad_tie_withheld(const void * t, int64_t r, int64_t A)
+{
+    const double pos[3][3] = {{AD_Q, AD_Q, AD_Q}, {AD_Q + 0.25, AD_Q, AD_Q}, {AD_Q + 50, AD_Q, AD_Q}};
+    const float vel[3][3] = {{0, 0, 0}, {0, 3.99f, 0}, {0, 0, 0}};
+    AdTieCalls++;
+    return subhalo_admit_withheld(pos[r], vel[r], pos[A], vel[A], 0.0625f, 0.5f, *(const double *) t, BOXSIZE);
+}
+
+/* The withholding: strictly below the distance, in the owner's dispersions of the stored records,
+ * across the box edge, not with a zero dispersion of the owner, against each particle's owner in a nest. */
+static void
+test_subhalo_admit_distance(void ** state)
+{
+    /* the tie's winner (the smaller TrackId) withheld: no other receiver is tried */
+    const int64_t btid[10] = {1, 2, 1, 2, 1, 2, 1, 2, 1, 2};
+    const int need = subhalo_admit_need(0.5, 10);
+    const double d12 = 12, d0 = 0;
+    struct SubhaloAdmitTree tie = {ad_tie_receiver, ad_tie_parent, ad_tie_depth, ad_tie_trackid, &d12, ad_tie_withheld};
+    const int64_t w12 = subhalo_admit_choice(btid, 10, 0, need, &tie);
+    const int calls12 = AdTieCalls;
+    tie.t = &d0;
+    const int64_t w0 = subhalo_admit_choice(btid, 10, 0, need, &tie);
+    tie.withheld = NULL;
+    const int64_t wnull = subhalo_admit_choice(btid, 10, 0, need, &tie);
+    CHECK(need == 5 && w12 == SUBHALO_ADMIT_WITHHELD && calls12 == 1 && w0 == 1 && wnull == 1,
+          "tie: need %d, choice %ld at 12 (%d tests), %ld at 0, %ld without the test\n", need, w12, calls12, w0, wnull);
+
+    CHECK(!subhalo_admit_distance_valid(-1e-3) && subhalo_admit_distance_valid(0) && subhalo_admit_distance_valid(12),
+          "SubhaloAdmitMinCoreDistance: -0.001, 0 and 12 judged %d %d %d\n", subhalo_admit_distance_valid(-1e-3), subhalo_admit_distance_valid(0),
+          subhalo_admit_distance_valid(12));
+    /* D(S, H) = 4 + dv / 0.5 */
+    ad_distance_case(AD_Q, 0.25, 3.99f, 0.0625f, 12, 0, 1, "D 11.98");
+    ad_distance_case(AD_Q, 0.25, 4.0f, 0.0625f, 12, 0, 0, "D 12 exactly");
+    ad_distance_case(AD_Q, 0.25, 4.01f, 0.0625f, 12, 0, 0, "D 12.02");
+    ad_distance_case(0.1, BOXSIZE - 0.25, 3.99f, 0.0625f, 12, 0, 1, "D 11.98 across the box edge");
+    /* H's position dispersion 0 with S at H's position: the velocity term alone is 7.98 */
+    ad_distance_case(AD_Q, 0, 3.99f, 0, 12, 0, 0, "H's dispersion 0");
+    ad_distance_case(AD_Q, 0.25, 3.0f, 0.0625f, 5, 0, 0, "D 10 at the distance 5");
+    ad_distance_case(AD_Q, 0.25, 3.0f, 0.0625f, 12, 0, 1, "D 10 at the distance 12");
+    /* 0.75 in S's own dispersions: the symmetric sinking form does not enter */
+    ad_distance_case(AD_Q, 0.25, 4.01f, 0.0625f, 12, 1, 0, "D 12.02 with SubhaloSinkSymmetric = 1");
+    /* the nest H > S > S2 with D(S2, S) = 11.98 and D(S2, H), D(S, H) of 800 or more: X (H's) still goes
+     * to S2, S's particles offered to S2 are withheld */
+    const struct AdCore core[3] = {{{AD_Q, AD_Q, AD_Q}, {0, 0, 0}, 0.0625f, 0.5f},
+                                   {{AD_Q + 50, AD_Q, AD_Q}, {0, 0, 0}, 0.0625f, 0.5f},
+                                   {{AD_Q + 50.25, AD_Q, AD_Q}, {0, 3.99f, 0}, 1.0f, 8.0f}};
+    struct AdUd ne0 = {.mode = AD_NESTED, .xs2 = 6, .core = core}, ne = {.mode = AD_NESTED, .xs2 = 6, .minD = 12, .core = core};
+    struct AdOut base, on;
+    ad_run_hooked(&ne0, 0.5, &base);
+    int64_t i, nS = 0, nH = 0, bad = 0;
+    MyIDType * id0 = malloc(sizeof(MyIDType) * (AdPairN + 1));
+    int64_t * r0 = malloc(sizeof(int64_t) * (AdPairN + 1)), n0 = AdPairN;
+    for(i = 0; i < n0; i++) {
+        struct SynPart sy;
+        memset(&sy, 0, sizeof(sy));
+        ad_particle(AdPairs[i].ID, 0.55, &sy, &ne0);
+        id0[i] = AdPairs[i].ID;
+        r0[i] = AdPairs[i].Receiver;
+        /* an S-owned particle offered to S2 is withheld; any other offer stands */
+        if(sy.tag == 1 && r0[i] == 2)
+            nS++;
+        else
+            nH++;
+    }
+    ad_run_hooked(&ne, 0.5, &on);
+    for(i = 0; i < n0; i++) {
+        struct SynPart sy;
+        memset(&sy, 0, sizeof(sy));
+        ad_particle(id0[i], 0.55, &sy, &ne0);
+        const int64_t want = sy.tag == 1 && r0[i] == 2 ? -1 : r0[i];
+        LOCAL_CHECK(bad, ad_pair(id0[i]) == want, "nest: particle %lu owned by %ld offered to %ld, expected %ld\n", (unsigned long) id0[i], sy.tag,
+                    ad_pair(id0[i]), want);
+    }
+    message(0, "Admission withheld, nest: %ld offers at distance 0 (%ld of S to S2), %ld admitted and %ld withheld at 12\n", n0, nS,
+            on.st.NAdmitted, on.st.NAdmitWithheld);
+    CHECK(nS > 0 && ad_pair(AD_X) == 2 && base.r[AD_X].TrackId == 2, "nest: %ld S-owned offers to S2, X offered to %ld\n", nS, ad_pair(AD_X));
+    CHECK(bad == 0 && AdPairN == nH && on.st.NAdmitted == nH && on.st.NAdmitWithheld == nS && on.r[AD_X].TrackId == 2,
+          "nest: %ld offers (%ld expected), %ld admitted, %ld withheld (%ld expected), X tagged %ld\n", AdPairN, nH, on.st.NAdmitted,
+          on.st.NAdmitWithheld, nS, on.r[AD_X].TrackId);
+    free(id0);
+    free(r0);
+    ad_free(&base);
+    ad_free(&on);
+    free(AdPairs);
+    AdPairs = NULL;
+    AdPairN = 0;
+}
+
+/* The threshold at k = 7, the candidate's exclusion from its own neighbours, non-tracers, the key's size
+ * at k = 64, and a receiver that takes a particle and sinks into an intermediate ancestor. */
+static void
+test_subhalo_admit_rules(void ** state)
+{
+    struct AdOut on;
+    int64_t i;
+    int k;
+    /* k = 7: s = 0.5 needs 4, s = 3/7 needs 3, s just above 3/7 needs 4 */
+    {
+        struct AdUd sh = {AD_SHELL, 0, 0, 7, 0, 0};
+        int64_t parent[3] = {-1, 0, 0};
+        int * recv = malloc(AD_END * sizeof(int)), * votes = malloc(AD_END * sizeof(int));
+        ad_predict(&sh, 0.55, parent, 2, 4, recv, votes);
+        int h3 = 0, h4 = 0;
+        for(i = 0; i < AD_END; i++) {
+            h3 += votes[i] == 3;
+            h4 += votes[i] == 4;
+        }
+        CHECK(h3 > 0 && h4 > 0, "k = 7: %d candidates at 3 votes, %d at 4\n", h3, h4);
+        free(recv);
+        free(votes);
+        const double shares[3] = {0.5, 3. / 7, (3. / 7) * (1 + 1e-9)};
+        const int need[3] = {4, 3, 4};
+        for(k = 0; k < 3; k++) {
+            char what[48];
+            snprintf(what, sizeof(what), "k = 7, share %.12g", shares[k]);
+            ad_run(&sh, shares[k], 1, &on);
+            free(ad_check_count(&sh, &on, need[k], what));
+            ad_free(&on);
+        }
+    }
+    /* Z coincident with W, Z's id below and above W's: five votes of ten, admitted and taken; a star W does not
+     * vote, a star Z is no candidate */
+    for(k = 0; k < 6; k++) {
+        struct AdUd tw = {AD_TWIN, 0, k % 2, 0, k / 2, 0};
+        const MyIDType z = tw.reverse ? AD_Y : AD_X;
+        char what[48];
+        snprintf(what, sizeof(what), "twin, Z id %lu, star %d", (unsigned long) z, tw.star);
+        ad_run(&tw, 0.5, 1, &on);
+        int * recv = ad_check_count(&tw, &on, 5, what);
+        const int want = tw.star ? -1 : 1;
+        CHECK(recv[z] == want && (want < 0 || on.r[z].BoundTrackId == 1), "%s: Z predicted %d (expected %d), bound to %ld\n", what,
+              recv[z], want, on.r[z].BoundTrackId);
+        free(recv);
+        ad_free(&on);
+    }
+    /* three coincident tracers, Z of the largest id third in its own query: Z's eleven neighbours are AD_X - 1
+     * (H), W and shell tracers 0-8, five for S, exactly the threshold of 5 / 11 */
+    {
+        struct AdUd tr = {AD_TWIN | AD_TRIPLE, 0, 1, 11, 0, 0};
+        ad_run(&tr, 5. / 11, 1, &on);
+        int * recv = ad_check_count(&tr, &on, 5, "triple, Z third");
+        CHECK(recv[AD_Y] == 1 && on.r[AD_Y].BoundTrackId == 1, "triple: Z predicted %d, bound to %ld\n", recv[AD_Y],
+              on.r[AD_Y].BoundTrackId);
+        free(recv);
+        ad_free(&on);
+    }
+    /* k = 64: a key of 64 tracers admits nothing and builds no tree; one tracer more, every H-owned one is
+     * a candidate with the 34 votes of S */
+    for(k = 0; k < 2; k++) {
+        struct AdUd sm = {AD_SMALL, 0, 0, 64, 0, 29 + k};
+        char what[32];
+        snprintf(what, sizeof(what), "k = 64, %d tracers", 29 + k + AD_NSMALL + 1);
+        ad_run(&sm, 0.5, 1, &on);
+        free(ad_check_count(&sm, &on, 32, what));
+        CHECK(k ? on.st.NAdmitted == sm.nh + 1 && on.st.NAdmitTaken >= 1 : on.st.NAdmitted == 0 && on.knnbuilds == 0,
+              "%s: %ld admitted, %ld taken, %ld neighbour trees\n", what, on.st.NAdmitted, on.st.NAdmitTaken, on.knnbuilds);
+        CHECK((on.r[AD_X].BoundTrackId == 1) == k, "%s: Z bound to %ld\n", what, on.r[AD_X].BoundTrackId);
+        ad_free(&on);
+    }
+    /* k = 64 at the share 34 / 64: every candidate has exactly the 34 votes it needs, all 64 neighbours count */
+    {
+        struct AdUd sm = {AD_SMALL, 0, 0, 64, 0, 30};
+        ad_run(&sm, 34. / 64, 1, &on);
+        free(ad_check_count(&sm, &on, 34, "k = 64, 34 votes needed"));
+        CHECK(on.st.NAdmitted == sm.nh + 1, "k = 64, 34 votes needed: %ld admitted\n", on.st.NAdmitted);
+        ad_free(&on);
+    }
+    /* X taken by S2, which sinks into S below H in the same call: X is bound once, to S, the tags hold (ad_run) */
+    {
+        struct AdUd sk = {AD_NESTED | AD_SINK, 6, 0, 0, 0, 0};
+        ad_run(&sk, 0.5, 1, &on);
+        int * recv = ad_check_count(&sk, &on, 5, "nested, S2 sinks");
+        /* the 16 that S2 binds count as taken by S2, although S2 then sinks and S holds them */
+        CHECK(recv[AD_X] == 2 && on.st.NAdmitTaken == 16 && on.st.NAdmitReceivers == 1,
+              "S2 sinks: X admitted to %d, %ld taken by %ld receivers\n", recv[AD_X], on.st.NAdmitTaken, on.st.NAdmitReceivers);
+        free(recv);
+        message(0, "Admission, S2 sinks: S2 Nbound %d SinkTrackId %ld, X tagged %ld bound %ld, %ld taken\n", on.rec[2].Nbound,
+                on.rec[2].SinkTrackId, on.r[AD_X].TrackId, on.r[AD_X].BoundTrackId, on.st.NAdmitTaken);
+        CHECK(on.rec[2].Nbound == 0 && on.rec[2].SinkTrackId == 1 && on.st.NAdmitTaken >= 1, "S2 sinks: S2 Nbound %d SinkTrackId %ld, %ld taken\n",
+              on.rec[2].Nbound, on.rec[2].SinkTrackId, on.st.NAdmitTaken);
+        CHECK(on.r[AD_X].TrackId == 1 && on.r[AD_X].BoundTrackId == 1, "S2 sinks: X tagged %ld bound %ld\n", on.r[AD_X].TrackId,
+              on.r[AD_X].BoundTrackId);
+        ad_free(&on);
+    }
+}
+
+/* The second attempt after a large loss in a call (AD_LOSS): the mean frame of S's 160 previously bound particles
+ * sits on the heavy fragment, whose 60 it keeps; 2 x 60 is below the live NPrev 160 but not below the record's
+ * Nbound 100. The core frame binds the 100 of the core, which stand as RESCUED; the reduced counters see one loss. */
+static void
+test_subhalo_rescue_loss_call(void ** state)
+{
+    struct AdUd lo = {AD_LOSS, 0, 0};
+    struct AdOut o;
+    int64_t i;
+    int bad = 0;
+    ad_run(&lo, 0, 1, &o);
+    message(0, "Loss in a call: S Nbound %d Flags %d; loss tried %ld rescued %ld, death tried %ld rescued %ld\n", o.rec[1].Nbound,
+            o.rec[1].Flags, o.st.NLossTried, o.st.NLossRescued, o.st.NRescueTried, o.st.NRescued);
+    CHECK((o.rec[1].Flags & SUBHALO_FLAG_RESCUED) && o.rec[1].Nbound == AD_S20 - AD_S0, "loss: S Flags %d Nbound %d\n",
+          o.rec[1].Flags, o.rec[1].Nbound);
+    for(i = AD_S0; i < AD_M0; i++)
+        LOCAL_CHECK(bad, (o.r[i].BoundTrackId == 1) == (i < AD_S20), "loss: particle %ld bound to %ld\n", i, o.r[i].BoundTrackId);
+    CHECK(bad == 0, "loss: S's bound set is not its core\n");
+    CHECK(o.st.NLossTried == 1 && o.st.NLossRescued == 1 && o.st.NRescueTried == 0 && o.st.NRescued == 0,
+          "loss: loss tried %ld rescued %ld, death tried %ld rescued %ld\n", o.st.NLossTried, o.st.NLossRescued, o.st.NRescueTried,
+          o.st.NRescued);
+    /* each unbinding is counted once: H's, and S's first and second attempts */
+    CHECK(o.st.NCandidates == 3, "loss: %ld unbindings counted, %ld capped\n", o.st.NCandidates, o.st.NItercap);
+    ad_free(&o);
+    /* with H's slow particles in S's core admitted (AD_SLOW): the second attempt stands, and the particles
+     * taken are the admitted ones its bound set holds */
+    {
+        struct AdUd ls = {AD_LOSS | AD_SLOW, 0, 0};
+        ad_run(&ls, 0.5, 1, &o);
+        int * recv = ad_check_count(&ls, &o, 5, "loss with admission");
+        int64_t nin = 0, nadm = 0;
+        for(i = 0; i < AD_END; i++) {
+            nadm += recv[i] == 1;
+            nin += recv[i] == 1 && o.r[i].BoundTrackId == 1;
+        }
+        message(0, "Loss with admission: S Nbound %d Flags %d, %ld admitted to S, %ld of them bound to S, %ld taken\n",
+                o.rec[1].Nbound, o.rec[1].Flags, nadm, nin, o.st.NAdmitTaken);
+        CHECK((o.rec[1].Flags & SUBHALO_FLAG_RESCUED) && o.st.NLossRescued == 1 && nin > 0 && o.st.NAdmitTaken == nin
+              && o.st.NAdmitReceivers == 1 && o.rec[1].Nbound == AD_S20 - AD_S0 + nin,
+              "loss with admission: S Flags %d Nbound %d, %ld bound of %ld admitted, %ld taken by %ld\n", o.rec[1].Flags,
+              o.rec[1].Nbound, nin, nadm, o.st.NAdmitTaken, o.st.NAdmitReceivers);
+        free(recv);
+        ad_free(&o);
+    }
 }
 
 /* 1 if the bigfile fname has the block (collective). */
@@ -5205,12 +5539,12 @@ test_subhalo_nocentral(void ** state)
     syn_teardown();
 }
 
-/* ---- regression item 3 and J3: the serial/in-place boundary with populated state ----
+/* ---- the serial/in-place boundary with populated state ----
  * Stage 0-1 serial (the overlap scenario: B a satellite of A with a tail partly bound by A);
  * stage 2 the group is oversized (SubhaloCollectiveMinPart 100), 40 of A's and 20 of B's
- * particles are in the field: Phase 2b unbinds B's sub-tree key in place (round 0) and then A
+ * particles are in the field: the finder unbinds B's sub-tree key in place (round 0) and then A
  * (round 1), B stays A's satellite, B's moved particles stay in its in-place source and A's are
- * released (decision 52);
+ * released (a central's source is its FOF group only);
  * stage 3 the same; stage 4 every clump particle dispersed: A and B are hostless with oversized
  * pseudo-keys, unbound in place; stage 5 serial again. Tag invariants, the restart
  * round trip of the PIG and the orphan links at every stage. SUBHALO_TEST_KEEP keeps the PIGs
@@ -5251,6 +5585,8 @@ fb_disperse(int stage)
 static void
 test_subhalo_fallback(void ** state)
 {
+    if(!full_test(__func__))
+        return;
     Cosmology CP;
     p2_setup(&CP);
     const char * dir = getenv("SUBHALO_TEST_DIR") ? getenv("SUBHALO_TEST_DIR") : "test_subhalo_fb";
@@ -5294,8 +5630,8 @@ test_subhalo_fallback(void ** state)
             for(i = 0; i < n; i++) {
                 const int c = p2_clump(r[i].ID);
                 const int moved = (c == 0 && r[i].ID % 50 == 7) || (c == 1 && (r[i].ID - P2_NA) % 30 == 11);
-                /* Phase 2b: B's moved particles stay in its in-place source (its tail, bound by A or
-                 * not); decision 52: A's, the central's FOF-less particles, are released untagged */
+                /* B's moved particles stay in its in-place source (its tail, bound by A or
+                 * not); A's, the central's FOF-less particles, are released untagged */
                 if(moved && r[i].GrNr < 0 && c == 1)
                     LOCAL_CHECK(bad, r[i].TrackId == 1 && (r[i].BoundTrackId == -1 || r[i].BoundTrackId == 0 || r[i].BoundTrackId == 1),
                                 "%s: field particle %lu of B tagged %ld bound %ld\n", what, (unsigned long) r[i].ID, r[i].TrackId, r[i].BoundTrackId);
@@ -5316,7 +5652,7 @@ test_subhalo_fallback(void ** state)
             CHECK(st->NFallbackField >= 2000, "%s: %ld particle tags written by the in-place pass\n", what, st->NFallbackField);
         }
         if(stage == 4)
-            /* Phase 2b: the hostless pseudo-key is unbound in place with the HBT recipe */
+            /* the hostless pseudo-key is unbound in place with the HBT recipe */
             CHECK(rec[0].Nbound > 0 && rec[0].HostGroup == -1 && rec[0].Rank == 0 && (rec[0].Flags & SUBHALO_FLAG_INPLACE)
                   && rec[0].Vmax > 0,
                   "%s: hostless A Nbound %d/%d HostGroup %ld Rank %d Flags %d Vmax %g\n", what, rec[0].Nbound, rec[0].NboundExclusive,
@@ -5340,7 +5676,7 @@ test_subhalo_fallback(void ** state)
         rm_tree(dir);
 }
 
-/* ---- J11: the iteration cap and the final-pass diagnostics; J4: the orphan lookup's memory
+/* ---- the iteration cap and the final-pass diagnostics; the orphan lookup's memory
  *      check fails the call cleanly ---- */
 static void
 test_subhalo_itercap(void ** state)
@@ -5374,7 +5710,7 @@ test_subhalo_itercap(void ** state)
             CHECK(SUBHALO_IS_PROVISIONAL(st->WorstTrackId), "itercap: worst track %ld at the first call (a newborn)\n", st->WorstTrackId);
         free(rec);
     }
-    /* J4: a lookup batch that cannot fit: the call is skipped before anything changes */
+    /* a lookup batch that cannot fit: the call is skipped before anything changes */
     int64_t n0, n1, i;
     struct tagrec * r0 = gather_tags(&n0);
     sp.SubhaloLookupBatchBytes = 10000000000000L;
@@ -5394,7 +5730,7 @@ test_subhalo_itercap(void ** state)
     p2_teardown();
 }
 
-/* ---- J4: the batched ID lookup under skewed hits, repeated ids, zero-query ranks, tiny
+/* ---- the batched ID lookup under skewed hits, repeated ids, zero-query ranks, tiny
  *      batches and the byte cap ---- */
 #define LK_N0 20000
 static void
@@ -5407,7 +5743,7 @@ lk_expect(MyIDType id, double pos[3], int64_t * bt)
 }
 
 /* A particle with id but answers that are not lk_expect's (a later duplicate), or a garbage /
- * swallowed one (Phase 5d audit R4). */
+ * swallowed one. */
 static void
 lk_add_other(MyIDType id, int garbage, int swallowed)
 {
@@ -5469,7 +5805,7 @@ test_subhalo_lookup(void ** state)
             add_dm_particle(id, pos);
             P[PartManager->NumPart - 1].BoundTrackId = bt;
         }
-    /* Phase 5d audit R4: duplicated live IDs, answered by the lowest P index in every mode (7 on
+    /* duplicated live IDs, answered by the lowest P index in every mode (7 on
      * rank 0, one id per other rank); ids whose lowest copies are garbage (11) or swallowed (13),
      * answered by their first live copy; ids held only by garbage (5000100) or swallowed
      * (5000101) particles, which are misses */
@@ -5522,8 +5858,8 @@ test_subhalo_lookup(void ** state)
     int lmode;
     for(lmode = 0; lmode < 3; lmode++)
     for(mode = 0; mode < 2; mode++) {
-        /* mode 0: three ids per rank and batch; mode 1: the 1 MB byte cap alone; lmode (Phase
-         * 5d): how the answers are found, auto / the sorted index / the scan of the particles */
+        /* mode 0: three ids per rank and batch; mode 1: the 1 MB byte cap alone; lmode:
+         * how the answers are found, auto / the sorted index / the scan of the particles */
         subhalo_lookup_set_max_batch(mode == 0 ? 3 : 0);
         subhalo_lookup_set_mode(lmode);
         subhalo_lookup_ids(q, nq, out, MPI_COMM_WORLD);
@@ -5545,7 +5881,7 @@ test_subhalo_lookup(void ** state)
             CHECK(gpeak <= sp.SubhaloLookupBatchBytes + 16384 && (NTask < 4 || gpeak > 0.5 * sp.SubhaloLookupBatchBytes),
                   "lookup: byte cap %ld, high water %g\n", sp.SubhaloLookupBatchBytes, gpeak);
     }
-    /* a call so small that the auto mode differs between the ranks (audit 5d R4): rank 0's
+    /* a call so small that the auto mode differs between the ranks: rank 0's
      * ~20000 live particles answer by the scan (ntot <= nlive / 16), the ~100 of the other ranks
      * by the index; the answers equal those of the forced modes */
     {
@@ -5591,7 +5927,7 @@ test_subhalo_lookup(void ** state)
     teardown_pman();
 }
 
-/* ------------------------------------------------------------------ decision 70: multi-particle orphans */
+/* ------------------------------------------------------------------ multi-particle orphans */
 
 /* The parameters with SubhaloOrphanTracers = K. */
 static void
@@ -6446,6 +6782,11 @@ int main(void) {
         cmocka_unit_test(test_subhalo_nest_tree),
         cmocka_unit_test(test_subhalo_deep_chain),
         cmocka_unit_test(test_subhalo_mixed_call),
+        cmocka_unit_test(test_subhalo_admit_take),
+        cmocka_unit_test(test_subhalo_admit_votes),
+        cmocka_unit_test(test_subhalo_admit_rules),
+        cmocka_unit_test(test_subhalo_admit_distance),
+        cmocka_unit_test(test_subhalo_rescue_loss_call),
         cmocka_unit_test(test_subhalo_nocentral),
         cmocka_unit_test(test_subhalo_fallback),
         cmocka_unit_test(test_subhalo_itercap),
@@ -6454,7 +6795,9 @@ int main(void) {
         cmocka_unit_test(test_subhalo_reserve_admission),
         cmocka_unit_test(test_subhalo_local_sort),
         cmocka_unit_test(test_subhalo_header_params),
+        cmocka_unit_test(test_subhalo_param_checks),
         cmocka_unit_test(test_subhalo_sampled_default),
+        cmocka_unit_test(test_subhalo_sampled_default_full),
         cmocka_unit_test(test_subhalo_weighted_plurality),
         cmocka_unit_test(test_subhalo_resurrection_order),
         cmocka_unit_test(test_subhalo_penalty_descendant),

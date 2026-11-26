@@ -1,20 +1,15 @@
 #ifndef SUBHALO_UNBIND_H
 #define SUBHALO_UNBIND_H
 
-/* Unbinding kernel and property interface of the subhalo finder (design 7.4, 7.5, D3 items 3-6):
- * a port of HBT-HERONS's tree, unbinding loop, core, sinking test and k-nearest tracer search.
- *
- * Thread-safe (one key per thread); scratch comes only from the caller's arena and is rewound on
- * return (except the tree of subhalo_knn_build). A key run alone splits its larger steps over the threads (see the threading block at
- * the end); results never depend on the thread count.
- *
- * Conventions (design 7.10): Pos in the translated comoving frame, Vel = a v_pec, energies per
- * unit mass in physical (km/s)^2:
- *   E_i   = 1/2 |Vel_i / a - RefVel / a + H a dx_i|^2 + phi_i (+ u_i for type 0 with WithThermal)
- *   dx_i  = NEAREST(Pos_i - RefPos)
- *   phi_i = -(G / a) sum_{j != i, Type_j in PotentialTypes} m_j W(|dx_ij|, h)
- * with W = grav_spline_potential. Every pair displacement is a nearest image taken at each
- * interaction, as HBT does, so sources of any extent are handled. Every ordering breaks ties by particle ID, then by P index. */
+/* Unbinding kernel and property interface of the subhalo finder (design 7.4, 7.5, D3 items 3-6): a port
+ * of HBT-HERONS's tree, unbinding loop, core, sinking test and k-nearest tracer search. Thread-safe (one
+ * key per thread); scratch only from the caller's arena, rewound on return (except the tree of
+ * subhalo_knn_build); a key run alone splits its larger steps over the threads, results never depend
+ * on the thread count. Conventions (design 7.10): Pos translated comoving, Vel = a v_pec, energies per
+ * unit mass in physical (km/s)^2, E_i = 1/2 |Vel_i / a - RefVel / a + H a dx_i|^2 + phi_i (+ u_i for
+ * type 0 with WithThermal), dx_i = NEAREST(Pos_i - RefPos), phi_i = -(G / a) sum_{j != i, Type_j in
+ * PotentialTypes} m_j W(|dx_ij|, h), W = grav_spline_potential: every pair displacement is a nearest
+ * image taken at each interaction, as HBT does. Ties break by particle ID, then by P index. */
 
 #include <stdint.h>
 #include "subhalo.h"
@@ -67,7 +62,8 @@ struct SubhaloUnbindParams {
  * exact energies, so the head holds MARGIN * Kt tracers. */
 #define SUBHALO_FINAL_REFINE_MIN 20
 #define SUBHALO_FINAL_REFINE_MARGIN 5
-/* Largest k accepted by subhalo_knn_query (the per-query list lives on the thread stack). */
+/* Largest neighbour number of a parameter. subhalo_knn_query accepts one more, for a query that finds
+ * the particle itself (the per-query list lives on the thread stack). */
 #define SUBHALO_KNN_MAXK 64
 
 /* Arena bytes per candidate particle: the caller's Index and Energy (16), plus the kernel's
@@ -76,22 +72,65 @@ struct SubhaloUnbindParams {
 #define SUBHALO_UNBIND_SCRATCH_BYTES_PER_PART 96
 #define SUBHALO_UNBIND_BYTES_PER_PART (16 + SUBHALO_UNBIND_SCRATCH_BYTES_PER_PART)
 
+/* The step decision of the unbinding loop, one rule for subhalo_unbind and the in-place loop
+ * (subhalo_collective.c). Death: a bound set below either survival threshold (HBT). */
+static inline int
+subhalo_unbind_dies(int64_t Nbound, int64_t NboundTracer, const struct SubhaloUnbindParams * up)
+{
+    return Nbound < up->MinNumPart || NboundTracer < up->MinNumTracerPart;
+}
+
+/* Outcome of an iteration that survived: count convergence Nbound >= Nlast * BoundMassPrecision
+ * (HBT), else the cap after MaxIter iterations (MaxIter > 0; the caller sets SUBHALO_FLAG_ITERCAP). */
+enum SubhaloUnbindStep { SUBHALO_STEP_CONTINUE = 0, SUBHALO_STEP_CONVERGED, SUBHALO_STEP_CAPPED };
+static inline enum SubhaloUnbindStep
+subhalo_unbind_step(int64_t Nbound, int64_t Nlast, int Iterations, const struct SubhaloUnbindParams * up)
+{
+    if((double) Nbound >= (double) Nlast * up->BoundMassPrecision)
+        return SUBHALO_STEP_CONVERGED;
+    if(up->MaxIter > 0 && Iterations >= up->MaxIter)
+        return SUBHALO_STEP_CAPPED;
+    return SUBHALO_STEP_CONTINUE;
+}
+
 /* Unbind c in place. Returns 1 if it survives, 0 if it died (Nbound 0, Index a permutation).
  * On survival Index[0, Nbound) is the bound set in ascending Energy (after a subsampled loop the
  * max(SampleSize, 0.1 Nbound) most bound re-ordered by exact self-energy, as HBT), then the unbound
- * in ascending Energy; RefPos/RefVel the bound CoM frame; Flags |= ITERCAP when MaxIter is hit. */
+ * in ascending Energy; RefPos/RefVel the bound CoM frame; Flags |= ITERCAP when the loop
+ * stops at MaxIter without converging. */
 int subhalo_unbind(struct SubCandidate * c, const struct SubhaloUnbindParams * up, struct SubhaloArena * arena);
 
-/* Core-frame rescue of a resolved track's candidate that subhalo_unbind killed from its mean frame. The core
- * is the source's own-tag particles with 0 <= BindRank < K; with fewer than max(1, K/2) it returns 0, c untouched,
- * *tried = 0 (tried may be NULL). Else c is unbound again from the core's frame, final: survival sets SUBHALO_FLAG_RESCUED,
- * a death restores c's fields and Index order (Energy is scratch, undefined after a death as after subhalo_unbind). */
-int subhalo_unbind_rescue(struct SubCandidate * c, int64_t K, const struct SubhaloUnbindParams * up,
-                          struct SubhaloArena * arena, int * tried);
+/* Frame of the rescue: the core is c's particles with TrackId == BoundTrackId == c->TrackId and
+ * 0 <= BindRank < K, in (BindRank, ID) order; the seed is the core's component-wise median velocity,
+ * the width s the median core speed about it; then SUBHALO_RESCUE_ITERATIONS times the core members
+ * within SUBHALO_RESCUE_CLIP s of the centre give the next centre (their CoM frame). Pos, Vel: the last
+ * such frame (a set of fewer than 3, without mass or with sums that overflow ends the iteration). Returns
+ * 0 (outputs untouched) when the core has fewer than max(1, K/2) members or a member with a non-finite
+ * position or velocity, s is not finite and > 0, or no frame was formed. c is unchanged; arena restored. */
+int subhalo_rescue_frame(const struct SubCandidate * c, int64_t K, const struct SubhaloUnbindParams * up,
+                         struct SubhaloArena * arena, double Pos[3], double Vel[3]);
+
+/* The second unbinding of subhalo_unbind_rescue: tried, 1 when it ran; stood, 1 when its result stands;
+ * Itercap and ConvergenceRatio, its own diagnostics (as subhalo_unbind's SUBHALO_FLAG_ITERCAP and ratio). */
+struct SubhaloSecondAttempt {
+    int tried, stood, Itercap;
+    double ConvergenceRatio;
+};
+
+/* Rescue of a resolved track's candidate c after its first subhalo_unbind (alive: its return), from the mean
+ * frame of the NPrev previously bound particles. The second attempt runs when c died or survived with
+ * subhalo_rescue_large_loss(Nbound, NPrev), and a subhalo_rescue_frame with core size K exists: c is unbound
+ * again from that frame, starting from the first result's Index order and flags without SUBHALO_FLAG_ITERCAP.
+ * Its result stands when it survives and the first died or bound fewer particles; it then carries
+ * SUBHALO_FLAG_RESCUED. Otherwise c's fields and Index order are restored to the first result bitwise (Energy is
+ * scratch: undefined after a death as after subhalo_unbind, stale after a restored survival). Returns whether the
+ * result that stands survives; sa (NULL allowed) gets what the second attempt did, all zero when it did not run. */
+int subhalo_unbind_rescue(struct SubCandidate * c, int alive, int64_t NPrev, int64_t K, const struct SubhaloUnbindParams * up,
+                          struct SubhaloArena * arena, struct SubhaloSecondAttempt * sa);
 
 /* Final pass over the bound prefix in its recomputed CoM frame: exact-mass energies, prefix sorted
  * by them; returns the count with E >= 0 (NboundPositive). Membership is unchanged. Sampled
- * (SampledFinalPass and Nbound > SampleSize > 0, decision 42.4): needs the unedited post-unbind
+ * (SampledFinalPass and Nbound > SampleSize > 0, as HBT): needs the unedited post-unbind
  * prefix; only its head of MARGIN * Kt tracers is sorted by exact energies, the rest keeps HBT's
  * loop order, and Energy is then the loop's estimator (not sorted; for the property sums only). */
 int64_t subhalo_final_pass(struct SubCandidate * c, const struct SubhaloUnbindParams * up, struct SubhaloArena * arena);
@@ -102,10 +141,14 @@ int64_t subhalo_final_pass(struct SubCandidate * c, const struct SubhaloUnbindPa
 void subhalo_core(const struct SubCandidate * c, const struct SubhaloUnbindParams * up, int CoreSize,
                   double CorePos[3], double CoreVel[3], double * SigmaX, double * SigmaV);
 
-/* HBT sinking test of satellite s against ancestor a using the cores above
+/* The sinking test's phase-space distance of core s from core a in a's dispersions,
+ * |dx| / aSigmaX + |dv| / aSigmaV (periodic minimum image); one compiled copy for every caller. */
+double subhalo_core_distance(const double sPos[3], const double sVel[3], const double aPos[3], const double aVel[3],
+                             double aSigmaX, double aSigmaV, double BoxSize);
+
+/* HBT sinking test of satellite core s against ancestor core a
  * (|dx| / SigmaX_a + |dv| / SigmaV_a < 2, or the symmetric form when symmetric != 0). */
-int subhalo_sink_test(const double sPos[3], const double sVel[3], const double aPos[3], const double aVel[3],
-                      double aSigmaX, double aSigmaV, double sSigmaX, double sSigmaV, int symmetric, double BoxSize);
+int subhalo_sink_test(const struct SubhaloCore * s, const struct SubhaloCore * a, int symmetric, double BoxSize);
 
 /* k nearest tracers (ReassignParticles): one read-only tree per key in the arena (its nodes may
  * take the whole remainder: take query buffers first), queried in batches; rows nearest first,
@@ -116,6 +159,9 @@ struct SubhaloKnnTree;
 struct SubhaloKnnTree * subhalo_knn_build(const int64_t * tr, int64_t nt, double BoxSize, struct SubhaloArena * arena);
 void subhalo_knn_query(const struct SubhaloKnnTree * t, const int64_t * query, int64_t nq, int k, int64_t * out);
 int64_t subhalo_knn_build_count(void);
+/* |NEAREST(x - y)|^2 with x the neighbour and y the query, absolute positions: the distance of
+ * every k-nearest search of the finder (not inlined, so that all of them round alike). */
+double subhalo_knn_r2(const double x[3], const double y[3], double BoxSize);
 void subhalo_knn_tracers(const int64_t * query, int64_t nq, const int64_t * tr, int64_t nt, int k,
                          int64_t * out, double BoxSize, struct SubhaloArena * arena);
 
@@ -153,22 +199,37 @@ void subhalo_props_rockstar(struct SubTrack * rec, const struct SubCandidate * c
                             const struct SubhaloUnbindParams * up, const double rho[SUBHALO_NSO],
                             int CoreSize, const double Offset[3], struct SubhaloArena * arena);
 
+/* The shape fit of both modes: the smallest aperture for which a shape is reported, and the
+ * iteration cap. */
+#define SUBHALO_SHAPE_MINPART 20
+#define SUBHALO_SHAPE_ITERATIONS 10
+
 /* Rockstar f_to_c: the NFW concentration with c / (ln(1 + c) - c / (1 + c)) = f, -1 on failure. */
 double subhalo_klypin_f_to_c(double f);
+/* Rockstar's RMAX_TO_RS and RS_CONSTANT (nfw.c, the NFW values Rmax / Rs and
+ * Vmax^2 Rvir / (G Mvir) * f(c) / c). */
+#define KLYPIN_RMAX_TO_RS 2.1626
+#define KLYPIN_RS_CONSTANT 0.216216
 
 /* ------------------------------------------------------------------ deferred properties (subhalo_props.c) */
 
 /* Rockstar's NFW fit Rs and RockstarCoreVel, BulkVel, Vrms on the aperture of the kc bound
- * particles inside the outermost virial crossing (design D4, decisions 44, 47.1); -1 when undefined.
+ * particles inside the outermost virial crossing (design D4, Rockstar's aperture); -1 when undefined.
  * Deviations from Rockstar: bin edges interpolated in one length unit (nfw.c mixes Mpc/h and kpc/h),
  * a double fit returning -1 on bad input, softening-floored edge radii, Vrms over the aperture's own
  * mass, only the crossing particle left out of the fit. Outputs final: velocities physical peculiar
  * km/s, Rs comoving in the run's length unit. subhalo_props_rockstar gives the same values
- * bitwise; subhalo_collective.c in place, with the same compensated sums (equal if they are exact). */
+ * bitwise; subhalo_collective_props.c in place, with the same compensated sums (equal if they are exact). */
 void subhalo_props_deferred(struct SubTrack * rec, const struct SubCandidate * c,
                             const struct SubhaloUnbindParams * up, const double rho[SUBHALO_NSO],
                             int CoreSize, struct SubhaloArena * arena);
 
+/* The velocity trio (subhalo_props.c) from the compensated aperture sums
+ * about the core velocity cvel (Vel units): Mb the aperture mass, Sb and S2 its first and second
+ * moments, Mc and Sc those of the Rockstar core; vkms converts Vel to km/s. One function for the
+ * serial and the distributed recipe, so that equal sums give equal columns. */
+void subhalo_deferred_velocities(float BulkVel[3], float CoreVel[3], float * Vrms, const double cvel[3], double Mb, double Mc,
+                                 double Sb[3][2], double S2[3][2], double Sc[3][2], double vkms);
 /* Pieces both modes share, so the serial and the in-place Rs come from the same arithmetic. */
 #define SUBHALO_NFW_MAXBINS 50        /* MAX_SCALE_BINS */
 #define SUBHALO_NFW_MINPERBIN 15      /* MIN_PART_PER_BIN (also Rockstar's iteration cap) */
@@ -199,7 +260,7 @@ void subhalo_props_baryons(struct SubTrack * rec, const struct SubCandidate * c,
 
 /* A step on more than PAR_MIN elements outside a parallel region (a key run alone) splits over the
  * threads. CHUNK_MIN fixes the chunks of the floating sums and the partition's switch, so it defines
- * results and must not change; PAR_MIN only shares work out (decisions 34, 42.5). set_par_min:
+ * results and must not change; PAR_MIN only shares work out. set_par_min:
  * tests only, outside any parallel region, n <= 0 restores the default. */
 #define SUBHALO_UNBIND_PAR_MIN 512
 #define SUBHALO_UNBIND_CHUNK_MIN 16384
