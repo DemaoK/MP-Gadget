@@ -751,6 +751,9 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
                 /* Not strictly necessary, but a good idea for performance*/
                 slots_gc_sorted(PartManager, SlotsManager);
             }
+            /* The finder, and the group save when it moved the particles, end with a domain exchange
+             * that can change this rank's particle number: reset the active list size.*/
+            Act.NumActiveParticle = PartManager->NumPart;
         }
 
         /* Write the potential planes*/
