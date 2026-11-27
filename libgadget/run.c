@@ -547,9 +547,12 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
         /* Gravitational acceleration here*/
         if(totgravactive) {
             if(All.HierarchicalGravity) {
-                /* We need to store a GravAccel for new star particles as well, so we need extra memory.*/
-                GravAccel.nstore = PartManager->NumPart + SlotsManager->info[0].size;
-                GravAccel.GravAccel = (MyFloat (*) [3]) mymalloc2("GravAccel", GravAccel.nstore * sizeof(GravAccel.GravAccel[0]));
+                /* For PM steps we re-use FullTreeGravAccel and so do not allocate this.*/
+                if(!is_PM) {
+                    /* We need to store a GravAccel for new star particles as well, so we need extra memory.*/
+                    GravAccel.nstore = PartManager->NumPart + SlotsManager->info[0].size;
+                    GravAccel.GravAccel = (MyFloat (*) [3]) mymalloc2("GravAccel", GravAccel.nstore * sizeof(GravAccel.GravAccel[0]));
+                }
                 hierarchical_gravity_accelerations(&Act, &pm, ddecomp, GravAccel, &times, HybridNuTracer, &All.CP, All.OutputDir);
             }
             else if(All.TreeGravOn && totgravactive) {
@@ -713,7 +716,7 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
              * If we do collect, reset active list size.*/
             int compact[6] = {0};
             if(slots_gc(compact, PartManager, SlotsManager))
-                Act.NumActiveParticle = PartManager->NumPart;
+                Act.NumActiveGravity = Act.NumActiveParticle = PartManager->NumPart;
         }
         FOFGroups fof = {0};
         if(WriteFOF) {
@@ -752,8 +755,8 @@ run(const int RestartSnapNum, const inttime_t ti_init, const struct header_data 
                 slots_gc_sorted(PartManager, SlotsManager);
             }
             /* The finder, and the group save when it moved the particles, end with a domain exchange
-             * that can change this rank's particle number: reset the active list size.*/
-            Act.NumActiveParticle = PartManager->NumPart;
+             * that can change this rank's particle number: reset the active list sizes.*/
+            Act.NumActiveGravity = Act.NumActiveParticle = PartManager->NumPart;
         }
 
         /* Write the potential planes*/
