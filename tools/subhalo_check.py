@@ -1602,7 +1602,7 @@ def orphan_set_state(pos, gid, scale, box, pen=None):
     rankw = 1.0 / (1.0 + np.sqrt(keep.astype(np.float64)))
     pen = np.zeros(n) if pen is None else np.asarray(pen, np.float64)
     w = np.where(pen[keep] > 0, np.exp(-np.maximum(pen[keep], 0)), 1.0) * rankw
-    # the C build flushes subnormals to zero (-ffast-math)
+    # the finder counts a weight below the smallest normal double as zero
     w[w < np.finfo(np.float64).tiny] = 0.0
     if not w.sum() > 0:
         w = rankw
