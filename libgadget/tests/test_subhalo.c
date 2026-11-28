@@ -3891,7 +3891,7 @@ test_subhalo_central_source(void ** state)
         for(c = 0; c < 2; c++)
             for(j = 0; j < CS_NMOVE; j++)
                 if(P[i].ID == cs_moved_id(c, j)) {
-                    P[i].Pos[0] = 72.5 + 62.5 * (j % 16);
+                    P[i].Pos[0] = p2_wrap(72.5 + 62.5 * (j % 16));
                     P[i].Pos[1] = 135. + 250. * c + 62.5 * (j / 16);
                     P[i].Pos[2] = 135.;
                     P[i].Vel[0] = P[i].Vel[1] = P[i].Vel[2] = 0;
