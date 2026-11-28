@@ -7,6 +7,7 @@
  * allocation; bottom allocations are scratch freed by the function that made them. */
 
 #include <math.h>
+#include <float.h>
 #include "subhalo.h"
 
 /* Per-thread arena bytes per particle of a key (design 7.1): the kernel's 112
@@ -418,12 +419,19 @@ struct SubhaloKeySeg {
  * SubhaloNumTracerHostFinding by (BindRank, ID) as TracerIDs and sets Host to the GrNr (-1: no
  * group) with the largest weight sum 1 / (1 + sqrt(i)), ties to the smaller GrNr. Collective. */
 void subhalo_host_vote(struct SubTrackTable * tab, MPI_Comm Comm);
+/* A weight below the smallest normal double counts as zero: a build with -ffast-math flushes it
+ * to zero, and the catalogue must not depend on that flag. */
+static inline double
+subhalo_weight_flush(double w)
+{
+    return w < DBL_MIN ? 0 : w;
+}
 /* exp(-TracerPenalty), exactly 1 for a zero (or negative) penalty: an orphan marker weighs exp(-penalty) /
  * (1 + sqrt(rank)), a descendant vote exp(-penalty) alone, so zero penalties give it equal weights. */
 static inline double
 subhalo_tracer_weight(float penalty)
 {
-    return penalty > 0 ? exp(-(double) penalty) : 1.0;
+    return penalty > 0 ? subhalo_weight_flush(exp(-(double) penalty)) : 1.0;
 }
 /* Step 3, previous-bound frames: sums over the live particles with BoundTrackId == T, as
  * nearest-image displacements from one common reference per track (the lowest (own tag, BindRank,

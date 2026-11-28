@@ -392,7 +392,7 @@ subhalo_orphan_update(struct SubTrack * t, const struct SubhaloIdHit * hit, int 
     int64_t cand[SUBHALO_MAXTRACERS];
     double w[SUBHALO_MAXTRACERS], W = 0, mx[3] = {0, 0, 0}, mv[3] = {0, 0, 0};
     for(k = 0; k < nk; k++) {
-        w[k] = subhalo_tracer_weight(hit[f[keep[k]]].Penalty) / (1.0 + sqrt((double) f[keep[k]]));
+        w[k] = subhalo_weight_flush(subhalo_tracer_weight(hit[f[keep[k]]].Penalty) / (1.0 + sqrt((double) f[keep[k]])));
         W += w[k];
     }
     /* every final weight underflowed (huge penalties): the rank weights alone, whose sum is > 0 */
